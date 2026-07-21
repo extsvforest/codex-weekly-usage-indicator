@@ -1,0 +1,6 @@
+* text=auto
+*.yml text eol=lf
+*.md text eol=lf
+*.cs text eol=lf
+*.csproj text eol=lf
+*.ps1 text eol=crlf

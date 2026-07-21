@@ -1,0 +1,7 @@
+.vs/
+dist/
+src/bin/
+src/obj/
+*.user
+*.suo
+*.pdb

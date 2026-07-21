@@ -1,0 +1,43 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: 8.0.x
+      - name: Build
+        shell: pwsh
+        run: .\scripts\build.ps1
+      - name: Package
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath 'dist\WeeklyUsageIndicator.exe').Hash.ToLowerInvariant()
+          "$hash  WeeklyUsageIndicator.exe" | Set-Content -LiteralPath 'dist\SHA256SUMS.txt' -Encoding ascii
+          New-Item -ItemType Directory -Path 'package\scripts' -Force | Out-Null
+          New-Item -ItemType Directory -Path 'package\dist' -Force | Out-Null
+          Copy-Item -LiteralPath 'dist\WeeklyUsageIndicator.exe','dist\SHA256SUMS.txt' -Destination 'package\dist'
+          Copy-Item -LiteralPath 'scripts\install.ps1','scripts\uninstall.ps1' -Destination 'package\scripts'
+          Copy-Item -LiteralPath 'README.md','PRIVACY.md','SECURITY.md','LICENSE' -Destination 'package'
+          Compress-Archive -Path 'package\*' -DestinationPath "CodexWeeklyUsageIndicator-$env:GITHUB_REF_NAME-win-x64.zip"
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$env:GITHUB_REF_NAME" `
+            "CodexWeeklyUsageIndicator-$env:GITHUB_REF_NAME-win-x64.zip" `
+            'dist\WeeklyUsageIndicator.exe' `
+            'dist\SHA256SUMS.txt' `
+            --title "Codex Weekly Usage Indicator $env:GITHUB_REF_NAME" `
+            --generate-notes
