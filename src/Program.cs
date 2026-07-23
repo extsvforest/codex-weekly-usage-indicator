@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Drawing.Drawing2D;
+using System.Runtime.InteropServices;
 using System.Text.Json;
 
 namespace WeeklyUsageIndicator;
@@ -54,6 +55,7 @@ internal sealed class UsageIndicatorForm : Form
     private bool _isRefreshing;
     private bool _isHovered;
     private bool _isDragging;
+    private bool _keepOnTop = true;
     private Point _dragCursorStart;
     private Point _dragFormStart;
 
@@ -137,7 +139,12 @@ internal sealed class UsageIndicatorForm : Form
             Checked = true,
             CheckOnClick = true
         };
-        topMostItem.CheckedChanged += (_, _) => TopMost = topMostItem.Checked;
+        topMostItem.CheckedChanged += (_, _) =>
+        {
+            _keepOnTop = topMostItem.Checked;
+            TopMost = _keepOnTop;
+            ReassertTopMost();
+        };
 
         var copyItem = new ToolStripMenuItem("현재 상태 복사");
         copyItem.Click += (_, _) =>
@@ -164,6 +171,12 @@ internal sealed class UsageIndicatorForm : Form
         Location = new Point(
             workingArea.Right - Width - 18,
             workingArea.Bottom - Height - 18);
+    }
+
+    private void ReassertTopMost()
+    {
+        if (!_keepOnTop || !Visible || !IsHandleCreated) return;
+        _ = NativeWindow.TrySetTopMost(Handle);
     }
 
     private void SyncCodexVisibility()
@@ -193,7 +206,11 @@ internal sealed class UsageIndicatorForm : Form
 
         if (!Visible) Show();
         Opacity = 1;
-        TopMost = true;
+        if (_keepOnTop)
+        {
+            TopMost = true;
+            ReassertTopMost();
+        }
     }
 
     private async Task RefreshUsageAsync(bool force = false)
@@ -388,6 +405,38 @@ internal sealed class UsageIndicatorForm : Form
     }
 }
 
+internal static class NativeWindow
+{
+    private static readonly IntPtr HwndTopMost = new(-1);
+    private const uint SwpNoSize = 0x0001;
+    private const uint SwpNoMove = 0x0002;
+    private const uint SwpNoActivate = 0x0010;
+    private const uint SwpShowWindow = 0x0040;
+
+    public static bool TrySetTopMost(IntPtr windowHandle)
+    {
+        return SetWindowPos(
+            windowHandle,
+            HwndTopMost,
+            0,
+            0,
+            0,
+            0,
+            SwpNoSize | SwpNoMove | SwpNoActivate | SwpShowWindow);
+    }
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetWindowPos(
+        IntPtr windowHandle,
+        IntPtr insertAfter,
+        int x,
+        int y,
+        int width,
+        int height,
+        uint flags);
+}
+
 internal sealed class CodexDesktopStateReader
 {
     public bool IsRunning()
@@ -481,7 +530,7 @@ internal sealed class AppServerClient : IDisposable
                     {
                         name = "weekly-usage-indicator",
                         title = "Weekly Usage Indicator",
-                        version = "1.1.0"
+                        version = "1.1.1"
                     },
                     capabilities = new { experimentalApi = true }
                 },
