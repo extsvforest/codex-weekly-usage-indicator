@@ -5,6 +5,7 @@ Codex Weekly Usage Indicator reads one value from the locally installed Codex ap
 The application:
 
 - does not store usage history;
+- stores only the last window coordinates in a local `settings.json` file;
 - does not read or store authentication tokens;
 - does not collect account identifiers;
 - does not include telemetry;

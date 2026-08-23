@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Drawing.Drawing2D;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Text.Json;
 
 namespace WeeklyUsageIndicator;
@@ -56,6 +57,7 @@ internal sealed class UsageIndicatorForm : Form
     private bool _isHovered;
     private bool _isDragging;
     private bool _keepOnTop = true;
+    private bool _positionInitialized;
     private Point _dragCursorStart;
     private Point _dragFormStart;
 
@@ -87,7 +89,7 @@ internal sealed class UsageIndicatorForm : Form
         {
             if (_previewMode)
             {
-                PlaceNearTaskbar();
+                EnsurePositionInitialized();
                 Opacity = 1;
                 _ = RefreshUsageAsync(force: true);
                 _pollTimer.Start();
@@ -107,6 +109,8 @@ internal sealed class UsageIndicatorForm : Form
         Resize += (_, _) => ApplyRoundedRegion();
         FormClosing += (_, _) =>
         {
+            if (_positionInitialized)
+                IndicatorSettingsStore.SavePosition(Location);
             _pollTimer.Stop();
             _codexStateTimer.Stop();
             _client.Dispose();
@@ -173,6 +177,31 @@ internal sealed class UsageIndicatorForm : Form
             workingArea.Bottom - Height - 18);
     }
 
+    private void EnsurePositionInitialized()
+    {
+        if (_positionInitialized) return;
+        _positionInitialized = true;
+
+        var savedPosition = IndicatorSettingsStore.LoadPosition();
+        if (savedPosition is { } position && TryRestorePosition(position))
+            return;
+
+        PlaceNearTaskbar();
+    }
+
+    private bool TryRestorePosition(Point position)
+    {
+        var targetScreen = Screen.AllScreens.FirstOrDefault(screen =>
+            screen.Bounds.Contains(position));
+        if (targetScreen is null) return false;
+
+        var screenBounds = targetScreen.Bounds;
+        Location = new Point(
+            Math.Clamp(position.X, screenBounds.Left, Math.Max(screenBounds.Left, screenBounds.Right - Width)),
+            Math.Clamp(position.Y, screenBounds.Top, Math.Max(screenBounds.Top, screenBounds.Bottom - Height)));
+        return true;
+    }
+
     private void ReassertTopMost()
     {
         if (!_keepOnTop || !Visible || !IsHandleCreated) return;
@@ -199,9 +228,16 @@ internal sealed class UsageIndicatorForm : Form
         if (!_codexWasRunning)
         {
             _codexWasRunning = true;
-            PlaceNearTaskbar();
+            EnsurePositionInitialized();
             _ = RefreshUsageAsync(force: true);
             _pollTimer.Start();
+        }
+
+        if (NativeWindow.IsForegroundWindowFullscreen(Handle))
+        {
+            Opacity = 0;
+            if (Visible) Hide();
+            return;
         }
 
         if (!Visible) Show();
@@ -383,6 +419,7 @@ internal sealed class UsageIndicatorForm : Form
         if (e.Button != MouseButtons.Left) return;
         _isDragging = false;
         Capture = false;
+        IndicatorSettingsStore.SavePosition(Location);
     }
 
     private void ApplyRoundedRegion()
@@ -405,9 +442,56 @@ internal sealed class UsageIndicatorForm : Form
     }
 }
 
+internal sealed record IndicatorSettings(int X, int Y);
+
+internal static class IndicatorSettingsStore
+{
+    private static readonly string SettingsDirectory = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "CodexWeeklyUsageIndicator");
+
+    private static readonly string SettingsPath = Path.Combine(SettingsDirectory, "settings.json");
+
+    public static Point? LoadPosition()
+    {
+        try
+        {
+            if (!File.Exists(SettingsPath)) return null;
+            var settings = JsonSerializer.Deserialize<IndicatorSettings>(File.ReadAllText(SettingsPath));
+            return settings is null ? null : new Point(settings.X, settings.Y);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    public static void SavePosition(Point position)
+    {
+        try
+        {
+            Directory.CreateDirectory(SettingsDirectory);
+            var temporaryPath = SettingsPath + ".tmp";
+            var json = JsonSerializer.Serialize(
+                new IndicatorSettings(position.X, position.Y),
+                new JsonSerializerOptions { WriteIndented = true });
+            File.WriteAllText(temporaryPath, json);
+            File.Move(temporaryPath, SettingsPath, overwrite: true);
+        }
+        catch
+        {
+            // Position persistence is best-effort and must never stop the widget.
+        }
+    }
+}
+
 internal static class NativeWindow
 {
     private static readonly IntPtr HwndTopMost = new(-1);
+    private const int GwlStyle = -16;
+    private const int SwShowMaximized = 3;
+    private const int WsCaption = 0x00C00000;
+    private const uint MonitorDefaultToNearest = 0x00000002;
     private const uint SwpNoSize = 0x0001;
     private const uint SwpNoMove = 0x0002;
     private const uint SwpNoActivate = 0x0010;
@@ -424,6 +508,119 @@ internal static class NativeWindow
             0,
             SwpNoSize | SwpNoMove | SwpNoActivate | SwpShowWindow);
     }
+
+    public static bool IsForegroundWindowFullscreen(IntPtr ignoredWindowHandle)
+    {
+        var foregroundWindow = GetForegroundWindow();
+        if (foregroundWindow == IntPtr.Zero || foregroundWindow == ignoredWindowHandle)
+            return false;
+        if (!IsWindowVisible(foregroundWindow) || IsIconic(foregroundWindow))
+            return false;
+
+        var className = new StringBuilder(64);
+        _ = GetClassName(foregroundWindow, className, className.Capacity);
+        if (className.ToString() is "Progman" or "WorkerW" or "Shell_TrayWnd")
+            return false;
+
+        var placement = new WindowPlacement
+        {
+            Length = (uint)Marshal.SizeOf<WindowPlacement>()
+        };
+        var style = GetWindowLong(foregroundWindow, GwlStyle);
+        if (GetWindowPlacement(foregroundWindow, ref placement) &&
+            placement.ShowCommand == SwShowMaximized &&
+            (style & WsCaption) != 0)
+        {
+            return false;
+        }
+
+        if (!GetWindowRect(foregroundWindow, out var windowRect))
+            return false;
+
+        var monitor = MonitorFromWindow(foregroundWindow, MonitorDefaultToNearest);
+        if (monitor == IntPtr.Zero) return false;
+
+        var monitorInfo = new MonitorInfo
+        {
+            Size = (uint)Marshal.SizeOf<MonitorInfo>()
+        };
+        if (!GetMonitorInfo(monitor, ref monitorInfo))
+            return false;
+
+        const int tolerance = 2;
+        return windowRect.Left <= monitorInfo.Monitor.Left + tolerance &&
+               windowRect.Top <= monitorInfo.Monitor.Top + tolerance &&
+               windowRect.Right >= monitorInfo.Monitor.Right - tolerance &&
+               windowRect.Bottom >= monitorInfo.Monitor.Bottom - tolerance;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct NativePoint
+    {
+        public int X;
+        public int Y;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct NativeRect
+    {
+        public int Left;
+        public int Top;
+        public int Right;
+        public int Bottom;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct WindowPlacement
+    {
+        public uint Length;
+        public uint Flags;
+        public uint ShowCommand;
+        public NativePoint MinPosition;
+        public NativePoint MaxPosition;
+        public NativeRect NormalPosition;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MonitorInfo
+    {
+        public uint Size;
+        public NativeRect Monitor;
+        public NativeRect WorkArea;
+        public uint Flags;
+    }
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool IsWindowVisible(IntPtr windowHandle);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool IsIconic(IntPtr windowHandle);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int GetClassName(IntPtr windowHandle, StringBuilder className, int maximumCount);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern int GetWindowLong(IntPtr windowHandle, int index);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetWindowPlacement(IntPtr windowHandle, ref WindowPlacement placement);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetWindowRect(IntPtr windowHandle, out NativeRect rectangle);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr MonitorFromWindow(IntPtr windowHandle, uint flags);
+
+    [DllImport("user32.dll", CharSet = CharSet.Auto)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetMonitorInfo(IntPtr monitor, ref MonitorInfo monitorInfo);
 
     [DllImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
