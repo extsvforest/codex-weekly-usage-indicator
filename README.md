@@ -8,6 +8,8 @@ An unofficial Windows widget that stays on top while Codex Desktop is running an
 - Reads the weekly usage window from the local Codex app-server.
 - Refreshes every 60 seconds; double-click to refresh immediately.
 - Supports dragging, copying the current value, and toggling always-on-top.
+- Remembers the last dragged position and restores it on the next launch.
+- Hides while another foreground app is fullscreen, then returns at the saved position.
 - Starts a small background watcher at Windows sign-in so it can follow future Codex launches.
 
 The widget does not store login tokens, account details, or usage history. See [PRIVACY.md](PRIVACY.md).
@@ -33,6 +35,7 @@ The widget does not store login tokens, account details, or usage history. See [
 ```
 
 The app is installed to `%LOCALAPPDATA%\CodexWeeklyUsageIndicator` and a per-user Startup shortcut is created.
+The saved window position is kept locally in `settings.json` inside that install directory.
 
 To uninstall:
 
