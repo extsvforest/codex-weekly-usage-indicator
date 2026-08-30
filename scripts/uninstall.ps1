@@ -24,4 +24,4 @@ if ((Test-Path -LiteralPath $resolvedInstall -PathType Container) -and
     Remove-Item -LiteralPath $resolvedInstall -Recurse -Force
 }
 
-Write-Host 'Codex Weekly Usage Indicator uninstalled.'
+Write-Host 'Codex + Claude Usage Indicator uninstalled.'
