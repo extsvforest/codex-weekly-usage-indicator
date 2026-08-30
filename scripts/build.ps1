@@ -2,8 +2,14 @@ $ErrorActionPreference = 'Stop'
 
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
 $projectPath = Join-Path $repositoryRoot 'src\WeeklyUsageIndicator.csproj'
+$testProjectPath = Join-Path $repositoryRoot 'tests\WeeklyUsageIndicator.Tests\WeeklyUsageIndicator.Tests.csproj'
 $distributionPath = Join-Path $repositoryRoot 'dist'
 $pathMap = "$repositoryRoot=/_/"
+
+dotnet run --project $testProjectPath -c Release --nologo
+if ($LASTEXITCODE -ne 0) {
+    throw "Claude usage regression tests failed with exit code $LASTEXITCODE."
+}
 
 dotnet clean $projectPath -c Release | Out-Null
 if ($LASTEXITCODE -ne 0) {

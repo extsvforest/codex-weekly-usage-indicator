@@ -55,7 +55,7 @@ internal sealed class UsageIndicatorForm : Form
     private readonly bool _previewMode;
 
     private UsageSnapshot? _codexSnapshot;
-    private ClaudeUsageSnapshot? _claudeSnapshot;
+    private ClaudeUsageResult? _claudeUsage;
     private string? _codexError;
     private string? _claudeError;
     private bool _codexWasRunning;
@@ -173,7 +173,7 @@ internal sealed class UsageIndicatorForm : Form
         {
             Clipboard.SetText(BuildClipboardText(
                 _codexSnapshot,
-                _claudeSnapshot,
+                _claudeUsage,
                 _codexError,
                 _claudeError,
                 _showClaude));
@@ -199,7 +199,7 @@ internal sealed class UsageIndicatorForm : Form
 
         if (!showClaude)
         {
-            _claudeSnapshot = null;
+            _claudeUsage = null;
             _claudeError = null;
             UpdateToolTip();
             Invalidate();
@@ -304,11 +304,11 @@ internal sealed class UsageIndicatorForm : Form
             var refreshTasks = new List<Task> { RefreshCodexAsync() };
             if (_showClaude)
             {
-                refreshTasks.Add(RefreshClaudeAsync(force));
+                refreshTasks.Add(RefreshClaudeAsync());
             }
             else
             {
-                _claudeSnapshot = null;
+                _claudeUsage = null;
                 _claudeError = null;
             }
 
@@ -326,7 +326,7 @@ internal sealed class UsageIndicatorForm : Form
     {
         _toolTip.SetToolTip(this, BuildTooltipText(
             _codexSnapshot,
-            _claudeSnapshot,
+            _claudeUsage,
             _codexError,
             _claudeError,
             _showClaude));
@@ -346,12 +346,12 @@ internal sealed class UsageIndicatorForm : Form
         }
     }
 
-    private async Task RefreshClaudeAsync(bool force)
+    private async Task RefreshClaudeAsync()
     {
         try
         {
             using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(18));
-            _claudeSnapshot = await _claudeClient.GetUsageAsync(force, timeout.Token);
+            _claudeUsage = await _claudeClient.GetUsageAsync(timeout.Token);
             _claudeError = null;
         }
         catch (Exception ex)
@@ -378,14 +378,17 @@ internal sealed class UsageIndicatorForm : Form
 
         var codexAvailable = _codexSnapshot is not null && _codexError is null;
         var claudeAvailable = _showClaude &&
-            _claudeSnapshot?.Fable is not null &&
+            _claudeUsage?.Snapshot.Fable is not null &&
             _claudeError is null;
         var codexAccent = Color.FromArgb(124, 156, 255);
         var claudeAccent = Color.FromArgb(217, 119, 87);
 
         if (codexAvailable && claudeAvailable)
         {
-            DrawDualProviders(graphics, _codexSnapshot!.UsedPercent, _claudeSnapshot!.Fable!.UsedPercent);
+            DrawDualProviders(
+                graphics,
+                _codexSnapshot!.UsedPercent,
+                _claudeUsage!.Snapshot.Fable!.UsedPercent);
         }
         else if (codexAvailable)
         {
@@ -393,7 +396,11 @@ internal sealed class UsageIndicatorForm : Form
         }
         else if (claudeAvailable)
         {
-            DrawProvider(graphics, new RectangleF(0, 0, Width, Height), _claudeSnapshot!.Fable!.UsedPercent, claudeAccent);
+            DrawProvider(
+                graphics,
+                new RectangleF(0, 0, Width, Height),
+                _claudeUsage!.Snapshot.Fable!.UsedPercent,
+                claudeAccent);
         }
         else if (_isRefreshing && _showClaude)
         {
@@ -470,9 +477,9 @@ internal sealed class UsageIndicatorForm : Form
         }
     }
 
-    private static string BuildTooltipText(
+    internal static string BuildTooltipText(
         UsageSnapshot? codex,
-        ClaudeUsageSnapshot? claude,
+        ClaudeUsageResult? claude,
         string? codexError,
         string? claudeError,
         bool showClaude)
@@ -482,7 +489,7 @@ internal sealed class UsageIndicatorForm : Form
 
     private static string BuildClipboardText(
         UsageSnapshot? codex,
-        ClaudeUsageSnapshot? claude,
+        ClaudeUsageResult? claude,
         string? codexError,
         string? claudeError,
         bool showClaude)
@@ -492,7 +499,7 @@ internal sealed class UsageIndicatorForm : Form
 
     private static string BuildDetailsText(
         UsageSnapshot? codex,
-        ClaudeUsageSnapshot? claude,
+        ClaudeUsageResult? claude,
         string? codexError,
         string? claudeError,
         bool showClaude,
@@ -505,11 +512,25 @@ internal sealed class UsageIndicatorForm : Form
 
         if (showClaude)
         {
+            var claudeSnapshot = claude?.Snapshot;
             builder.AppendLine();
             builder.AppendLine("CLAUDE");
-            AppendUsageWindow(builder, "5시간", claude?.FiveHour?.UsedPercent, claude?.FiveHour?.ResetsAt);
-            AppendUsageWindow(builder, "주간", claude?.Weekly?.UsedPercent, claude?.Weekly?.ResetsAt);
-            AppendUsageWindow(builder, "Fable", claude?.Fable?.UsedPercent, claude?.Fable?.ResetsAt);
+            AppendUsageWindow(
+                builder,
+                "5시간",
+                claudeSnapshot?.FiveHour?.UsedPercent,
+                claudeSnapshot?.FiveHour?.ResetsAt);
+            AppendUsageWindow(
+                builder,
+                "주간",
+                claudeSnapshot?.Weekly?.UsedPercent,
+                claudeSnapshot?.Weekly?.ResetsAt);
+            AppendUsageWindow(
+                builder,
+                "Fable",
+                claudeSnapshot?.Fable?.UsedPercent,
+                claudeSnapshot?.Fable?.ResetsAt);
+            AppendClaudeRefreshState(builder, claude);
             AppendRefreshError(builder, claudeError);
         }
 
@@ -545,6 +566,20 @@ internal sealed class UsageIndicatorForm : Form
     {
         if (error is null) return;
         builder.AppendLine($"업데이트 실패: {error}");
+    }
+
+    private static void AppendClaudeRefreshState(
+        StringBuilder builder,
+        ClaudeUsageResult? claude)
+    {
+        if (claude is not { IsStale: true }) return;
+
+        builder.AppendLine(
+            $"업데이트 지연: 마지막 성공 {claude.LastUpdatedAt.ToLocalTime():yyyy-MM-dd HH:mm}");
+        if (claude.RetryAfter is { } retryAfter)
+        {
+            builder.AppendLine($"  다음 시도: {FormatResetTime(retryAfter)}");
+        }
     }
 
     private static string FormatResetTime(DateTimeOffset? resetsAt)

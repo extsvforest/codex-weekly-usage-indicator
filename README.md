@@ -10,8 +10,9 @@ An unofficial Windows widget that stays on top while Codex Desktop is running an
 - Expands one successful provider to the full width when the other provider is unavailable.
 - Shows Codex weekly reset details plus Claude 5-hour, weekly, and Fable reset details in a hover tooltip.
 - Reads the weekly usage window from the local Codex app-server.
-- Reads Claude limits from Anthropic's usage endpoint with a five-minute in-memory cache.
-- Refreshes every 60 seconds; double-click to refresh immediately.
+- Reads Claude limits from Anthropic's usage endpoint with a ten-minute in-memory cache.
+- Keeps the last successful Claude value visible during temporary rate limits or service errors and reports the delay in the tooltip.
+- Refreshes every 60 seconds; double-click to refresh Codex immediately while Claude continues to honor its ten-minute cache.
 - Supports dragging, copying the current values, toggling always-on-top, and turning the Claude panel on or off from the right-click menu.
 - Remembers the last dragged position and restores it on the next launch.
 - Hides while another foreground app is fullscreen, then returns at the saved position.
@@ -63,9 +64,11 @@ The executable is written to `dist\WeeklyUsageIndicator.exe`. Release builds omi
 
 The WinForms process checks for the packaged Codex Desktop host. While Codex is active, it launches `codex app-server --stdio`, initializes the local JSONL protocol, and reads `account/rateLimits/read`. It selects the rate-limit window closest to seven days and renders the remaining percentage.
 
-For Claude, it reads the OAuth access token from `CLAUDE_CONFIG_DIR\.credentials.json` or `%USERPROFILE%\.claude\.credentials.json`, then requests `https://api.anthropic.com/api/oauth/usage`. The response supplies the 5-hour, all-model weekly, and model-scoped Fable weekly windows. The token is not logged or persisted by the widget, and successful Claude responses are cached in memory for five minutes.
+For Claude, it reads the OAuth access token from `CLAUDE_CONFIG_DIR\.credentials.json` or `%USERPROFILE%\.claude\.credentials.json`, then requests `https://api.anthropic.com/api/oauth/usage`. The response supplies the 5-hour, all-model weekly, and model-scoped Fable weekly windows. The token is not logged or persisted by the widget, and successful Claude responses are cached in memory for ten minutes.
 
 If the account does not expose a Fable-specific weekly limit, or one provider fails to refresh, that provider is omitted from the compact surface. Turning off **Claude 사용량 표시** also skips the Claude network request until it is turned on again.
+
+Temporary rate limits, network failures, and server errors keep the last successful Claude value visible while the tooltip shows the last update and next retry time.
 
 The app-server child process is stopped whenever Codex is no longer running.
 
