@@ -38,25 +38,32 @@ internal sealed class UsageIndicatorForm : Form
     private const int WidgetWidth = 272;
     private const int WidgetHeight = 64;
 
-    private readonly AppServerClient _client = new();
+    private readonly AppServerClient _codexClient = new();
+    private readonly ClaudeUsageClient _claudeClient = new();
     private readonly CodexDesktopStateReader _codexStateReader = new();
     private readonly System.Windows.Forms.Timer _pollTimer = new() { Interval = 60_000 };
     private readonly System.Windows.Forms.Timer _codexStateTimer = new() { Interval = 1_000 };
-    private readonly ToolTip _toolTip = new() { InitialDelay = 350, ReshowDelay = 100 };
+    private readonly ToolTip _toolTip = new()
+    {
+        InitialDelay = 350,
+        ReshowDelay = 100,
+        AutoPopDelay = 30_000,
+        ShowAlways = true
+    };
     private readonly ContextMenuStrip _contextMenu = new();
-    private readonly Font _headerFont = new("Segoe UI", 9.5f, FontStyle.Bold);
-    private readonly Font _valueFont = new("Segoe UI", 9f, FontStyle.Bold);
-    private readonly Font _detailFont = new("Segoe UI", 8.25f, FontStyle.Regular);
+    private readonly Font _valueFont = new("Segoe UI", 13f, FontStyle.Bold);
     private readonly bool _previewMode;
 
-    private UsageSnapshot? _snapshot;
-    private string? _lastError;
+    private UsageSnapshot? _codexSnapshot;
+    private ClaudeUsageSnapshot? _claudeSnapshot;
+    private string? _codexError;
+    private string? _claudeError;
     private bool _codexWasRunning;
-    private bool _isLoading = true;
     private bool _isRefreshing;
     private bool _isHovered;
     private bool _isDragging;
     private bool _keepOnTop = true;
+    private bool _showClaude;
     private bool _positionInitialized;
     private Point _dragCursorStart;
     private Point _dragFormStart;
@@ -64,6 +71,7 @@ internal sealed class UsageIndicatorForm : Form
     public UsageIndicatorForm(bool previewMode)
     {
         _previewMode = previewMode;
+        _showClaude = IndicatorSettingsStore.LoadShowClaude();
         AutoScaleMode = AutoScaleMode.Dpi;
         BackColor = Color.FromArgb(24, 24, 28);
         ClientSize = new Size(WidgetWidth, WidgetHeight);
@@ -75,13 +83,14 @@ internal sealed class UsageIndicatorForm : Form
         ShowIcon = false;
         ShowInTaskbar = false;
         StartPosition = FormStartPosition.Manual;
-        Text = "Codex 주간 사용량";
+        Text = "Codex 및 Claude 사용량";
         TopMost = true;
-        AccessibleName = "Codex 주간 사용량 인디케이터";
+        AccessibleName = "Codex 및 Claude Fable 사용량 인디케이터";
         Opacity = 0;
 
         BuildContextMenu();
         ApplyRoundedRegion();
+        _toolTip.SetToolTip(this, "Codex 및 Claude 사용량을 불러오는 중…");
 
         _pollTimer.Tick += async (_, _) => await RefreshUsageAsync();
         _codexStateTimer.Tick += (_, _) => SyncCodexVisibility();
@@ -113,10 +122,11 @@ internal sealed class UsageIndicatorForm : Form
                 IndicatorSettingsStore.SavePosition(Location);
             _pollTimer.Stop();
             _codexStateTimer.Stop();
-            _client.Dispose();
-            _headerFont.Dispose();
+            _codexClient.Dispose();
+            _claudeClient.Dispose();
+            _toolTip.Dispose();
+            _contextMenu.Dispose();
             _valueFont.Dispose();
-            _detailFont.Dispose();
         };
     }
 
@@ -138,6 +148,14 @@ internal sealed class UsageIndicatorForm : Form
         var refreshItem = new ToolStripMenuItem("새로고침");
         refreshItem.Click += async (_, _) => await RefreshUsageAsync(force: true);
 
+        var showClaudeItem = new ToolStripMenuItem("Claude 사용량 표시")
+        {
+            Checked = _showClaude,
+            CheckOnClick = true
+        };
+        showClaudeItem.CheckedChanged += async (_, _) =>
+            await SetClaudeVisibilityAsync(showClaudeItem.Checked);
+
         var topMostItem = new ToolStripMenuItem("항상 위에 표시")
         {
             Checked = true,
@@ -153,8 +171,12 @@ internal sealed class UsageIndicatorForm : Form
         var copyItem = new ToolStripMenuItem("현재 상태 복사");
         copyItem.Click += (_, _) =>
         {
-            if (_snapshot is null) return;
-            Clipboard.SetText(BuildClipboardText(_snapshot));
+            Clipboard.SetText(BuildClipboardText(
+                _codexSnapshot,
+                _claudeSnapshot,
+                _codexError,
+                _claudeError,
+                _showClaude));
         };
 
         var exitItem = new ToolStripMenuItem("닫기");
@@ -162,11 +184,30 @@ internal sealed class UsageIndicatorForm : Form
 
         _contextMenu.Items.AddRange([
             refreshItem,
+            showClaudeItem,
             topMostItem,
             copyItem,
             new ToolStripSeparator(),
             exitItem
         ]);
+    }
+
+    private async Task SetClaudeVisibilityAsync(bool showClaude)
+    {
+        _showClaude = showClaude;
+        IndicatorSettingsStore.SaveShowClaude(showClaude);
+
+        if (!showClaude)
+        {
+            _claudeSnapshot = null;
+            _claudeError = null;
+            UpdateToolTip();
+            Invalidate();
+            return;
+        }
+
+        _claudeError = null;
+        await RefreshUsageAsync(force: true);
     }
 
     private void PlaceNearTaskbar()
@@ -216,7 +257,7 @@ internal sealed class UsageIndicatorForm : Form
             if (_codexWasRunning)
             {
                 _pollTimer.Stop();
-                _client.Pause();
+                _codexClient.Pause();
             }
 
             _codexWasRunning = false;
@@ -256,27 +297,66 @@ internal sealed class UsageIndicatorForm : Form
         if (_isRefreshing) return;
 
         _isRefreshing = true;
-        _lastError = null;
-        if (_snapshot is null) _isLoading = true;
         Invalidate();
 
         try
         {
-            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
-            _snapshot = await _client.GetWeeklyUsageAsync(timeout.Token);
-            _isLoading = false;
-            _toolTip.SetToolTip(this, BuildTooltipText(_snapshot));
-        }
-        catch (Exception ex)
-        {
-            _isLoading = false;
-            _lastError = FriendlyError(ex);
-            _toolTip.SetToolTip(this, $"업데이트 실패: {_lastError}\n더블클릭하면 다시 시도합니다.");
+            var refreshTasks = new List<Task> { RefreshCodexAsync() };
+            if (_showClaude)
+            {
+                refreshTasks.Add(RefreshClaudeAsync(force));
+            }
+            else
+            {
+                _claudeSnapshot = null;
+                _claudeError = null;
+            }
+
+            await Task.WhenAll(refreshTasks);
+            UpdateToolTip();
         }
         finally
         {
             _isRefreshing = false;
             Invalidate();
+        }
+    }
+
+    private void UpdateToolTip()
+    {
+        _toolTip.SetToolTip(this, BuildTooltipText(
+            _codexSnapshot,
+            _claudeSnapshot,
+            _codexError,
+            _claudeError,
+            _showClaude));
+    }
+
+    private async Task RefreshCodexAsync()
+    {
+        try
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+            _codexSnapshot = await _codexClient.GetWeeklyUsageAsync(timeout.Token);
+            _codexError = null;
+        }
+        catch (Exception ex)
+        {
+            _codexError = FriendlyCodexError(ex);
+        }
+    }
+
+    private async Task RefreshClaudeAsync(bool force)
+    {
+        try
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(18));
+            _claudeSnapshot = await _claudeClient.GetUsageAsync(force, timeout.Token);
+            _claudeError = null;
+        }
+        catch (Exception ex)
+        {
+            _claudeError = FriendlyClaudeError(ex);
         }
     }
 
@@ -296,63 +376,93 @@ internal sealed class UsageIndicatorForm : Form
         using var borderPath = RoundedRectangle(new RectangleF(0.5f, 0.5f, Width - 1f, Height - 1f), 15f);
         graphics.DrawPath(borderPen, borderPath);
 
-        if (_isLoading)
+        var codexAvailable = _codexSnapshot is not null && _codexError is null;
+        var claudeAvailable = _showClaude &&
+            _claudeSnapshot?.Fable is not null &&
+            _claudeError is null;
+        var codexAccent = Color.FromArgb(124, 156, 255);
+        var claudeAccent = Color.FromArgb(217, 119, 87);
+
+        if (codexAvailable && claudeAvailable)
         {
-            DrawLoading(graphics);
-            return;
+            DrawDualProviders(graphics, _codexSnapshot!.UsedPercent, _claudeSnapshot!.Fable!.UsedPercent);
         }
-
-        if (_snapshot is null)
+        else if (codexAvailable)
         {
-            DrawError(graphics);
-            return;
+            DrawProvider(graphics, new RectangleF(0, 0, Width, Height), _codexSnapshot!.UsedPercent, codexAccent);
         }
-
-        DrawUsage(graphics, _snapshot);
+        else if (claudeAvailable)
+        {
+            DrawProvider(graphics, new RectangleF(0, 0, Width, Height), _claudeSnapshot!.Fable!.UsedPercent, claudeAccent);
+        }
+        else if (_isRefreshing && _showClaude)
+        {
+            DrawDualProviders(graphics, null, null);
+        }
+        else
+        {
+            DrawProvider(graphics, new RectangleF(0, 0, Width, Height), null, codexAccent);
+        }
     }
 
-    private void DrawLoading(Graphics graphics)
+    private void DrawDualProviders(Graphics graphics, double? codexUsed, double? claudeUsed)
     {
-        using var primaryBrush = new SolidBrush(Color.FromArgb(236, 236, 242));
-        const string text = "주간 사용량 불러오는 중…";
-        var textSize = graphics.MeasureString(text, _headerFont);
-        graphics.DrawString(text, _headerFont, primaryBrush, (WidgetWidth - textSize.Width) / 2f, 20);
+        var panelWidth = Width / 2f;
+        DrawProvider(
+            graphics,
+            new RectangleF(0, 0, panelWidth, Height),
+            codexUsed,
+            Color.FromArgb(124, 156, 255));
+        DrawProvider(
+            graphics,
+            new RectangleF(panelWidth, 0, Width - panelWidth, Height),
+            claudeUsed,
+            Color.FromArgb(217, 119, 87));
+
+        using var dividerPen = new Pen(Color.FromArgb(54, 54, 63), 1f);
+        graphics.DrawLine(dividerPen, panelWidth, 9, panelWidth, Height - 9);
     }
 
-    private void DrawError(Graphics graphics)
+    private void DrawProvider(
+        Graphics graphics,
+        RectangleF panel,
+        double? usedPercent,
+        Color accent)
     {
-        using var primaryBrush = new SolidBrush(Color.FromArgb(244, 224, 224));
-        using var secondaryBrush = new SolidBrush(Color.FromArgb(183, 150, 150));
-        const string title = "사용량을 불러오지 못했어요";
-        const string detail = "더블클릭하여 다시 시도";
-        var titleSize = graphics.MeasureString(title, _headerFont);
-        var detailSize = graphics.MeasureString(detail, _detailFont);
-        graphics.DrawString(title, _headerFont, primaryBrush, (WidgetWidth - titleSize.Width) / 2f, 10);
-        graphics.DrawString(detail, _detailFont, secondaryBrush, (WidgetWidth - detailSize.Width) / 2f, 34);
-    }
+        var clampedUsed = usedPercent is null
+            ? (double?)null
+            : Math.Clamp(usedPercent.Value, 0d, 100d);
+        var remaining = clampedUsed is null
+            ? (int?)null
+            : (int)Math.Round(100d - clampedUsed.Value, MidpointRounding.AwayFromZero);
 
-    private void DrawUsage(Graphics graphics, UsageSnapshot snapshot)
-    {
-        var used = Math.Clamp(snapshot.UsedPercent, 0, 100);
-        var remaining = 100 - used;
-        var accent = RemainingColor(remaining);
-
-        using var primaryBrush = new SolidBrush(Color.FromArgb(238, 238, 244));
+        using var valueBrush = new SolidBrush(Color.FromArgb(244, 244, 247));
+        using var unavailableBrush = new SolidBrush(Color.FromArgb(151, 151, 162));
         using var accentBrush = new SolidBrush(accent);
         using var trackBrush = new SolidBrush(Color.FromArgb(54, 54, 64));
 
-        var valueText = $"주간 사용량 {remaining}% 남음";
+        var valueText = remaining is { } percent
+            ? $"{percent}%"
+            : _isRefreshing ? "…" : "—";
         var valueSize = graphics.MeasureString(valueText, _valueFont);
-        graphics.DrawString(valueText, _valueFont, primaryBrush, (WidgetWidth - valueSize.Width) / 2f, 9);
+        graphics.DrawString(
+            valueText,
+            _valueFont,
+            remaining is null ? unavailableBrush : valueBrush,
+            panel.Left + (panel.Width - valueSize.Width) / 2f,
+            5);
 
-        const float trackX = 16;
-        const float trackY = 39;
-        var trackWidth = WidgetWidth - 32f;
-        const float trackHeight = 8;
+        var horizontalPadding = panel.Width > WidgetWidth / 2f ? 20f : 12f;
+        var trackX = panel.Left + horizontalPadding;
+        const float trackY = 45;
+        var trackWidth = panel.Width - horizontalPadding * 2f;
+        const float trackHeight = 7;
         using var trackPath = RoundedRectangle(new RectangleF(trackX, trackY, trackWidth, trackHeight), 4f);
         graphics.FillPath(trackBrush, trackPath);
 
-        var fillWidth = remaining <= 0 ? 0 : Math.Max(trackHeight, trackWidth * remaining / 100f);
+        var fillWidth = remaining is null or <= 0
+            ? 0
+            : Math.Max(trackHeight, trackWidth * remaining.Value / 100f);
         if (fillWidth > 0)
         {
             using var fillPath = RoundedRectangle(new RectangleF(trackX, trackY, fillWidth, trackHeight), 4f);
@@ -360,24 +470,103 @@ internal sealed class UsageIndicatorForm : Form
         }
     }
 
-    private static Color RemainingColor(int remainingPercent) => remainingPercent switch
+    private static string BuildTooltipText(
+        UsageSnapshot? codex,
+        ClaudeUsageSnapshot? claude,
+        string? codexError,
+        string? claudeError,
+        bool showClaude)
     {
-        <= 10 => Color.FromArgb(255, 107, 107),
-        <= 30 => Color.FromArgb(255, 180, 84),
-        _ => Color.FromArgb(124, 156, 255)
-    };
-
-    private static string BuildTooltipText(UsageSnapshot snapshot)
-    {
-        return $"Codex 주간 사용량: {100 - snapshot.UsedPercent}% 남음 ({snapshot.UsedPercent}% 사용)\n\n드래그: 이동 · 더블클릭: 새로고침 · 우클릭: 메뉴";
+        return BuildDetailsText(codex, claude, codexError, claudeError, showClaude, includeControls: true);
     }
 
-    private static string BuildClipboardText(UsageSnapshot snapshot)
+    private static string BuildClipboardText(
+        UsageSnapshot? codex,
+        ClaudeUsageSnapshot? claude,
+        string? codexError,
+        string? claudeError,
+        bool showClaude)
     {
-        return $"Codex 주간 사용량 {100 - snapshot.UsedPercent}% 남음 ({snapshot.UsedPercent}% 사용)";
+        return BuildDetailsText(codex, claude, codexError, claudeError, showClaude, includeControls: false);
     }
 
-    private static string FriendlyError(Exception exception)
+    private static string BuildDetailsText(
+        UsageSnapshot? codex,
+        ClaudeUsageSnapshot? claude,
+        string? codexError,
+        string? claudeError,
+        bool showClaude,
+        bool includeControls)
+    {
+        var builder = new StringBuilder();
+        builder.AppendLine("CODEX");
+        AppendUsageWindow(builder, "주간", codex?.UsedPercent, codex?.ResetsAt);
+        AppendRefreshError(builder, codexError);
+
+        if (showClaude)
+        {
+            builder.AppendLine();
+            builder.AppendLine("CLAUDE");
+            AppendUsageWindow(builder, "5시간", claude?.FiveHour?.UsedPercent, claude?.FiveHour?.ResetsAt);
+            AppendUsageWindow(builder, "주간", claude?.Weekly?.UsedPercent, claude?.Weekly?.ResetsAt);
+            AppendUsageWindow(builder, "Fable", claude?.Fable?.UsedPercent, claude?.Fable?.ResetsAt);
+            AppendRefreshError(builder, claudeError);
+        }
+
+        if (includeControls)
+        {
+            builder.AppendLine();
+            builder.Append("드래그: 이동 · 더블클릭: 새로고침 · 우클릭: 메뉴");
+        }
+
+        return builder.ToString().TrimEnd();
+    }
+
+    private static void AppendUsageWindow(
+        StringBuilder builder,
+        string label,
+        double? usedPercent,
+        DateTimeOffset? resetsAt)
+    {
+        if (usedPercent is null)
+        {
+            builder.AppendLine($"{label}: 정보 없음");
+            return;
+        }
+
+        var used = (int)Math.Round(
+            Math.Clamp(usedPercent.Value, 0d, 100d),
+            MidpointRounding.AwayFromZero);
+        builder.AppendLine($"{label}: {100 - used}% 남음 ({used}% 사용)");
+        builder.AppendLine($"  초기화: {FormatResetTime(resetsAt)}");
+    }
+
+    private static void AppendRefreshError(StringBuilder builder, string? error)
+    {
+        if (error is null) return;
+        builder.AppendLine($"업데이트 실패: {error}");
+    }
+
+    private static string FormatResetTime(DateTimeOffset? resetsAt)
+    {
+        if (resetsAt is null) return "정보 없음";
+
+        var localReset = resetsAt.Value.ToLocalTime();
+        var remaining = localReset - DateTimeOffset.Now;
+        return $"{localReset:yyyy-MM-dd HH:mm} ({FormatTimeRemaining(remaining)})";
+    }
+
+    private static string FormatTimeRemaining(TimeSpan remaining)
+    {
+        if (remaining <= TimeSpan.Zero) return "지금";
+
+        var days = (int)remaining.TotalDays;
+        if (days > 0) return $"{days}일 {remaining.Hours}시간 후";
+        if (remaining.Hours > 0) return $"{remaining.Hours}시간 {remaining.Minutes}분 후";
+        return $"{Math.Max(0, remaining.Minutes)}분 후";
+    }
+
+    private static string FriendlyCodexError(Exception exception)
     {
         if (exception is TimeoutException or TaskCanceledException)
             return "Codex 응답 시간이 초과되었습니다.";
@@ -385,10 +574,28 @@ internal sealed class UsageIndicatorForm : Form
             return "Codex 실행 파일을 찾지 못했습니다.";
         if (exception.Message.Contains("not logged", StringComparison.OrdinalIgnoreCase))
             return "Codex 로그인이 필요합니다.";
-        return exception.Message.Length > 120
-            ? exception.Message[..120]
-            : exception.Message;
+        return TruncateError(exception.Message);
     }
+
+    private static string FriendlyClaudeError(Exception exception)
+    {
+        if (exception is TimeoutException or TaskCanceledException)
+            return "Claude 응답 시간이 초과되었습니다.";
+        if (exception is UnauthorizedAccessException)
+            return "Claude Code 로그인이 만료되었습니다.";
+        if (exception.Message.Contains("credentials", StringComparison.OrdinalIgnoreCase) ||
+            exception.Message.Contains("login", StringComparison.OrdinalIgnoreCase))
+        {
+            return "Claude Code 로그인이 필요합니다.";
+        }
+        if (exception.Message.Contains("rate-limit", StringComparison.OrdinalIgnoreCase))
+            return "Claude 사용량 조회가 잠시 제한되었습니다.";
+        return TruncateError(exception.Message);
+    }
+
+    private static string TruncateError(string message) => message.Length > 120
+        ? message[..120]
+        : message;
 
     private void HandleMouseDown(object? sender, MouseEventArgs e)
     {
@@ -442,7 +649,7 @@ internal sealed class UsageIndicatorForm : Form
     }
 }
 
-internal sealed record IndicatorSettings(int X, int Y);
+internal sealed record IndicatorSettings(int? X, int? Y, bool? ShowClaude);
 
 internal static class IndicatorSettingsStore
 {
@@ -454,11 +661,36 @@ internal static class IndicatorSettingsStore
 
     public static Point? LoadPosition()
     {
+        var settings = LoadSettings();
+        return settings?.X is { } x && settings.Y is { } y
+            ? new Point(x, y)
+            : null;
+    }
+
+    public static bool LoadShowClaude() => LoadSettings()?.ShowClaude ?? true;
+
+    public static void SavePosition(Point position)
+    {
+        var current = LoadSettings();
+        SaveSettings(new IndicatorSettings(
+            position.X,
+            position.Y,
+            current?.ShowClaude ?? true));
+    }
+
+    public static void SaveShowClaude(bool showClaude)
+    {
+        var current = LoadSettings();
+        SaveSettings(new IndicatorSettings(current?.X, current?.Y, showClaude));
+    }
+
+    private static IndicatorSettings? LoadSettings()
+    {
         try
         {
-            if (!File.Exists(SettingsPath)) return null;
-            var settings = JsonSerializer.Deserialize<IndicatorSettings>(File.ReadAllText(SettingsPath));
-            return settings is null ? null : new Point(settings.X, settings.Y);
+            return File.Exists(SettingsPath)
+                ? JsonSerializer.Deserialize<IndicatorSettings>(File.ReadAllText(SettingsPath))
+                : null;
         }
         catch
         {
@@ -466,21 +698,21 @@ internal static class IndicatorSettingsStore
         }
     }
 
-    public static void SavePosition(Point position)
+    private static void SaveSettings(IndicatorSettings settings)
     {
         try
         {
             Directory.CreateDirectory(SettingsDirectory);
             var temporaryPath = SettingsPath + ".tmp";
             var json = JsonSerializer.Serialize(
-                new IndicatorSettings(position.X, position.Y),
+                settings,
                 new JsonSerializerOptions { WriteIndented = true });
             File.WriteAllText(temporaryPath, json);
             File.Move(temporaryPath, SettingsPath, overwrite: true);
         }
         catch
         {
-            // Position persistence is best-effort and must never stop the widget.
+            // Local preferences are best-effort and must never stop the widget.
         }
     }
 }

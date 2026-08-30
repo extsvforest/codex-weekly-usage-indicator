@@ -6,6 +6,9 @@ $distributionPath = Join-Path $repositoryRoot 'dist'
 $pathMap = "$repositoryRoot=/_/"
 
 dotnet clean $projectPath -c Release | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    throw "dotnet clean failed with exit code $LASTEXITCODE."
+}
 New-Item -ItemType Directory -Path $distributionPath -Force | Out-Null
 
 dotnet publish $projectPath `
@@ -17,6 +20,9 @@ dotnet publish $projectPath `
     -p:DebugSymbols=false `
     "-p:PathMap=$pathMap" `
     -o $distributionPath
+if ($LASTEXITCODE -ne 0) {
+    throw "dotnet publish failed with exit code $LASTEXITCODE."
+}
 
 $symbolsPath = Join-Path $distributionPath 'WeeklyUsageIndicator.pdb'
 if (Test-Path -LiteralPath $symbolsPath -PathType Leaf) {

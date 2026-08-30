@@ -1,26 +1,32 @@
-# Codex Weekly Usage Indicator
+# Codex + Claude Usage Indicator
 
-An unofficial Windows widget that stays on top while Codex Desktop is running and shows the remaining weekly usage allowance.
+An unofficial Windows widget that stays on top while Codex Desktop is running and shows Codex weekly usage alongside Claude Fable usage.
 
 ## What it does
 
 - Appears while Codex Desktop is running and hides when Codex exits.
+- Keeps the existing 272 × 64 window and uses one or two fluid panels depending on which providers are available.
+- Shows only white remaining percentages: Codex is identified by a blue bar and Claude Fable by a terracotta-orange bar.
+- Expands one successful provider to the full width when the other provider is unavailable.
+- Shows Codex weekly reset details plus Claude 5-hour, weekly, and Fable reset details in a hover tooltip.
 - Reads the weekly usage window from the local Codex app-server.
+- Reads Claude limits from Anthropic's usage endpoint with a five-minute in-memory cache.
 - Refreshes every 60 seconds; double-click to refresh immediately.
-- Supports dragging, copying the current value, and toggling always-on-top.
+- Supports dragging, copying the current values, toggling always-on-top, and turning the Claude panel on or off from the right-click menu.
 - Remembers the last dragged position and restores it on the next launch.
 - Hides while another foreground app is fullscreen, then returns at the saved position.
 - Starts a small background watcher at Windows sign-in so it can follow future Codex launches.
 
-The widget does not store login tokens, account details, or usage history. See [PRIVACY.md](PRIVACY.md).
+The widget does not store login tokens, account details, or usage history. The Claude access token is read into memory only for the request to Anthropic's usage endpoint. See [PRIVACY.md](PRIVACY.md).
 
 > [!IMPORTANT]
-> This is an unofficial community project. It relies on an experimental local Codex app-server method (`account/rateLimits/read`) that may change without notice.
+> This is an unofficial community project. It relies on an experimental local Codex app-server method (`account/rateLimits/read`) and an undocumented Anthropic usage endpoint (`/api/oauth/usage`). Either may change without notice.
 
 ## Requirements
 
 - Windows 10 or 11
 - Codex Desktop installed and signed in
+- Optional: Claude Code installed and signed in on Windows to add Claude/Fable usage
 - [.NET 8 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/8.0)
 - .NET 8 SDK only when building from source
 
@@ -35,7 +41,7 @@ The widget does not store login tokens, account details, or usage history. See [
 ```
 
 The app is installed to `%LOCALAPPDATA%\CodexWeeklyUsageIndicator` and a per-user Startup shortcut is created.
-The saved window position is kept locally in `settings.json` inside that install directory.
+The saved window position and Claude visibility preference are kept locally in `settings.json` inside that install directory.
 
 To uninstall:
 
@@ -57,12 +63,17 @@ The executable is written to `dist\WeeklyUsageIndicator.exe`. Release builds omi
 
 The WinForms process checks for the packaged Codex Desktop host. While Codex is active, it launches `codex app-server --stdio`, initializes the local JSONL protocol, and reads `account/rateLimits/read`. It selects the rate-limit window closest to seven days and renders the remaining percentage.
 
+For Claude, it reads the OAuth access token from `CLAUDE_CONFIG_DIR\.credentials.json` or `%USERPROFILE%\.claude\.credentials.json`, then requests `https://api.anthropic.com/api/oauth/usage`. The response supplies the 5-hour, all-model weekly, and model-scoped Fable weekly windows. The token is not logged or persisted by the widget, and successful Claude responses are cached in memory for five minutes.
+
+If the account does not expose a Fable-specific weekly limit, or one provider fails to refresh, that provider is omitted from the compact surface. Turning off **Claude 사용량 표시** also skips the Claude network request until it is turned on again.
+
 The app-server child process is stopped whenever Codex is no longer running.
 
 ## Project files
 
 - `src/` — WinForms application
 - `scripts/` — build, install, and uninstall helpers
+- `wireframes/` — compact widget UI specification
 - `.github/workflows/` — clean Windows builds and tagged releases
 - `AGENTS.md` — guidance for coding agents
 

@@ -26,7 +26,7 @@ $shell = New-Object -ComObject WScript.Shell
 $shortcut = $shell.CreateShortcut($shortcutPath)
 $shortcut.TargetPath = $installedExecutable
 $shortcut.WorkingDirectory = $installDirectory
-$shortcut.Description = 'Codex weekly usage indicator'
+$shortcut.Description = 'Codex and Claude usage indicator'
 $shortcut.Save()
 
 Start-Process -FilePath $installedExecutable -WorkingDirectory $installDirectory -WindowStyle Hidden

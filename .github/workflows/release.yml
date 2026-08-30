@@ -39,5 +39,5 @@ jobs:
             "CodexWeeklyUsageIndicator-$env:GITHUB_REF_NAME-win-x64.zip" `
             'dist\WeeklyUsageIndicator.exe' `
             'dist\SHA256SUMS.txt' `
-            --title "Codex Weekly Usage Indicator $env:GITHUB_REF_NAME" `
+            --title "Codex + Claude Usage Indicator $env:GITHUB_REF_NAME" `
             --generate-notes
