@@ -13,78 +13,163 @@ internal sealed record ClaudeUsageSnapshot(
     ClaudeUsageWindow? Weekly,
     ClaudeUsageWindow? Fable);
 
+internal sealed record ClaudeUsageResult(
+    ClaudeUsageSnapshot Snapshot,
+    DateTimeOffset LastUpdatedAt,
+    DateTimeOffset? RetryAfter,
+    bool IsStale);
+
+internal sealed class ClaudeUsageRateLimitedException(DateTimeOffset retryAfter)
+    : HttpRequestException("Claude usage service is temporarily rate-limited.")
+{
+    public DateTimeOffset RetryAfter { get; } = retryAfter;
+}
+
 internal sealed class ClaudeUsageClient : IDisposable
 {
     private static readonly Uri UsageEndpoint = new("https://api.anthropic.com/api/oauth/usage");
-    private static readonly TimeSpan CacheLifetime = TimeSpan.FromMinutes(5);
+    private static readonly TimeSpan CacheLifetime = TimeSpan.FromMinutes(10);
     private static readonly TimeSpan DefaultBackoff = TimeSpan.FromMinutes(5);
 
-    private readonly HttpClient _httpClient = new()
-    {
-        Timeout = TimeSpan.FromSeconds(15)
-    };
-
+    private readonly HttpClient _httpClient;
+    private readonly TimeProvider _timeProvider;
+    private readonly Func<string> _accessTokenProvider;
     private readonly SemaphoreSlim _requestGate = new(1, 1);
     private ClaudeUsageSnapshot? _cachedSnapshot;
     private DateTimeOffset _lastFetchedAt = DateTimeOffset.MinValue;
     private DateTimeOffset _retryAfter = DateTimeOffset.MinValue;
+    private int _consecutiveRateLimits;
     private bool _disposed;
 
-    public async Task<ClaudeUsageSnapshot> GetUsageAsync(
-        bool forceRefresh,
-        CancellationToken cancellationToken)
+    public ClaudeUsageClient()
+        : this(new HttpClientHandler(), TimeProvider.System, ReadAccessToken)
+    {
+    }
+
+    internal ClaudeUsageClient(
+        HttpMessageHandler messageHandler,
+        TimeProvider timeProvider,
+        Func<string> accessTokenProvider)
+    {
+        _httpClient = new HttpClient(messageHandler)
+        {
+            Timeout = TimeSpan.FromSeconds(15)
+        };
+        _timeProvider = timeProvider;
+        _accessTokenProvider = accessTokenProvider;
+    }
+
+    public async Task<ClaudeUsageResult> GetUsageAsync(CancellationToken cancellationToken)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         await _requestGate.WaitAsync(cancellationToken);
         try
         {
-            var now = DateTimeOffset.UtcNow;
+            var now = _timeProvider.GetUtcNow();
             if (now < _retryAfter)
-                throw new HttpRequestException("Claude usage service is temporarily rate-limited.");
-
-            if (!forceRefresh &&
-                _cachedSnapshot is not null &&
-                now - _lastFetchedAt < CacheLifetime)
             {
-                return _cachedSnapshot;
+                return _cachedSnapshot is not null
+                    ? CreateCachedResult(isStale: true)
+                    : throw new ClaudeUsageRateLimitedException(_retryAfter);
             }
 
-            var accessToken = ReadAccessToken();
+            if (_cachedSnapshot is not null &&
+                now - _lastFetchedAt < CacheLifetime)
+            {
+                return CreateCachedResult(isStale: false);
+            }
+
+            var accessToken = _accessTokenProvider();
             using var request = new HttpRequestMessage(HttpMethod.Get, UsageEndpoint);
             request.Headers.TryAddWithoutValidation("Authorization", $"Bearer {accessToken}");
             request.Headers.TryAddWithoutValidation("anthropic-beta", "oauth-2025-04-20");
             request.Headers.TryAddWithoutValidation("User-Agent", "codex-claude-weekly-usage-indicator");
             request.Headers.TryAddWithoutValidation("Accept", "application/json");
 
-            using var response = await _httpClient.SendAsync(
-                request,
-                HttpCompletionOption.ResponseHeadersRead,
-                cancellationToken);
-
-            if (response.StatusCode == HttpStatusCode.TooManyRequests)
+            HttpResponseMessage response;
+            try
             {
-                _retryAfter = ResolveRetryAfter(response, now);
-                throw new HttpRequestException("Claude usage service is temporarily rate-limited.");
+                response = await _httpClient.SendAsync(
+                    request,
+                    HttpCompletionOption.ResponseHeadersRead,
+                    cancellationToken);
+            }
+            catch (Exception exception) when (
+                IsTransientException(exception) &&
+                _cachedSnapshot is not null)
+            {
+                SetTransientBackoff(now);
+                return CreateCachedResult(isStale: true);
             }
 
-            if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
-                throw new UnauthorizedAccessException("Claude Code login is missing or expired.");
+            using (response)
+            {
+                if (response.StatusCode == HttpStatusCode.TooManyRequests)
+                {
+                    _consecutiveRateLimits++;
+                    _retryAfter = ResolveRetryAfter(response, now, _consecutiveRateLimits);
+                    return _cachedSnapshot is not null
+                        ? CreateCachedResult(isStale: true)
+                        : throw new ClaudeUsageRateLimitedException(_retryAfter);
+                }
 
-            if (!response.IsSuccessStatusCode)
-                throw new HttpRequestException($"Claude usage service returned HTTP {(int)response.StatusCode}.");
+                if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
+                    throw new UnauthorizedAccessException("Claude Code login is missing or expired.");
 
-            var json = await response.Content.ReadAsStringAsync(cancellationToken);
-            var snapshot = ParseUsage(json);
-            _cachedSnapshot = snapshot;
-            _lastFetchedAt = now;
-            _retryAfter = DateTimeOffset.MinValue;
-            return snapshot;
+                if (response.StatusCode == HttpStatusCode.RequestTimeout ||
+                    (int)response.StatusCode >= 500)
+                {
+                    SetTransientBackoff(now);
+                    return _cachedSnapshot is not null
+                        ? CreateCachedResult(isStale: true)
+                        : throw new HttpRequestException(
+                            $"Claude usage service returned HTTP {(int)response.StatusCode}.");
+                }
+
+                if (!response.IsSuccessStatusCode)
+                    throw new HttpRequestException(
+                        $"Claude usage service returned HTTP {(int)response.StatusCode}.");
+
+                string json;
+                try
+                {
+                    json = await response.Content.ReadAsStringAsync(cancellationToken);
+                }
+                catch (Exception exception) when (
+                    IsTransientException(exception) &&
+                    _cachedSnapshot is not null)
+                {
+                    SetTransientBackoff(now);
+                    return CreateCachedResult(isStale: true);
+                }
+
+                var snapshot = ParseUsage(json);
+                _cachedSnapshot = snapshot;
+                _lastFetchedAt = now;
+                _retryAfter = DateTimeOffset.MinValue;
+                _consecutiveRateLimits = 0;
+                return new ClaudeUsageResult(snapshot, now, null, IsStale: false);
+            }
         }
         finally
         {
             _requestGate.Release();
         }
     }
+
+    private ClaudeUsageResult CreateCachedResult(bool isStale) => new(
+        _cachedSnapshot!,
+        _lastFetchedAt,
+        isStale ? _retryAfter : null,
+        isStale);
+
+    private void SetTransientBackoff(DateTimeOffset now)
+    {
+        _retryAfter = now + DefaultBackoff;
+    }
+
+    private static bool IsTransientException(Exception exception) =>
+        exception is HttpRequestException or TaskCanceledException;
 
     internal static ClaudeUsageSnapshot ParseUsage(string json)
     {
@@ -245,15 +330,23 @@ internal sealed class ClaudeUsageClient : IDisposable
         throw new InvalidOperationException("Claude Code login is required.");
     }
 
-    private static DateTimeOffset ResolveRetryAfter(HttpResponseMessage response, DateTimeOffset now)
+    private static DateTimeOffset ResolveRetryAfter(
+        HttpResponseMessage response,
+        DateTimeOffset now,
+        int consecutiveRateLimits)
     {
         var retryAfter = response.Headers.RetryAfter;
         if (retryAfter?.Delta is { } delta && delta > TimeSpan.Zero)
-            return now + ClampBackoff(delta);
+            return AddBackoffSafely(now, delta);
         if (retryAfter?.Date is { } date && date > now)
-            return now + ClampBackoff(date - now);
-        return now + DefaultBackoff;
+            return date;
+
+        var multiplier = Math.Pow(2, Math.Min(Math.Max(0, consecutiveRateLimits - 1), 2));
+        return now + ClampBackoff(TimeSpan.FromTicks((long)(DefaultBackoff.Ticks * multiplier)));
     }
+
+    private static DateTimeOffset AddBackoffSafely(DateTimeOffset now, TimeSpan backoff) =>
+        backoff >= DateTimeOffset.MaxValue - now ? DateTimeOffset.MaxValue : now + backoff;
 
     private static TimeSpan ClampBackoff(TimeSpan value)
     {

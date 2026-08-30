@@ -10,7 +10,7 @@ The application:
 - does not collect account identifiers;
 - does not include telemetry;
 - makes no outbound request for Codex usage;
-- sends Claude usage requests only to `https://api.anthropic.com/api/oauth/usage` and caches successful responses in memory for five minutes.
+- sends Claude usage requests only to `https://api.anthropic.com/api/oauth/usage` and caches successful responses in memory for ten minutes.
 
 Codex Desktop, its local app-server, Claude Code, and Anthropic's API remain governed by their own terms and privacy practices.
 
