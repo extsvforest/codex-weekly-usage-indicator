@@ -356,6 +356,7 @@ internal sealed class UsageIndicatorForm : Form
         }
         catch (Exception ex)
         {
+            _claudeUsage = null;
             _claudeError = FriendlyClaudeError(ex);
         }
     }
@@ -512,7 +513,7 @@ internal sealed class UsageIndicatorForm : Form
 
         if (showClaude)
         {
-            var claudeSnapshot = claude?.Snapshot;
+            var claudeSnapshot = claudeError is null ? claude?.Snapshot : null;
             builder.AppendLine();
             builder.AppendLine("CLAUDE");
             AppendUsageWindow(
@@ -530,7 +531,7 @@ internal sealed class UsageIndicatorForm : Form
                 "Fable",
                 claudeSnapshot?.Fable?.UsedPercent,
                 claudeSnapshot?.Fable?.ResetsAt);
-            AppendClaudeRefreshState(builder, claude);
+            if (claudeError is null) AppendClaudeRefreshState(builder, claude);
             AppendRefreshError(builder, claudeError);
         }
 
@@ -612,19 +613,25 @@ internal sealed class UsageIndicatorForm : Form
         return TruncateError(exception.Message);
     }
 
-    private static string FriendlyClaudeError(Exception exception)
+    internal static string FriendlyClaudeError(Exception exception)
     {
         if (exception is TimeoutException or TaskCanceledException)
             return "Claude 응답 시간이 초과되었습니다.";
         if (exception is UnauthorizedAccessException)
             return "Claude Code 로그인이 만료되었습니다.";
+        if (exception is ClaudeUsageRateLimitedException rateLimited)
+        {
+            return $"Claude 사용량 조회가 제한되었습니다. 다음 시도: {FormatResetTime(rateLimited.RetryAfter)}";
+        }
+        if (exception is ClaudeUsageTemporarilyUnavailableException unavailable)
+        {
+            return $"Claude 사용량 조회가 지연되었습니다. 다음 시도: {FormatResetTime(unavailable.RetryAfter)}";
+        }
         if (exception.Message.Contains("credentials", StringComparison.OrdinalIgnoreCase) ||
             exception.Message.Contains("login", StringComparison.OrdinalIgnoreCase))
         {
             return "Claude Code 로그인이 필요합니다.";
         }
-        if (exception.Message.Contains("rate-limit", StringComparison.OrdinalIgnoreCase))
-            return "Claude 사용량 조회가 잠시 제한되었습니다.";
         return TruncateError(exception.Message);
     }
 

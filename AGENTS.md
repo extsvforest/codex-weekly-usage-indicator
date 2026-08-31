@@ -17,7 +17,8 @@ This repository contains a small Windows-only WinForms utility. Keep changes foc
 - Do not add telemetry or other outbound network calls.
 - Do not commit absolute local paths, screenshots of real account usage, pet assets, build output, or credentials.
 - Treat `account/rateLimits/read` and Anthropic's `/api/oauth/usage` response as experimental and fail gracefully if either changes.
-- Re-read Claude credentials for each network refresh, retain successful snapshots only in memory, respect server backoff, and do not refresh Claude more often than every ten minutes, including explicit UI refreshes.
+- Re-read Claude credentials for each network refresh, respect server backoff, and do not refresh Claude more often than every ten minutes, including explicit UI refreshes.
+- Persist at most one credential-free Claude recovery snapshot containing only percentages, reset times, and update time. Use it only for transient cold-start failures, delete it after 24 hours, its Fable reset, or a credential-file change, and never let it suppress the first live request in a new process.
 - Stop the app-server child process when the widget pauses or exits.
 - Preserve the single-instance mutex and the always-on-top tool-window behavior.
 
@@ -37,5 +38,6 @@ Then check that:
 4. Hover details include Codex weekly plus Claude 5-hour, weekly, and Fable percentages and reset times.
 5. The right-click Claude visibility toggle persists and suppresses Claude requests while off.
 6. A temporary Claude 429, network error, or server error keeps the last successful value visible and reports the update delay in the tooltip.
-7. The context menu works, the widget hides, and its app-server child exits when Codex closes.
-8. `install.ps1` and `uninstall.ps1` only modify the current user's dedicated install directory and Startup shortcut.
+7. A cold-start transient failure uses only a recent, unexpired sanitized snapshot and still attempts a live Claude request first.
+8. The context menu works, the widget hides, and its app-server child exits when Codex closes.
+9. `install.ps1` and `uninstall.ps1` only modify the current user's dedicated install directory and Startup shortcut.

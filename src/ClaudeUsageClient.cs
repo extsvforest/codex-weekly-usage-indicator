@@ -19,8 +19,21 @@ internal sealed record ClaudeUsageResult(
     DateTimeOffset? RetryAfter,
     bool IsStale);
 
+internal sealed record ClaudeCredentialFileState(
+    string FullPath,
+    DateTimeOffset LastWriteTime,
+    long Length);
+
 internal sealed class ClaudeUsageRateLimitedException(DateTimeOffset retryAfter)
     : HttpRequestException("Claude usage service is temporarily rate-limited.")
+{
+    public DateTimeOffset RetryAfter { get; } = retryAfter;
+}
+
+internal sealed class ClaudeUsageTemporarilyUnavailableException(
+    DateTimeOffset retryAfter,
+    Exception? innerException = null)
+    : HttpRequestException("Claude usage service is temporarily unavailable.", innerException)
 {
     public DateTimeOffset RetryAfter { get; } = retryAfter;
 }
@@ -29,20 +42,31 @@ internal sealed class ClaudeUsageClient : IDisposable
 {
     private static readonly Uri UsageEndpoint = new("https://api.anthropic.com/api/oauth/usage");
     private static readonly TimeSpan CacheLifetime = TimeSpan.FromMinutes(10);
+    private static readonly TimeSpan PersistentCacheLifetime = TimeSpan.FromHours(24);
     private static readonly TimeSpan DefaultBackoff = TimeSpan.FromMinutes(5);
 
     private readonly HttpClient _httpClient;
     private readonly TimeProvider _timeProvider;
     private readonly Func<string> _accessTokenProvider;
+    private readonly Func<ClaudeCredentialFileState?> _credentialFileStateProvider;
+    private readonly IClaudeUsageCacheStore _cacheStore;
     private readonly SemaphoreSlim _requestGate = new(1, 1);
     private ClaudeUsageSnapshot? _cachedSnapshot;
     private DateTimeOffset _lastFetchedAt = DateTimeOffset.MinValue;
     private DateTimeOffset _retryAfter = DateTimeOffset.MinValue;
     private int _consecutiveRateLimits;
+    private bool _retryIsRateLimit;
+    private bool _hasNetworkSnapshot;
+    private ClaudeCredentialFileState? _credentialFileState;
     private bool _disposed;
 
     public ClaudeUsageClient()
-        : this(new HttpClientHandler(), TimeProvider.System, ReadAccessToken)
+        : this(
+            new HttpClientHandler(),
+            TimeProvider.System,
+            ReadAccessToken,
+            ReadCredentialFileState,
+            ClaudeUsageFileCacheStore.CreateDefault())
     {
     }
 
@@ -50,6 +74,30 @@ internal sealed class ClaudeUsageClient : IDisposable
         HttpMessageHandler messageHandler,
         TimeProvider timeProvider,
         Func<string> accessTokenProvider)
+        : this(
+            messageHandler,
+            timeProvider,
+            accessTokenProvider,
+            () => null,
+            ClaudeUsageNullCacheStore.Instance)
+    {
+    }
+
+    internal ClaudeUsageClient(
+        HttpMessageHandler messageHandler,
+        TimeProvider timeProvider,
+        Func<string> accessTokenProvider,
+        IClaudeUsageCacheStore cacheStore)
+        : this(messageHandler, timeProvider, accessTokenProvider, () => null, cacheStore)
+    {
+    }
+
+    internal ClaudeUsageClient(
+        HttpMessageHandler messageHandler,
+        TimeProvider timeProvider,
+        Func<string> accessTokenProvider,
+        Func<ClaudeCredentialFileState?> credentialFileStateProvider,
+        IClaudeUsageCacheStore cacheStore)
     {
         _httpClient = new HttpClient(messageHandler)
         {
@@ -57,6 +105,23 @@ internal sealed class ClaudeUsageClient : IDisposable
         };
         _timeProvider = timeProvider;
         _accessTokenProvider = accessTokenProvider;
+        _credentialFileStateProvider = credentialFileStateProvider;
+        _cacheStore = cacheStore;
+        _credentialFileState = _credentialFileStateProvider();
+
+        var persisted = _cacheStore.Load();
+        var now = _timeProvider.GetUtcNow();
+        if (persisted is not null &&
+            IsCacheUsable(persisted.Snapshot, persisted.LastUpdatedAt, now) &&
+            !CachePredatesCredentialFile(persisted.LastUpdatedAt))
+        {
+            _cachedSnapshot = persisted.Snapshot;
+            _lastFetchedAt = persisted.LastUpdatedAt;
+        }
+        else if (persisted is not null)
+        {
+            _cacheStore.Clear();
+        }
     }
 
     public async Task<ClaudeUsageResult> GetUsageAsync(CancellationToken cancellationToken)
@@ -66,20 +131,32 @@ internal sealed class ClaudeUsageClient : IDisposable
         try
         {
             var now = _timeProvider.GetUtcNow();
+            RefreshCredentialFileState();
             if (now < _retryAfter)
             {
-                return _cachedSnapshot is not null
+                return HasUsableCache(now)
                     ? CreateCachedResult(isStale: true)
-                    : throw new ClaudeUsageRateLimitedException(_retryAfter);
+                    : throw CreateRetryException();
             }
 
-            if (_cachedSnapshot is not null &&
+            if (_hasNetworkSnapshot &&
+                HasUsableCache(now) &&
                 now - _lastFetchedAt < CacheLifetime)
             {
                 return CreateCachedResult(isStale: false);
             }
 
-            var accessToken = _accessTokenProvider();
+            string accessToken;
+            try
+            {
+                accessToken = _accessTokenProvider();
+            }
+            catch
+            {
+                ClearCachedSnapshot(clearPersisted: true);
+                throw;
+            }
+
             using var request = new HttpRequestMessage(HttpMethod.Get, UsageEndpoint);
             request.Headers.TryAddWithoutValidation("Authorization", $"Bearer {accessToken}");
             request.Headers.TryAddWithoutValidation("anthropic-beta", "oauth-2025-04-20");
@@ -94,12 +171,12 @@ internal sealed class ClaudeUsageClient : IDisposable
                     HttpCompletionOption.ResponseHeadersRead,
                     cancellationToken);
             }
-            catch (Exception exception) when (
-                IsTransientException(exception) &&
-                _cachedSnapshot is not null)
+            catch (Exception exception) when (IsTransientException(exception))
             {
                 SetTransientBackoff(now);
-                return CreateCachedResult(isStale: true);
+                return HasUsableCache(now)
+                    ? CreateCachedResult(isStale: true)
+                    : throw new ClaudeUsageTemporarilyUnavailableException(_retryAfter, exception);
             }
 
             using (response)
@@ -108,47 +185,66 @@ internal sealed class ClaudeUsageClient : IDisposable
                 {
                     _consecutiveRateLimits++;
                     _retryAfter = ResolveRetryAfter(response, now, _consecutiveRateLimits);
-                    return _cachedSnapshot is not null
+                    _retryIsRateLimit = true;
+                    return HasUsableCache(now)
                         ? CreateCachedResult(isStale: true)
                         : throw new ClaudeUsageRateLimitedException(_retryAfter);
                 }
 
                 if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
+                {
+                    ClearCachedSnapshot(clearPersisted: true);
                     throw new UnauthorizedAccessException("Claude Code login is missing or expired.");
+                }
 
                 if (response.StatusCode == HttpStatusCode.RequestTimeout ||
                     (int)response.StatusCode >= 500)
                 {
                     SetTransientBackoff(now);
-                    return _cachedSnapshot is not null
+                    return HasUsableCache(now)
                         ? CreateCachedResult(isStale: true)
-                        : throw new HttpRequestException(
-                            $"Claude usage service returned HTTP {(int)response.StatusCode}.");
+                        : throw new ClaudeUsageTemporarilyUnavailableException(_retryAfter);
                 }
 
                 if (!response.IsSuccessStatusCode)
+                {
+                    ClearCachedSnapshot(clearPersisted: true);
                     throw new HttpRequestException(
                         $"Claude usage service returned HTTP {(int)response.StatusCode}.");
+                }
 
                 string json;
                 try
                 {
                     json = await response.Content.ReadAsStringAsync(cancellationToken);
                 }
-                catch (Exception exception) when (
-                    IsTransientException(exception) &&
-                    _cachedSnapshot is not null)
+                catch (Exception exception) when (IsTransientException(exception))
                 {
                     SetTransientBackoff(now);
-                    return CreateCachedResult(isStale: true);
+                    return HasUsableCache(now)
+                        ? CreateCachedResult(isStale: true)
+                        : throw new ClaudeUsageTemporarilyUnavailableException(_retryAfter, exception);
                 }
 
-                var snapshot = ParseUsage(json);
+                ClaudeUsageSnapshot snapshot;
+                try
+                {
+                    snapshot = ParseUsage(json);
+                }
+                catch (Exception exception) when (exception is JsonException or InvalidDataException)
+                {
+                    ClearCachedSnapshot(clearPersisted: true);
+                    throw;
+                }
+                var fetchedAt = _timeProvider.GetUtcNow();
                 _cachedSnapshot = snapshot;
-                _lastFetchedAt = now;
+                _lastFetchedAt = fetchedAt;
                 _retryAfter = DateTimeOffset.MinValue;
                 _consecutiveRateLimits = 0;
-                return new ClaudeUsageResult(snapshot, now, null, IsStale: false);
+                _retryIsRateLimit = false;
+                _hasNetworkSnapshot = true;
+                _cacheStore.Save(new ClaudeUsageCacheEntry(snapshot, fetchedAt));
+                return new ClaudeUsageResult(snapshot, fetchedAt, null, IsStale: false);
             }
         }
         finally
@@ -163,9 +259,68 @@ internal sealed class ClaudeUsageClient : IDisposable
         isStale ? _retryAfter : null,
         isStale);
 
+    private bool HasUsableCache(DateTimeOffset now)
+    {
+        if (_cachedSnapshot is null || !IsCacheUsable(_cachedSnapshot, _lastFetchedAt, now))
+        {
+            ClearCachedSnapshot(clearPersisted: true);
+            return false;
+        }
+
+        return true;
+    }
+
+    private static bool IsCacheUsable(
+        ClaudeUsageSnapshot? snapshot,
+        DateTimeOffset lastUpdatedAt,
+        DateTimeOffset now)
+    {
+        var age = now - lastUpdatedAt;
+        if (age < TimeSpan.Zero ||
+            age > PersistentCacheLifetime ||
+            snapshot?.Fable is not { } fable ||
+            !IsValidPercent(fable.UsedPercent))
+        {
+            return false;
+        }
+
+        return fable.ResetsAt is not { } resetsAt || resetsAt > now;
+    }
+
+    private static bool IsValidPercent(double value) =>
+        double.IsFinite(value) && value is >= 0d and <= 100d;
+
+    private void RefreshCredentialFileState()
+    {
+        var current = _credentialFileStateProvider();
+        if (current == _credentialFileState) return;
+
+        _credentialFileState = current;
+        ClearCachedSnapshot(clearPersisted: true);
+        _retryAfter = DateTimeOffset.MinValue;
+        _consecutiveRateLimits = 0;
+        _retryIsRateLimit = false;
+    }
+
+    private bool CachePredatesCredentialFile(DateTimeOffset lastUpdatedAt) =>
+        _credentialFileState is { } credential && credential.LastWriteTime > lastUpdatedAt;
+
+    private void ClearCachedSnapshot(bool clearPersisted)
+    {
+        _cachedSnapshot = null;
+        _lastFetchedAt = DateTimeOffset.MinValue;
+        _hasNetworkSnapshot = false;
+        if (clearPersisted) _cacheStore.Clear();
+    }
+
+    private Exception CreateRetryException() => _retryIsRateLimit
+        ? new ClaudeUsageRateLimitedException(_retryAfter)
+        : new ClaudeUsageTemporarilyUnavailableException(_retryAfter);
+
     private void SetTransientBackoff(DateTimeOffset now)
     {
         _retryAfter = now + DefaultBackoff;
+        _retryIsRateLimit = false;
     }
 
     private static bool IsTransientException(Exception exception) =>
@@ -297,11 +452,7 @@ internal sealed class ClaudeUsageClient : IDisposable
 
     private static string ReadAccessToken()
     {
-        var configuredDirectory = Environment.GetEnvironmentVariable("CLAUDE_CONFIG_DIR");
-        var claudeDirectory = string.IsNullOrWhiteSpace(configuredDirectory)
-            ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude")
-            : configuredDirectory;
-        var credentialPath = Path.Combine(claudeDirectory, ".credentials.json");
+        var credentialPath = GetCredentialPath();
 
         try
         {
@@ -328,6 +479,32 @@ internal sealed class ClaudeUsageClient : IDisposable
         }
 
         throw new InvalidOperationException("Claude Code login is required.");
+    }
+
+    private static ClaudeCredentialFileState? ReadCredentialFileState()
+    {
+        try
+        {
+            var file = new FileInfo(GetCredentialPath());
+            if (!file.Exists) return null;
+            return new ClaudeCredentialFileState(
+                file.FullName,
+                new DateTimeOffset(file.LastWriteTimeUtc),
+                file.Length);
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            return null;
+        }
+    }
+
+    private static string GetCredentialPath()
+    {
+        var configuredDirectory = Environment.GetEnvironmentVariable("CLAUDE_CONFIG_DIR");
+        var claudeDirectory = string.IsNullOrWhiteSpace(configuredDirectory)
+            ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude")
+            : configuredDirectory;
+        return Path.Combine(claudeDirectory, ".credentials.json");
     }
 
     private static DateTimeOffset ResolveRetryAfter(
