@@ -1,18 +1,21 @@
-using System.Net;
-using System.Text;
+using System.Text.Json;
 using WeeklyUsageIndicator;
 
 var tests = new (string Name, Func<Task> Run)[]
 {
-    ("ten-minute cache prevents duplicate requests", TestFreshCacheAsync),
-    ("429 keeps cached usage and backs off progressively", TestRateLimitRecoveryAsync),
-    ("Retry-After is honored while cached usage remains visible", TestRetryAfterAsync),
-    ("server errors keep cached usage until recovery", TestServerErrorRecoveryAsync),
-    ("network errors keep cached usage until recovery", TestNetworkErrorRecoveryAsync),
-    ("body-read errors keep cached usage until recovery", TestBodyReadErrorRecoveryAsync),
-    ("request timeouts keep cached usage until recovery", TestRequestTimeoutRecoveryAsync),
-    ("authentication and schema failures remain hard failures", TestHardFailuresAsync),
-    ("429 without cached usage remains a hard failure", TestRateLimitWithoutCacheAsync),
+    ("official Claude /usage output is parsed", TestObservedUsageOutputAsync),
+    ("decimal percentages and year rollover are parsed", TestUsageTextVariantsAsync),
+    ("model turns and costs are rejected", TestNoModelTurnGuardAsync),
+    ("authentication and malformed output are hard failures", TestSourceHardFailuresAsync),
+    ("Claude process invocation is shell-free and session-free", TestProcessArgumentsAsync),
+    ("ten-minute cache prevents duplicate commands", TestFreshCacheAsync),
+    ("transient command failures keep cached usage and back off", TestTransientRecoveryAsync),
+    ("persisted usage protects a transient cold start", TestPersistedColdStartAsync),
+    ("hard failures clear cached usage", TestHardFailuresClearCacheAsync),
+    ("caller cancellation preserves accepted cached usage", TestCallerCancellationPreservesCacheAsync),
+    ("expired persisted usage is rejected", TestExpiredPersistedCacheAsync),
+    ("file cache stores only the sanitized snapshot", TestFileCacheAsync),
+    ("temporary errors expose the next attempt", TestRetryErrorTextAsync),
     ("stale tooltip reports last success and next retry", TestStaleTooltipAsync)
 };
 
@@ -24,254 +27,322 @@ foreach (var test in tests)
 
 return;
 
+static Task TestObservedUsageOutputAsync()
+{
+    var now = new DateTimeOffset(2026, 9, 1, 4, 25, 0, TimeSpan.Zero);
+    var text = """
+        You are currently using your subscription to power your Claude Code usage
+
+        Current session: 0% used · resets Sep 1, 6:19pm (Asia/Seoul)
+        Current week (all models): 12% used · resets Sep 5, 5:59pm (Asia/Seoul)
+        Current week (Fable): 24% used · resets Sep 5, 5:59pm (Asia/Seoul)
+
+        What's contributing to your limits usage?
+        """;
+    var snapshot = ClaudeCodeUsageSource.ParseEnvelope(UsageEnvelope(text), now);
+
+    Assert(snapshot.FiveHour?.UsedPercent == 0, "the current session percentage should be parsed");
+    Assert(snapshot.Weekly?.UsedPercent == 12, "the all-model weekly percentage should be parsed");
+    Assert(snapshot.Fable?.UsedPercent == 24, "the Fable weekly percentage should be parsed");
+    Assert(snapshot.FiveHour?.ResetsAt == new DateTimeOffset(2026, 9, 1, 18, 19, 0, TimeSpan.FromHours(9)),
+        "the reset should preserve the reported time zone");
+    return Task.CompletedTask;
+}
+
+static Task TestUsageTextVariantsAsync()
+{
+    var now = new DateTimeOffset(2026, 12, 31, 14, 0, 0, TimeSpan.Zero);
+    var text = """
+        Current session: 1.5% used · resets Jan 1, 2am (Asia/Seoul)
+        Current week (all models): 2.25% used · resets Jan 3, 6:30pm (Asia/Seoul)
+        Current week (Fable): 3.75% used · resets Jan 3, 6:30pm (Asia/Seoul)
+        """;
+    var snapshot = ClaudeCodeUsageSource.ParseUsageText(text, now);
+
+    Assert(snapshot.FiveHour?.UsedPercent == 1.5, "decimal percentages should be accepted");
+    Assert(snapshot.FiveHour?.ResetsAt?.Year == 2027, "a January reset after December should roll into the next year");
+    return Task.CompletedTask;
+}
+
+static Task TestNoModelTurnGuardAsync()
+{
+    var now = DateTimeOffset.UtcNow;
+    AssertThrows<InvalidDataException>(
+        () => ClaudeCodeUsageSource.ParseEnvelope(UsageEnvelope(SampleUsageText(), numTurns: 1), now),
+        "a model turn must never be accepted as a usage lookup");
+    AssertThrows<InvalidDataException>(
+        () => ClaudeCodeUsageSource.ParseEnvelope(UsageEnvelope(SampleUsageText(), totalCost: 0.01), now),
+        "a paid response must never be accepted as a usage lookup");
+    return Task.CompletedTask;
+}
+
+static async Task TestSourceHardFailuresAsync()
+{
+    var clock = new ManualTimeProvider(new DateTimeOffset(2026, 9, 1, 4, 0, 0, TimeSpan.Zero));
+    var loginRunner = new SequenceCommandRunner(
+        new ClaudeCommandResult(1, string.Empty, "Not logged in. Please login."));
+    var loginSource = new ClaudeCodeUsageSource(loginRunner, clock);
+    await AssertThrowsAsync<UnauthorizedAccessException>(
+        () => loginSource.ReadAsync(CancellationToken.None),
+        "a Claude Code login failure should remain a hard failure");
+
+    var malformedSource = new ClaudeCodeUsageSource(
+        new SequenceCommandRunner(new ClaudeCommandResult(0, "not-json", string.Empty)),
+        clock);
+    await AssertThrowsAsync<JsonException>(
+        () => malformedSource.ReadAsync(CancellationToken.None),
+        "malformed JSON should not revive stale usage");
+
+    var invalidKeySource = new ClaudeCodeUsageSource(
+        new SequenceCommandRunner(new ClaudeCommandResult(1, string.Empty, "Invalid API key")),
+        clock);
+    await AssertThrowsAsync<UnauthorizedAccessException>(
+        () => invalidKeySource.ReadAsync(CancellationToken.None),
+        "official invalid-key errors should not be treated as transient");
+}
+
+static Task TestProcessArgumentsAsync()
+{
+    var startInfo = ClaudeCodeProcessRunner.CreateStartInfo("claude.exe");
+    var arguments = startInfo.ArgumentList.ToArray();
+    Assert(!startInfo.UseShellExecute && startInfo.CreateNoWindow, "Claude must run without a shell or visible window");
+    Assert(arguments.Contains("/usage"), "the built-in /usage command should be invoked");
+    Assert(arguments.Contains("--safe-mode"), "custom hooks, plugins, and MCP servers must not affect the lookup");
+    Assert(arguments.Contains("--no-session-persistence"), "the lookup must not leave a resumable session");
+    Assert(arguments.Contains("--no-chrome"), "the lookup must not open browser integration");
+    Assert(arguments.SequenceEqual([
+        "-p", "--safe-mode", "--no-session-persistence", "--no-chrome", "/usage", "--output-format", "json", "--max-turns", "0"]),
+        "the command contract should remain exact and reviewable");
+    Assert(UsageIndicatorForm.ClaudeRefreshTimeout > ClaudeCodeProcessRunner.CommandTimeout,
+        "the UI timeout must leave the process runner time to classify a slow command as transient");
+    return Task.CompletedTask;
+}
+
 static async Task TestFreshCacheAsync()
 {
-    var clock = new ManualTimeProvider(new DateTimeOffset(2026, 8, 30, 12, 0, 0, TimeSpan.Zero));
-    var handler = new SequenceHandler(SuccessResponse(10));
-    using var client = CreateClient(handler, clock);
+    var start = new DateTimeOffset(2026, 9, 1, 4, 0, 0, TimeSpan.Zero);
+    var clock = new ManualTimeProvider(start);
+    var source = new SequenceUsageSource(Snapshot(10, start));
+    using var client = new ClaudeUsageClient(source, clock);
 
     var first = await client.GetUsageAsync(CancellationToken.None);
     clock.Advance(TimeSpan.FromMinutes(9));
     var cached = await client.GetUsageAsync(CancellationToken.None);
 
-    Assert(handler.RequestCount == 1, "fresh cache should avoid a second HTTP request");
+    Assert(source.ReadCount == 1, "fresh cache should avoid a second Claude command");
     Assert(!first.IsStale && !cached.IsStale, "fresh cache should not be marked stale");
-    Assert(cached.Snapshot.Fable?.UsedPercent == 10, "cached Fable value should be preserved");
+    Assert(cached.Snapshot.Fable?.UsedPercent == 10, "the cached Fable value should be preserved");
 }
 
-static async Task TestRateLimitRecoveryAsync()
+static async Task TestTransientRecoveryAsync()
 {
-    var start = new DateTimeOffset(2026, 8, 30, 12, 0, 0, TimeSpan.Zero);
+    var start = new DateTimeOffset(2026, 9, 1, 4, 0, 0, TimeSpan.Zero);
     var clock = new ManualTimeProvider(start);
-    var handler = new SequenceHandler(
-        SuccessResponse(10),
-        StatusResponse(HttpStatusCode.TooManyRequests),
-        StatusResponse(HttpStatusCode.TooManyRequests),
-        StatusResponse(HttpStatusCode.TooManyRequests),
-        SuccessResponse(22));
-    using var client = CreateClient(handler, clock);
+    var source = new SequenceUsageSource(
+        Snapshot(10, start),
+        new IOException("temporarily unavailable"),
+        new TimeoutException("slow"),
+        new IOException("temporarily unavailable"),
+        Snapshot(22, start.AddMinutes(40)));
+    using var client = new ClaudeUsageClient(source, clock);
 
     await client.GetUsageAsync(CancellationToken.None);
     clock.Advance(TimeSpan.FromMinutes(10));
-    var firstLimited = await client.GetUsageAsync(CancellationToken.None);
-    Assert(firstLimited.IsStale, "a cached value should become stale after 429");
-    Assert(firstLimited.RetryAfter == clock.GetUtcNow().AddMinutes(5), "first fallback backoff should be five minutes");
-    Assert(firstLimited.Snapshot.Fable?.UsedPercent == 10, "429 should keep the last Fable value");
+    var first = await client.GetUsageAsync(CancellationToken.None);
+    Assert(first.IsStale && first.RetryAfter == clock.GetUtcNow().AddMinutes(5),
+        "the first transient failure should keep the cache and wait five minutes");
 
-    var duringBackoff = await client.GetUsageAsync(CancellationToken.None);
-    Assert(duringBackoff.IsStale, "cached value should remain stale during backoff");
-    Assert(handler.RequestCount == 2, "backoff should suppress repeated HTTP requests");
+    var suppressed = await client.GetUsageAsync(CancellationToken.None);
+    Assert(suppressed.IsStale && source.ReadCount == 2, "backoff should suppress repeated commands");
 
     clock.Advance(TimeSpan.FromMinutes(5));
-    var secondLimited = await client.GetUsageAsync(CancellationToken.None);
-    Assert(secondLimited.RetryAfter == clock.GetUtcNow().AddMinutes(10), "second fallback backoff should be ten minutes");
+    var second = await client.GetUsageAsync(CancellationToken.None);
+    Assert(second.RetryAfter == clock.GetUtcNow().AddMinutes(10), "the second failure should wait ten minutes");
 
     clock.Advance(TimeSpan.FromMinutes(10));
-    var thirdLimited = await client.GetUsageAsync(CancellationToken.None);
-    Assert(thirdLimited.RetryAfter == clock.GetUtcNow().AddMinutes(15), "third fallback backoff should be fifteen minutes");
+    var third = await client.GetUsageAsync(CancellationToken.None);
+    Assert(third.RetryAfter == clock.GetUtcNow().AddMinutes(15), "the third failure should wait fifteen minutes");
 
     clock.Advance(TimeSpan.FromMinutes(15));
     var recovered = await client.GetUsageAsync(CancellationToken.None);
-    Assert(!recovered.IsStale, "a successful retry should clear stale state");
-    Assert(recovered.RetryAfter is null, "a successful retry should clear retry timing");
-    Assert(recovered.Snapshot.Fable?.UsedPercent == 22, "recovery should replace the cached value");
-    Assert(handler.RequestCount == 5, "recovery should use the next queued response");
+    Assert(!recovered.IsStale && recovered.Snapshot.Fable?.UsedPercent == 22,
+        "a successful command should replace stale usage");
 }
 
-static async Task TestRetryAfterAsync()
+static async Task TestPersistedColdStartAsync()
 {
-    var clock = new ManualTimeProvider(new DateTimeOffset(2026, 8, 30, 12, 0, 0, TimeSpan.Zero));
-    var limited = StatusResponse(HttpStatusCode.TooManyRequests);
-    limited.Headers.RetryAfter = new System.Net.Http.Headers.RetryConditionHeaderValue(TimeSpan.FromMinutes(30));
-    var handler = new SequenceHandler(SuccessResponse(10), limited);
-    using var client = CreateClient(handler, clock);
-
-    await client.GetUsageAsync(CancellationToken.None);
-    clock.Advance(TimeSpan.FromMinutes(10));
-    var stale = await client.GetUsageAsync(CancellationToken.None);
-    Assert(stale.RetryAfter == clock.GetUtcNow().AddMinutes(30), "Retry-After should be honored beyond the fallback cap");
-
-    clock.Advance(TimeSpan.FromMinutes(29));
-    await client.GetUsageAsync(CancellationToken.None);
-    Assert(handler.RequestCount == 2, "Retry-After should suppress early requests");
-}
-
-static async Task TestServerErrorRecoveryAsync()
-{
-    var clock = new ManualTimeProvider(new DateTimeOffset(2026, 8, 30, 12, 0, 0, TimeSpan.Zero));
-    var handler = new SequenceHandler(
-        SuccessResponse(10),
-        StatusResponse(HttpStatusCode.ServiceUnavailable),
-        SuccessResponse(30));
-    using var client = CreateClient(handler, clock);
-
-    await client.GetUsageAsync(CancellationToken.None);
-    clock.Advance(TimeSpan.FromMinutes(10));
-    var stale = await client.GetUsageAsync(CancellationToken.None);
-    Assert(stale.IsStale, "server errors should use the cached value");
-    Assert(stale.RetryAfter == clock.GetUtcNow().AddMinutes(5), "server errors should back off for five minutes");
-
-    clock.Advance(TimeSpan.FromMinutes(5));
-    var recovered = await client.GetUsageAsync(CancellationToken.None);
-    Assert(!recovered.IsStale && recovered.Snapshot.Fable?.UsedPercent == 30, "server recovery should refresh the value");
-}
-
-static async Task TestNetworkErrorRecoveryAsync()
-{
-    var clock = new ManualTimeProvider(new DateTimeOffset(2026, 8, 30, 12, 0, 0, TimeSpan.Zero));
-    var handler = new SequenceHandler(
-        SuccessResponse(10),
-        new HttpRequestException("offline"),
-        SuccessResponse(40));
-    using var client = CreateClient(handler, clock);
-
-    await client.GetUsageAsync(CancellationToken.None);
-    clock.Advance(TimeSpan.FromMinutes(10));
-    var stale = await client.GetUsageAsync(CancellationToken.None);
-    Assert(stale.IsStale, "network errors should use the cached value");
-    Assert(stale.RetryAfter == clock.GetUtcNow().AddMinutes(5), "network errors should back off for five minutes");
-
-    clock.Advance(TimeSpan.FromMinutes(5));
-    var recovered = await client.GetUsageAsync(CancellationToken.None);
-    Assert(!recovered.IsStale && recovered.Snapshot.Fable?.UsedPercent == 40, "network recovery should refresh the value");
-}
-
-static async Task TestBodyReadErrorRecoveryAsync()
-{
-    var clock = new ManualTimeProvider(new DateTimeOffset(2026, 8, 30, 12, 0, 0, TimeSpan.Zero));
-    var brokenResponse = new HttpResponseMessage(HttpStatusCode.OK)
+    var start = new DateTimeOffset(2026, 9, 1, 4, 0, 0, TimeSpan.Zero);
+    var store = new MemoryCacheStore
     {
-        Content = new ThrowingContent(new HttpRequestException("body disconnected"))
+        Entry = new ClaudeUsageCacheEntry(Snapshot(30, start), start)
     };
-    var handler = new SequenceHandler(SuccessResponse(10), brokenResponse, SuccessResponse(45));
-    using var client = CreateClient(handler, clock);
+    var source = new SequenceUsageSource(new IOException("offline"));
+    using var client = new ClaudeUsageClient(source, new ManualTimeProvider(start), store);
+
+    var stale = await client.GetUsageAsync(CancellationToken.None);
+    Assert(source.ReadCount == 1, "persisted usage must not suppress the first live command");
+    Assert(stale.IsStale && stale.Snapshot.Fable?.UsedPercent == 30,
+        "a transient cold start should keep the persisted value visible");
+}
+
+static async Task TestHardFailuresClearCacheAsync()
+{
+    var start = new DateTimeOffset(2026, 9, 1, 4, 0, 0, TimeSpan.Zero);
+    var clock = new ManualTimeProvider(start);
+    var store = new MemoryCacheStore();
+    var source = new SequenceUsageSource(
+        Snapshot(10, start),
+        new InvalidDataException("schema changed"),
+        new IOException("offline"));
+    using var client = new ClaudeUsageClient(source, clock, store);
 
     await client.GetUsageAsync(CancellationToken.None);
     clock.Advance(TimeSpan.FromMinutes(10));
-    var stale = await client.GetUsageAsync(CancellationToken.None);
-    Assert(stale.IsStale, "body-read transport errors should use the cached value");
-    Assert(stale.RetryAfter == clock.GetUtcNow().AddMinutes(5), "body-read errors should back off for five minutes");
+    await AssertThrowsAsync<InvalidDataException>(
+        () => client.GetUsageAsync(CancellationToken.None),
+        "a schema failure should not return stale data");
+    Assert(store.Entry is null, "a schema failure should delete persisted usage");
 
-    clock.Advance(TimeSpan.FromMinutes(5));
-    var recovered = await client.GetUsageAsync(CancellationToken.None);
-    Assert(!recovered.IsStale && recovered.Snapshot.Fable?.UsedPercent == 45, "body-read recovery should refresh the value");
+    await AssertThrowsAsync<ClaudeUsageTemporarilyUnavailableException>(
+        () => client.GetUsageAsync(CancellationToken.None),
+        "a later transient failure must not resurrect rejected data");
 }
 
-static async Task TestRequestTimeoutRecoveryAsync()
+static async Task TestCallerCancellationPreservesCacheAsync()
 {
-    var clock = new ManualTimeProvider(new DateTimeOffset(2026, 8, 30, 12, 0, 0, TimeSpan.Zero));
-    var handler = new SequenceHandler(
-        SuccessResponse(10),
-        StatusResponse(HttpStatusCode.RequestTimeout),
-        SuccessResponse(50));
-    using var client = CreateClient(handler, clock);
-
-    await client.GetUsageAsync(CancellationToken.None);
-    clock.Advance(TimeSpan.FromMinutes(10));
-    var stale = await client.GetUsageAsync(CancellationToken.None);
-    Assert(stale.IsStale, "HTTP 408 should use the cached value");
-
-    clock.Advance(TimeSpan.FromMinutes(5));
-    var recovered = await client.GetUsageAsync(CancellationToken.None);
-    Assert(!recovered.IsStale && recovered.Snapshot.Fable?.UsedPercent == 50, "HTTP 408 recovery should refresh the value");
-}
-
-static async Task TestHardFailuresAsync()
-{
-    var start = new DateTimeOffset(2026, 8, 30, 12, 0, 0, TimeSpan.Zero);
-    var authClock = new ManualTimeProvider(start);
-    var authHandler = new SequenceHandler(
-        SuccessResponse(10),
-        StatusResponse(HttpStatusCode.Unauthorized));
-    using (var authClient = CreateClient(authHandler, authClock))
+    var start = new DateTimeOffset(2026, 9, 1, 4, 0, 0, TimeSpan.Zero);
+    var clock = new ManualTimeProvider(start);
+    var store = new MemoryCacheStore();
+    using var cancellation = new CancellationTokenSource();
+    var source = new CallbackUsageSource(call =>
     {
-        await authClient.GetUsageAsync(CancellationToken.None);
-        authClock.Advance(TimeSpan.FromMinutes(10));
-        await AssertThrowsAsync<UnauthorizedAccessException>(
-            () => authClient.GetUsageAsync(CancellationToken.None),
-            "authentication errors should not return stale data");
-    }
+        if (call == 1) return Snapshot(10, start);
+        cancellation.Cancel();
+        throw new OperationCanceledException(cancellation.Token);
+    });
+    using var client = new ClaudeUsageClient(source, clock, store);
 
-    var schemaClock = new ManualTimeProvider(start);
-    var schemaHandler = new SequenceHandler(
-        SuccessResponse(10),
-        JsonResponse("not-json"));
-    using var schemaClient = CreateClient(schemaHandler, schemaClock);
-    await schemaClient.GetUsageAsync(CancellationToken.None);
-    schemaClock.Advance(TimeSpan.FromMinutes(10));
-    await AssertThrowsAsync<System.Text.Json.JsonException>(
-        () => schemaClient.GetUsageAsync(CancellationToken.None),
-        "schema errors should not return stale data");
+    await client.GetUsageAsync(CancellationToken.None);
+    clock.Advance(TimeSpan.FromMinutes(10));
+    await AssertThrowsAsync<OperationCanceledException>(
+        () => client.GetUsageAsync(cancellation.Token),
+        "the caller cancellation should still propagate");
+    Assert(store.Entry?.Snapshot.Fable?.UsedPercent == 10,
+        "caller cancellation must not delete the last accepted snapshot");
 }
 
-static async Task TestRateLimitWithoutCacheAsync()
+static async Task TestExpiredPersistedCacheAsync()
 {
-    var clock = new ManualTimeProvider(new DateTimeOffset(2026, 8, 30, 12, 0, 0, TimeSpan.Zero));
-    var handler = new SequenceHandler(StatusResponse(HttpStatusCode.TooManyRequests));
-    using var client = CreateClient(handler, clock);
+    var start = new DateTimeOffset(2026, 9, 1, 4, 0, 0, TimeSpan.Zero);
+    var oldStore = new MemoryCacheStore
+    {
+        Entry = new ClaudeUsageCacheEntry(Snapshot(10, start), start.AddHours(-25))
+    };
+    using var oldClient = new ClaudeUsageClient(
+        new SequenceUsageSource(new IOException("offline")),
+        new ManualTimeProvider(start),
+        oldStore);
+    await AssertThrowsAsync<ClaudeUsageTemporarilyUnavailableException>(
+        () => oldClient.GetUsageAsync(CancellationToken.None),
+        "a snapshot older than 24 hours should not be shown");
+    Assert(oldStore.Entry is null, "an old snapshot should be deleted");
 
+    var resetSnapshot = Snapshot(20, start) with
+    {
+        Fable = new ClaudeUsageWindow(20, start.AddMinutes(-1))
+    };
+    var resetStore = new MemoryCacheStore
+    {
+        Entry = new ClaudeUsageCacheEntry(resetSnapshot, start.AddHours(-1))
+    };
+    using var resetClient = new ClaudeUsageClient(
+        new SequenceUsageSource(new IOException("offline")),
+        new ManualTimeProvider(start),
+        resetStore);
+    await AssertThrowsAsync<ClaudeUsageTemporarilyUnavailableException>(
+        () => resetClient.GetUsageAsync(CancellationToken.None),
+        "a snapshot past its Fable reset should not be shown");
+    Assert(resetStore.Entry is null, "a snapshot past its reset should be deleted");
+}
+
+static Task TestFileCacheAsync()
+{
+    var temporaryDirectory = Path.Combine(Path.GetTempPath(), $"WeeklyUsageIndicator.Tests-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(temporaryDirectory);
     try
     {
-        await client.GetUsageAsync(CancellationToken.None);
-        throw new InvalidOperationException("429 without a cached value should throw");
+        var cachePath = Path.Combine(temporaryDirectory, ClaudeUsageFileCacheStore.CacheFileName);
+        var now = new DateTimeOffset(2026, 9, 1, 4, 0, 0, TimeSpan.Zero);
+        var entry = new ClaudeUsageCacheEntry(Snapshot(30, now), now);
+        var store = new ClaudeUsageFileCacheStore(cachePath);
+
+        store.Save(entry);
+        using (var document = JsonDocument.Parse(File.ReadAllText(cachePath)))
+        {
+            var fields = document.RootElement.EnumerateObject().Select(property => property.Name).ToArray();
+            Assert(fields.SequenceEqual(["Snapshot", "LastUpdatedAt"]),
+                "the cache should contain only snapshot and update time");
+        }
+        Assert(store.Load() == entry, "the file cache should round-trip the sanitized snapshot");
+
+        File.WriteAllText(cachePath, "not-json");
+        Assert(store.Load() is null && !File.Exists(cachePath), "a corrupt cache should be ignored and deleted");
     }
-    catch (ClaudeUsageRateLimitedException exception)
+    finally
     {
-        Assert(exception.RetryAfter == clock.GetUtcNow().AddMinutes(5), "hard failure should carry retry timing");
+        Directory.Delete(temporaryDirectory, recursive: true);
     }
+    return Task.CompletedTask;
+}
+
+static Task TestRetryErrorTextAsync()
+{
+    var error = UsageIndicatorForm.FriendlyClaudeError(
+        new ClaudeUsageTemporarilyUnavailableException(DateTimeOffset.Now.AddMinutes(5)));
+    var missing = UsageIndicatorForm.FriendlyClaudeError(
+        new FileNotFoundException("Claude Code executable was not found."));
+    Assert(error.Contains("다음 시도", StringComparison.Ordinal), "temporary errors should show the next attempt");
+    Assert(missing.Contains("실행 파일", StringComparison.Ordinal), "a missing Claude Code install should be actionable");
+    return Task.CompletedTask;
 }
 
 static Task TestStaleTooltipAsync()
 {
     var now = DateTimeOffset.Now;
-    var snapshot = new ClaudeUsageSnapshot(
-        new ClaudeUsageWindow(10, now.AddHours(2)),
-        new ClaudeUsageWindow(20, now.AddDays(3)),
-        new ClaudeUsageWindow(30, now.AddDays(3)));
-    var stale = new ClaudeUsageResult(snapshot, now.AddMinutes(-12), now.AddMinutes(5), IsStale: true);
+    var stale = new ClaudeUsageResult(
+        Snapshot(30, now),
+        now.AddMinutes(-12),
+        now.AddMinutes(5),
+        IsStale: true);
     var tooltip = UsageIndicatorForm.BuildTooltipText(null, stale, null, null, showClaude: true);
 
-    Assert(tooltip.Contains("업데이트 지연", StringComparison.Ordinal), "tooltip should identify delayed updates");
-    Assert(tooltip.Contains("마지막 성공", StringComparison.Ordinal), "tooltip should show last success");
-    Assert(tooltip.Contains("다음 시도", StringComparison.Ordinal), "tooltip should show next retry");
-    Assert(tooltip.Contains("Fable: 70% 남음", StringComparison.Ordinal), "tooltip should retain cached Fable usage");
+    Assert(tooltip.Contains("업데이트 지연", StringComparison.Ordinal), "the tooltip should identify delayed updates");
+    Assert(tooltip.Contains("마지막 성공", StringComparison.Ordinal), "the tooltip should show the last success");
+    Assert(tooltip.Contains("다음 시도", StringComparison.Ordinal), "the tooltip should show the next retry");
+    Assert(tooltip.Contains("Fable: 70% 남음", StringComparison.Ordinal), "the tooltip should retain cached Fable usage");
     return Task.CompletedTask;
 }
 
-static ClaudeUsageClient CreateClient(SequenceHandler handler, ManualTimeProvider clock) =>
-    new(handler, clock, () => "test-token");
+static ClaudeUsageSnapshot Snapshot(double fableUsedPercent, DateTimeOffset now) => new(
+    new ClaudeUsageWindow(10, now.AddHours(3)),
+    new ClaudeUsageWindow(20, now.AddDays(3)),
+    new ClaudeUsageWindow(fableUsedPercent, now.AddDays(3)));
 
-static HttpResponseMessage SuccessResponse(double fableUsedPercent)
-{
-    var json = $$"""
-        {
-          "five_hour": { "utilization": 10, "resets_at": "2026-08-30T14:00:00Z" },
-          "seven_day": { "utilization": 20, "resets_at": "2026-09-03T12:00:00Z" },
-          "limits": [
-            {
-              "kind": "weekly_scoped",
-              "percent": {{fableUsedPercent}},
-              "resets_at": "2026-09-03T12:00:00Z",
-              "scope": { "model": { "display_name": "Fable" } }
-            }
-          ]
-        }
-        """;
-    return new HttpResponseMessage(HttpStatusCode.OK)
+static string SampleUsageText() => """
+    Current session: 10% used · resets Sep 1, 6pm (Asia/Seoul)
+    Current week (all models): 20% used · resets Sep 5, 6pm (Asia/Seoul)
+    Current week (Fable): 30% used · resets Sep 5, 6pm (Asia/Seoul)
+    """;
+
+static string UsageEnvelope(string result, int numTurns = 0, double totalCost = 0) =>
+    JsonSerializer.Serialize(new
     {
-        Content = new StringContent(json, Encoding.UTF8, "application/json")
-    };
-}
-
-static HttpResponseMessage StatusResponse(HttpStatusCode statusCode) => new(statusCode)
-{
-    Content = new StringContent("{}", Encoding.UTF8, "application/json")
-};
-
-static HttpResponseMessage JsonResponse(string json) => new(HttpStatusCode.OK)
-{
-    Content = new StringContent(json, Encoding.UTF8, "application/json")
-};
+        is_error = false,
+        num_turns = numTurns,
+        total_cost_usd = totalCost,
+        duration_api_ms = 0,
+        result
+    });
 
 static async Task AssertThrowsAsync<TException>(Func<Task> action, string message)
     where TException : Exception
@@ -284,7 +355,20 @@ static async Task AssertThrowsAsync<TException>(Func<Task> action, string messag
     {
         return;
     }
+    throw new InvalidOperationException(message);
+}
 
+static void AssertThrows<TException>(Action action, string message)
+    where TException : Exception
+{
+    try
+    {
+        action();
+    }
+    catch (TException)
+    {
+        return;
+    }
     throw new InvalidOperationException(message);
 }
 
@@ -296,43 +380,46 @@ static void Assert(bool condition, string message)
 internal sealed class ManualTimeProvider(DateTimeOffset utcNow) : TimeProvider
 {
     private DateTimeOffset _utcNow = utcNow;
-
     public override DateTimeOffset GetUtcNow() => _utcNow;
-
     public void Advance(TimeSpan duration) => _utcNow += duration;
 }
 
-internal sealed class SequenceHandler(params object[] outcomes) : HttpMessageHandler
+internal sealed class MemoryCacheStore : IClaudeUsageCacheStore
+{
+    public ClaudeUsageCacheEntry? Entry { get; set; }
+    public ClaudeUsageCacheEntry? Load() => Entry;
+    public void Save(ClaudeUsageCacheEntry entry) => Entry = entry;
+    public void Clear() => Entry = null;
+}
+
+internal sealed class SequenceUsageSource(params object[] outcomes) : IClaudeUsageSource
 {
     private readonly Queue<object> _outcomes = new(outcomes);
+    public int ReadCount { get; private set; }
 
-    public int RequestCount { get; private set; }
-
-    protected override Task<HttpResponseMessage> SendAsync(
-        HttpRequestMessage request,
-        CancellationToken cancellationToken)
+    public Task<ClaudeUsageSnapshot> ReadAsync(CancellationToken cancellationToken)
     {
-        RequestCount++;
-        if (_outcomes.Count == 0)
-            throw new InvalidOperationException("No queued HTTP outcome remains.");
-
+        ReadCount++;
+        if (_outcomes.Count == 0) throw new InvalidOperationException("No queued Claude usage outcome remains.");
         return _outcomes.Dequeue() switch
         {
-            HttpResponseMessage response => Task.FromResult(response),
-            Exception exception => Task.FromException<HttpResponseMessage>(exception),
-            _ => throw new InvalidOperationException("Unsupported HTTP outcome type.")
+            ClaudeUsageSnapshot snapshot => Task.FromResult(snapshot),
+            Exception exception => Task.FromException<ClaudeUsageSnapshot>(exception),
+            _ => throw new InvalidOperationException("Unsupported Claude usage outcome type.")
         };
     }
 }
 
-internal sealed class ThrowingContent(Exception exception) : HttpContent
+internal sealed class CallbackUsageSource(Func<int, ClaudeUsageSnapshot> callback) : IClaudeUsageSource
 {
-    protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context) =>
-        Task.FromException(exception);
+    private int _callCount;
+    public Task<ClaudeUsageSnapshot> ReadAsync(CancellationToken cancellationToken) =>
+        Task.FromResult(callback(++_callCount));
+}
 
-    protected override bool TryComputeLength(out long length)
-    {
-        length = 0;
-        return false;
-    }
+internal sealed class SequenceCommandRunner(params ClaudeCommandResult[] outcomes) : IClaudeCommandRunner
+{
+    private readonly Queue<ClaudeCommandResult> _outcomes = new(outcomes);
+    public Task<ClaudeCommandResult> RunUsageAsync(CancellationToken cancellationToken) =>
+        Task.FromResult(_outcomes.Dequeue());
 }
