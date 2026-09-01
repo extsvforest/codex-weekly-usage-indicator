@@ -7,18 +7,19 @@ This repository contains a small Windows-only WinForms utility. Keep changes foc
 - `UsageIndicatorForm` owns lifecycle, drawing, polling, and user interaction.
 - `CodexDesktopStateReader` detects the packaged Codex Desktop host.
 - `AppServerClient` starts the local `codex app-server --stdio` child process and speaks JSONL.
-- `ClaudeUsageClient` reads the standard local Claude Code credential and requests the Anthropic usage endpoint.
+- `ClaudeCodeUsageSource` invokes the native Claude Code `/usage` command; `ClaudeUsageClient` owns caching and backoff.
 - Weekly usage is selected by choosing the returned window whose duration is closest to seven days.
 - The main Claude value represents the model-scoped Fable weekly limit; its tooltip also reports the 5-hour and all-model weekly windows.
 
 ## Invariants
 
-- Never print, log, persist, or transmit authentication tokens anywhere except the Claude access token sent to `https://api.anthropic.com/api/oauth/usage` as required for the usage request.
+- Never read, print, log, persist, or transmit Claude authentication tokens. Claude Code owns its authentication and token refresh.
 - Do not add telemetry or other outbound network calls.
 - Do not commit absolute local paths, screenshots of real account usage, pet assets, build output, or credentials.
-- Treat `account/rateLimits/read` and Anthropic's `/api/oauth/usage` response as experimental and fail gracefully if either changes.
-- Re-read Claude credentials for each network refresh, respect server backoff, and do not refresh Claude more often than every ten minutes, including explicit UI refreshes.
-- Persist at most one credential-free Claude recovery snapshot containing only percentages, reset times, and update time. Use it only for transient cold-start failures, delete it after 24 hours, its Fable reset, or a credential-file change, and never let it suppress the first live request in a new process.
+- Treat `account/rateLimits/read` and Claude Code's `/usage` text output as changeable contracts and fail gracefully if either changes.
+- Invoke Claude in safe mode without a shell, browser integration, or session persistence, and set `--max-turns 0`. Require `num_turns == 0` and `total_cost_usd == 0`; reject the response if either guard fails.
+- Do not invoke Claude more often than every ten minutes, including explicit UI refreshes, and back off transient command failures.
+- Persist at most one credential-free Claude recovery snapshot containing only percentages, reset times, and update time. Use it only for transient cold-start failures, delete it after 24 hours, its Fable reset, or an authentication/schema failure, and never let it suppress the first live request in a new process.
 - Stop the app-server child process when the widget pauses or exits.
 - Preserve the single-instance mutex and the always-on-top tool-window behavior.
 
@@ -37,7 +38,7 @@ Then check that:
 3. Codex and Claude values refresh independently; one provider failing does not leave an empty half-panel.
 4. Hover details include Codex weekly plus Claude 5-hour, weekly, and Fable percentages and reset times.
 5. The right-click Claude visibility toggle persists and suppresses Claude requests while off.
-6. A temporary Claude 429, network error, or server error keeps the last successful value visible and reports the update delay in the tooltip.
+6. A temporary Claude command, network, or service error keeps the last successful value visible and reports the update delay in the tooltip.
 7. A cold-start transient failure uses only a recent, unexpired sanitized snapshot and still attempts a live Claude request first.
 8. The context menu works, the widget hides, and its app-server child exits when Codex closes.
 9. `install.ps1` and `uninstall.ps1` only modify the current user's dedicated install directory and Startup shortcut.

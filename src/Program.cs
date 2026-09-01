@@ -35,6 +35,9 @@ internal sealed record UsageSnapshot(
 
 internal sealed class UsageIndicatorForm : Form
 {
+    internal static readonly TimeSpan ClaudeRefreshTimeout =
+        ClaudeCodeProcessRunner.CommandTimeout + TimeSpan.FromSeconds(5);
+
     private const int WidgetWidth = 272;
     private const int WidgetHeight = 64;
 
@@ -350,7 +353,7 @@ internal sealed class UsageIndicatorForm : Form
     {
         try
         {
-            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(18));
+            using var timeout = new CancellationTokenSource(ClaudeRefreshTimeout);
             _claudeUsage = await _claudeClient.GetUsageAsync(timeout.Token);
             _claudeError = null;
         }
@@ -619,13 +622,14 @@ internal sealed class UsageIndicatorForm : Form
             return "Claude 응답 시간이 초과되었습니다.";
         if (exception is UnauthorizedAccessException)
             return "Claude Code 로그인이 만료되었습니다.";
-        if (exception is ClaudeUsageRateLimitedException rateLimited)
-        {
-            return $"Claude 사용량 조회가 제한되었습니다. 다음 시도: {FormatResetTime(rateLimited.RetryAfter)}";
-        }
         if (exception is ClaudeUsageTemporarilyUnavailableException unavailable)
         {
             return $"Claude 사용량 조회가 지연되었습니다. 다음 시도: {FormatResetTime(unavailable.RetryAfter)}";
+        }
+        if (exception is FileNotFoundException ||
+            exception.Message.Contains("executable", StringComparison.OrdinalIgnoreCase))
+        {
+            return "Claude Code 실행 파일을 찾지 못했습니다.";
         }
         if (exception.Message.Contains("credentials", StringComparison.OrdinalIgnoreCase) ||
             exception.Message.Contains("login", StringComparison.OrdinalIgnoreCase))

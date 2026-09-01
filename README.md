@@ -10,7 +10,7 @@ An unofficial Windows widget that stays on top while Codex Desktop is running an
 - Expands one successful provider to the full width when the other provider is unavailable.
 - Shows Codex weekly reset details plus Claude 5-hour, weekly, and Fable reset details in a hover tooltip.
 - Reads the weekly usage window from the local Codex app-server.
-- Reads Claude limits from Anthropic's usage endpoint with a ten-minute in-memory cache.
+- Reads Claude limits through Claude Code's built-in `/usage` command with a ten-minute in-memory cache.
 - Keeps one credential-free successful Claude snapshot locally for up to 24 hours so a rate-limited cold start does not blank the panel.
 - Keeps the last successful Claude value visible during temporary rate limits or service errors and reports the delay in the tooltip.
 - Refreshes every 60 seconds; double-click to refresh Codex immediately while Claude continues to honor its ten-minute cache.
@@ -19,16 +19,16 @@ An unofficial Windows widget that stays on top while Codex Desktop is running an
 - Hides while another foreground app is fullscreen, then returns at the saved position.
 - Starts a small background watcher at Windows sign-in so it can follow future Codex launches.
 
-The widget does not store login tokens, account details, or usage history. It stores only the latest successful Claude percentages, reset times, and update time for short-lived recovery. The Claude access token is read into memory only for the request to Anthropic's usage endpoint. See [PRIVACY.md](PRIVACY.md).
+The widget does not read or store login tokens, account details, or usage history. It stores only the latest successful Claude percentages, reset times, and update time for short-lived recovery. Claude Code itself owns authentication and token refresh. See [PRIVACY.md](PRIVACY.md).
 
 > [!IMPORTANT]
-> This is an unofficial community project. It relies on an experimental local Codex app-server method (`account/rateLimits/read`) and an undocumented Anthropic usage endpoint (`/api/oauth/usage`). Either may change without notice.
+> This is an unofficial community project. It relies on an experimental local Codex app-server method (`account/rateLimits/read`) and the text output of Claude Code's built-in `/usage` command. Either may change without notice.
 
 ## Requirements
 
 - Windows 10 or 11
 - Codex Desktop installed and signed in
-- Optional: Claude Code installed and signed in on Windows to add Claude/Fable usage
+- Optional: a recent native Claude Code for Windows that supports `/usage` and `--safe-mode`, installed and signed in, to add Claude/Fable usage
 - [.NET 8 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/8.0)
 - .NET 8 SDK only when building from source
 
@@ -65,13 +65,13 @@ The executable is written to `dist\WeeklyUsageIndicator.exe`. Release builds omi
 
 The WinForms process checks for the packaged Codex Desktop host. While Codex is active, it launches `codex app-server --stdio`, initializes the local JSONL protocol, and reads `account/rateLimits/read`. It selects the rate-limit window closest to seven days and renders the remaining percentage.
 
-For Claude, it reads the OAuth access token from `CLAUDE_CONFIG_DIR\.credentials.json` or `%USERPROFILE%\.claude\.credentials.json`, then requests `https://api.anthropic.com/api/oauth/usage`. The response supplies the 5-hour, all-model weekly, and model-scoped Fable weekly windows. The token is not logged or persisted by the widget, and successful Claude responses are cached in memory for ten minutes.
+For Claude, it runs the local native executable with `claude -p --safe-mode --no-session-persistence --no-chrome /usage --output-format json --max-turns 0`. Safe mode prevents personal hooks, plugins, MCP servers, and project instructions from affecting the lookup. Claude Code handles its own authentication and token refresh, while the widget parses the returned 5-hour, all-model weekly, and Fable weekly windows. Agentic turns are disabled, the widget also rejects any response that reports a model turn or non-zero cost, and successful results are cached in memory for ten minutes.
 
-The latest successful percentages, reset times, and update time are also written to `claude-usage-cache.json` without credentials or account identifiers. A new process still attempts a live request immediately; the local snapshot is used only when that request is temporarily rate-limited or unavailable, and is rejected after 24 hours, after its Fable reset, or when the Claude credential file changes.
+The latest successful percentages, reset times, and update time are also written to `claude-usage-cache.json` without credentials or account identifiers. A new process still invokes Claude Code immediately; the local snapshot is used only when that command is temporarily unavailable, and is rejected after 24 hours or after its Fable reset. Authentication or response-schema failures delete it rather than showing data Claude Code has rejected.
 
-If the account does not expose a Fable-specific weekly limit, or one provider fails to refresh, that provider is omitted from the compact surface. Turning off **Claude 사용량 표시** also skips the Claude network request until it is turned on again.
+If the account does not expose a Fable-specific weekly limit, or one provider fails to refresh, that provider is omitted from the compact surface. Turning off **Claude 사용량 표시** also skips the Claude command until it is turned on again.
 
-Temporary rate limits, network failures, and server errors keep the last successful Claude value visible while the tooltip shows the last update and next retry time.
+Temporary Claude Code, network, or service failures keep the last successful Claude value visible while the tooltip shows the last update and next retry time.
 
 The app-server child process is stopped whenever Codex is no longer running.
 
