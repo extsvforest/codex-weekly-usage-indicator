@@ -71,6 +71,8 @@ The latest successful percentages, reset times, and update time are also written
 
 If the account does not expose a Fable-specific weekly limit, or one provider fails to refresh, that provider is omitted from the compact surface. Turning off **Claude 사용량 표시** also skips the Claude command until it is turned on again.
 
+Claude percentages remain valid when `/usage` omits reset times (for example, `Current session: 0% used`). Missing or unrecognized reset times appear as unknown. The 5-hour and all-model weekly windows are parsed independently, so an unavailable optional window does not hide a valid Fable percentage.
+
 Temporary Claude Code, network, or service failures keep the last successful Claude value visible while the tooltip shows the last update and next retry time.
 
 The app-server child process is stopped whenever Codex is no longer running.
