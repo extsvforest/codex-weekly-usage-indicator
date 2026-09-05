@@ -94,8 +94,10 @@ internal sealed class ClaudeCodeUsageSource : IClaudeUsageSource
                 fable = window;
         }
 
-        if (fiveHour is null || weekly is null || fable is null)
-            throw new InvalidDataException("Claude Code /usage did not return all expected limits.");
+        // Only Fable drives the compact panel. An absent or malformed optional
+        // window must not discard other independently valid limits.
+        if (fable is null)
+            throw new InvalidDataException("Claude Code /usage did not return a valid Fable limit.");
 
         return new ClaudeUsageSnapshot(fiveHour, weekly, fable);
     }
@@ -111,7 +113,7 @@ internal sealed class ClaudeCodeUsageSource : IClaudeUsageSource
 
         var match = UsageLinePattern.Match(line);
         if (!match.Success || !match.Groups["label"].Value.Equals(label, StringComparison.Ordinal))
-            throw new InvalidDataException($"Claude Code returned a malformed {label} limit.");
+            return true;
 
         if (!double.TryParse(
                 match.Groups["percent"].Value,
@@ -121,13 +123,25 @@ internal sealed class ClaudeCodeUsageSource : IClaudeUsageSource
             !double.IsFinite(usedPercent) ||
             usedPercent is < 0d or > 100d)
         {
-            throw new InvalidDataException($"Claude Code returned an invalid {label} percentage.");
+            return true;
         }
 
-        var resetsAt = ParseResetTime(
-            match.Groups["reset"].Value,
-            match.Groups["timezone"].Value,
-            now);
+        DateTimeOffset? resetsAt = null;
+        var resetMatch = ResetPattern.Match(match.Groups["resetSuffix"].Value);
+        if (resetMatch.Success)
+        {
+            try
+            {
+                resetsAt = ParseResetTime(
+                    resetMatch.Groups["reset"].Value,
+                    resetMatch.Groups["timezone"].Value,
+                    now);
+            }
+            catch (InvalidDataException)
+            {
+                // The percentage is independently valid; unknown dates stay unknown.
+            }
+        }
         window = new ClaudeUsageWindow(usedPercent, resetsAt);
         return true;
     }
@@ -215,7 +229,11 @@ internal sealed class ClaudeCodeUsageSource : IClaudeUsageSource
     }
 
     private static readonly Regex UsageLinePattern = new(
-        @"^(?<label>Current (?:session|week \(all models\)|week \(Fable\))):\s*(?<percent>\d+(?:\.\d+)?)%\s+used\s+·\s+resets\s+(?<reset>.+?)\s+\((?<timezone>[^)]+)\)\s*$",
+        @"^(?<label>Current (?:session|week \(all models\)|week \(Fable\))):\s*(?<percent>\d+(?:\.\d+)?)%\s+used(?:\s+·\s+resets\s+(?<resetSuffix>.+?))?\s*$",
+        RegexOptions.CultureInvariant);
+
+    private static readonly Regex ResetPattern = new(
+        @"^(?<reset>.+?)\s+\((?<timezone>[^)]+)\)$",
         RegexOptions.CultureInvariant);
 }
 

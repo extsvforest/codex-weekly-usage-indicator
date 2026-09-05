@@ -4,6 +4,10 @@ using WeeklyUsageIndicator;
 var tests = new (string Name, Func<Task> Run)[]
 {
     ("official Claude /usage output is parsed", TestObservedUsageOutputAsync),
+    ("usage without reset times remains valid through client and tooltip", TestUsageWithoutResetsAsync),
+    ("optional limits fail independently", TestIndependentLimitsAsync),
+    ("unknown reset format preserves verified percentages", TestUnknownResetFormatAsync),
+    ("missing or invalid Fable never becomes zero usage", TestInvalidFableAsync),
     ("decimal percentages and year rollover are parsed", TestUsageTextVariantsAsync),
     ("model turns and costs are rejected", TestNoModelTurnGuardAsync),
     ("authentication and malformed output are hard failures", TestSourceHardFailuresAsync),
@@ -46,6 +50,71 @@ static Task TestObservedUsageOutputAsync()
     Assert(snapshot.Fable?.UsedPercent == 24, "the Fable weekly percentage should be parsed");
     Assert(snapshot.FiveHour?.ResetsAt == new DateTimeOffset(2026, 9, 1, 18, 19, 0, TimeSpan.FromHours(9)),
         "the reset should preserve the reported time zone");
+    return Task.CompletedTask;
+}
+
+static async Task TestUsageWithoutResetsAsync()
+{
+    var now = new DateTimeOffset(2026, 9, 5, 0, 0, 0, TimeSpan.Zero);
+    var raw = UsageEnvelope("""
+        Current session: 0% used
+        Current week (all models): 0% used
+        Current week (Fable): 0% used
+        """);
+    var source = new ClaudeCodeUsageSource(
+        new SequenceCommandRunner(new ClaudeCommandResult(0, raw, string.Empty)),
+        new ManualTimeProvider(now));
+    var store = new MemoryCacheStore();
+    using var client = new ClaudeUsageClient(source, new ManualTimeProvider(now), store);
+    var result = await client.GetUsageAsync(CancellationToken.None);
+    Assert(!result.IsStale && result.Snapshot.Fable?.UsedPercent == 0,
+        "the observed reset-free response should produce fresh usage");
+    Assert(result.Snapshot.FiveHour?.ResetsAt is null && result.Snapshot.Weekly?.ResetsAt is null &&
+        result.Snapshot.Fable?.ResetsAt is null, "absent reset times must remain unknown");
+    Assert(store.Entry?.Snapshot == result.Snapshot, "reset-free usage should be persisted");
+    var tooltip = UsageIndicatorForm.BuildTooltipText(null, result, null, null, showClaude: true);
+    Assert(tooltip.Contains("Fable: 100% 남음", StringComparison.Ordinal), "the panel should have a valid remaining value");
+    Assert(tooltip.Contains("초기화: 정보 없음", StringComparison.Ordinal), "missing resets must not be invented");
+}
+
+static Task TestIndependentLimitsAsync()
+{
+    var now = new DateTimeOffset(2026, 9, 1, 4, 0, 0, TimeSpan.Zero);
+    foreach (var session in new[] { "", "Current session: unavailable", "Current session: 101% used" })
+    {
+        var text = session + "\nCurrent week (all models): 20% used\nCurrent week (Fable): 30% used";
+        var snapshot = ClaudeCodeUsageSource.ParseEnvelope(UsageEnvelope(text), now);
+        Assert(snapshot.FiveHour is null, "missing or invalid session usage should remain unknown");
+        Assert(snapshot.Weekly?.UsedPercent == 20 && snapshot.Fable?.UsedPercent == 30,
+            "an optional session failure must not discard valid weekly limits");
+    }
+    var fableOnly = ClaudeCodeUsageSource.ParseUsageText("Current week (Fable): 30% used", now);
+    Assert(fableOnly.FiveHour is null && fableOnly.Weekly is null && fableOnly.Fable?.UsedPercent == 30,
+        "Fable remains usable when both optional windows are absent");
+    return Task.CompletedTask;
+}
+
+static Task TestUnknownResetFormatAsync()
+{
+    var now = new DateTimeOffset(2026, 9, 1, 4, 0, 0, TimeSpan.Zero);
+    foreach (var suffix in new[] { " · resets tomorrow", " · resets Sep 5, 6pm (Unknown/Zone)", " · resets not-a-date (Asia/Seoul)" })
+    {
+        var snapshot = ClaudeCodeUsageSource.ParseUsageText("Current week (Fable): 30% used" + suffix, now);
+        Assert(snapshot.Fable?.UsedPercent == 30 && snapshot.Fable.ResetsAt is null,
+            "an unknown reset format should not erase a valid percentage or invent a date");
+    }
+    return Task.CompletedTask;
+}
+
+static Task TestInvalidFableAsync()
+{
+    var now = DateTimeOffset.UtcNow;
+    foreach (var fable in new[] { "", "Current week (Fable): unavailable", "Current week (Fable): 101% used", "Current week (Fable): -1% used", "Current week (Fable): NaN% used", "Current week (Fable): 30% used garbage" })
+    {
+        AssertThrows<InvalidDataException>(() => ClaudeCodeUsageSource.ParseUsageText(
+            "Current session: 10% used\nCurrent week (all models): 20% used\n" + fable, now),
+            "invalid Fable usage must not become zero usage or another limit");
+    }
     return Task.CompletedTask;
 }
 
