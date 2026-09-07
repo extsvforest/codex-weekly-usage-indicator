@@ -17,7 +17,7 @@ An unofficial Windows widget that stays on top while Codex Desktop is running an
 - Supports dragging, copying the current values, toggling always-on-top, and turning the Claude panel on or off from the right-click menu.
 - Remembers the last dragged position and restores it on the next launch.
 - Hides while another foreground app is fullscreen, then returns at the saved position.
-- Starts a small background watcher at Windows sign-in so it can follow future Codex launches.
+- Uses a per-user Windows scheduled task at sign-in, so the widget runs independently of Codex. A lightweight supervisor restarts the widget after an abnormal exit, waiting one minute (up to 999 retries per supervisor run).
 
 The widget does not read or store login tokens, account details, or usage history. It stores only the latest successful Claude percentages, reset times, and update time for short-lived recovery. Claude Code itself owns authentication and token refresh. See [PRIVACY.md](PRIVACY.md).
 
@@ -42,7 +42,7 @@ The widget does not read or store login tokens, account details, or usage histor
 .\scripts\install.ps1
 ```
 
-The app is installed to `%LOCALAPPDATA%\CodexWeeklyUsageIndicator` and a per-user Startup shortcut is created.
+The app is installed to `%LOCALAPPDATA%\CodexWeeklyUsageIndicator`. A per-user `CodexWeeklyUsageIndicator-<Windows SID>` scheduled task starts its supervisor at sign-in, using the signed-in user's normal privileges without storing a password. The supervisor launches and watches the widget; two processes from the same EXE are expected, but only one window. Installation also starts the task immediately, checks that both processes appear, and then removes the old Startup shortcut. Windows Task Scheduler must be available; an installation error must be resolved before relying on automatic recovery.
 The saved window position and Claude visibility preference are kept locally in `settings.json` inside that install directory. One sanitized Claude recovery snapshot may be kept in `claude-usage-cache.json` and is ignored after 24 hours or after its Fable reset.
 
 To uninstall:
@@ -52,6 +52,8 @@ To uninstall:
 ```
 
 Release binaries are currently unsigned, so Windows may display a warning. SHA-256 checksums are included with each release.
+
+Choosing **종료** from the widget menu exits normally and also ends the supervisor. It starts again at your next Windows sign-in. To start it sooner with recovery enabled, run its `CodexWeeklyUsageIndicator-<Windows SID>` task in Windows Task Scheduler or run `scripts\install.ps1` again. Launching the EXE directly does not enable supervision for that process. Stopping the scheduled task or killing the supervisor also stops automatic recovery until the task is started again. Uninstall removes the scheduled task before deleting the app.
 
 ## Build from source
 

@@ -3,6 +3,7 @@ using WeeklyUsageIndicator;
 
 var tests = new (string Name, Func<Task> Run)[]
 {
+    ("supervisor retries abnormal exits but respects normal Quit", TestSupervisorAsync),
     ("official Claude /usage output is parsed", TestObservedUsageOutputAsync),
     ("usage without reset times remains valid through client and tooltip", TestUsageWithoutResetsAsync),
     ("optional limits fail independently", TestIndependentLimitsAsync),
@@ -30,6 +31,29 @@ foreach (var test in tests)
 }
 
 return;
+
+static Task TestSupervisorAsync()
+{
+    var runs = 0;
+    var waits = 0;
+    var result = WidgetSupervisor.RunLoop(() => ++runs < 3 ? -1 : 0, interval =>
+    {
+        Assert(interval == TimeSpan.FromMinutes(1), "recovery must not tight-loop");
+        waits++;
+    });
+    Assert(result == 0 && runs == 3 && waits == 2, "nonzero exits retry; normal Quit stops");
+    runs = waits = 0;
+    result = WidgetSupervisor.RunLoop(() => { runs++; return 0; }, _ => waits++);
+    Assert(result == 0 && runs == 1 && waits == 0, "normal Quit must never relaunch");
+    runs = waits = 0;
+    result = WidgetSupervisor.RunLoop(() =>
+    {
+        runs++;
+        throw new System.ComponentModel.Win32Exception("test start failure");
+    }, _ => waits++);
+    Assert(result != 0 && runs == 1000 && waits == 999, "failed starts have a bounded retry budget");
+    return Task.CompletedTask;
+}
 
 static Task TestObservedUsageOutputAsync()
 {

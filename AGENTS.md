@@ -22,6 +22,7 @@ This repository contains a small Windows-only WinForms utility. Keep changes foc
 - Persist at most one credential-free Claude recovery snapshot containing only percentages, reset times, and update time. Use it only for transient cold-start failures, delete it after 24 hours, its Fable reset, or an authentication/schema failure, and never let it suppress the first live request in a new process.
 - Stop the app-server child process when the widget pauses or exits.
 - Preserve the single-instance mutex and the always-on-top tool-window behavior.
+- The installer must launch the `--supervise` mode through the per-user interactive, least-privilege scheduled task, never directly from Codex. The supervisor retries nonzero widget exits/start failures only; normal Quit must end supervision. Do not substitute Task Scheduler RestartOnFailure for this loop: it did not retry an exited action in live tests. Disable/stop the task before upgrade or uninstall; filter processes by the current user's exact installed EXE path.
 
 ## Validation
 
@@ -41,4 +42,5 @@ Then check that:
 6. A temporary Claude command, network, or service error keeps the last successful value visible and reports the update delay in the tooltip.
 7. A cold-start transient failure uses only a recent, unexpired sanitized snapshot and still attempts a live Claude request first.
 8. The context menu works, the widget hides, and its app-server child exits when Codex closes.
-9. `install.ps1` and `uninstall.ps1` only modify the current user's dedicated install directory and Startup shortcut.
+9. `install.ps1` and `uninstall.ps1` only modify the current user's dedicated install directory, legacy Startup shortcut, and SID-named scheduled task.
+10. The task owns the supervisor and its widget child independently of Codex. Forced termination of the widget child recovers after about one minute; normal Quit ends both processes and does not recover. Reinstall leaves one supervisor and one widget; uninstall removes the task before stopping the app.
