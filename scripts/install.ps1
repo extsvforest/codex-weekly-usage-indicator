@@ -1,4 +1,5 @@
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'install-environment.ps1')
 
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
 $sourceExecutable = Join-Path $repositoryRoot 'dist\WeeklyUsageIndicator.exe'
@@ -13,12 +14,16 @@ if (-not (Test-Path -LiteralPath $sourceExecutable -PathType Leaf)) {
     throw "Build output not found: $sourceExecutable. Download a release or run .\scripts\build.ps1 first."
 }
 
+New-Item -ItemType Directory -Path $installDirectory -Force | Out-Null
+Assert-WidgetInstallPath -Path $installDirectory
+
 # Stop scheduler recovery before replacing the binary. Never stop another user's copy.
 $existingTask = Get-ScheduledTask -TaskName $taskName -TaskPath '\' -ErrorAction SilentlyContinue
 if ($existingTask) {
     Disable-ScheduledTask -InputObject $existingTask | Out-Null
     Stop-ScheduledTask -InputObject $existingTask
 }
+
 $runningIndicators = @(Get-Process -Name 'WeeklyUsageIndicator' -ErrorAction SilentlyContinue |
     Where-Object { $_.Path -eq $installedExecutable })
 if ($runningIndicators.Count -gt 0) {
@@ -28,7 +33,6 @@ if ($runningIndicators.Count -gt 0) {
     }
 }
 
-New-Item -ItemType Directory -Path $installDirectory -Force | Out-Null
 Copy-Item -LiteralPath $sourceExecutable -Destination $installedExecutable -Force
 
 $action = New-ScheduledTaskAction -Execute $installedExecutable -Argument '--supervise' -WorkingDirectory $installDirectory
@@ -53,7 +57,7 @@ for ($attempt = 0; $attempt -lt 20; $attempt++) {
     if ($started) { break }
 }
 if (-not $started) {
-    throw "The scheduled task did not start the installed widget. Check '$taskName' in Windows Task Scheduler and rerun the installer after resolving the error."
+    throw "The scheduled task did not start the installed widget. Check '$taskName' in Windows Task Scheduler. If running inside a packaged app such as Codex, rerun from a standalone Windows PowerShell window to avoid AppData redirection."
 }
 if (Test-Path -LiteralPath $shortcutPath -PathType Leaf) {
     Remove-Item -LiteralPath $shortcutPath -Force

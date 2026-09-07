@@ -1,4 +1,5 @@
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'install-environment.ps1')
 
 $installDirectory = Join-Path $env:LOCALAPPDATA 'CodexWeeklyUsageIndicator'
 $startupDirectory = [Environment]::GetFolderPath([Environment+SpecialFolder]::Startup)
@@ -6,6 +7,7 @@ $shortcutPath = Join-Path $startupDirectory 'Codex Weekly Usage Indicator.lnk'
 $installedExecutable = Join-Path $installDirectory 'WeeklyUsageIndicator.exe'
 $userSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 $taskName = "CodexWeeklyUsageIndicator-$userSid"
+Assert-WidgetInstallPath -Path $installDirectory
 
 # Remove recovery before stopping the app or deleting its files.
 $existingTask = Get-ScheduledTask -TaskName $taskName -TaskPath '\' -ErrorAction SilentlyContinue

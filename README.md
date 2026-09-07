@@ -36,7 +36,7 @@ The widget does not read or store login tokens, account details, or usage histor
 
 1. Download and extract the Windows zip from [Releases](https://github.com/GiantForestStudio/codex-weekly-usage-indicator/releases).
 2. Review the included PowerShell scripts.
-3. Run:
+3. Open a standalone Windows PowerShell window (outside packaged apps such as Codex), change to the extracted directory, and run:
 
 ```powershell
 .\scripts\install.ps1
@@ -44,6 +44,8 @@ The widget does not read or store login tokens, account details, or usage histor
 
 The app is installed to `%LOCALAPPDATA%\CodexWeeklyUsageIndicator`. A per-user `CodexWeeklyUsageIndicator-<Windows SID>` scheduled task starts its supervisor at sign-in, using the signed-in user's normal privileges without storing a password. The supervisor launches and watches the widget; two processes from the same EXE are expected, but only one window. Installation also starts the task immediately, checks that both processes appear, and then removes the old Startup shortcut. Windows Task Scheduler must be available; an installation error must be resolved before relying on automatic recovery.
 The saved window position and Claude visibility preference are kept locally in `settings.json` inside that install directory. One sanitized Claude recovery snapshot may be kept in `claude-usage-cache.json` and is ignored after 24 hours or after its Fable reset.
+
+Run installation and removal outside packaged app terminals: Windows can redirect their AppData writes into an app-private folder that Task Scheduler cannot see, causing `0x80070002` even when that terminal reports the EXE exists. Both scripts check the real directory path and refuse redirected locations before changing tasks or running widgets.
 
 To uninstall:
 

@@ -23,6 +23,7 @@ This repository contains a small Windows-only WinForms utility. Keep changes foc
 - Stop the app-server child process when the widget pauses or exits.
 - Preserve the single-instance mutex and the always-on-top tool-window behavior.
 - The installer must launch the `--supervise` mode through the per-user interactive, least-privilege scheduled task, never directly from Codex. The supervisor retries nonzero widget exits/start failures only; normal Quit must end supervision. Do not substitute Task Scheduler RestartOnFailure for this loop: it did not retry an exited action in live tests. Disable/stop the task before upgrade or uninstall; filter processes by the current user's exact installed EXE path.
+- Check the install directory's final handle path before stopping tasks or processes: packaged shells can redirect AppData even without reporting a package identity. Package `install-environment.ps1` with both lifecycle scripts.
 
 ## Validation
 
