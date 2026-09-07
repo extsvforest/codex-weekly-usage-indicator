@@ -10,13 +10,16 @@ namespace WeeklyUsageIndicator;
 internal static class Program
 {
     [STAThread]
-    private static void Main(string[] args)
+    private static int Main(string[] args)
     {
+        if (args.Any(argument => argument.Equals("--supervise", StringComparison.OrdinalIgnoreCase)))
+            return WidgetSupervisor.Run();
+
         using var singleInstance = new Mutex(
             initiallyOwned: true,
             name: @"Local\CodexWeeklyUsageIndicator",
             createdNew: out var isFirstInstance);
-        if (!isFirstInstance) return;
+        if (!isFirstInstance) return 0;
 
         var previewMode = args.Any(argument =>
             argument.Equals("--preview", StringComparison.OrdinalIgnoreCase));
@@ -24,6 +27,7 @@ internal static class Program
         ApplicationConfiguration.Initialize();
         Application.Run(new UsageIndicatorForm(previewMode));
         GC.KeepAlive(singleInstance);
+        return 0;
     }
 }
 

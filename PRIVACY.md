@@ -10,6 +10,7 @@ The application:
 - does not read, print, log, copy, or persist Claude authentication tokens;
 - does not collect account identifiers;
 - does not include telemetry;
+- registers a per-user Windows logon/recovery task containing the local executable path and Windows user SID, with no stored password or elevated privileges;
 - makes no outbound request for Codex usage;
 - makes no direct Claude network request; it invokes `claude.exe` in safe mode without a shell or persistent session, caches successful `/usage` results in memory for ten minutes, and deletes the local recovery snapshot after 24 hours, its Fable reset, or an authentication/schema failure.
 

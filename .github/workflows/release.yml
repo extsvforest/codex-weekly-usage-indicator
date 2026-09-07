@@ -27,7 +27,7 @@ jobs:
           New-Item -ItemType Directory -Path 'package\scripts' -Force | Out-Null
           New-Item -ItemType Directory -Path 'package\dist' -Force | Out-Null
           Copy-Item -LiteralPath 'dist\WeeklyUsageIndicator.exe','dist\SHA256SUMS.txt' -Destination 'package\dist'
-          Copy-Item -LiteralPath 'scripts\install.ps1','scripts\uninstall.ps1' -Destination 'package\scripts'
+          Copy-Item -LiteralPath 'scripts\install.ps1','scripts\uninstall.ps1','scripts\install-environment.ps1' -Destination 'package\scripts'
           Copy-Item -LiteralPath 'README.md','PRIVACY.md','SECURITY.md','LICENSE' -Destination 'package'
           Compress-Archive -Path 'package\*' -DestinationPath "CodexWeeklyUsageIndicator-$env:GITHUB_REF_NAME-win-x64.zip"
       - name: Publish release
