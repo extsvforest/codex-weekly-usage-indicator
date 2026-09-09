@@ -19,7 +19,17 @@ An unofficial Windows widget that stays on top while Codex Desktop is running an
 - Hides while another foreground app is fullscreen, then returns at the saved position.
 - Uses a per-user Windows scheduled task at sign-in, so the widget runs independently of Codex. A lightweight supervisor restarts the widget after an abnormal exit, waiting one minute (up to 999 retries per supervisor run).
 
-The widget does not read or store login tokens, account details, or usage history. It stores only the latest successful Claude percentages, reset times, and update time for short-lived recovery. Claude Code itself owns authentication and token refresh. See [PRIVACY.md](PRIVACY.md).
+Account management is optional. After you register a Codex account, the widget stores account labels, identities, each account's latest usage snapshot, and Codex login snapshots encrypted with Windows CurrentUser DPAPI. The live authentication file remains authoritative for the active account. Claude credentials are never accessed; Claude Code owns its authentication and token refresh. See [PRIVACY.md](PRIVACY.md).
+
+## Manual Codex accounts
+
+Open **Codex 계정 관리…** from the right-click menu, or double-click the tray icon. Enter a label and register the current account first. Enter another label and choose **다른 계정 로그인**; complete the official browser login using the additional account. This login uses an isolated private `CODEX_HOME` and does not log the desktop out.
+
+To switch, finish your Codex work and close Codex Desktop and other Codex CLI/engine processes. Select the saved account and click **선택 계정으로 전환**. The widget stops its own usage helper, verifies that no Codex writers remain, saves the latest current login, and applies the selected login. It attempts to reopen the previously observed packaged desktop; if necessary, launch Codex from the Start menu and confirm the account there. File application and desktop login verification are separate outcomes.
+
+Only explicit selections cause a switch. There is no automatic quota rotation, proxy, inactive-account polling, or quota pooling. Inactive usage figures show the last observation and its time. A pending encrypted transaction blocks polling until **미완료 전환 복구** reconciles it with the actual live authentication; unknown third-party login changes are not overwritten.
+
+The first version supports local Windows file-based ChatGPT authentication. Unsupported keyring/managed configurations fail closed. The vault is stored separately at `%LOCALAPPDATA%\CodexWeeklyUsageIndicator.Accounts`; uninstall preserves it. Delete inactive accounts from the manager before removing the app if you no longer want their saved credentials. This convenience tool does not establish that any particular multi-account usage pattern is permitted by the service terms.
 
 > [!IMPORTANT]
 > This is an unofficial community project. It relies on an experimental local Codex app-server method (`account/rateLimits/read`) and the text output of Claude Code's built-in `/usage` command. Either may change without notice.

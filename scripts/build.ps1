@@ -8,7 +8,7 @@ $pathMap = "$repositoryRoot=/_/"
 
 dotnet run --project $testProjectPath -c Release --nologo
 if ($LASTEXITCODE -ne 0) {
-    throw "Claude usage regression tests failed with exit code $LASTEXITCODE."
+    throw "Usage and account regression tests failed with exit code $LASTEXITCODE."
 }
 
 dotnet clean $projectPath -c Release | Out-Null

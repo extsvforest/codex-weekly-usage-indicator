@@ -17,6 +17,14 @@ if (-not (Test-Path -LiteralPath $sourceExecutable -PathType Leaf)) {
 New-Item -ItemType Directory -Path $installDirectory -Force | Out-Null
 Assert-WidgetInstallPath -Path $installDirectory
 
+# Share the account transaction gate before stopping any process. A pending
+# encrypted journal remains recoverable after an abnormal widget exit.
+$accountTransactionMutex = [Threading.Mutex]::new($false, 'Local\CodexWeeklyUsageIndicator.AccountTransaction')
+$accountTransactionOwned = $false
+try {
+    try { $accountTransactionOwned = $accountTransactionMutex.WaitOne(0) }
+    catch [Threading.AbandonedMutexException] { $accountTransactionOwned = $true }
+    if (-not $accountTransactionOwned) { throw 'An account operation is in progress. Finish it before installing or uninstalling.' }
 # Stop scheduler recovery before replacing the binary. Never stop another user's copy.
 $existingTask = Get-ScheduledTask -TaskName $taskName -TaskPath '\' -ErrorAction SilentlyContinue
 if ($existingTask) {
@@ -65,3 +73,8 @@ if (Test-Path -LiteralPath $shortcutPath -PathType Leaf) {
 
 Write-Host "Installed: $installedExecutable"
 Write-Host "Logon and recovery task: $taskName"
+
+} finally {
+    if ($accountTransactionOwned) { $accountTransactionMutex.ReleaseMutex() }
+    $accountTransactionMutex.Dispose()
+}

@@ -9,6 +9,14 @@ $userSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 $taskName = "CodexWeeklyUsageIndicator-$userSid"
 Assert-WidgetInstallPath -Path $installDirectory
 
+# Share the account transaction gate before stopping any process. A pending
+# encrypted journal remains recoverable after an abnormal widget exit.
+$accountTransactionMutex = [Threading.Mutex]::new($false, 'Local\CodexWeeklyUsageIndicator.AccountTransaction')
+$accountTransactionOwned = $false
+try {
+    try { $accountTransactionOwned = $accountTransactionMutex.WaitOne(0) }
+    catch [Threading.AbandonedMutexException] { $accountTransactionOwned = $true }
+    if (-not $accountTransactionOwned) { throw 'An account operation is in progress. Finish it before installing or uninstalling.' }
 # Remove recovery before stopping the app or deleting its files.
 $existingTask = Get-ScheduledTask -TaskName $taskName -TaskPath '\' -ErrorAction SilentlyContinue
 if ($existingTask) {
@@ -38,3 +46,8 @@ if ((Test-Path -LiteralPath $resolvedInstall -PathType Container) -and
 }
 
 Write-Host 'Codex + Claude Usage Indicator uninstalled.'
+
+} finally {
+    if ($accountTransactionOwned) { $accountTransactionMutex.ReleaseMutex() }
+    $accountTransactionMutex.Dispose()
+}
