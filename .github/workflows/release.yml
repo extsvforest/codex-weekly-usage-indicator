@@ -30,7 +30,7 @@ jobs:
           Copy-Item -LiteralPath 'scripts\install.ps1','scripts\uninstall.ps1','scripts\install-environment.ps1' -Destination 'package\scripts'
           Copy-Item -LiteralPath 'README.md','PRIVACY.md','SECURITY.md','LICENSE' -Destination 'package'
           Compress-Archive -Path 'package\*' -DestinationPath "CodexWeeklyUsageIndicator-$env:GITHUB_REF_NAME-win-x64.zip"
-      - name: Publish release
+      - name: Create draft release for artifact verification
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -40,4 +40,5 @@ jobs:
             'dist\WeeklyUsageIndicator.exe' `
             'dist\SHA256SUMS.txt' `
             --title "Codex + Claude Usage Indicator $env:GITHUB_REF_NAME" `
+            --draft `
             --generate-notes

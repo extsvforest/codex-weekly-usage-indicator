@@ -21,7 +21,7 @@ This repository contains a small Windows-only WinForms utility. Keep changes foc
 - Do not invoke Claude more often than every ten minutes, including explicit UI refreshes, and back off transient command failures.
 - Persist at most one credential-free Claude recovery snapshot containing only percentages, reset times, and update time. Use it only for transient cold-start failures, delete it after 24 hours, its Fable reset, or an authentication/schema failure, and never let it suppress the first live request in a new process.
 - Stop the app-server child process when the widget pauses or exits.
-- Preserve the single-instance mutex and the always-on-top tool-window behavior.
+- Preserve the single-instance mutex and the always-on-top tool-window behavior without taking keyboard focus or changing the foreground window. Widget show, hide/re-show, and timer maintenance must leave another window's focused input unchanged; do not restore topmost behavior through an activating WinForms `TopMost` assignment.
 - The installer must launch the `--supervise` mode through the per-user interactive, least-privilege scheduled task, never directly from Codex. The supervisor retries nonzero widget exits/start failures only; normal Quit must end supervision. Do not substitute Task Scheduler RestartOnFailure for this loop: it did not retry an exited action in live tests. Disable/stop the task before upgrade or uninstall; filter processes by the current user's exact installed EXE path.
 - Check the install directory's final handle path before stopping tasks or processes: packaged shells can redirect AppData even without reporting a package identity. Package `install-environment.ps1` with both lifecycle scripts.
 
@@ -45,3 +45,4 @@ Then check that:
 8. The context menu works, the widget hides, and its app-server child exits when Codex closes.
 9. `install.ps1` and `uninstall.ps1` only modify the current user's dedicated install directory, legacy Startup shortcut, and SID-named scheduled task.
 10. The task owns the supervisor and its widget child independently of Codex. Forced termination of the widget child recovers after about one minute; normal Quit ends both processes and does not recover. Reinstall leaves one supervisor and one widget; uninstall removes the task before stopping the app.
+11. `AccountUiSmoke` verifies native keyboard focus and foreground-window preservation during widget show, hide/re-show, and repeated maintenance, while checking that the widget remains topmost. Preserve this regression coverage when changing window presentation.
