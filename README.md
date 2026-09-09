@@ -19,7 +19,19 @@ An unofficial Windows widget that stays on top while Codex Desktop is running an
 - Hides while another foreground app is fullscreen, then returns at the saved position.
 - Uses a per-user Windows scheduled task at sign-in, so the widget runs independently of Codex. A lightweight supervisor restarts the widget after an abnormal exit, waiting one minute (up to 999 retries per supervisor run).
 
-The widget does not read or store login tokens, account details, or usage history. It stores only the latest successful Claude percentages, reset times, and update time for short-lived recovery. Claude Code itself owns authentication and token refresh. See [PRIVACY.md](PRIVACY.md).
+Account management is optional. After you register a Codex account, the widget stores account labels, identities, each account's latest usage snapshot, and Codex login snapshots encrypted with Windows CurrentUser DPAPI. The live authentication file remains authoritative for the active account. Claude credentials are never accessed; Claude Code owns its authentication and token refresh. See [PRIVACY.md](PRIVACY.md).
+
+## Manual Codex accounts
+
+Open **Codex 계정 관리…** from the right-click menu, or double-click the tray icon. Choose **현재 계정 등록** to save the current login with a unique default name. Select an account in the left list to view its status and usage; use **이름 변경** or F2 to edit its name. Enter saves and Escape cancels. Account names appear only in the manager; the compact indicator shows percentages and bars. Renaming only changes local metadata and does not restart the usage helper. If you sign into an unregistered account directly in Codex, the manager offers registration above the existing list.
+
+Choose **+ 다른 계정 추가**, optionally name the account, then select **브라우저에서 로그인**. Complete the official browser login using the additional account. This login uses an isolated private `CODEX_HOME` and does not log the desktop out; **로그인 취소** stops only the login process owned by this tool. The widget maintains its topmost position without activating itself, including when it reappears, so typing in the manager or another app keeps focus.
+
+Select the saved account and click **이 계정으로 전환**. The preparation dialog shows the source and target names and waits while you finish your work and close Codex Desktop and other Codex CLI/engine processes. **전환하고 Codex 열기** becomes available when they have stopped; cancellation keeps the current login. The widget stops its own usage helper, verifies once more that no Codex writers remain, saves the latest current login, and applies the selected login. It attempts to reopen the previously observed packaged desktop; if necessary, launch Codex from the Start menu and confirm the account there. File application and desktop login verification are separate outcomes.
+
+Only explicit selections cause a switch. There is no automatic quota rotation, proxy, inactive-account polling, or quota pooling. Inactive usage figures show the last observation and its time; values past their reset time are marked **갱신 필요**. A pending encrypted transaction blocks polling until **미완료 전환 복구** reconciles it with the actual live authentication; unknown third-party login changes are not overwritten. The management window supports display scaling, and its details scroll when the window is made smaller.
+
+The first version supports local Windows file-based ChatGPT authentication. Unsupported keyring/managed configurations fail closed. The vault is stored separately at `%LOCALAPPDATA%\CodexWeeklyUsageIndicator.Accounts`; uninstall preserves it. Delete inactive accounts from the manager before removing the app if you no longer want their saved credentials. This convenience tool does not establish that any particular multi-account usage pattern is permitted by the service terms.
 
 > [!IMPORTANT]
 > This is an unofficial community project. It relies on an experimental local Codex app-server method (`account/rateLimits/read`) and the text output of Claude Code's built-in `/usage` command. Either may change without notice.

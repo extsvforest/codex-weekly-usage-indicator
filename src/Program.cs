@@ -12,6 +12,7 @@ internal static class Program
     [STAThread]
     private static int Main(string[] args)
     {
+        var openAccounts = args.Any(argument => argument.Equals("--accounts", StringComparison.OrdinalIgnoreCase));
         if (args.Any(argument => argument.Equals("--supervise", StringComparison.OrdinalIgnoreCase)))
             return WidgetSupervisor.Run();
 
@@ -19,13 +20,21 @@ internal static class Program
             initiallyOwned: true,
             name: @"Local\CodexWeeklyUsageIndicator",
             createdNew: out var isFirstInstance);
-        if (!isFirstInstance) return 0;
+        if (!isFirstInstance)
+        {
+            if (openAccounts)
+            {
+                using var signal = new EventWaitHandle(false, EventResetMode.AutoReset, @"Local\CodexWeeklyUsageIndicator.OpenAccounts");
+                signal.Set();
+            }
+            return 0;
+        }
 
         var previewMode = args.Any(argument =>
             argument.Equals("--preview", StringComparison.OrdinalIgnoreCase));
 
         ApplicationConfiguration.Initialize();
-        Application.Run(new UsageIndicatorForm(previewMode));
+        Application.Run(new UsageIndicatorForm(previewMode, openAccounts));
         GC.KeepAlive(singleInstance);
         return 0;
     }
@@ -72,13 +81,20 @@ internal sealed class UsageIndicatorForm : Form
     private bool _keepOnTop = true;
     private bool _showClaude;
     private bool _positionInitialized;
+    private readonly CodexAccountStore _accountStore = new();
+    private AccountManagerForm? _accountManager;
+    private NotifyIcon? _accountTray;
+    private bool _accountBusy;
+    private long _accountGeneration;
+    private string? _helperIdentityKey;
+    private readonly EventWaitHandle _openAccountsSignal = new(false, EventResetMode.AutoReset, @"Local\CodexWeeklyUsageIndicator.OpenAccounts");
     private Point _dragCursorStart;
     private Point _dragFormStart;
 
-    public UsageIndicatorForm(bool previewMode)
+    public UsageIndicatorForm(bool previewMode, bool openAccounts = false)
     {
         _previewMode = previewMode;
-        _showClaude = IndicatorSettingsStore.LoadShowClaude();
+        _showClaude = !previewMode && IndicatorSettingsStore.LoadShowClaude();
         AutoScaleMode = AutoScaleMode.Dpi;
         BackColor = Color.FromArgb(24, 24, 28);
         ClientSize = new Size(WidgetWidth, WidgetHeight);
@@ -91,16 +107,21 @@ internal sealed class UsageIndicatorForm : Form
         ShowInTaskbar = false;
         StartPosition = FormStartPosition.Manual;
         Text = "Codex 및 Claude 사용량";
-        TopMost = true;
         AccessibleName = "Codex 및 Claude Fable 사용량 인디케이터";
         Opacity = 0;
 
         BuildContextMenu();
+        _accountTray = new NotifyIcon { Icon = SystemIcons.Application, Text = "Codex 사용량 · 계정 관리", ContextMenuStrip = _contextMenu, Visible = !previewMode };
+        _accountTray.DoubleClick += (_, _) => ShowAccountManager();
         ApplyRoundedRegion();
         _toolTip.SetToolTip(this, "Codex 및 Claude 사용량을 불러오는 중…");
 
         _pollTimer.Tick += async (_, _) => await RefreshUsageAsync();
-        _codexStateTimer.Tick += (_, _) => SyncCodexVisibility();
+        _codexStateTimer.Tick += (_, _) =>
+        {
+            if (_openAccountsSignal.WaitOne(0)) ShowAccountManager();
+            SyncCodexVisibility();
+        };
         Shown += (_, _) =>
         {
             if (_previewMode)
@@ -108,12 +129,17 @@ internal sealed class UsageIndicatorForm : Form
                 EnsurePositionInitialized();
                 Opacity = 1;
                 _ = RefreshUsageAsync(force: true);
-                _pollTimer.Start();
                 return;
             }
 
+            if (_accountStore.HasPendingRecovery)
+            {
+                _accountBusy = true;
+                ShowAccountManager();
+            }
             SyncCodexVisibility();
             _codexStateTimer.Start();
+            if (openAccounts) ShowAccountManager();
         };
 
         MouseEnter += (_, _) => { _isHovered = true; Invalidate(); };
@@ -123,9 +149,15 @@ internal sealed class UsageIndicatorForm : Form
         MouseUp += HandleMouseUp;
         DoubleClick += async (_, _) => await RefreshUsageAsync(force: true);
         Resize += (_, _) => ApplyRoundedRegion();
-        FormClosing += (_, _) =>
+        FormClosing += (_, e) =>
         {
-            if (_positionInitialized)
+            if (_accountManager is { IsOperationInProgress: true })
+            {
+                e.Cancel = true;
+                _accountManager.Activate();
+                return;
+            }
+            if (_positionInitialized && !_previewMode)
                 IndicatorSettingsStore.SavePosition(Location);
             _pollTimer.Stop();
             _codexStateTimer.Stop();
@@ -134,6 +166,9 @@ internal sealed class UsageIndicatorForm : Form
             _toolTip.Dispose();
             _contextMenu.Dispose();
             _valueFont.Dispose();
+            _accountTray?.Dispose();
+            _openAccountsSignal.Dispose();
+            _accountManager?.Close();
         };
     }
 
@@ -144,14 +179,21 @@ internal sealed class UsageIndicatorForm : Form
         get
         {
             const int WsExToolWindow = 0x00000080;
+            const int WsExNoActivate = 0x08000000;
+            const int WsExTopMost = 0x00000008;
             var parameters = base.CreateParams;
-            parameters.ExStyle |= WsExToolWindow;
+            parameters.ExStyle |= WsExToolWindow | WsExNoActivate;
+            // Form.TopMost makes WinForms focus the form when it becomes visible,
+            // even with ShowWithoutActivation. Keep z-order in native styles instead.
+            if (_keepOnTop) parameters.ExStyle |= WsExTopMost;
             return parameters;
         }
     }
 
     private void BuildContextMenu()
     {
+        var accountsItem = new ToolStripMenuItem("Codex 계정 관리…");
+        accountsItem.Click += (_, _) => ShowAccountManager();
         var refreshItem = new ToolStripMenuItem("새로고침");
         refreshItem.Click += async (_, _) => await RefreshUsageAsync(force: true);
 
@@ -171,8 +213,7 @@ internal sealed class UsageIndicatorForm : Form
         topMostItem.CheckedChanged += (_, _) =>
         {
             _keepOnTop = topMostItem.Checked;
-            TopMost = _keepOnTop;
-            ReassertTopMost();
+            if (IsHandleCreated) _ = NativeWindow.TrySetTopMost(Handle, _keepOnTop);
         };
 
         var copyItem = new ToolStripMenuItem("현재 상태 복사");
@@ -194,6 +235,7 @@ internal sealed class UsageIndicatorForm : Form
             showClaudeItem,
             topMostItem,
             copyItem,
+            accountsItem,
             new ToolStripSeparator(),
             exitItem
         ]);
@@ -258,6 +300,7 @@ internal sealed class UsageIndicatorForm : Form
 
     private void SyncCodexVisibility()
     {
+        if (_accountBusy || _accountStore.HasPendingRecovery) return;
         var codexIsRunning = _codexStateReader.IsRunning();
         if (!codexIsRunning)
         {
@@ -276,6 +319,7 @@ internal sealed class UsageIndicatorForm : Form
         if (!_codexWasRunning)
         {
             _codexWasRunning = true;
+            _codexClient.Resume();
             EnsurePositionInitialized();
             _ = RefreshUsageAsync(force: true);
             _pollTimer.Start();
@@ -288,22 +332,38 @@ internal sealed class UsageIndicatorForm : Form
             return;
         }
 
+        MaintainVisiblePresentation();
+    }
+
+    internal void MaintainVisiblePresentation()
+    {
         if (!Visible) Show();
-        Opacity = 1;
+        if (Opacity != 1) Opacity = 1;
         if (_keepOnTop)
         {
-            TopMost = true;
+            // The WinForms TopMost setter can activate this form even when it
+            // is already topmost. Timer maintenance must use SWP_NOACTIVATE.
             ReassertTopMost();
         }
     }
 
     private async Task RefreshUsageAsync(bool force = false)
     {
+        if (_previewMode)
+        {
+            _codexSnapshot = new UsageSnapshot(38, DateTimeOffset.Now.AddDays(3), 10080, "codex");
+            _codexError = null;
+            UpdateToolTip();
+            Invalidate();
+            return;
+        }
+        if (_accountBusy || _accountStore.HasPendingRecovery) return;
         if (!_previewMode && !_codexWasRunning) return;
         if (_isRefreshing && !force) return;
         if (_isRefreshing) return;
 
         _isRefreshing = true;
+        var refreshGeneration = _accountGeneration;
         Invalidate();
 
         try
@@ -326,6 +386,8 @@ internal sealed class UsageIndicatorForm : Form
         {
             _isRefreshing = false;
             Invalidate();
+            if (refreshGeneration != _accountGeneration && !_accountBusy && !IsDisposed)
+                _ = RefreshUsageAsync(force: true);
         }
     }
 
@@ -341,16 +403,66 @@ internal sealed class UsageIndicatorForm : Form
 
     private async Task RefreshCodexAsync()
     {
+        var generation = _accountGeneration;
         try
         {
             using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
-            _codexSnapshot = await _codexClient.GetWeeklyUsageAsync(timeout.Token);
+            var identity = _accountStore.IsEnabled ? _accountStore.GetCurrentIdentity().Key : null;
+            if (identity is not null && identity != _helperIdentityKey)
+            {
+                await _codexClient.SuspendAsync();
+                if (generation != _accountGeneration || _accountBusy) return;
+                _codexClient.Resume();
+                _helperIdentityKey = identity;
+                _codexSnapshot = null;
+            }
+            UsageSnapshot snapshot;
+            if (identity is null) snapshot = await _codexClient.GetWeeklyUsageAsync(timeout.Token);
+            else
+            {
+                var observed = await _codexClient.GetWeeklyUsageWithAccountAsync(timeout.Token);
+                if (!observed.IsChatGpt) throw new InvalidOperationException("Codex 조회 프로세스의 ChatGPT 로그인을 확인할 수 없습니다.");
+                snapshot = observed.Usage;
+            }
+            if (generation != _accountGeneration || _accountBusy) return;
+            if (identity is not null && identity != _accountStore.GetCurrentIdentity().Key) return;
+            _codexSnapshot = snapshot;
             _codexError = null;
+            if (identity is not null && snapshot is not null) _accountStore.SaveUsage(identity, snapshot);
         }
         catch (Exception ex)
         {
+            if (generation != _accountGeneration || _accountBusy) return;
             _codexError = FriendlyCodexError(ex);
         }
+    }
+
+    private void ShowAccountManager()
+    {
+        if (_previewMode) return;
+        if (_accountManager is null || _accountManager.IsDisposed)
+            _accountManager = new AccountManagerForm(_accountStore, SuspendAccountsAsync, ResumeAccounts);
+        _accountManager.Show();
+        _accountManager.Activate();
+    }
+
+    private async Task SuspendAccountsAsync()
+    {
+        _accountBusy = true;
+        _accountGeneration++;
+        _pollTimer.Stop();
+        await _codexClient.SuspendAsync();
+    }
+
+    private void ResumeAccounts()
+    {
+        _accountBusy = _accountStore.HasPendingRecovery;
+        _codexSnapshot = null;
+        _helperIdentityKey = null;
+        _codexError = null;
+        _codexWasRunning = false;
+        if (!_accountBusy) SyncCodexVisibility();
+        Invalidate();
     }
 
     private async Task RefreshClaudeAsync()
@@ -770,6 +882,7 @@ internal static class IndicatorSettingsStore
 internal static class NativeWindow
 {
     private static readonly IntPtr HwndTopMost = new(-1);
+    private static readonly IntPtr HwndNotTopMost = new(-2);
     private const int GwlStyle = -16;
     private const int SwShowMaximized = 3;
     private const int WsCaption = 0x00C00000;
@@ -779,11 +892,11 @@ internal static class NativeWindow
     private const uint SwpNoActivate = 0x0010;
     private const uint SwpShowWindow = 0x0040;
 
-    public static bool TrySetTopMost(IntPtr windowHandle)
+    public static bool TrySetTopMost(IntPtr windowHandle, bool topMost = true)
     {
         return SetWindowPos(
             windowHandle,
-            HwndTopMost,
+            topMost ? HwndTopMost : HwndNotTopMost,
             0,
             0,
             0,
@@ -943,389 +1056,5 @@ internal sealed class CodexDesktopStateReader
         }
 
         return false;
-    }
-}
-
-internal sealed class AppServerClient : IDisposable
-{
-    private readonly ConcurrentDictionary<int, TaskCompletionSource<JsonElement>> _pending = new();
-    private readonly SemaphoreSlim _startGate = new(1, 1);
-    private readonly SemaphoreSlim _writeGate = new(1, 1);
-    private readonly CancellationTokenSource _lifetime = new();
-
-    private Process? _process;
-    private StreamWriter? _input;
-    private Task? _readerTask;
-    private int _nextRequestId;
-    private bool _initialized;
-    private bool _disposed;
-
-    public async Task<UsageSnapshot> GetWeeklyUsageAsync(CancellationToken cancellationToken)
-    {
-        await EnsureStartedAsync(cancellationToken);
-        var result = await CallCoreAsync("account/rateLimits/read", new { }, cancellationToken);
-        return ParseWeeklyUsage(result);
-    }
-
-    private async Task EnsureStartedAsync(CancellationToken cancellationToken)
-    {
-        if (_initialized && _process is { HasExited: false }) return;
-
-        await _startGate.WaitAsync(cancellationToken);
-        try
-        {
-            if (_initialized && _process is { HasExited: false }) return;
-            StopProcess();
-
-            var codexPath = LocateCodexExecutable()
-                ?? throw new FileNotFoundException("codex.exe was not found. Install or open Codex Desktop first.");
-
-            var startInfo = new ProcessStartInfo
-            {
-                FileName = codexPath,
-                Arguments = "app-server --stdio",
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                RedirectStandardInput = true,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                WorkingDirectory = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)
-            };
-
-            _process = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
-            if (!_process.Start())
-                throw new InvalidOperationException("Codex app-server could not be started.");
-
-            _input = _process.StandardInput;
-            _input.AutoFlush = true;
-            _readerTask = ReadLoopAsync(_process, _lifetime.Token);
-            _ = DrainErrorAsync(_process, _lifetime.Token);
-
-            await CallCoreAsync(
-                "initialize",
-                new
-                {
-                    clientInfo = new
-                    {
-                        name = "weekly-usage-indicator",
-                        title = "Weekly Usage Indicator",
-                        version = "1.1.1"
-                    },
-                    capabilities = new { experimentalApi = true }
-                },
-                cancellationToken,
-                requireInitialized: false);
-
-            await SendNotificationAsync("initialized", cancellationToken);
-            _initialized = true;
-        }
-        catch
-        {
-            StopProcess();
-            throw;
-        }
-        finally
-        {
-            _startGate.Release();
-        }
-    }
-
-    private async Task<JsonElement> CallCoreAsync(
-        string method,
-        object parameters,
-        CancellationToken cancellationToken,
-        bool requireInitialized = true)
-    {
-        if (requireInitialized && !_initialized)
-            throw new InvalidOperationException("Codex app-server is not initialized.");
-
-        var id = Interlocked.Increment(ref _nextRequestId);
-        var completion = new TaskCompletionSource<JsonElement>(TaskCreationOptions.RunContinuationsAsynchronously);
-        if (!_pending.TryAdd(id, completion))
-            throw new InvalidOperationException("Could not register a Codex request.");
-
-        try
-        {
-            await SendLineAsync(JsonSerializer.Serialize(new { id, method, @params = parameters }), cancellationToken);
-            return await completion.Task.WaitAsync(cancellationToken);
-        }
-        finally
-        {
-            _pending.TryRemove(id, out _);
-        }
-    }
-
-    private Task SendNotificationAsync(string method, CancellationToken cancellationToken) =>
-        SendLineAsync(JsonSerializer.Serialize(new { method }), cancellationToken);
-
-    private async Task SendLineAsync(string line, CancellationToken cancellationToken)
-    {
-        await _writeGate.WaitAsync(cancellationToken);
-        try
-        {
-            var writer = _input ?? throw new IOException("Codex app-server input is unavailable.");
-            await writer.WriteLineAsync(line.AsMemory(), cancellationToken);
-            await writer.FlushAsync(cancellationToken);
-        }
-        finally
-        {
-            _writeGate.Release();
-        }
-    }
-
-    private async Task ReadLoopAsync(Process process, CancellationToken cancellationToken)
-    {
-        Exception? terminalError = null;
-        try
-        {
-            while (!cancellationToken.IsCancellationRequested && !process.HasExited)
-            {
-                var line = await process.StandardOutput.ReadLineAsync(cancellationToken);
-                if (line is null) break;
-                if (string.IsNullOrWhiteSpace(line)) continue;
-
-                try
-                {
-                    using var document = JsonDocument.Parse(line);
-                    var root = document.RootElement;
-                    if (!root.TryGetProperty("id", out var idElement) ||
-                        idElement.ValueKind != JsonValueKind.Number ||
-                        !idElement.TryGetInt32(out var id) ||
-                        !_pending.TryGetValue(id, out var completion))
-                    {
-                        continue;
-                    }
-
-                    if (root.TryGetProperty("error", out var error))
-                    {
-                        completion.TrySetException(new InvalidOperationException(error.ToString()));
-                    }
-                    else if (root.TryGetProperty("result", out var result))
-                    {
-                        completion.TrySetResult(result.Clone());
-                    }
-                    else
-                    {
-                        completion.TrySetException(new InvalidDataException("Codex returned an incomplete response."));
-                    }
-                }
-                catch (JsonException)
-                {
-                    // App-server stdout is expected to be JSONL. Ignore unrelated diagnostic lines.
-                }
-            }
-
-            if (!cancellationToken.IsCancellationRequested)
-                terminalError = new IOException("Codex app-server disconnected.");
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-            // Normal shutdown.
-        }
-        catch (Exception ex)
-        {
-            terminalError = ex;
-        }
-        finally
-        {
-            if (terminalError is not null)
-            {
-                _initialized = false;
-                foreach (var completion in _pending.Values)
-                    completion.TrySetException(terminalError);
-            }
-        }
-    }
-
-    private static async Task DrainErrorAsync(Process process, CancellationToken cancellationToken)
-    {
-        try
-        {
-            while (!cancellationToken.IsCancellationRequested && !process.HasExited)
-            {
-                if (await process.StandardError.ReadLineAsync(cancellationToken) is null) break;
-            }
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-            // Normal shutdown.
-        }
-        catch
-        {
-            // Diagnostics must never stop usage updates.
-        }
-    }
-
-    private static UsageSnapshot ParseWeeklyUsage(JsonElement response)
-    {
-        var snapshot = SelectCoreSnapshot(response);
-        var limitId = snapshot.TryGetProperty("limitId", out var idElement) && idElement.ValueKind == JsonValueKind.String
-            ? idElement.GetString() ?? "codex"
-            : "codex";
-
-        var windows = new List<(int Used, long? Duration, long? ResetsAt, string Name)>();
-        AddWindow(snapshot, "primary", windows);
-        AddWindow(snapshot, "secondary", windows);
-
-        if (windows.Count == 0)
-            throw new InvalidDataException("Codex did not return a usage window.");
-
-        var weekly = windows
-            .OrderBy(window => WeeklyDistance(window.Duration))
-            .ThenByDescending(window => window.Duration ?? 0)
-            .First();
-
-        DateTimeOffset? resetsAt = null;
-        if (weekly.ResetsAt is > 0)
-            resetsAt = DateTimeOffset.FromUnixTimeSeconds(weekly.ResetsAt.Value).ToLocalTime();
-
-        return new UsageSnapshot(
-            Math.Clamp(weekly.Used, 0, 100),
-            resetsAt,
-            weekly.Duration,
-            limitId);
-    }
-
-    private static JsonElement SelectCoreSnapshot(JsonElement response)
-    {
-        if (response.TryGetProperty("rateLimitsByLimitId", out var byId) && byId.ValueKind == JsonValueKind.Object)
-        {
-            if (byId.TryGetProperty("codex", out var codex) && codex.ValueKind == JsonValueKind.Object)
-                return codex;
-
-            foreach (var property in byId.EnumerateObject())
-            {
-                if (property.Value.ValueKind != JsonValueKind.Object) continue;
-                if (!property.Value.TryGetProperty("limitName", out var name) || name.ValueKind == JsonValueKind.Null)
-                    return property.Value;
-            }
-        }
-
-        if (response.TryGetProperty("rateLimits", out var legacy) && legacy.ValueKind == JsonValueKind.Object)
-            return legacy;
-
-        throw new InvalidDataException("Codex did not return rate-limit data.");
-    }
-
-    private static void AddWindow(
-        JsonElement snapshot,
-        string propertyName,
-        ICollection<(int Used, long? Duration, long? ResetsAt, string Name)> windows)
-    {
-        if (!snapshot.TryGetProperty(propertyName, out var window) || window.ValueKind != JsonValueKind.Object)
-            return;
-        if (!window.TryGetProperty("usedPercent", out var usedElement) || !usedElement.TryGetInt32(out var used))
-            return;
-
-        long? duration = null;
-        if (window.TryGetProperty("windowDurationMins", out var durationElement) &&
-            durationElement.ValueKind == JsonValueKind.Number &&
-            durationElement.TryGetInt64(out var durationValue))
-        {
-            duration = durationValue;
-        }
-
-        long? resetsAt = null;
-        if (window.TryGetProperty("resetsAt", out var resetElement) &&
-            resetElement.ValueKind == JsonValueKind.Number &&
-            resetElement.TryGetInt64(out var resetValue))
-        {
-            resetsAt = resetValue;
-        }
-
-        windows.Add((used, duration, resetsAt, propertyName));
-    }
-
-    private static long WeeklyDistance(long? durationMinutes)
-    {
-        const long weekMinutes = 7 * 24 * 60;
-        return durationMinutes is null
-            ? long.MaxValue / 2
-            : Math.Abs(durationMinutes.Value - weekMinutes);
-    }
-
-    private static string? LocateCodexExecutable()
-    {
-        var configured = Environment.GetEnvironmentVariable("CODEX_WEEKLY_INDICATOR_CODEX_PATH");
-        if (!string.IsNullOrWhiteSpace(configured) && File.Exists(configured))
-            return configured;
-
-        var localBin = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "OpenAI",
-            "Codex",
-            "bin");
-
-        try
-        {
-            if (Directory.Exists(localBin))
-            {
-                var localCodex = Directory
-                    .EnumerateFiles(localBin, "codex.exe", SearchOption.AllDirectories)
-                    .Select(path => new FileInfo(path))
-                    .OrderByDescending(file => file.LastWriteTimeUtc)
-                    .FirstOrDefault();
-                if (localCodex is not null) return localCodex.FullName;
-            }
-        }
-        catch
-        {
-            // Continue to PATH lookup.
-        }
-
-        var pathValue = Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
-        foreach (var directory in pathValue.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries))
-        {
-            try
-            {
-                var candidate = Path.Combine(directory.Trim().Trim('"'), "codex.exe");
-                if (File.Exists(candidate)) return candidate;
-            }
-            catch
-            {
-                // Ignore malformed PATH entries.
-            }
-        }
-
-        return null;
-    }
-
-    private void StopProcess()
-    {
-        _initialized = false;
-        try { _input?.Close(); } catch { }
-        _input = null;
-
-        if (_process is not null)
-        {
-            try
-            {
-                if (!_process.HasExited) _process.Kill(entireProcessTree: true);
-            }
-            catch { }
-            _process.Dispose();
-            _process = null;
-        }
-
-        foreach (var completion in _pending.Values)
-            completion.TrySetException(new IOException("Codex app-server was restarted."));
-        _pending.Clear();
-    }
-
-    public void Pause()
-    {
-        if (_disposed) return;
-        StopProcess();
-    }
-
-    public void Dispose()
-    {
-        if (_disposed) return;
-        _disposed = true;
-        _lifetime.Cancel();
-        StopProcess();
-        _lifetime.Dispose();
-        _startGate.Dispose();
-        _writeGate.Dispose();
     }
 }
