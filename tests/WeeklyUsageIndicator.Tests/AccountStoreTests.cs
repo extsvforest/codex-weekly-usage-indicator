@@ -14,6 +14,7 @@ internal static class AccountStoreTests
         TestOpaqueRoundTripAndRotation(fixture);
         TestIdentityAndValidation(fixture);
         TestUsageBindingAndRemoval(fixture);
+        TestMetadataOnlyRename(fixture);
         TestCrashRecovery(fixture);
         TestUnknownIdentityRecovery(fixture);
         TestPreSwapRace(fixture);
@@ -111,6 +112,66 @@ internal static class AccountStoreTests
         Assert(store.ListAccounts().Single(e => e.Id == b.Id).Usage is null, "target never inherits old account usage");
         store.Remove(a.Id);
         Assert(store.ListAccounts().Count == 1, "inactive credential can be removed");
+    }
+
+    private static void TestMetadataOnlyRename(Fixture fixture)
+    {
+        var (store, home) = fixture.NewStore();
+        var authA = Auth("rename-a", "workspace", "a");
+        var authB = Auth("rename-b", "workspace", "b");
+        WriteAuth(home, authA);
+        var a = store.RegisterCurrent("A");
+        var b = fixture.Import(store, authB, "B");
+        store.SaveUsage(store.GetCurrentIdentity().Key, new UsageSnapshot(24, DateTimeOffset.UtcNow.AddDays(2), 10080, "codex"));
+        store.SwitchTo(b.Id, () => { });
+        store.SaveUsage(store.GetCurrentIdentity().Key, new UsageSnapshot(67, DateTimeOffset.UtcNow.AddDays(3), 10080, "codex"));
+        store.SwitchTo(a.Id, () => { });
+        var before = store.ListAccounts();
+        var beforeA = before.Single(e => e.Id == a.Id);
+        var beforeB = before.Single(e => e.Id == b.Id);
+        // Exclusive auth handle proves renaming neither reads nor rewrites live credentials.
+        using (var authLease = new FileStream(Path.Combine(home, "auth.json"), FileMode.Open, FileAccess.Read, FileShare.None))
+        {
+            store.Rename(a.Id, "  개인 작업  ");
+            store.Rename(b.Id, "두 번째 계정");
+        }
+        var renamed = store.ListAccounts();
+        Assert(renamed.Single(e => e.Id == a.Id) == (beforeA with { Label = "개인 작업" }),
+            "active rename trims label and preserves identity, usage, observation time, and active state");
+        Assert(renamed.Single(e => e.Id == b.Id) == (beforeB with { Label = "두 번째 계정" }),
+            "inactive rename preserves every non-label field");
+        Equal(ReadAuth(home), authA, "rename leaves live auth byte-for-byte unchanged");
+        store.SwitchTo(b.Id, () => { });
+        Equal(ReadAuth(home), authB, "renamed inactive credentials preserve every opaque byte");
+        store.SwitchTo(a.Id, () => { });
+        Equal(ReadAuth(home), authA, "renamed active credentials preserve every opaque byte");
+
+        var vaultPath = Path.Combine(store.RootPath, "accounts.dpapi");
+        foreach (var invalid in new[] { "", "   ", new string('x', 41), "name\ninside", "name\0inside" })
+        {
+            var encryptedBefore = File.ReadAllBytes(vaultPath);
+            AssertThrows(() => store.Rename(a.Id, invalid), "invalid label rejected");
+            Equal(File.ReadAllBytes(vaultPath), encryptedBefore, "invalid rename does not rewrite vault");
+            Equal(ReadAuth(home), authA, "invalid rename does not change live auth");
+        }
+        var beforeMissing = File.ReadAllBytes(vaultPath);
+        AssertThrows(() => store.Rename(Guid.NewGuid().ToString("N"), "missing"), "missing account ID rejected");
+        Equal(File.ReadAllBytes(vaultPath), beforeMissing, "missing ID does not rewrite vault");
+
+        File.Delete(Path.Combine(home, "auth.json"));
+        store.Rename(a.Id, "로그아웃 중 변경");
+        store.Rename(b.Id, "로그아웃 중 변경");
+        Assert(!File.Exists(Path.Combine(home, "auth.json")), "logged-out rename never creates an auth file");
+        Assert(store.ListAccounts().All(e => e.Label == "로그아웃 중 변경" && !e.IsActive),
+            "logged-out metadata rename works and duplicate labels remain permitted");
+        WriteAuth(home, authA);
+        store.Checkpoint = phase => { if (phase == "journal-written") throw new SimulatedCrash(); };
+        AssertThrows(() => store.SwitchTo(b.Id, () => { }), "synthetic pending recovery created");
+        store.Checkpoint = null;
+        var beforeRecovery = File.ReadAllBytes(vaultPath);
+        AssertThrows(() => store.Rename(a.Id, "blocked"), "pending transaction blocks metadata changes");
+        Equal(File.ReadAllBytes(vaultPath), beforeRecovery, "blocked rename preserves pending recovery metadata");
+        store.Recover(() => { });
     }
 
     private static void TestCrashRecovery(Fixture fixture)

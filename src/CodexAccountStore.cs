@@ -167,6 +167,20 @@ internal sealed class CodexAccountStore
         DeleteChecked(_journalPath);
     }
 
+    public void Rename(string id, string label)
+    {
+        using var gate = AcquireLock();
+        RequireNoRecovery();
+        label = NormalizeLabel(label);
+        var vault = LoadVault();
+        var entry = vault.Accounts.SingleOrDefault(a => a.Id == id)
+            ?? throw new InvalidOperationException("저장된 계정을 찾을 수 없습니다.");
+        // Metadata-only: do not inspect or replace live auth, even for the active account.
+        if (entry.Label == label) return;
+        entry.Label = label;
+        WriteEncrypted(_vaultPath, vault);
+    }
+
     public void Remove(string id)
     {
         using var gate = AcquireLock();
@@ -201,9 +215,7 @@ internal sealed class CodexAccountStore
 
     private static Entry Upsert(Vault vault, byte[] bytes, AccountIdentity identity, string label)
     {
-        label = label.Trim();
-        if (label.Length is < 1 or > 40 || label.Any(char.IsControl))
-            throw new InvalidOperationException("계정 이름은 제어 문자 없이 1~40자로 입력하세요.");
+        label = NormalizeLabel(label);
         var entry = vault.Accounts.SingleOrDefault(a => a.Key == identity.Key);
         if (entry is null)
         {
@@ -215,6 +227,14 @@ internal sealed class CodexAccountStore
         entry.Hint = identity.Hint;
         entry.Auth = bytes;
         return entry;
+    }
+
+    private static string NormalizeLabel(string label)
+    {
+        label = label?.Trim() ?? "";
+        if (label.Length is < 1 or > 40 || label.Any(char.IsControl))
+            throw new InvalidOperationException("계정 이름은 제어 문자 없이 1~40자로 입력하세요.");
+        return label;
     }
 
     private static void UpdateAuth(Vault vault, string key, byte[] bytes)

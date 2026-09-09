@@ -98,7 +98,7 @@ internal sealed class AppServerClient : IDisposable
         {
             await CallCoreAsync(session, "initialize", new
             {
-                clientInfo = new { name = "weekly-usage-indicator", title = "Weekly Usage Indicator", version = "1.4.1" },
+                clientInfo = new { name = "weekly-usage-indicator", title = "Weekly Usage Indicator", version = "1.5.0" },
                 capabilities = new { experimentalApi = true }
             }, token).ConfigureAwait(false);
             await SendLineAsync(session, JsonSerializer.Serialize(new { method = "initialized" }), token).ConfigureAwait(false);

@@ -95,7 +95,7 @@ internal sealed class UsageIndicatorForm : Form
     public UsageIndicatorForm(bool previewMode, bool openAccounts = false)
     {
         _previewMode = previewMode;
-        _showClaude = IndicatorSettingsStore.LoadShowClaude();
+        _showClaude = !previewMode && IndicatorSettingsStore.LoadShowClaude();
         AutoScaleMode = AutoScaleMode.Dpi;
         BackColor = Color.FromArgb(24, 24, 28);
         ClientSize = new Size(WidgetWidth, WidgetHeight);
@@ -108,7 +108,6 @@ internal sealed class UsageIndicatorForm : Form
         ShowInTaskbar = false;
         StartPosition = FormStartPosition.Manual;
         Text = "Codex 및 Claude 사용량";
-        TopMost = true;
         AccessibleName = "Codex 및 Claude Fable 사용량 인디케이터";
         Opacity = 0;
 
@@ -131,7 +130,6 @@ internal sealed class UsageIndicatorForm : Form
                 EnsurePositionInitialized();
                 Opacity = 1;
                 _ = RefreshUsageAsync(force: true);
-                _pollTimer.Start();
                 return;
             }
 
@@ -161,7 +159,7 @@ internal sealed class UsageIndicatorForm : Form
                 _accountManager.Activate();
                 return;
             }
-            if (_positionInitialized)
+            if (_positionInitialized && !_previewMode)
                 IndicatorSettingsStore.SavePosition(Location);
             _pollTimer.Stop();
             _codexStateTimer.Stop();
@@ -184,8 +182,12 @@ internal sealed class UsageIndicatorForm : Form
         {
             const int WsExToolWindow = 0x00000080;
             const int WsExNoActivate = 0x08000000;
+            const int WsExTopMost = 0x00000008;
             var parameters = base.CreateParams;
             parameters.ExStyle |= WsExToolWindow | WsExNoActivate;
+            // Form.TopMost makes WinForms focus the form when it becomes visible,
+            // even with ShowWithoutActivation. Keep z-order in native styles instead.
+            if (_keepOnTop) parameters.ExStyle |= WsExTopMost;
             return parameters;
         }
     }
@@ -213,8 +215,7 @@ internal sealed class UsageIndicatorForm : Form
         topMostItem.CheckedChanged += (_, _) =>
         {
             _keepOnTop = topMostItem.Checked;
-            TopMost = _keepOnTop;
-            ReassertTopMost();
+            if (IsHandleCreated) _ = NativeWindow.TrySetTopMost(Handle, _keepOnTop);
         };
 
         var copyItem = new ToolStripMenuItem("현재 상태 복사");
@@ -333,8 +334,13 @@ internal sealed class UsageIndicatorForm : Form
             return;
         }
 
+        MaintainVisiblePresentation();
+    }
+
+    internal void MaintainVisiblePresentation()
+    {
         if (!Visible) Show();
-        Opacity = 1;
+        if (Opacity != 1) Opacity = 1;
         if (_keepOnTop)
         {
             // The WinForms TopMost setter can activate this form even when it
@@ -345,6 +351,14 @@ internal sealed class UsageIndicatorForm : Form
 
     private async Task RefreshUsageAsync(bool force = false)
     {
+        if (_previewMode)
+        {
+            _codexSnapshot = new UsageSnapshot(38, DateTimeOffset.Now.AddDays(3), 10080, "codex");
+            _codexError = null;
+            UpdateToolTip();
+            Invalidate();
+            return;
+        }
         if (_accountBusy || _accountStore.HasPendingRecovery) return;
         if (!_previewMode && !_codexWasRunning) return;
         if (_isRefreshing && !force) return;
@@ -430,7 +444,8 @@ internal sealed class UsageIndicatorForm : Form
     {
         if (_previewMode) return;
         if (_accountManager is null || _accountManager.IsDisposed)
-            _accountManager = new AccountManagerForm(_accountStore, SuspendAccountsAsync, ResumeAccounts);
+            _accountManager = new AccountManagerForm(_accountStore, SuspendAccountsAsync, ResumeAccounts,
+                () => { RefreshAccountLabel(); Invalidate(); });
         _accountManager.Show();
         _accountManager.Activate();
     }
@@ -884,6 +899,7 @@ internal static class IndicatorSettingsStore
 internal static class NativeWindow
 {
     private static readonly IntPtr HwndTopMost = new(-1);
+    private static readonly IntPtr HwndNotTopMost = new(-2);
     private const int GwlStyle = -16;
     private const int SwShowMaximized = 3;
     private const int WsCaption = 0x00C00000;
@@ -893,11 +909,11 @@ internal static class NativeWindow
     private const uint SwpNoActivate = 0x0010;
     private const uint SwpShowWindow = 0x0040;
 
-    public static bool TrySetTopMost(IntPtr windowHandle)
+    public static bool TrySetTopMost(IntPtr windowHandle, bool topMost = true)
     {
         return SetWindowPos(
             windowHandle,
-            HwndTopMost,
+            topMost ? HwndTopMost : HwndNotTopMost,
             0,
             0,
             0,
