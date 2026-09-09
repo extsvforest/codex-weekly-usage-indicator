@@ -183,8 +183,9 @@ internal sealed class UsageIndicatorForm : Form
         get
         {
             const int WsExToolWindow = 0x00000080;
+            const int WsExNoActivate = 0x08000000;
             var parameters = base.CreateParams;
-            parameters.ExStyle |= WsExToolWindow;
+            parameters.ExStyle |= WsExToolWindow | WsExNoActivate;
             return parameters;
         }
     }
@@ -336,7 +337,8 @@ internal sealed class UsageIndicatorForm : Form
         Opacity = 1;
         if (_keepOnTop)
         {
-            TopMost = true;
+            // The WinForms TopMost setter can activate this form even when it
+            // is already topmost. Timer maintenance must use SWP_NOACTIVATE.
             ReassertTopMost();
         }
     }

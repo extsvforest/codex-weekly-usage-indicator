@@ -6,7 +6,7 @@ internal sealed class AccountManagerForm : Form
     private readonly Func<Task> _suspend;
     private readonly Action _resume;
     private readonly ListView _accounts = new() { View = View.Details, FullRowSelect = true, MultiSelect = false, HideSelection = false, Dock = DockStyle.Fill };
-    private readonly TextBox _label = new() { Width = 170, PlaceholderText = "계정 별칭 (예: Pro A)" };
+    private readonly TextBox _label = new() { Width = 210, PlaceholderText = "이름 (비우면 자동으로 지정)" };
     private readonly Label _status = new() { Dock = DockStyle.Fill, AutoSize = false, Padding = new Padding(12), Text = "현재 계정을 등록한 다음 두 번째 계정을 추가하세요." };
     private readonly FlowLayoutPanel _buttons = new() { Dock = DockStyle.Fill, Padding = new Padding(8), WrapContents = true, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink };
     private readonly Button _cancel = new() { Text = "로그인 취소", AutoSize = true, Enabled = false };
@@ -60,6 +60,9 @@ internal sealed class AccountManagerForm : Form
     {
         if (_busy) return;
         _busy = true;
+        _status.ForeColor = SystemColors.ControlText;
+        _status.Text = "계정 작업을 준비하고 있습니다…";
+        UseWaitCursor = true;
         using var transactionGate = new Mutex(false, CodexAccountStore.TransactionMutexName);
         var ownsGate = false;
         foreach (Control control in _buttons.Controls) control.Enabled = false;
@@ -73,13 +76,14 @@ internal sealed class AccountManagerForm : Form
             await action();
         }
         catch (OperationCanceledException) { _status.Text = "로그인을 취소했습니다. 현재 계정은 유지됩니다."; }
-        catch (Exception ex) { _status.Text = ex.Message; }
+        catch (Exception ex) { _status.ForeColor = Color.Firebrick; _status.Text = ex.Message; }
         finally
         {
             // UI event continuations retain the WinForms thread; named mutex ownership
             // spans browser login and import, so lifecycle scripts cannot kill either.
             if (ownsGate) transactionGate.ReleaseMutex();
             _busy = false;
+            UseWaitCursor = false;
             foreach (Control control in _buttons.Controls) control.Enabled = true;
             _cancel.Enabled = false;
             Reload(preserveStatus: true);
@@ -87,22 +91,34 @@ internal sealed class AccountManagerForm : Form
         }
     }
 
-    private string AccountLabel => string.IsNullOrWhiteSpace(_label.Text)
-        ? throw new InvalidOperationException("계정을 구분할 별칭을 먼저 입력하세요.") : _label.Text.Trim();
+    private string AccountLabel(bool registeringCurrent = false)
+    {
+        if (!string.IsNullOrWhiteSpace(_label.Text)) return _label.Text.Trim();
+        var accounts = _store.IsEnabled ? _store.ListAccounts() : Array.Empty<SavedCodexAccount>();
+        if (registeringCurrent && accounts.FirstOrDefault(account => account.IsActive) is { } current)
+            return current.Label;
+        for (var number = 1; ; number++)
+        {
+            var candidate = $"계정 {number}";
+            if (!accounts.Any(account => account.Label.Equals(candidate, StringComparison.OrdinalIgnoreCase)))
+                return candidate;
+        }
+    }
 
     private SavedCodexAccount Selected => _accounts.SelectedItems.Count == 1
         ? (SavedCodexAccount)_accounts.SelectedItems[0].Tag! : throw new InvalidOperationException("목록에서 계정을 선택하세요.");
 
     private Task RegisterAsync()
     {
-        _store.RegisterCurrent(AccountLabel);
-        _status.Text = "현재 계정을 등록했습니다. 다음으로 다른 계정 로그인을 선택하세요.";
+        var account = _store.RegisterCurrent(AccountLabel(registeringCurrent: true));
+        _status.ForeColor = Color.DarkGreen;
+        _status.Text = $"‘{account.Label}’ 등록 완료. 다음으로 ‘다른 계정 로그인’을 선택하세요. 이름은 비워도 됩니다.";
         return Task.CompletedTask;
     }
 
     private async Task LoginAsync()
     {
-        var label = AccountLabel;
+        var label = AccountLabel();
         if (!_store.IsEnabled || _store.ListAccounts().Count == 0)
             throw new InvalidOperationException("복귀할 수 있도록 현재 계정을 먼저 등록하세요.");
         using var cancellation = new CancellationTokenSource();

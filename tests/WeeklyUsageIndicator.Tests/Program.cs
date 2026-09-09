@@ -6,7 +6,7 @@ var tests = new (string Name, Func<Task> Run)[]
     ("Codex app-server lifecycle isolation", AppServerLifecycleTests.RunAsync),
     ("Codex account vault and crash recovery", AccountStoreTests.RunAsync),
     ("isolated Codex login runtime", AccountRuntimeTests.RunAsync),
-    ("optional synthetic account UI capture", AccountUiSmoke.RunAsync),
+    ("account registration click works with an optional name", AccountUiSmoke.RunAsync),
     ("supervisor retries abnormal exits but respects normal Quit", TestSupervisorAsync),
     ("official Claude /usage output is parsed", TestObservedUsageOutputAsync),
     ("usage without reset times remains valid through client and tooltip", TestUsageWithoutResetsAsync),

@@ -23,7 +23,7 @@ Account management is optional. After you register a Codex account, the widget s
 
 ## Manual Codex accounts
 
-Open **Codex 계정 관리…** from the right-click menu, or double-click the tray icon. Enter a label and register the current account first. Enter another label and choose **다른 계정 로그인**; complete the official browser login using the additional account. This login uses an isolated private `CODEX_HOME` and does not log the desktop out.
+Open **Codex 계정 관리…** from the right-click menu, or double-click the tray icon. Register the current account first. Names are optional: a blank field uses `계정 1`, `계정 2`, and so on; registering the current account again preserves its existing name. Choose **다른 계정 로그인** and complete the official browser login using the additional account. This login uses an isolated private `CODEX_HOME` and does not log the desktop out. The widget maintains its topmost position without activating itself, so typing in the manager or another app keeps focus.
 
 To switch, finish your Codex work and close Codex Desktop and other Codex CLI/engine processes. Select the saved account and click **선택 계정으로 전환**. The widget stops its own usage helper, verifies that no Codex writers remain, saves the latest current login, and applies the selected login. It attempts to reopen the previously observed packaged desktop; if necessary, launch Codex from the Start menu and confirm the account there. File application and desktop login verification are separate outcomes.
 
