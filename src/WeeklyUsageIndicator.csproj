@@ -9,7 +9,7 @@
     <AssemblyName>WeeklyUsageIndicator</AssemblyName>
     <RootNamespace>WeeklyUsageIndicator</RootNamespace>
     <ApplicationManifest>app.manifest</ApplicationManifest>
-    <Version>1.5.0</Version>
+    <Version>1.5.1</Version>
     <Deterministic>true</Deterministic>
     <DebugType>none</DebugType>
     <DebugSymbols>false</DebugSymbols>

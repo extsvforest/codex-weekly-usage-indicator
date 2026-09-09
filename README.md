@@ -23,7 +23,7 @@ Account management is optional. After you register a Codex account, the widget s
 
 ## Manual Codex accounts
 
-Open **Codex 계정 관리…** from the right-click menu, or double-click the tray icon. Choose **현재 계정 등록** to save the current login with a unique default name. Select an account in the left list to view its status and usage; use **이름 변경** or F2 to edit its name. Enter saves and Escape cancels. Renaming only changes local metadata and does not restart the usage helper. If you sign into an unregistered account directly in Codex, the manager offers registration above the existing list.
+Open **Codex 계정 관리…** from the right-click menu, or double-click the tray icon. Choose **현재 계정 등록** to save the current login with a unique default name. Select an account in the left list to view its status and usage; use **이름 변경** or F2 to edit its name. Enter saves and Escape cancels. Account names appear only in the manager; the compact indicator shows percentages and bars. Renaming only changes local metadata and does not restart the usage helper. If you sign into an unregistered account directly in Codex, the manager offers registration above the existing list.
 
 Choose **+ 다른 계정 추가**, optionally name the account, then select **브라우저에서 로그인**. Complete the official browser login using the additional account. This login uses an isolated private `CODEX_HOME` and does not log the desktop out; **로그인 취소** stops only the login process owned by this tool. The widget maintains its topmost position without activating itself, including when it reappears, so typing in the manager or another app keeps focus.
 

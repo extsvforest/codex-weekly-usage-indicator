@@ -86,7 +86,6 @@ internal sealed class UsageIndicatorForm : Form
     private NotifyIcon? _accountTray;
     private bool _accountBusy;
     private long _accountGeneration;
-    private string? _activeAccountLabel;
     private string? _helperIdentityKey;
     private readonly EventWaitHandle _openAccountsSignal = new(false, EventResetMode.AutoReset, @"Local\CodexWeeklyUsageIndicator.OpenAccounts");
     private Point _dragCursorStart;
@@ -138,7 +137,6 @@ internal sealed class UsageIndicatorForm : Form
                 _accountBusy = true;
                 ShowAccountManager();
             }
-            RefreshAccountLabel();
             SyncCodexVisibility();
             _codexStateTimer.Start();
             if (openAccounts) ShowAccountManager();
@@ -431,7 +429,6 @@ internal sealed class UsageIndicatorForm : Form
             _codexSnapshot = snapshot;
             _codexError = null;
             if (identity is not null && snapshot is not null) _accountStore.SaveUsage(identity, snapshot);
-            RefreshAccountLabel();
         }
         catch (Exception ex)
         {
@@ -444,8 +441,7 @@ internal sealed class UsageIndicatorForm : Form
     {
         if (_previewMode) return;
         if (_accountManager is null || _accountManager.IsDisposed)
-            _accountManager = new AccountManagerForm(_accountStore, SuspendAccountsAsync, ResumeAccounts,
-                () => { RefreshAccountLabel(); Invalidate(); });
+            _accountManager = new AccountManagerForm(_accountStore, SuspendAccountsAsync, ResumeAccounts);
         _accountManager.Show();
         _accountManager.Activate();
     }
@@ -465,15 +461,8 @@ internal sealed class UsageIndicatorForm : Form
         _helperIdentityKey = null;
         _codexError = null;
         _codexWasRunning = false;
-        RefreshAccountLabel();
         if (!_accountBusy) SyncCodexVisibility();
         Invalidate();
-    }
-
-    private void RefreshAccountLabel()
-    {
-        try { _activeAccountLabel = _accountStore.IsEnabled ? _accountStore.ListAccounts().FirstOrDefault(a => a.IsActive)?.Label : null; }
-        catch { _activeAccountLabel = "계정 확인 필요"; }
     }
 
     private async Task RefreshClaudeAsync()
@@ -540,12 +529,6 @@ internal sealed class UsageIndicatorForm : Form
         else
         {
             DrawProvider(graphics, new RectangleF(0, 0, Width, Height), null, codexAccent);
-        }
-        if (_activeAccountLabel is not null && (codexAvailable || !claudeAvailable))
-        {
-            var labelWidth = claudeAvailable || (_isRefreshing && _showClaude) ? Width / 2 : Width;
-            TextRenderer.DrawText(graphics, _activeAccountLabel, Font, new Rectangle(8, 29, labelWidth - 16, 14),
-                Color.FromArgb(165, 175, 200), TextFormatFlags.HorizontalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
         }
     }
 
