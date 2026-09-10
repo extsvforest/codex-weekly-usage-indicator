@@ -2,6 +2,16 @@
 
 The existing WinForms widget owns the small usage surface and opens a separate account manager. The user selects accounts explicitly. Inactive usage is a dated observation, not a background login or synthetic combined quota. The current widget geometry and Claude source/cache contracts remain intact.
 
+## On-demand usage (1.6)
+
+An explicit selected-account button reads weekly and optional 5-hour windows with the official `account/rateLimits/read` interface. List selection, list refresh, and the manager's five-second local refresh never query inactive accounts. The UI stores one successful snapshot/time, with no history, delta, or attribution. Failed and canceled requests retain that observation. The active account reuses the widget helper; an inactive account uses a separate private file-store `CODEX_HOME` without copying user configuration or passing tokens in arguments.
+
+Inactive requests hold the existing process-wide mutex and vault file lock on one synchronous worker thread across the async protocol operation. The UI remains responsive, and the active helper continues polling; its optional vault cache write is skipped while the query owns storage. Switching, import, rename, removal, duplicate query, and installer replacement cannot interleave with the transaction.
+
+Rate-limit reads can implicitly refresh authentication even with `account/read.refreshToken=false`. Query staging therefore has a separate encrypted journal, never the disposable `login-*` cleanup path. The owned helper uses a non-breakaway kill-on-close Job and must exit before credential read-back. Success, protocol failure, and cancellation all save its validated same-account credentials before removing staging. Shutdown uncertainty retains staging and journal. Before writing the vault, the chosen auth and expected prior digest are durably written to the encrypted journal; recovery can be interrupted repeatedly and the desktop can independently change accounts without reverting a committed refresh. Active live authentication remains authoritative and is never written by this path.
+
+Crash recovery is explicit and conservatively requires all potential Codex writers to exit, accounting for the narrow process-start/Job-assignment interval. A pending query is announced on startup and blocks account mutations, while active-account usage polling remains available. Missing/corrupt credentials or inconsistent vault revisions preserve recovery evidence and fail closed.
+
 ## Authentication and recovery
 
 The local live authentication file is authoritative for the active account. Every switch stops the widget's own app-server, checks for remaining native Codex writers, reads the latest source credential, writes an encrypted recovery transaction, saves the source, and atomically applies the selected credential. File replacement is read back. Saved auth JSON is treated as opaque data so future fields survive.

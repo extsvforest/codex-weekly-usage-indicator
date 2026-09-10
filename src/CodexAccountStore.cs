@@ -10,6 +10,10 @@ using System.Text.RegularExpressions;
 namespace WeeklyUsageIndicator;
 
 internal sealed record AccountIdentity(string Key, string Hint);
+internal sealed class AccountStoreBusyException : InvalidOperationException
+{
+    internal AccountStoreBusyException() : base("다른 계정 관리 작업이 진행 중입니다. 잠시 후 다시 시도하세요.") { }
+}
 internal sealed record SavedCodexAccount(string Id, string Label, string IdentityHint, bool IsActive,
     UsageSnapshot? Usage, DateTimeOffset? ObservedAt);
 
@@ -17,7 +21,7 @@ internal sealed record SavedCodexAccount(string Id, string Label, string Identit
 /// Opt-in, local-only account storage. Live auth.json is authoritative for the active account.
 /// This class never refreshes a token, starts Codex, changes config, or reads Claude credentials.
 /// </summary>
-internal sealed class CodexAccountStore
+internal sealed partial class CodexAccountStore
 {
     internal const string TransactionMutexName = @"Local\CodexWeeklyUsageIndicator.AccountTransaction";
     private const int MaxAuthBytes = 1024 * 1024;
@@ -142,6 +146,7 @@ internal sealed class CodexAccountStore
         ArgumentNullException.ThrowIfNull(assertStopped);
         CheckSupportedStore();
         using var gate = AcquireLock();
+        if (HasPendingUsageQuery) RecoverUsageQueryCore(assertStopped);
         if (!HasPendingRecovery) return;
         assertStopped();
         var journal = ReadEncrypted<SwitchJournal>(_journalPath);
@@ -196,8 +201,12 @@ internal sealed class CodexAccountStore
 
     public void SaveUsage(string identityKey, UsageSnapshot snapshot)
     {
-        if (!IsEnabled || HasPendingRecovery) return;
-        using var gate = AcquireLock();
+        // An isolated query owns the vault briefly; live polling may keep its in-memory value.
+        if (!IsEnabled || HasPendingRecovery || HasPendingUsageQuery) return;
+        IDisposable gate;
+        try { gate = AcquireLock(); }
+        catch (AccountStoreBusyException) { return; }
+        using var ownedGate = gate;
         RequireNoRecovery();
         if (GetCurrentIdentity().Key != identityKey) return;
         var vault = LoadVault();
@@ -285,6 +294,7 @@ internal sealed class CodexAccountStore
     private void RequireNoRecovery()
     {
         if (HasPendingRecovery) throw new InvalidOperationException("미완료 계정 교체를 먼저 복구하세요.");
+        if (HasPendingUsageQuery) throw new InvalidOperationException("중단된 사용량 조회를 먼저 복구하세요.");
     }
 
     private void RequireSameAuth(byte[] expected)
@@ -414,7 +424,7 @@ internal sealed class CodexAccountStore
         if (!acquired)
         {
             mutex.Dispose();
-            throw new InvalidOperationException("다른 계정 관리 작업이 진행 중입니다. 잠시 후 다시 시도하세요.");
+            throw new AccountStoreBusyException();
         }
         try
         {
@@ -435,7 +445,7 @@ internal sealed class CodexAccountStore
         }
         catch (IOException)
         {
-            throw new InvalidOperationException("다른 계정 관리 작업이 진행 중입니다. 잠시 후 다시 시도하세요.");
+            throw new AccountStoreBusyException();
         }
         }
         catch

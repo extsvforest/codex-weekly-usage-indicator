@@ -82,7 +82,7 @@ internal sealed class AccountSwitchDialog : Form
         _assertWritersStopped = assertWritersStopped ?? CodexAccountRuntime.AssertWritersStopped;
         Name = "AccountSwitchDialog";
         AccountUiTheme.SetForm(this);
-        Text = recovery ? "미완료 전환 복구" : "계정 전환 준비";
+        Text = recovery ? "중단된 계정 작업 복구" : "계정 전환 준비";
         StartPosition = FormStartPosition.CenterParent;
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MinimizeBox = false; MaximizeBox = false; ShowInTaskbar = false;
