@@ -44,7 +44,10 @@ internal sealed record UsageSnapshot(
     int UsedPercent,
     DateTimeOffset? ResetsAt,
     long? WindowDurationMinutes,
-    string LimitId);
+    string LimitId,
+    UsageWindow? ShortWindow = null);
+
+internal sealed record UsageWindow(int UsedPercent, DateTimeOffset? ResetsAt, long? WindowDurationMinutes);
 
 internal sealed class UsageIndicatorForm : Form
 {
@@ -137,6 +140,7 @@ internal sealed class UsageIndicatorForm : Form
                 _accountBusy = true;
                 ShowAccountManager();
             }
+            else if (_accountStore.HasPendingUsageQuery) ShowAccountManager();
             SyncCodexVisibility();
             _codexStateTimer.Start();
             if (openAccounts) ShowAccountManager();
@@ -441,9 +445,38 @@ internal sealed class UsageIndicatorForm : Form
     {
         if (_previewMode) return;
         if (_accountManager is null || _accountManager.IsDisposed)
-            _accountManager = new AccountManagerForm(_accountStore, SuspendAccountsAsync, ResumeAccounts);
+            _accountManager = new AccountManagerForm(_accountStore, SuspendAccountsAsync, ResumeAccounts,
+                queryUsage: QueryAccountUsageAsync);
         _accountManager.Show();
         _accountManager.Activate();
+    }
+
+    private async Task QueryAccountUsageAsync(SavedCodexAccount account, CancellationToken token)
+    {
+        if (!account.IsActive)
+        {
+            await CodexAccountUsageReader.ReadInactiveAsync(_accountStore, account.Id, token);
+            return;
+        }
+        if (!_codexStateReader.IsRunning())
+            throw new InvalidOperationException("현재 계정의 사용량을 조회하려면 Codex 앱을 열어 주세요.");
+        var generation = _accountGeneration;
+        var identity = _accountStore.GetCurrentIdentity().Key;
+        if (_accountStore.ListAccounts().SingleOrDefault(a => a.Id == account.Id)?.IsActive != true)
+            throw new InvalidOperationException("현재 계정이 변경되었습니다. 목록을 갱신한 뒤 다시 조회하세요.");
+        if (_helperIdentityKey != identity)
+        {
+            await _codexClient.SuspendAsync();
+            _codexClient.Resume();
+            _helperIdentityKey = identity;
+        }
+        var result = await _codexClient.GetWeeklyUsageWithAccountAsync(token);
+        if (!result.IsChatGpt || generation != _accountGeneration || _accountBusy ||
+            _accountStore.GetCurrentIdentity().Key != identity)
+            throw new InvalidOperationException("조회 중 현재 계정이 변경되었습니다. 목록을 갱신한 뒤 다시 조회하세요.");
+        _accountStore.SaveUsage(identity, result.Usage);
+        _codexSnapshot = result.Usage; _codexError = null;
+        UpdateToolTip(); Invalidate();
     }
 
     private async Task SuspendAccountsAsync()

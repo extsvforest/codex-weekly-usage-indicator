@@ -6,6 +6,7 @@ namespace WeeklyUsageIndicator;
 
 // account/read exposes no workspace/user ID. Email corroborates a session; it is not a full identity proof.
 internal sealed record CodexAccountUsage(UsageSnapshot Usage, string? Email, string? PlanType, bool IsChatGpt);
+internal sealed class CodexUsageAuthenticationException : IOException;
 
 /// <summary>Owns one serialized, cancellable app-server session. No session owns another session's state.</summary>
 internal sealed class AppServerClient : IDisposable
@@ -13,6 +14,7 @@ internal sealed class AppServerClient : IDisposable
     private readonly object _stateLock = new();
     private readonly SemaphoreSlim _operationGate = new(1, 1);
     private readonly Func<ProcessStartInfo> _startInfoFactory;
+    private readonly bool _ownJob;
     private CancellationTokenSource _generation = new();
     private Session? _session;
     private bool _suspended;
@@ -21,8 +23,9 @@ internal sealed class AppServerClient : IDisposable
 
     public AppServerClient() : this(CreateStartInfo) { }
 
-    // Test seam: fake stdio server only; production always uses the official local executable.
-    internal AppServerClient(Func<ProcessStartInfo> startInfoFactory) => _startInfoFactory = startInfoFactory;
+    // Explicit isolated home in production; fake stdio server in tests.
+    internal AppServerClient(Func<ProcessStartInfo> startInfoFactory, bool ownJob = false)
+    { _startInfoFactory = startInfoFactory; _ownJob = ownJob; }
 
     public async Task<UsageSnapshot> GetWeeklyUsageAsync(CancellationToken cancellationToken) =>
         (await ReadUsageAsync(includeAccount: false, cancellationToken).ConfigureAwait(false)).Usage;
@@ -83,13 +86,31 @@ internal sealed class AppServerClient : IDisposable
             ThrowIfUnavailable();
             token.ThrowIfCancellationRequested();
             var process = new Process { StartInfo = _startInfoFactory(), EnableRaisingEvents = true };
+            CodexLoginJob? job = _ownJob ? new CodexLoginJob(allowChildBreakaway: false) : null;
+            var started = false;
             try
             {
                 if (!process.Start()) throw new IOException("Codex app-server could not be started.");
-                session = new Session(process);
+                started = true;
+                job?.Attach(process);
+                session = new Session(process, job);
                 _session = session;
             }
-            catch { process.Dispose(); throw; }
+            catch
+            {
+                job?.Dispose();
+                try
+                {
+                    if (started && !process.HasExited)
+                    {
+                        process.Kill(entireProcessTree: true);
+                        if (!process.WaitForExit(8000)) throw new UsageHelperShutdownException();
+                    }
+                }
+                catch { throw new UsageHelperShutdownException(); }
+                finally { process.Dispose(); }
+                throw;
+            }
         }
 
         session.Reader = ReadLoopAsync(session);
@@ -98,7 +119,7 @@ internal sealed class AppServerClient : IDisposable
         {
             await CallCoreAsync(session, "initialize", new
             {
-                clientInfo = new { name = "weekly-usage-indicator", title = "Weekly Usage Indicator", version = "1.5.1" },
+                clientInfo = new { name = "weekly-usage-indicator", title = "Weekly Usage Indicator", version = "1.6.0" },
                 capabilities = new { experimentalApi = true }
             }, token).ConfigureAwait(false);
             await SendLineAsync(session, JsonSerializer.Serialize(new { method = "initialized" }), token).ConfigureAwait(false);
@@ -167,9 +188,16 @@ internal sealed class AppServerClient : IDisposable
                     if (root.ValueKind != JsonValueKind.Object ||
                         !root.TryGetProperty("id", out var idElement) || idElement.ValueKind != JsonValueKind.Number || !idElement.TryGetInt32(out var id) ||
                         !session.Pending.TryGetValue(id, out var completion)) continue;
-                    if (root.TryGetProperty("error", out _))
+                    if (root.TryGetProperty("error", out var error))
+                    {
                         // Protocol errors can include sensitive server context. Never surface the raw payload.
-                        completion.TrySetException(new IOException("Codex could not read account usage. Check the account login."));
+                        var message = error.ValueKind == JsonValueKind.Object && error.TryGetProperty("message", out var errorMessage)
+                            && errorMessage.ValueKind == JsonValueKind.String ? errorMessage.GetString() ?? "" : "";
+                        var authFailure = new[] { "401", "unauthorized", "authentication required", "refresh_token", "token expired" }
+                            .Any(term => message.Contains(term, StringComparison.OrdinalIgnoreCase));
+                        completion.TrySetException(authFailure ? new CodexUsageAuthenticationException() :
+                            new IOException("Codex could not read account usage. Check the account login."));
+                    }
                     else if (root.TryGetProperty("result", out var result))
                         completion.TrySetResult(result.Clone());
                     else completion.TrySetException(new InvalidDataException("Codex returned an incomplete response."));
@@ -235,6 +263,7 @@ internal sealed class AppServerClient : IDisposable
         var session = _session;
         if (session is null) return;
         session.Lifetime.Cancel();
+        session.Job?.Dispose();
         try { session.Process.StandardInput.Close(); } catch { }
         try
         {
@@ -275,9 +304,10 @@ internal sealed class AppServerClient : IDisposable
         // Keep gates and generation valid for callers already unwinding their canceled operation.
     }
 
-    private sealed class Session(Process process)
+    private sealed class Session(Process process, CodexLoginJob? job)
     {
         internal readonly Process Process = process;
+        internal readonly CodexLoginJob? Job = job;
         internal readonly CancellationTokenSource Lifetime = new();
         internal readonly ConcurrentDictionary<int, TaskCompletionSource<JsonElement>> Pending = new();
         internal Task Reader = Task.CompletedTask;
@@ -313,7 +343,9 @@ internal sealed class AppServerClient : IDisposable
             Math.Clamp(weekly.Used, 0, 100),
             resetsAt,
             weekly.Duration,
-            limitId);
+            limitId,
+            windows.Where(w => w.Duration == 300 && w.Used is >= 0 and <= 100).Select(w => new UsageWindow(
+                w.Used, w.ResetsAt is > 0 ? DateTimeOffset.FromUnixTimeSeconds(w.ResetsAt.Value) : null, w.Duration)).FirstOrDefault());
     }
 
     private static JsonElement SelectCoreSnapshot(JsonElement response)

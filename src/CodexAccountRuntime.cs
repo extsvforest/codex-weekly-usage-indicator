@@ -307,7 +307,7 @@ internal sealed class CodexLoginJob : IDisposable
 {
     private readonly SafeFileHandle _handle;
 
-    internal CodexLoginJob()
+    internal CodexLoginJob(bool allowChildBreakaway = true)
     {
         // Null security attributes make this private unnamed handle noninheritable.
         _handle = CreateJobObjectW(IntPtr.Zero, null);
@@ -322,7 +322,7 @@ internal sealed class CodexLoginJob : IDisposable
             {
                 // KILL_ON_JOB_CLOSE | SILENT_BREAKAWAY_OK: own the login process,
                 // while allowing its browser launcher/children to live independently.
-                LimitFlags = 0x00002000 | 0x00001000
+                LimitFlags = 0x00002000 | (allowChildBreakaway ? 0x00001000u : 0u)
             }
         };
         if (!SetInformationJobObject(_handle, 9, ref limits, (uint)Marshal.SizeOf<ExtendedLimitInformation>()))

@@ -22,11 +22,12 @@ internal static class AppServerLifecycleTests
     private static async Task AccountReadConsistencyAsync(string root)
     {
         using var limit = new CancellationTokenSource(TimeSpan.FromSeconds(20));
-        using (var client = new AppServerClient(() => FakeServer(Path.Combine(root, "account.txt"), "none", 0)))
+        using (var client = new AppServerClient(() => FakeServer(Path.Combine(root, "account.txt"), "none", 0), ownJob: true))
         {
             var response = await client.GetWeeklyUsageWithAccountAsync(limit.Token);
             Check(response.IsChatGpt && response.Email == "fixture@example.invalid" && response.Usage.UsedPercent == 23,
                 "Combined read must associate usage with the same helper's sanitized account metadata.");
+            Check(response.Usage.ShortWindow?.UsedPercent == 91, "5-hour window is included separately from weekly usage");
             await client.SuspendAsync();
         }
         using (var client = new AppServerClient(() => FakeServer(Path.Combine(root, "account-change.txt"), "accountChange", 0)))
@@ -41,7 +42,7 @@ internal static class AppServerLifecycleTests
     {
         var marker = Path.Combine(root, "usage.txt");
         var starts = 0;
-        using var client = new AppServerClient(() => FakeServer(marker, "usage", ++starts == 1 ? 60000 : 0));
+        using var client = new AppServerClient(() => FakeServer(marker, "usage", ++starts == 1 ? 60000 : 0), ownJob: true);
         using var limit = new CancellationTokenSource(TimeSpan.FromSeconds(20));
         var requests = Enumerable.Range(0, 5).Select(_ => client.GetWeeklyUsageAsync(limit.Token)).ToArray();
         var pid = await WaitForMarkerAsync(marker, limit.Token);
@@ -65,7 +66,7 @@ internal static class AppServerLifecycleTests
     private static async Task CancelInitializeAsync(string root)
     {
         var marker = Path.Combine(root, "initialize.txt");
-        using var client = new AppServerClient(() => FakeServer(marker, "initialize", 60000));
+        using var client = new AppServerClient(() => FakeServer(marker, "initialize", 60000), ownJob: true);
         using var limit = new CancellationTokenSource(TimeSpan.FromSeconds(20));
         var request = client.GetWeeklyUsageAsync(limit.Token);
         var pid = await WaitForMarkerAsync(marker, limit.Token);

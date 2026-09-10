@@ -6,6 +6,7 @@ internal sealed class AccountManagerForm : Form
     private readonly Func<Task> _suspend;
     private readonly Action _resume;
     private readonly Action? _accountsChanged;
+    private readonly Func<SavedCodexAccount, CancellationToken, Task> _queryUsage;
     private readonly AccountListBox _accounts = new() { Name = "AccountList", Dock = DockStyle.Fill, DisplayMember = nameof(SavedCodexAccount.Label) };
     private readonly Label _count = AccountUiTheme.Label("저장된 계정");
     private readonly Label _status = AccountUiTheme.Label("계정을 선택해 상태를 확인하세요.");
@@ -16,6 +17,8 @@ internal sealed class AccountManagerForm : Form
     private readonly Label _usageTitle = AccountUiTheme.Label("주간 잔여 사용량", color: AccountUiTheme.Muted);
     private readonly Label _observed = AccountUiTheme.Label("", color: AccountUiTheme.Muted);
     private readonly Label _reset = AccountUiTheme.Label("", color: AccountUiTheme.Muted);
+    private readonly Label _shortRemaining = AccountUiTheme.Label("", color: AccountUiTheme.Text);
+    private readonly Label _shortReset = AccountUiTheme.Label("", color: AccountUiTheme.Muted);
     private readonly Label _switchHelp = AccountUiTheme.Label("", color: AccountUiTheme.Muted);
     private readonly AccountUsageBar _bar = new() { Dock = DockStyle.Fill };
     private readonly Button _add = AccountUiTheme.Button("AddAccountButton", "+ 다른 계정 추가", true);
@@ -24,7 +27,8 @@ internal sealed class AccountManagerForm : Form
     private readonly Button _rename = AccountUiTheme.Button("RenameAccountButton", "이름 변경");
     private readonly Button _switch = AccountUiTheme.Button("SwitchAccountButton", "이 계정으로 전환", true);
     private readonly Button _delete = AccountUiTheme.Button("DeleteAccountButton", "저장된 로그인 삭제");
-    private readonly Button _refresh = AccountUiTheme.Button("RefreshAccountsButton", "새로고침");
+    private readonly Button _refresh = AccountUiTheme.Button("RefreshAccountsButton", "목록 갱신");
+    private readonly Button _readUsage = AccountUiTheme.Button("ReadAccountUsageButton", "사용량 조회");
     private readonly Button _recover = AccountUiTheme.Button("RecoverAccountsButton", "미완료 전환 복구");
     private readonly Button _cancel = AccountUiTheme.Button("CancelLoginButton", "로그인 취소");
     private readonly Panel _detail = new() { Name = "AccountDetailPanel", Dock = DockStyle.Fill, BackColor = AccountUiTheme.Surface, AutoScroll = true };
@@ -39,10 +43,12 @@ internal sealed class AccountManagerForm : Form
     internal bool IsOperationInProgress => _busy;
     private SavedCodexAccount? Selected => _accounts.SelectedItem as SavedCodexAccount;
 
-    public AccountManagerForm(CodexAccountStore store, Func<Task> suspend, Action resume, Action? accountsChanged = null)
+    public AccountManagerForm(CodexAccountStore store, Func<Task> suspend, Action resume, Action? accountsChanged = null,
+        Func<SavedCodexAccount, CancellationToken, Task>? queryUsage = null)
     {
         SuspendLayout();
         _store = store; _suspend = suspend; _resume = resume; _accountsChanged = accountsChanged;
+        _queryUsage = queryUsage ?? ((account, token) => CodexAccountUsageReader.ReadInactiveAsync(store, account.Id, token));
         Name = "AccountManagerForm";
         AccountUiTheme.SetForm(this);
         Text = "Codex 계정 관리";
@@ -92,13 +98,14 @@ internal sealed class AccountManagerForm : Form
         right.Controls.Add(_detail); right.Controls.Add(_empty);
         body.Controls.Add(right, 1, 0);
         root.Controls.Add(body, 0, 2);
-        var footer = AccountUiTheme.Label("저장된 계정의 사용량은 마지막 확인값입니다. 자동 전환하지 않습니다.", color: AccountUiTheme.Muted);
+        var footer = AccountUiTheme.Label("‘사용량 조회’로 선택한 계정의 최신 값을 확인하세요. 다른 계정은 자동 조회하지 않습니다.", color: AccountUiTheme.Muted);
         footer.Margin = new Padding(0, 8, 0, 0);
         root.Controls.Add(footer, 0, 3);
         Controls.Add(root);
 
         _accounts.SelectedIndexChanged += (_, _) => { if (!_reloading) ShowSelected(); };
         _refresh.Click += (_, _) => { if (!_busy && Reload()) SetStatus("계정 목록을 새로 확인했습니다."); };
+        _readUsage.Click += async (_, _) => await ReadSelectedUsageAsync();
         _register.Click += async (_, _) => await RegisterCurrentAsync();
         _registerActive.Click += async (_, _) => await RegisterCurrentAsync();
         _rename.Click += (_, _) => RenameSelected();
@@ -106,7 +113,7 @@ internal sealed class AccountManagerForm : Form
         _switch.Click += async (_, _) => await SwitchSelectedAsync();
         _delete.Click += (_, _) => DeleteSelected();
         _recover.Click += async (_, _) => await RecoverAsync();
-        _cancel.Click += (_, _) => { _loginCancellation?.Cancel(); _cancel.Enabled = false; SetStatus("로그인을 취소하고 임시 정보를 정리하고 있습니다…"); };
+        _cancel.Click += (_, _) => { _loginCancellation?.Cancel(); _cancel.Enabled = false; SetStatus("요청을 취소하고 로그인 정보를 안전하게 정리하고 있습니다…"); };
         KeyDown += (_, e) => { if (e.KeyCode == Keys.F2 && !_busy && Selected is not null) { e.Handled = true; RenameSelected(); } };
         _refreshTimer.Tick += (_, _) => { if (!_busy && !OwnedForms.Any(f => f.Visible)) Reload(quiet: true); };
         Shown += (_, _) =>
@@ -116,7 +123,7 @@ internal sealed class AccountManagerForm : Form
             Location = new Point(Math.Clamp(Left, area.Left, Math.Max(area.Left, area.Right - Width)), Math.Clamp(Top, area.Top, Math.Max(area.Top, area.Bottom - Height)));
             _desktopPath = CodexAccountRuntime.CaptureDesktopLaunchPath(); Reload(); _refreshTimer.Start();
         };
-        FormClosing += (_, e) => { if (_busy) { e.Cancel = true; SetStatus("진행 중인 작업이 있습니다. 로그인 중이라면 ‘로그인 취소’를 눌러주세요."); } };
+        FormClosing += (_, e) => { if (_busy) { e.Cancel = true; SetStatus("진행 중인 작업이 있습니다. 취소 버튼으로 요청을 마친 뒤 닫아주세요."); } };
         FormClosed += (_, _) => _refreshTimer.Stop();
         ResumeLayout(performLayout: true);
     }
@@ -134,12 +141,12 @@ internal sealed class AccountManagerForm : Form
     {
         var layout = AccountUiTheme.Stack(7);
         layout.Dock = DockStyle.Top;
-        layout.MinimumSize = new Size(0, 428);
-        layout.Height = 428;
+        layout.MinimumSize = new Size(0, 496);
+        layout.Height = 496;
         layout.Padding = new Padding(22);
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 50));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 166));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 234));
         layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
@@ -154,13 +161,18 @@ internal sealed class AccountManagerForm : Form
         _state.Dock = DockStyle.Fill; _identity.Dock = DockStyle.Fill;
         identity.Controls.Add(_state, 0, 0); identity.Controls.Add(_identity, 0, 1);
         layout.Controls.Add(identity, 0, 1);
-        var usage = AccountUiTheme.Stack(5);
+        var usage = AccountUiTheme.Stack(7);
         usage.BackColor = AccountUiTheme.Raised; usage.Padding = new Padding(16, 10, 16, 10);
-        foreach (var height in new[] { 25, 47, 10, 28, 28 }) usage.RowStyles.Add(new RowStyle(SizeType.Absolute, height));
-        usage.Controls.Add(_usageTitle, 0, 0);
+        foreach (var height in new[] { 36, 47, 10, 28, 28, 30, 28 }) usage.RowStyles.Add(new RowStyle(SizeType.Absolute, height));
+        var usageHeader = new Panel { Dock = DockStyle.Fill, Margin = new Padding(0) };
+        _usageTitle.Dock = DockStyle.Fill; _usageTitle.AutoSize = false; _usageTitle.TextAlign = ContentAlignment.MiddleLeft;
+        _readUsage.Dock = DockStyle.Right; _readUsage.MinimumSize = new Size(98, 32); _readUsage.Padding = new Padding(8, 0, 8, 0);
+        usageHeader.Controls.Add(_usageTitle); usageHeader.Controls.Add(_readUsage);
+        usage.Controls.Add(usageHeader, 0, 0);
         usage.Controls.Add(_remaining, 0, 1); usage.Controls.Add(_bar, 0, 2);
         _observed.Dock = DockStyle.Fill; _observed.TextAlign = ContentAlignment.BottomLeft;
         usage.Controls.Add(_observed, 0, 3); usage.Controls.Add(_reset, 0, 4);
+        usage.Controls.Add(_shortRemaining, 0, 5); usage.Controls.Add(_shortReset, 0, 6);
         layout.Controls.Add(usage, 0, 2);
         _switchHelp.Dock = DockStyle.Fill; _switchHelp.AutoSize = false;
         layout.Controls.Add(_switchHelp, 0, 4);
@@ -214,7 +226,7 @@ internal sealed class AccountManagerForm : Form
         await RunAsync(true, "브라우저에서 추가할 계정으로 로그인하세요. 현재 계정은 유지됩니다.", async () =>
         {
             using var cancellation = new CancellationTokenSource();
-            _loginCancellation = cancellation; _cancel.Visible = true; _cancel.Enabled = true;
+            _loginCancellation = cancellation; _cancel.Text = "로그인 취소"; _cancel.Visible = true; _cancel.Enabled = true;
             try
             {
                 using var login = await CodexAccountRuntime.LoginAsync(_store.RootPath, cancellation.Token);
@@ -224,6 +236,33 @@ internal sealed class AccountManagerForm : Form
             }
             finally { _loginCancellation = null; }
         });
+    }
+
+    private async Task ReadSelectedUsageAsync()
+    {
+        if (_busy || Selected is not { } account) return;
+        await RunAsync(false, $"‘{account.Label}’ 사용량을 조회하고 있습니다…", async () =>
+        {
+            using var cancellation = new CancellationTokenSource();
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellation.Token, timeout.Token);
+            _loginCancellation = cancellation; _cancel.Text = "조회 취소"; _cancel.Visible = true; _cancel.Enabled = true;
+            try
+            {
+                await _queryUsage(account, linked.Token);
+                Reload(account.Id);
+                SetStatus($"‘{account.Label}’ 사용량을 확인했습니다.", success: true);
+            }
+            catch (OperationCanceledException) when (timeout.IsCancellationRequested && !cancellation.IsCancellationRequested)
+            { throw new TimeoutException("조회 시간이 초과되었습니다. 마지막 확인값은 유지됩니다. 잠시 후 다시 시도하세요."); }
+            catch (UsageHelperShutdownException) { throw; }
+            catch (CodexUsageAuthenticationException)
+            { throw new InvalidOperationException(account.IsActive ? "현재 로그인을 갱신할 수 없습니다. Codex 앱에서 다시 로그인한 뒤 조회해 주세요."
+                : "저장된 로그인을 갱신할 수 없습니다. ‘다른 계정 추가’에서 같은 계정으로 다시 로그인해 주세요."); }
+            catch (IOException)
+            { throw new InvalidOperationException("사용량을 가져오지 못했습니다. 마지막 확인값은 유지됩니다. 연결을 확인한 뒤 다시 시도하세요."); }
+            finally { _loginCancellation = null; }
+        }, acquireGate: account.IsActive, canceledMessage: "사용량 조회를 취소했습니다. 마지막 확인값은 유지됩니다.");
     }
 
     private async Task SwitchSelectedAsync()
@@ -262,12 +301,13 @@ internal sealed class AccountManagerForm : Form
             if (dialog.ShowDialog(this) != DialogResult.OK) { SetStatus("복구를 취소했습니다. 미완료 기록은 보존됩니다."); return; }
             if (_store.IsEnabled) CodexAccountRuntime.ClearStaleLoginDirectories(_store.RootPath);
             _store.Recover(CodexAccountRuntime.AssertWritersStopped);
-            Reload(); _accountsChanged?.Invoke(); SetStatus("미완료 전환을 복구했습니다.", success: true);
+            Reload(); _accountsChanged?.Invoke(); SetStatus("중단된 계정 작업을 복구했습니다.", success: true);
             await Task.CompletedTask;
         });
     }
 
-    private async Task RunAsync(bool suspend, string message, Func<Task> action)
+    private async Task RunAsync(bool suspend, string message, Func<Task> action, bool acquireGate = true,
+        string canceledMessage = "로그인을 취소했습니다. 현재 계정은 유지됩니다.")
     {
         if (_busy) return;
         _busy = true; UpdateActions(); _progress.Visible = true; SetStatus(message);
@@ -277,11 +317,14 @@ internal sealed class AccountManagerForm : Form
         {
             _desktopPath ??= CodexAccountRuntime.CaptureDesktopLaunchPath();
             if (suspend) await _suspend();
-            try { ownsGate = gate.WaitOne(0); } catch (AbandonedMutexException) { ownsGate = true; }
-            if (!ownsGate) throw new InvalidOperationException("설치 또는 다른 계정 작업이 진행 중입니다. 완료 후 다시 시도하세요.");
+            if (acquireGate)
+            {
+                try { ownsGate = gate.WaitOne(0); } catch (AbandonedMutexException) { ownsGate = true; }
+                if (!ownsGate) throw new InvalidOperationException("설치 또는 다른 계정 작업이 진행 중입니다. 완료 후 다시 시도하세요.");
+            }
             await action();
         }
-        catch (OperationCanceledException) { SetStatus("로그인을 취소했습니다. 현재 계정은 유지됩니다."); }
+        catch (OperationCanceledException) { SetStatus(canceledMessage); }
         catch (Exception ex) { SetStatus(ex.Message, error: true); }
         finally
         {
@@ -317,9 +360,10 @@ internal sealed class AccountManagerForm : Form
             _empty.Visible = _items.Count == 0; _detail.Visible = _items.Count > 0;
             ShowSelected(); UpdateActions();
             if (_store.HasPendingRecovery) SetStatus("미완료 전환이 있습니다. 복구를 완료하면 다시 사용할 수 있습니다.", error: true);
+            else if (_store.HasPendingUsageQuery) SetStatus("중단된 사용량 조회가 있습니다. 복구하여 로그인 정보를 보존해 주세요.", error: true);
             else if (_items.Count > 0 && !_items.Any(a => a.IsActive)) SetStatus("현재 로그인은 아직 등록되지 않았습니다. 전환하려면 현재 계정을 먼저 등록하세요.");
             else if (!quiet && _items.Count == 0) SetStatus("현재 계정을 먼저 등록하세요. 이름은 자동으로 지정됩니다.");
-            return !_store.HasPendingRecovery && (_items.Count == 0 || _items.Any(a => a.IsActive));
+            return !_store.HasPendingRecovery && !_store.HasPendingUsageQuery && (_items.Count == 0 || _items.Any(a => a.IsActive));
         }
         catch (Exception ex) { SetStatus(ex.Message, error: true); return false; }
     }
@@ -330,12 +374,16 @@ internal sealed class AccountManagerForm : Form
         _title.Text = account.Label;
         _state.Text = account.IsActive ? "● 현재 사용 중" : "저장된 계정";
         _identity.Text = account.IdentityHint;
-        _usageTitle.Text = account.IsActive ? "주간 잔여 사용량" : "주간 잔여 사용량 · 저장된 값";
+        _usageTitle.Text = "주간 잔여 사용량";
         var expired = account.Usage?.ResetsAt is { } resetAt && resetAt <= DateTimeOffset.Now;
         _remaining.Text = expired ? "갱신 필요" : account.Usage is { } usage ? $"{Math.Clamp(100 - usage.UsedPercent, 0, 100)}%" : "미확인";
         _bar.Remaining = !expired && account.Usage is { } snapshot ? Math.Clamp(100 - snapshot.UsedPercent, 0, 100) : null;
         _observed.Text = account.ObservedAt is { } observed ? $"마지막 확인  {observed.ToLocalTime():MM-dd HH:mm}" : "아직 사용량을 확인하지 않았습니다.";
-        _reset.Text = expired ? "초기화 시점이 지났습니다. 이 계정 사용 시 다시 확인합니다." : account.Usage?.ResetsAt is { } reset ? $"초기화 예정  {reset.ToLocalTime():MM-dd HH:mm}" : "초기화 예정  —";
+        _reset.Text = expired ? "초기화 시점이 지났습니다. ‘사용량 조회’로 확인하세요." : account.Usage?.ResetsAt is { } reset ? $"초기화 예정  {reset.ToLocalTime():MM-dd HH:mm}" : "초기화 예정  —";
+        var shortWindow = account.Usage?.ShortWindow;
+        var shortExpired = shortWindow?.ResetsAt is { } shortReset && shortReset <= DateTimeOffset.Now;
+        _shortRemaining.Text = shortExpired ? "5시간 잔여  갱신 필요" : shortWindow is null ? "5시간 잔여  정보 없음" : $"5시간 잔여  {100 - shortWindow.UsedPercent}%";
+        _shortReset.Text = shortWindow?.ResetsAt is { } shortAt ? $"5시간 초기화  {shortAt.ToLocalTime():MM-dd HH:mm}" : "5시간 초기화  —";
         _switchHelp.Text = account.IsActive ? "이 계정을 사용하고 있습니다. 이름은 언제든 바꿀 수 있습니다." : "전환 준비 화면에서 Codex 종료 상태를 확인합니다.";
         _switch.Text = account.IsActive ? "현재 사용 중인 계정" : "이 계정으로 전환";
         UpdateActions();
@@ -343,9 +391,10 @@ internal sealed class AccountManagerForm : Form
 
     private void UpdateActions()
     {
-        var pending = _store.HasPendingRecovery;
+        var pending = _store.HasPendingRecovery || _store.HasPendingUsageQuery;
         _accounts.Enabled = !_busy;
         _refresh.Enabled = !_busy;
+        _readUsage.Enabled = !_busy && !pending && Selected is not null;
         _add.Enabled = !_busy && !pending && _items.Count > 0;
         _register.Enabled = !_busy && !pending;
         _registerActive.Visible = _items.Count > 0 && !_items.Any(a => a.IsActive) && !pending;
@@ -354,6 +403,7 @@ internal sealed class AccountManagerForm : Form
         _switch.Enabled = !_busy && !pending && _items.Any(a => a.IsActive) && Selected is { IsActive: false };
         _delete.Enabled = !_busy && !pending && Selected is { IsActive: false };
         _recover.Visible = pending; _recover.Enabled = !_busy;
+        _recover.Text = _store.HasPendingUsageQuery ? "중단된 조회 복구" : "미완료 전환 복구";
     }
 
     private void SetStatus(string message, bool error = false, bool success = false)

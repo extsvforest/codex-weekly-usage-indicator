@@ -36,7 +36,7 @@ internal static class AccountRuntimeTests
 
         var testBase = Environment.GetEnvironmentVariable("GFS_ACCOUNT_TEST_ROOT")
             ?? Path.Combine(Path.GetTempPath(), "gfs-agent", "260909_codex-account-switch", "tests");
-        var root = Path.Combine(testBase, "runtime-" + Guid.NewGuid().ToString("N"));
+        var root = Path.GetFullPath(Path.Combine(testBase, "runtime-" + Guid.NewGuid().ToString("N")));
         Directory.CreateDirectory(root);
         try
         {
