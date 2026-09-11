@@ -37,12 +37,18 @@ internal static class UsageTooltipHoverSmoke
                         input.Focus(); widget.Show(); await Task.Delay(150); input.Focus();
                         var foreground = GetForegroundWindow(); var focus = GetFocus();
                         var area = Screen.FromControl(focusForm).WorkingArea;
+                        var events = new List<string>();
+                        widget.MouseEnter += (_, _) => events.Add("enter");
+                        widget.MouseLeave += (_, _) => events.Add("leave");
+                        widget.LocationChanged += (_, _) => events.Add("move");
+                        widget.VisibleChanged += (_, _) => events.Add("visible=" + widget.Visible);
                         var positions = new[] { new Point(area.Right - widget.Width, area.Bottom - widget.Height), area.Location,
                             new Point(area.Right - widget.Width, area.Top), new Point(area.Left, area.Bottom - widget.Height) };
                         foreach (var position in positions)
                         {
                             Cursor.Position = new Point(area.Left + area.Width / 2, area.Top + area.Height / 2);
                             await Task.Delay(200); widget.Location = position; widget.MaintainVisiblePresentation();
+                            events.Clear();
                             var before = tooltip.ShowCount;
                             var pointer = new Point(widget.Left + widget.Width / 2, widget.Top + widget.Height / 2);
                             Cursor.Position = pointer;
@@ -70,7 +76,7 @@ internal static class UsageTooltipHoverSmoke
                             }
                             var pointerTarget = WindowFromPoint(pointer);
                             GetWindowThreadProcessId(pointerTarget, out var pointerProcess);
-                            Console.WriteLine($"Hover diagnostic: popups={tooltip.ShowCount - before}, visible={visibleSamples}, hiddenAfterShown={hiddenAfterShown}, cursorHeld={Cursor.Position == pointer}, targetIsWidget={pointerTarget == widget.Handle}, targetIsTestProcess={pointerProcess == Environment.ProcessId}");
+                            Console.WriteLine($"Hover diagnostic: popups={tooltip.ShowCount - before}, visible={visibleSamples}, hiddenAfterShown={hiddenAfterShown}, cursorHeld={Cursor.Position == pointer}, targetIsWidget={pointerTarget == widget.Handle}, targetIsTestProcess={pointerProcess == Environment.ProcessId}, events={string.Join(',', events)}");
                             Check(tooltip.ShowCount - before == 1 && visibleSamples >= 50 && hiddenAfterShown == 0, "one continuous popup survives four seconds of actual hover and maintenance");
                             Check(GetForegroundWindow() == foreground && GetFocus() == focus && input.Focused, "hover preserves foreground and keyboard focus");
                         }
