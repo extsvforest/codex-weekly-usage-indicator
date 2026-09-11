@@ -93,7 +93,8 @@ internal static class CombinedUsageUiSmoke
                         Check(calls == 6 && !form.CombinedUsage.IsComplete(DateTimeOffset.Now) && form.CombinedUsage.ConfirmedRemaining(DateTimeOffset.Now) == 87,
                             "one failed account is retained as previous data and excluded from the confirmed subtotal");
                         Capture(form, "combined-partial.png");
-                        mode = "cancel"; refresh.PerformClick(); await Until(() => calls == 8);
+                        mode = "cancel"; refresh.PerformClick(); await Until(() => calls >= 8 || !form.IsOperationInProgress);
+                        Check(calls == 8, $"cancel scenario entered requested member (calls={calls}, busy={form.IsOperationInProgress}, status={Find<Label>("StatusLabel").Text})");
                         Find<Button>("CancelLoginButton").PerformClick(); await Until(() => !form.IsOperationInProgress);
                         Check(calls == 8 && form.CombinedUsage.WasCanceled && !store.HasPendingUsageQuery, "cancel stops current request and never starts remaining account");
                         mode = "cleanup"; refresh.PerformClick(); await Until(() => !form.IsOperationInProgress);

@@ -32,7 +32,7 @@ internal sealed class CombinedUsagePanel : UserControl
         var now = DateTimeOffset.Now; var complete = snapshot.IsComplete(now); var count = snapshot.ConfirmedCount(now);
         _total.Text = complete ? $"{snapshot.ConfirmedRemaining(now)}%" : "—";
         _total.ForeColor = complete ? AccountUiTheme.Accent : AccountUiTheme.Muted;
-        _coverage.Text = complete ? $"총 {snapshot.Accounts.Count * 100}% 중 · 계정당 100% 기준" : !snapshot.IsBatch ? "개별 확인값 · 전체 갱신 필요" : count > 0
+        _coverage.Text = complete ? $"총 {snapshot.Accounts.Count * 100}% 중 · 계정당 100% 기준" : !snapshot.IsBatch ? (snapshot.CompletedAt is null ? "저장된 값 · 전체 갱신 필요" : "개별 확인값 · 전체 갱신 필요") : count > 0
             ? $"확인된 잔여 {snapshot.ConfirmedRemaining(now)}% · {count}/{snapshot.Accounts.Count}개" : "전체 합계 확인 필요";
         _coverage.ForeColor = complete ? AccountUiTheme.Muted : AccountUiTheme.Warning;
         var dated = snapshot.ByReset().Where(row => row.IsCurrent(now)).ToArray(); var next = dated.FirstOrDefault();

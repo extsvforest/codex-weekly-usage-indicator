@@ -18,7 +18,7 @@ internal static class UsageTooltipText
             text.AppendLine(combined.IsComplete(now)
                 ? $"전체 계정 · 주간 잔여 {combined.ConfirmedRemaining(now)}% / {combined.Accounts.Count * 100}%"
                 : "전체 계정 · 합계 갱신 필요");
-            text.AppendLine(!combined.IsBatch && combined.CompletedAt is not null ? "개별 확인값 · 전체 합계 갱신 필요" : combined.CompletedAt is { } at
+            text.AppendLine(combined.IsBatch && combined.CompletedAt is null ? $"전체 조회 중 · {combined.ConfirmedCount(now)}/{combined.Accounts.Count}개 확인" : !combined.IsBatch && combined.CompletedAt is not null ? "개별 확인값 · 전체 합계 갱신 필요" : combined.CompletedAt is { } at
                 ? $"{(combined.IsComplete(now) ? "전체 확인" : "마지막 조회")} {at.ToLocalTime():MM/dd HH:mm} 기준 · 계정당 100%"
                 : "저장된 값 · 계정 관리에서 전체 갱신해 주세요.");
             if (combined.IsBatch && !combined.IsComplete(now) && combined.ConfirmedCount(now) > 0)
