@@ -1,212 +1,163 @@
 namespace WeeklyUsageIndicator;
 
-internal sealed class AccountManagerForm : Form
+internal sealed partial class AccountManagerForm : Form
 {
     private readonly CodexAccountStore _store;
     private readonly Func<Task> _suspend;
     private readonly Action _resume;
     private readonly Action? _accountsChanged;
     private readonly Func<SavedCodexAccount, CancellationToken, Task> _queryUsage;
-    private readonly AccountListBox _accounts = new() { Name = "AccountList", Dock = DockStyle.Fill, DisplayMember = nameof(SavedCodexAccount.Label) };
-    private readonly Label _count = AccountUiTheme.Label("저장된 계정");
-    private readonly Label _status = AccountUiTheme.Label("계정을 선택해 상태를 확인하세요.");
-    private readonly Label _title = AccountUiTheme.Label("", 18, true);
-    private readonly Label _identity = AccountUiTheme.Label("", color: AccountUiTheme.Muted);
-    private readonly Label _state = AccountUiTheme.Label("", color: AccountUiTheme.Accent);
-    private readonly Label _remaining = AccountUiTheme.Label("미확인", 26, true);
-    private readonly Label _usageTitle = AccountUiTheme.Label("주간 잔여 사용량", color: AccountUiTheme.Muted);
-    private readonly Label _observed = AccountUiTheme.Label("", color: AccountUiTheme.Muted);
-    private readonly Label _reset = AccountUiTheme.Label("", color: AccountUiTheme.Muted);
-    private readonly Label _shortRemaining = AccountUiTheme.Label("", color: AccountUiTheme.Text);
-    private readonly Label _shortReset = AccountUiTheme.Label("", color: AccountUiTheme.Muted);
-    private readonly Label _switchHelp = AccountUiTheme.Label("", color: AccountUiTheme.Muted);
-    private readonly AccountUsageBar _bar = new() { Dock = DockStyle.Fill };
-    private readonly Button _add = AccountUiTheme.Button("AddAccountButton", "+ 다른 계정 추가", true);
+    private readonly AccountTable _accounts = new();
+    private readonly Label _count = AccountUiTheme.Label("저장된 계정", 11, true);
+    private readonly Label _status = AccountUiTheme.Label("");
+    private readonly Button _add = AccountUiTheme.Button("AddAccountButton", "+ 계정 추가");
+    private readonly Button _refreshAll = AccountUiTheme.Button("RefreshAllUsageButton", "전체 갱신", true);
     private readonly Button _register = AccountUiTheme.Button("RegisterCurrentButton", "현재 계정 등록", true);
     private readonly Button _registerActive = AccountUiTheme.Button("RegisterActiveAccountButton", "현재 계정 등록");
-    private readonly Button _rename = AccountUiTheme.Button("RenameAccountButton", "이름 변경");
-    private readonly Button _switch = AccountUiTheme.Button("SwitchAccountButton", "이 계정으로 전환", true);
-    private readonly Button _delete = AccountUiTheme.Button("DeleteAccountButton", "저장된 로그인 삭제");
-    private readonly Button _refresh = AccountUiTheme.Button("RefreshAccountsButton", "목록 갱신");
-    private readonly Button _readUsage = AccountUiTheme.Button("ReadAccountUsageButton", "사용량 조회");
+    private readonly ToolStripMenuItem _rename = new("이름 변경") { Name = "RenameAccountButton" };
+    private readonly ToolStripMenuItem _readUsage = new("이 계정 사용량 조회") { Name = "ReadAccountUsageButton" };
+    private readonly ToolStripMenuItem _delete = new("저장된 로그인 삭제") { Name = "DeleteAccountButton" };
+    private readonly ToolStripMenuItem _refresh = new("저장된 계정 목록 다시 읽기") { Name = "RefreshAccountsButton" };
+    private readonly ToolStripMenuItem _info = new("상세 정보") { Name = "AccountInfoMenuItem" };
+    private readonly ContextMenuStrip _menu = new();
+    private readonly ContextMenuStrip _pageMenu = new();
     private readonly Button _recover = AccountUiTheme.Button("RecoverAccountsButton", "미완료 전환 복구");
-    private readonly Button _cancel = AccountUiTheme.Button("CancelLoginButton", "로그인 취소");
-    private readonly Panel _detail = new() { Name = "AccountDetailPanel", Dock = DockStyle.Fill, BackColor = AccountUiTheme.Surface, AutoScroll = true };
+    private readonly Button _cancel = AccountUiTheme.Button("CancelLoginButton", "조회 취소");
     private readonly Panel _empty = new() { Dock = DockStyle.Fill, BackColor = AccountUiTheme.Surface };
     private readonly ProgressBar _progress = new() { Dock = DockStyle.Bottom, Height = 3, Style = ProgressBarStyle.Marquee, Visible = false };
     private readonly System.Windows.Forms.Timer _refreshTimer = new() { Interval = 5000 };
+    private readonly TableLayoutPanel _root = AccountUiTheme.Stack(6);
+    private readonly TableLayoutPanel _notice = new() { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1, Margin = new Padding(0, 0, 0, 12), Padding = new Padding(12, 6, 8, 6), BackColor = AccountUiTheme.Raised };
+    private readonly CombinedUsagePanel _overview = new() { Dock = DockStyle.Fill, Margin = new Padding(0, 0, 0, 20) };
+    private readonly CombinedUsageSnapshot _combined;
+    private readonly Action? _usageChanged;
     private IReadOnlyList<SavedCodexAccount> _items = Array.Empty<SavedCodexAccount>();
     private CancellationTokenSource? _loginCancellation;
-    private bool _busy;
-    private bool _reloading;
-    private string? _desktopPath;
+    private bool _busy, _reloading, _overviewInitialized, _batchQuerying, _closeAfterBatch;
+    private int _batchCompleted;
+    private string? _desktopPath, _operationMessage;
+    private bool _operationError, _operationSuccess;
+    private readonly bool _refreshAllOnOpen;
     private UsageQueryStatus _usageQueryStatus = new(UsageQueryState.None);
-    private string? _operationMessage;
-    private bool _operationError;
-    private bool _operationSuccess;
+    internal CombinedUsageSnapshot CombinedUsage => _combined;
     internal bool IsOperationInProgress => _busy;
+    internal ToolStripItem MenuAction(string name) => _menu.Items.Cast<ToolStripItem>().Concat(_pageMenu.Items.Cast<ToolStripItem>()).Single(i => i.Name == name);
+    internal Button? SelectedSwitchButton => _accounts.SelectedSwitchButton;
     private SavedCodexAccount? Selected => _accounts.SelectedItem as SavedCodexAccount;
 
     public AccountManagerForm(CodexAccountStore store, Func<Task> suspend, Action resume, Action? accountsChanged = null,
-        Func<SavedCodexAccount, CancellationToken, Task>? queryUsage = null)
+        Func<SavedCodexAccount, CancellationToken, Task>? queryUsage = null, bool refreshAllOnOpen = true, CombinedUsageSnapshot? combined = null, Action? usageChanged = null)
     {
-        SuspendLayout();
-        _store = store; _suspend = suspend; _resume = resume; _accountsChanged = accountsChanged;
+        SuspendLayout(); _store = store; _suspend = suspend; _resume = resume; _accountsChanged = accountsChanged;
         _queryUsage = queryUsage ?? ((account, token) => CodexAccountUsageReader.ReadInactiveAsync(store, account.Id, token));
-        Name = "AccountManagerForm";
-        AccountUiTheme.SetForm(this);
-        Text = "Codex 계정 관리";
-        ClientSize = new Size(980, 660);
-        MinimumSize = new Size(850, 520);
-        StartPosition = FormStartPosition.CenterScreen;
-        KeyPreview = true;
-        var root = AccountUiTheme.Stack(4);
-        root.Padding = new Padding(24);
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 76));
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 100));
-        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
-
-        var header = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1, Margin = new Padding(0) };
-        header.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100)); header.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-        var headings = AccountUiTheme.Stack(2);
-        headings.RowStyles.Add(new RowStyle(SizeType.Absolute, 42)); headings.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        headings.Controls.Add(AccountUiTheme.Label("Codex 계정", 22, true), 0, 0);
-        headings.Controls.Add(AccountUiTheme.Label("직접 고르고, 필요할 때 전환하세요.", color: AccountUiTheme.Muted), 0, 1);
-        _add.Anchor = AnchorStyles.Right | AnchorStyles.Top;
-        header.Controls.Add(headings, 0, 0); header.Controls.Add(_add, 1, 0);
-        root.Controls.Add(header, 0, 0);
-
-        var notice = new Panel { Dock = DockStyle.Fill, BackColor = AccountUiTheme.Raised, Padding = new Padding(14, 10, 14, 10), Margin = new Padding(0, 0, 0, 14) };
-        _status.Name = "StatusLabel"; _status.Dock = DockStyle.Fill; _status.AutoSize = false;
-        var noticeActions = new FlowLayoutPanel { Dock = DockStyle.Right, AutoSize = true, WrapContents = false, FlowDirection = FlowDirection.RightToLeft };
-        _cancel.Visible = false; _recover.Visible = false;
-        _registerActive.Visible = false;
-        noticeActions.Controls.Add(_cancel); noticeActions.Controls.Add(_recover); noticeActions.Controls.Add(_registerActive);
-        notice.Controls.Add(_status); notice.Controls.Add(noticeActions); notice.Controls.Add(_progress);
-        root.Controls.Add(notice, 0, 1);
-
-        var body = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1, Margin = new Padding(0) };
-        body.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 30)); body.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 70));
-        var sidebar = AccountUiTheme.Stack(2);
-        sidebar.BackColor = AccountUiTheme.Surface; sidebar.Margin = new Padding(0, 0, 16, 0);
-        sidebar.RowStyles.Add(new RowStyle(SizeType.Absolute, 52)); sidebar.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        var listHeader = new Panel { Dock = DockStyle.Fill, Padding = new Padding(14, 8, 10, 6) };
-        _count.Dock = DockStyle.Fill; _count.AutoSize = false; _count.TextAlign = ContentAlignment.MiddleLeft;
-        _refresh.Dock = DockStyle.Right; _refresh.MinimumSize = new Size(70, 32); _refresh.Padding = new Padding(6, 0, 6, 0);
-        listHeader.Controls.Add(_count); listHeader.Controls.Add(_refresh);
-        sidebar.Controls.Add(listHeader, 0, 0); sidebar.Controls.Add(_accounts, 0, 1);
-        body.Controls.Add(sidebar, 0, 0);
-        var right = new Panel { Dock = DockStyle.Fill, Margin = new Padding(0) };
-        BuildDetail(); BuildEmpty();
-        right.Controls.Add(_detail); right.Controls.Add(_empty);
-        body.Controls.Add(right, 1, 0);
-        root.Controls.Add(body, 0, 2);
-        var footer = AccountUiTheme.Label("‘사용량 조회’로 선택한 계정의 최신 값을 확인하세요. 다른 계정은 자동 조회하지 않습니다.", color: AccountUiTheme.Muted);
-        footer.Margin = new Padding(0, 8, 0, 0);
-        root.Controls.Add(footer, 0, 3);
-        Controls.Add(root);
-
-        _accounts.SelectedIndexChanged += (_, _) => { if (!_reloading) ShowSelected(); };
-        _refresh.Click += (_, _) => { if (!_busy && Reload()) SetStatus("계정 목록을 새로 확인했습니다."); };
-        _readUsage.Click += async (_, _) => await ReadSelectedUsageAsync();
-        _register.Click += async (_, _) => await RegisterCurrentAsync();
-        _registerActive.Click += async (_, _) => await RegisterCurrentAsync();
-        _rename.Click += (_, _) => RenameSelected();
-        _add.Click += async (_, _) => await AddAccountAsync();
-        _switch.Click += async (_, _) => await SwitchSelectedAsync();
-        _delete.Click += (_, _) => DeleteSelected();
-        _recover.Click += async (_, _) => await RecoverAsync();
+        _combined = combined ?? new(); _usageChanged = usageChanged;
+        _refreshAllOnOpen = refreshAllOnOpen; Name = "AccountManagerForm";
+        AccountUiTheme.SetForm(this); Text = "Codex 계정 관리";
+        ClientSize = new Size(920, 740); MinimumSize = new Size(780, 550); StartPosition = FormStartPosition.CenterScreen; KeyPreview = true;
+        _root.Padding = new Padding(24);
+        foreach (var h in new[] { 66, 192, 0, 42 }) _root.RowStyles.Add(new RowStyle(SizeType.Absolute, h));
+        _root.RowStyles.Add(new RowStyle(SizeType.Percent, 100)); _root.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
+        var header = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 3, RowCount = 1, Margin = new Padding(0) };
+        header.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100)); header.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize)); header.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        header.Controls.Add(AccountUiTheme.Label("Codex 계정", 22, true), 0, 0);
+        _add.Anchor = _refreshAll.Anchor = AnchorStyles.Top | AnchorStyles.Right; _add.Margin = new Padding(0, 0, 10, 0);
+        header.Controls.Add(_add, 1, 0); header.Controls.Add(_refreshAll, 2, 0);
+        _root.Controls.Add(header, 0, 0); _root.Controls.Add(_overview, 0, 1);
+        _status.Name = "StatusLabel"; _status.Dock = DockStyle.Fill; _status.AutoSize = false; _status.TextAlign = ContentAlignment.MiddleLeft;
+        _notice.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100)); _notice.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        var noticeActions = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = false, Margin = new Padding(8, 0, 0, 0), FlowDirection = FlowDirection.RightToLeft };
+        _cancel.Visible = _recover.Visible = _registerActive.Visible = false;
+        noticeActions.Controls.AddRange(new Control[] { _cancel, _recover, _registerActive });
+        _notice.Controls.Add(_status, 0, 0); _notice.Controls.Add(noticeActions, 1, 0); _root.Controls.Add(_notice, 0, 2);
+        var listHeader = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1, Margin = new Padding(0) };
+        listHeader.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100)); listHeader.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        listHeader.Controls.Add(_count, 0, 0);
+        var order = AccountUiTheme.Label("초기화가 가까운 순", color: AccountUiTheme.Muted); order.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+        listHeader.Controls.Add(order, 1, 0); _root.Controls.Add(listHeader, 0, 3);
+        var body = new Panel { Dock = DockStyle.Fill, Margin = new Padding(0) }; BuildEmpty(); body.Controls.Add(_accounts); body.Controls.Add(_empty); _root.Controls.Add(body, 0, 4);
+        var footer = AccountUiTheme.Label("패널을 새로 열 때 한 번 확인합니다. 이후에는 ‘전체 갱신’을 눌러 주세요.", 8.5f, color: AccountUiTheme.Muted);
+        footer.Margin = new Padding(0, 12, 0, 0); _root.Controls.Add(footer, 0, 5); Controls.Add(_root); Controls.Add(_progress);
+        foreach (var menu in new[] { _menu, _pageMenu }) { menu.BackColor = AccountUiTheme.Raised; menu.ForeColor = AccountUiTheme.Text; menu.Font = Font; menu.ShowImageMargin = false; }
+        _menu.Items.AddRange(new ToolStripItem[] { _readUsage, _rename, _info, new ToolStripSeparator(), _delete }); _pageMenu.Items.Add(_refresh); ContextMenuStrip = _pageMenu;
+        _accounts.ManageRequested += (_, anchor) => { UpdateActions(); _menu.Show(anchor, new Point(0, anchor.Height)); };
+        _accounts.SwitchRequested += async _ => await SwitchSelectedAsync();
+        _accounts.SelectedIndexChanged += (_, _) => { if (!_reloading) UpdateActions(); };
+        _refresh.Click += (_, _) => { if (!_busy && Reload()) SetStatus("저장된 계정 목록을 다시 읽었습니다."); };
+        _refreshAll.Click += async (_, _) => await ReadAllUsageAsync();
+        _readUsage.Click += async (_, _) => await ReadSelectedUsageAsync(); _rename.Click += (_, _) => RenameSelected();
+        _info.Click += (_, _) => ShowAccountInfo(); _delete.Click += (_, _) => DeleteSelected();
+        _register.Click += async (_, _) => await RegisterCurrentAsync(); _registerActive.Click += async (_, _) => await RegisterCurrentAsync();
+        _add.Click += async (_, _) => await AddAccountAsync(); _recover.Click += async (_, _) => await RecoverAsync();
         _cancel.Click += (_, _) => { _loginCancellation?.Cancel(); _cancel.Enabled = false; SetStatus("요청을 취소하고 로그인 정보를 안전하게 정리하고 있습니다…"); };
         KeyDown += (_, e) => { if (e.KeyCode == Keys.F2 && !_busy && Selected is not null) { e.Handled = true; RenameSelected(); } };
-        _refreshTimer.Tick += (_, _) => { if (!_busy && !OwnedForms.Any(f => f.Visible)) Reload(quiet: true); };
-        Shown += (_, _) =>
+        _refreshTimer.Tick += (_, _) => { if (!_busy && !_menu.Visible && !_pageMenu.Visible && !OwnedForms.Any(f => f.Visible)) Reload(quiet: true); };
+        Shown += async (_, _) =>
         {
-            var area = Screen.FromControl(this).WorkingArea;
-            Size = new Size(Math.Min(Width, area.Width), Math.Min(Height, area.Height));
+            var area = Screen.FromControl(this).WorkingArea; Size = new Size(Math.Min(Width, area.Width), Math.Min(Height, area.Height));
             Location = new Point(Math.Clamp(Left, area.Left, Math.Max(area.Left, area.Right - Width)), Math.Clamp(Top, area.Top, Math.Max(area.Top, area.Bottom - Height)));
             _desktopPath = CodexAccountRuntime.CaptureDesktopLaunchPath(); Reload(); _refreshTimer.Start();
+            if (_refreshAllOnOpen && _items.Count > 0 && !_store.HasPendingRecovery && _usageQueryStatus.State == UsageQueryState.None) await ReadAllUsageAsync();
         };
-        FormClosing += (_, e) => { if (_busy) { e.Cancel = true; SetStatus("진행 중인 작업이 있습니다. 취소 버튼으로 요청을 마친 뒤 닫아주세요."); } };
-        FormClosed += (_, _) => _refreshTimer.Stop();
-        ResumeLayout(performLayout: true);
-    }
-
-    private Task RegisterCurrentAsync() => RunAsync(true, "현재 계정을 등록하고 있습니다…", async () =>
+        FormClosing += (_, e) =>
         {
-            var account = _store.RegisterCurrent(NextName());
-            Reload(account.Id);
-            SetStatus($"‘{account.Label}’ 등록 완료. 이름은 오른쪽 ‘이름 변경’에서 바꿀 수 있습니다.", success: true);
-            _accountsChanged?.Invoke();
-            await Task.CompletedTask;
-        });
-
-    private void BuildDetail()
-    {
-        var layout = AccountUiTheme.Stack(7);
-        layout.Dock = DockStyle.Top;
-        layout.MinimumSize = new Size(0, 496);
-        layout.Height = 496;
-        layout.Padding = new Padding(22);
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 50));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 234));
-        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
-        var titleRow = new Panel { Dock = DockStyle.Fill };
-        _rename.Dock = DockStyle.Right;
-        _title.Dock = DockStyle.Fill; _title.AutoSize = false; _title.AutoEllipsis = true;
-        titleRow.Controls.Add(_title); titleRow.Controls.Add(_rename);
-        layout.Controls.Add(titleRow, 0, 0);
-        var identity = AccountUiTheme.Stack(2);
-        identity.RowStyles.Add(new RowStyle(SizeType.Percent, 50)); identity.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
-        _state.Dock = DockStyle.Fill; _identity.Dock = DockStyle.Fill;
-        identity.Controls.Add(_state, 0, 0); identity.Controls.Add(_identity, 0, 1);
-        layout.Controls.Add(identity, 0, 1);
-        var usage = AccountUiTheme.Stack(7);
-        usage.BackColor = AccountUiTheme.Raised; usage.Padding = new Padding(16, 10, 16, 10);
-        foreach (var height in new[] { 36, 47, 10, 28, 28, 30, 28 }) usage.RowStyles.Add(new RowStyle(SizeType.Absolute, height));
-        var usageHeader = new Panel { Dock = DockStyle.Fill, Margin = new Padding(0) };
-        _usageTitle.Dock = DockStyle.Fill; _usageTitle.AutoSize = false; _usageTitle.TextAlign = ContentAlignment.MiddleLeft;
-        _readUsage.Dock = DockStyle.Right; _readUsage.MinimumSize = new Size(98, 32); _readUsage.Padding = new Padding(8, 0, 8, 0);
-        usageHeader.Controls.Add(_usageTitle); usageHeader.Controls.Add(_readUsage);
-        usage.Controls.Add(usageHeader, 0, 0);
-        usage.Controls.Add(_remaining, 0, 1); usage.Controls.Add(_bar, 0, 2);
-        _observed.Dock = DockStyle.Fill; _observed.TextAlign = ContentAlignment.BottomLeft;
-        usage.Controls.Add(_observed, 0, 3); usage.Controls.Add(_reset, 0, 4);
-        usage.Controls.Add(_shortRemaining, 0, 5); usage.Controls.Add(_shortReset, 0, 6);
-        layout.Controls.Add(usage, 0, 2);
-        _switchHelp.Dock = DockStyle.Fill; _switchHelp.AutoSize = false;
-        layout.Controls.Add(_switchHelp, 0, 4);
-        _switch.Dock = DockStyle.Fill;
-        layout.Controls.Add(_switch, 0, 5);
-        _delete.Anchor = AnchorStyles.Left | AnchorStyles.Bottom;
-        _delete.MinimumSize = new Size(140, 28); _delete.Padding = new Padding(0); _delete.BackColor = AccountUiTheme.Surface;
-        _delete.ForeColor = AccountUiTheme.Muted;
-        layout.Controls.Add(_delete, 0, 6);
-        _detail.Controls.Add(layout);
-        _detail.Resize += (_, _) => layout.Height = Math.Max(layout.MinimumSize.Height, _detail.ClientSize.Height);
+            if (!_busy) return; e.Cancel = true;
+            if (_batchQuerying) { _closeAfterBatch = true; _loginCancellation?.Cancel(); SetStatus("전체 조회를 취소하고 안전하게 정리한 뒤 닫습니다…"); }
+            else SetStatus("진행 중인 작업이 있습니다. 취소 버튼으로 요청을 마친 뒤 닫아주세요.");
+        };
+        FormClosed += (_, _) => _refreshTimer.Stop(); ResumeLayout(true);
     }
-
+    private Task RegisterCurrentAsync() => RunAsync(true, "현재 계정을 등록하고 있습니다…", async () =>
+    {
+        var account = _store.RegisterCurrent(NextName()); Reload(account.Id);
+        SetStatus($"‘{account.Label}’ 등록 완료. 계정의 ··· 메뉴에서 이름을 바꿀 수 있습니다.", success: true);
+        _accountsChanged?.Invoke(); await Task.CompletedTask;
+    });
     private void BuildEmpty()
     {
-        var layout = AccountUiTheme.Stack(5); layout.Padding = new Padding(32);
-        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 35));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 80));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
-        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 65));
-        layout.Controls.Add(AccountUiTheme.Label("첫 계정을 등록하세요", 19, true), 0, 1);
-        var description = AccountUiTheme.Label("지금 Codex에서 사용하는 계정을 저장하면 시작할 수 있습니다.\n이름은 나중에 바꿀 수 있고, 현재 로그인은 유지됩니다.", color: AccountUiTheme.Muted);
-        description.Dock = DockStyle.Fill; description.AutoSize = false;
-        layout.Controls.Add(description, 0, 2);
-        _register.Dock = DockStyle.Fill;
-        layout.Controls.Add(_register, 0, 3);
-        _empty.Controls.Add(layout);
+        var layout = AccountUiTheme.Stack(4); layout.Padding = new Padding(24);
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 44)); layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 60));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 44)); layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        layout.Controls.Add(AccountUiTheme.Label("첫 계정을 등록하세요", 18, true), 0, 0);
+        var description = AccountUiTheme.Label("지금 사용하는 Codex 계정을 저장하면 시작할 수 있습니다.\n이름은 나중에 바꿀 수 있고, 현재 로그인은 유지됩니다.", color: AccountUiTheme.Muted);
+        layout.Controls.Add(description, 0, 1); layout.Controls.Add(_register, 0, 2); _empty.Controls.Add(layout);
     }
-
+    private void ShowAccountInfo()
+    {
+        if (Selected is not { } account) return;
+        using var dialog = new Form { Name = "AccountInfoDialog", Text = "계정 상세", ClientSize = new Size(460, 280), StartPosition = FormStartPosition.CenterParent, FormBorderStyle = FormBorderStyle.FixedDialog, MaximizeBox = false, MinimizeBox = false };
+        AccountUiTheme.SetForm(dialog);
+        var layout = AccountUiTheme.Stack(5); layout.Padding = new Padding(24);
+        foreach (var h in new[] { 44, 34, 58, 52, 44 }) layout.RowStyles.Add(new RowStyle(SizeType.Absolute, h));
+        layout.Controls.Add(AccountUiTheme.Label(account.Label, 16, true), 0, 0); layout.Controls.Add(AccountUiTheme.Label(account.IdentityHint, color: AccountUiTheme.Muted), 0, 1);
+        var shortWindow = account.Usage?.ShortWindow; var now = DateTimeOffset.Now;
+        var remaining = shortWindow is null ? "정보 없음" : shortWindow.ResetsAt <= now ? "갱신 필요" : $"{100 - shortWindow.UsedPercent}%";
+        layout.Controls.Add(AccountUiTheme.Label($"5시간 잔여  {remaining}\n초기화  {(shortWindow?.ResetsAt is { } reset ? reset.ToLocalTime().ToString("MM/dd HH:mm") : "—")}"), 0, 2);
+        layout.Controls.Add(AccountUiTheme.Label(account.ObservedAt is { } observed ? $"개별 조회의 마지막 확인  {observed.ToLocalTime():MM/dd HH:mm}\n전체 잔여량은 마지막 전체 확인 기준입니다." : "아직 사용량을 확인하지 않았습니다.", color: AccountUiTheme.Muted), 0, 3);
+        var close = AccountUiTheme.Button("CloseAccountInfoButton", "닫기"); close.DialogResult = DialogResult.OK; layout.Controls.Add(close, 0, 4); dialog.AcceptButton = dialog.CancelButton = close;
+        dialog.Controls.Add(layout); dialog.ShowDialog(this);
+    }
+    private void UpdateNotice()
+    {
+        var show = (_status.Text.Length > 0 && !_operationSuccess) || _loginCancellation is not null ||
+            _store.HasPendingRecovery || _usageQueryStatus.State != UsageQueryState.None || (_items.Count > 0 && !_items.Any(a => a.IsActive));
+        _notice.Visible = show;
+        var height = show ? (int)Math.Round((_operationError || _usageQueryStatus.State != UsageQueryState.None ? 100 : 72) * DeviceDpi / 96f) : 0;
+        if (_root.RowStyles.Count > 2 && _root.RowStyles[2].Height != height) _root.RowStyles[2].Height = height;
+    }
+    private void UpdateActions()
+    {
+        var pending = _store.HasPendingRecovery || _usageQueryStatus.State == UsageQueryState.RecoveryRequired;
+        _accounts.Enabled = !_busy; _refresh.Enabled = !_busy; _readUsage.Enabled = !_busy && !pending && Selected is not null;
+        _add.Enabled = !_busy && !pending && _items.Count > 0; _register.Enabled = !_busy && !pending;
+        _registerActive.Visible = _items.Count > 0 && !_items.Any(a => a.IsActive) && !pending; _registerActive.Enabled = !_busy;
+        _rename.Enabled = _info.Enabled = !_busy && !pending && Selected is not null;
+        _delete.Enabled = !_busy && !pending && Selected is { IsActive: false };
+        _recover.Visible = pending || _usageQueryStatus.State == UsageQueryState.CleanupPending; _recover.Enabled = !_busy;
+        _recover.Text = _store.HasPendingRecovery ? "미완료 전환 복구" : _usageQueryStatus.State == UsageQueryState.CleanupPending ? "임시 파일 정리" : "중단된 조회 복구";
+        _refreshAll.Enabled = !_busy && !pending && _items.Count > 0;
+        _overview.Display(_combined, _busy || pending, _batchCompleted, _batchQuerying);
+        _accounts.Display(_combined, _busy, !pending, _items.Any(a => a.IsActive)); UpdateNotice(); _usageChanged?.Invoke();
+    }
     private string NextName()
     {
         for (var n = 1; ; n++) if (!_items.Any(a => a.Label == $"계정 {n}")) return $"계정 {n}";
@@ -253,7 +204,12 @@ internal sealed class AccountManagerForm : Form
             _loginCancellation = cancellation; _cancel.Text = "조회 취소"; _cancel.Visible = true; _cancel.Enabled = true;
             try
             {
+                var requestedAt = DateTimeOffset.UtcNow;
                 await _queryUsage(account, linked.Token);
+                var observed = _store.ListAccounts().Single(a => a.Id == account.Id);
+                if (observed.ObservedAt is null || observed.ObservedAt < requestedAt)
+                    throw new InvalidOperationException("새 확인값을 저장하지 못했습니다. 다시 조회해 주세요.");
+                _combined.RecordIndividual(observed);
                 Reload(account.Id);
                 SetStatus($"‘{account.Label}’ 사용량을 확인했습니다.", success: true);
             }
@@ -352,10 +308,11 @@ internal sealed class AccountManagerForm : Form
                 try { _resume(); }
                 catch { SetStatus("계정 작업은 끝났지만 사용량 조회를 재개하지 못했습니다. 위젯을 다시 열어주세요.", error: true); }
             }
+            if (_closeAfterBatch) { _closeAfterBatch = false; BeginInvoke(new Action(Close)); }
         }
     }
 
-    private bool Reload(string? selectId = null, bool quiet = false)
+    internal bool Reload(string? selectId = null, bool quiet = false)
     {
         try
         {
@@ -373,52 +330,16 @@ internal sealed class AccountManagerForm : Form
                 _accounts.EndUpdate(); _reloading = false;
             }
             _count.Text = $"계정 {_items.Count}개";
-            _empty.Visible = _items.Count == 0; _detail.Visible = _items.Count > 0;
+            _empty.Visible = _items.Count == 0; _accounts.Visible = _items.Count > 0;
             _usageQueryStatus = _store.GetUsageQueryStatus();
+            if (!_overviewInitialized) { if (_combined.Accounts.Count == 0) _combined.Initialize(fresh, batch: false); else _combined.Reconcile(fresh); _overviewInitialized = true; }
+            else _combined.Reconcile(fresh);
             if (!quiet) { _operationMessage = null; _operationError = false; _operationSuccess = false; }
-            ShowSelected(); UpdateActions();
+            UpdateActions();
             RenderStatus();
             return !_store.HasPendingRecovery && _usageQueryStatus.State != UsageQueryState.RecoveryRequired && (_items.Count == 0 || _items.Any(a => a.IsActive));
         }
         catch (Exception ex) { SetStatus(ex.Message, error: true); return false; }
-    }
-
-    private void ShowSelected()
-    {
-        if (Selected is not { } account) { UpdateActions(); return; }
-        _title.Text = account.Label;
-        _state.Text = account.IsActive ? "● 현재 사용 중" : "저장된 계정";
-        _identity.Text = account.IdentityHint;
-        _usageTitle.Text = "주간 잔여 사용량";
-        var expired = account.Usage?.ResetsAt is { } resetAt && resetAt <= DateTimeOffset.Now;
-        _remaining.Text = expired ? "갱신 필요" : account.Usage is { } usage ? $"{Math.Clamp(100 - usage.UsedPercent, 0, 100)}%" : "미확인";
-        _bar.Remaining = !expired && account.Usage is { } snapshot ? Math.Clamp(100 - snapshot.UsedPercent, 0, 100) : null;
-        _observed.Text = account.ObservedAt is { } observed ? $"마지막 확인  {observed.ToLocalTime():MM-dd HH:mm}" : "아직 사용량을 확인하지 않았습니다.";
-        _reset.Text = expired ? "초기화 시점이 지났습니다. ‘사용량 조회’로 확인하세요." : account.Usage?.ResetsAt is { } reset ? $"초기화 예정  {reset.ToLocalTime():MM-dd HH:mm}" : "초기화 예정  —";
-        var shortWindow = account.Usage?.ShortWindow;
-        var shortExpired = shortWindow?.ResetsAt is { } shortReset && shortReset <= DateTimeOffset.Now;
-        _shortRemaining.Text = shortExpired ? "5시간 잔여  갱신 필요" : shortWindow is null ? "5시간 잔여  정보 없음" : $"5시간 잔여  {100 - shortWindow.UsedPercent}%";
-        _shortReset.Text = shortWindow?.ResetsAt is { } shortAt ? $"5시간 초기화  {shortAt.ToLocalTime():MM-dd HH:mm}" : "5시간 초기화  —";
-        _switchHelp.Text = account.IsActive ? "이 계정을 사용하고 있습니다. 이름은 언제든 바꿀 수 있습니다." : "전환 준비 화면에서 Codex 종료 상태를 확인합니다.";
-        _switch.Text = account.IsActive ? "현재 사용 중인 계정" : "이 계정으로 전환";
-        UpdateActions();
-    }
-
-    private void UpdateActions()
-    {
-        var pending = _store.HasPendingRecovery || _usageQueryStatus.State == UsageQueryState.RecoveryRequired;
-        _accounts.Enabled = !_busy;
-        _refresh.Enabled = !_busy;
-        _readUsage.Enabled = !_busy && !pending && Selected is not null;
-        _add.Enabled = !_busy && !pending && _items.Count > 0;
-        _register.Enabled = !_busy && !pending;
-        _registerActive.Visible = _items.Count > 0 && !_items.Any(a => a.IsActive) && !pending;
-        _registerActive.Enabled = !_busy;
-        _rename.Enabled = !_busy && !pending && Selected is not null;
-        _switch.Enabled = !_busy && !pending && _items.Any(a => a.IsActive) && Selected is { IsActive: false };
-        _delete.Enabled = !_busy && !pending && Selected is { IsActive: false };
-        _recover.Visible = pending || _usageQueryStatus.State == UsageQueryState.CleanupPending; _recover.Enabled = !_busy;
-        _recover.Text = _store.HasPendingRecovery ? "미완료 전환 복구" : _usageQueryStatus.State == UsageQueryState.CleanupPending ? "임시 파일 정리" : "중단된 조회 복구";
     }
 
     private void SetStatus(string message, bool error = false, bool success = false)
@@ -435,16 +356,17 @@ internal sealed class AccountManagerForm : Form
             ? "로그인 정보 저장 완료 · 임시 파일 정리 대기" + (_usageQueryStatus.Failure is { } failure ? $" ({failure.Summary})" : "") : null;
         var fallback = _items.Count == 0 ? "현재 계정을 먼저 등록하세요. 이름은 자동으로 지정됩니다."
             : !_items.Any(a => a.IsActive) ? "현재 로그인은 아직 등록되지 않았습니다. 전환하려면 현재 계정을 먼저 등록하세요."
-            : "계정을 선택해 상태를 확인하세요.";
-        _status.Text = string.Join("\n", new[] { _operationMessage, recovery, cleanup }.Where(text => text is not null));
+            : "";
+        _status.Text = string.Join("\n", new[] { _operationMessage, recovery, cleanup, _items.Count > 0 && !_items.Any(a => a.IsActive) ? "현재 로그인은 미등록 상태입니다. 먼저 등록해 주세요." : null }.Where(text => text is not null));
         if (_status.Text.Length == 0) _status.Text = fallback;
         _status.ForeColor = _operationError || recovery is not null ? AccountUiTheme.Error
             : _operationSuccess && cleanup is null ? AccountUiTheme.Accent : AccountUiTheme.Text;
+        UpdateNotice();
     }
 
     protected override void Dispose(bool disposing)
     {
-        if (disposing) _refreshTimer.Dispose();
+        if (disposing) { _refreshTimer.Dispose(); _menu.Dispose(); _pageMenu.Dispose(); }
         base.Dispose(disposing);
     }
 }

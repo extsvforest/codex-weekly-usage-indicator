@@ -27,19 +27,19 @@ internal static class AccountUiSmoke
                 File.WriteAllBytes(Path.Combine(home, "auth.json"), Fixture("a"));
                 var store = new CodexAccountStore(Path.Combine(root, "vault"), home);
                 var suspended = 0; var resumed = 0;
-                using var form = new AccountManagerForm(store, () => { suspended++; return Task.CompletedTask; }, () => resumed++);
+                using var form = new AccountManagerForm(store, () => { suspended++; return Task.CompletedTask; }, () => resumed++, refreshAllOnOpen: false);
                 form.Show();
                 Application.DoEvents();
                 Capture(form, output, "-empty");
                 Button(form, "RegisterCurrentButton").PerformClick();
                 Check(store.IsEnabled && store.ListAccounts().Single().Label == "계정 1", "registration needs no name entry");
-                var list = Find<ListBox>(form, "AccountList");
+                var list = Find<AccountTable>(form, "AccountList");
                 Check(list.Items.Count == 1 && list.SelectedIndex == 0, "registration immediately selects the account");
                 Check(!form.IsOperationInProgress && suspended == 1 && resumed == 1, "registration restores operation state");
-                Check(!Button(form, "SwitchAccountButton").Enabled && !Button(form, "DeleteAccountButton").Enabled, "current account cannot switch or delete");
-                Check(Button(form, "RenameAccountButton").Enabled, "current account can rename");
+                Check(!form.SelectedSwitchButton!.Enabled && !form.MenuAction("DeleteAccountButton").Enabled, "current account cannot switch or delete");
+                Check(form.MenuAction("RenameAccountButton").Enabled, "current account can rename");
 
-                RespondToDialog(() => Button(form, "RenameAccountButton").PerformClick(), "AccountNameDialog", dialog =>
+                RespondToDialog(() => form.MenuAction("RenameAccountButton").PerformClick(), "AccountNameDialog", dialog =>
                 {
                     var input = Find<TextBox>(dialog, "AccountNameTextBox");
                     Check(input.Text == "계정 1", "rename opens with current name");
@@ -67,7 +67,7 @@ internal static class AccountUiSmoke
                 });
                 Check(store.ListAccounts().Single().Label == "Pro A · 주 계정", "save renames current account");
                 Check(suspended == 1 && resumed == 1, "metadata rename must not restart helper");
-                RespondToDialog(() => Button(form, "RenameAccountButton").PerformClick(), "AccountNameDialog", dialog =>
+                RespondToDialog(() => form.MenuAction("RenameAccountButton").PerformClick(), "AccountNameDialog", dialog =>
                 {
                     Find<TextBox>(dialog, "AccountNameTextBox").Text = "discard this";
                     Button(dialog, "CancelNameButton").PerformClick();
@@ -82,7 +82,7 @@ internal static class AccountUiSmoke
                     Button(dialog, "CancelNameButton").PerformClick();
                 });
                 Check(store.ListAccounts().Count == 1 && suspended == 1, "canceling add must not start login or interrupt helper");
-                RespondToDialog(() => Button(form, "RenameAccountButton").PerformClick(), "AccountNameDialog", dialog =>
+                RespondToDialog(() => form.MenuAction("RenameAccountButton").PerformClick(), "AccountNameDialog", dialog =>
                 {
                     Find<TextBox>(dialog, "AccountNameTextBox").Text = " ";
                     Button(dialog, "SaveNameButton").PerformClick();
@@ -93,12 +93,12 @@ internal static class AccountUiSmoke
                 var second = Path.Combine(root, "second.json");
                 File.WriteAllBytes(second, Fixture("b"));
                 store.ImportLoginFile(second, "Pro B · 추가 계정");
-                Button(form, "RefreshAccountsButton").PerformClick();
+                form.MenuAction("RefreshAccountsButton").PerformClick();
                 Check(list.Items.Count == 2, "refresh loads saved accounts");
                 list.SelectedIndex = 1;
                 Application.DoEvents();
-                Check(Button(form, "SwitchAccountButton").Enabled && Button(form, "DeleteAccountButton").Enabled, "saved account exposes switch and delete");
-                RespondToDialog(() => Button(form, "RenameAccountButton").PerformClick(), "AccountNameDialog", dialog =>
+                Check(form.SelectedSwitchButton!.Enabled && form.MenuAction("DeleteAccountButton").Enabled, "saved account exposes switch and delete");
+                RespondToDialog(() => form.MenuAction("RenameAccountButton").PerformClick(), "AccountNameDialog", dialog =>
                 {
                     Find<TextBox>(dialog, "AccountNameTextBox").Text = "Pro B · 보조 계정";
                     Button(dialog, "SaveNameButton").PerformClick();
@@ -142,14 +142,14 @@ internal static class AccountUiSmoke
                 Capture(form, output, "");
                 form.Size = form.MinimumSize;
                 Capture(form, output, "-minimum");
-                var detail = Find<Panel>(form, "AccountDetailPanel");
-                detail.ScrollControlIntoView(Button(form, "DeleteAccountButton"));
+                var switchButton = form.SelectedSwitchButton!;
+                list.ScrollControlIntoView(switchButton);
                 Application.DoEvents();
-                Check(detail.RectangleToScreen(detail.ClientRectangle).Contains(Button(form, "DeleteAccountButton").RectangleToScreen(Button(form, "DeleteAccountButton").ClientRectangle)), "minimum-size detail scroll exposes lower actions");
+                Check(list.RectangleToScreen(list.ClientRectangle).Contains(switchButton.RectangleToScreen(switchButton.ClientRectangle)), "minimum-size account list exposes row actions by scrolling");
                 Capture(form, output, "-minimum-actions");
                 File.WriteAllBytes(Path.Combine(home, "auth.json"), Fixture("c"));
-                Button(form, "RefreshAccountsButton").PerformClick();
-                Check(Button(form, "RegisterActiveAccountButton").Visible && !Button(form, "SwitchAccountButton").Enabled, "unregistered current account has a registration path before switching");
+                form.MenuAction("RefreshAccountsButton").PerformClick();
+                Check(Button(form, "RegisterActiveAccountButton").Visible && !form.SelectedSwitchButton!.Enabled, "unregistered current account has a registration path before switching");
                 Capture(form, output, "-unregistered");
                 Button(form, "RegisterActiveAccountButton").PerformClick();
                 Check(store.ListAccounts().Count == 3 && store.ListAccounts().Single(a => a.IsActive).Label == "계정 1", "external current account can register without re-login");

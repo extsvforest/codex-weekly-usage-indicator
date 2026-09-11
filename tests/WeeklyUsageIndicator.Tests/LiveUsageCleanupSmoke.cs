@@ -23,7 +23,7 @@ internal static class LiveUsageCleanupSmoke
                 if (CodexAccountRuntime.CaptureDesktopLaunchPath() is null) throw new InvalidOperationException("Desktop must remain running.");
                 var callbacks = 0;
                 using var form = new AccountManagerForm(store, () => { callbacks++; return Task.CompletedTask; }, () => callbacks++,
-                    queryUsage: (_, _) => { callbacks++; throw new InvalidOperationException("Cleanup must not query usage."); });
+                    queryUsage: (_, _) => { callbacks++; throw new InvalidOperationException("Cleanup must not query usage."); }, refreshAllOnOpen: false);
                 form.Shown += async (_, _) =>
                 {
                     try

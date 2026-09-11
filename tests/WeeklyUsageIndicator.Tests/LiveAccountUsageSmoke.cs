@@ -26,14 +26,14 @@ internal static class LiveAccountUsageSmoke
                 var original = File.ReadAllBytes(authPath);
                 var startedAt = DateTimeOffset.UtcNow;
                 var suspendCount = 0;
-                using var form = new AccountManagerForm(store, () => { suspendCount++; return Task.CompletedTask; }, () => suspendCount++);
+                using var form = new AccountManagerForm(store, () => { suspendCount++; return Task.CompletedTask; }, () => suspendCount++, refreshAllOnOpen: false);
                 form.Shown += async (_, _) =>
                 {
                     try
                     {
-                        var list = (ListBox)form.Controls.Find("AccountList", true).Single();
+                        var list = (AccountTable)form.Controls.Find("AccountList", true).Single();
                         list.SelectedIndex = list.Items.Cast<SavedCodexAccount>().ToList().FindIndex(a => a.Id == target[0].Id);
-                        var button = (Button)form.Controls.Find("ReadAccountUsageButton", true).Single();
+                        var button = form.MenuAction("ReadAccountUsageButton");
                         button.PerformClick();
                         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(45));
                         while (form.IsOperationInProgress) await Task.Delay(50, timeout.Token);

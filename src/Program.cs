@@ -62,7 +62,7 @@ internal sealed class UsageIndicatorForm : Form
     private readonly CodexDesktopStateReader _codexStateReader = new();
     private readonly System.Windows.Forms.Timer _pollTimer = new() { Interval = 60_000 };
     private readonly System.Windows.Forms.Timer _codexStateTimer = new() { Interval = 1_000 };
-    private readonly ToolTip _toolTip = new()
+    private readonly UsageToolTip _toolTip = new()
     {
         InitialDelay = 350,
         ReshowDelay = 100,
@@ -86,6 +86,7 @@ internal sealed class UsageIndicatorForm : Form
     private bool _positionInitialized;
     private readonly CodexAccountStore _accountStore = new();
     private AccountManagerForm? _accountManager;
+    private readonly CombinedUsageSnapshot _combinedUsage = new();
     private NotifyIcon? _accountTray;
     private bool _accountBusy;
     private long _accountGeneration;
@@ -146,7 +147,7 @@ internal sealed class UsageIndicatorForm : Form
             if (openAccounts) ShowAccountManager();
         };
 
-        MouseEnter += (_, _) => { _isHovered = true; Invalidate(); };
+        MouseEnter += (_, _) => { _isHovered = true; UpdateToolTip(); Invalidate(); };
         MouseLeave += (_, _) => { _isHovered = false; Invalidate(); };
         MouseDown += HandleMouseDown;
         MouseMove += HandleMouseMove;
@@ -397,12 +398,20 @@ internal sealed class UsageIndicatorForm : Form
 
     private void UpdateToolTip()
     {
-        _toolTip.SetToolTip(this, BuildTooltipText(
-            _codexSnapshot,
-            _claudeUsage,
-            _codexError,
-            _claudeError,
-            _showClaude));
+        IReadOnlyList<SavedCodexAccount> accounts = Array.Empty<SavedCodexAccount>();
+        if (!_previewMode)
+        {
+            try
+            {
+                accounts = _accountStore.IsEnabled ? _accountStore.ListAccounts() : Array.Empty<SavedCodexAccount>();
+                if (_combinedUsage.Accounts.Count == 0) _combinedUsage.Initialize(accounts, batch: false);
+                else _combinedUsage.Reconcile(accounts);
+            }
+            catch (AccountStoreBusyException) { }
+            catch (Exception) { }
+        }
+        _toolTip.SetToolTip(this, BuildTooltipText(_codexSnapshot, _claudeUsage, _codexError, _claudeError,
+            _showClaude, _combinedUsage, accounts.FirstOrDefault(a => a.IsActive)?.Label));
     }
 
     private async Task RefreshCodexAsync()
@@ -446,7 +455,7 @@ internal sealed class UsageIndicatorForm : Form
         if (_previewMode) return;
         if (_accountManager is null || _accountManager.IsDisposed)
             _accountManager = new AccountManagerForm(_accountStore, SuspendAccountsAsync, ResumeAccounts,
-                queryUsage: QueryAccountUsageAsync);
+                queryUsage: QueryAccountUsageAsync, combined: _combinedUsage, usageChanged: UpdateToolTip);
         _accountManager.Show();
         _accountManager.Activate();
     }
@@ -630,15 +639,9 @@ internal sealed class UsageIndicatorForm : Form
         }
     }
 
-    internal static string BuildTooltipText(
-        UsageSnapshot? codex,
-        ClaudeUsageResult? claude,
-        string? codexError,
-        string? claudeError,
-        bool showClaude)
-    {
-        return BuildDetailsText(codex, claude, codexError, claudeError, showClaude, includeControls: true);
-    }
+    internal static string BuildTooltipText(UsageSnapshot? codex, ClaudeUsageResult? claude,
+        string? codexError, string? claudeError, bool showClaude, CombinedUsageSnapshot? combined = null, string? activeLabel = null)
+        => UsageTooltipText.Build(codex, claude, codexError, claudeError, showClaude, combined, activeLabel);
 
     private static string BuildClipboardText(
         UsageSnapshot? codex,

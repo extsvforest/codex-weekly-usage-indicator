@@ -12,6 +12,12 @@ if (args.Contains("--live-usage-cleanup-smoke"))
     return;
 }
 
+if (args.Contains("--combined-ui-smoke")) { await CombinedUsageUiSmoke.RunAsync(); return; }
+
+if (args.Contains("--live-combined-usage-smoke")) { await LiveCombinedUsageSmoke.RunAsync(); return; }
+
+if (args.Contains("--tooltip-ui-smoke")) { await UsageTooltipUiSmoke.RunAsync(); return; }
+
 var tests = new (string Name, Func<Task> Run)[]
 {
     ("Codex app-server lifecycle isolation", AppServerLifecycleTests.RunAsync),
@@ -20,6 +26,10 @@ var tests = new (string Name, Func<Task> Run)[]
     ("isolated Codex login runtime", AccountRuntimeTests.RunAsync),
     ("account manager registration, rename, cancellation and input focus", AccountUiSmoke.RunAsync),
     ("manual usage buttons, async failure and cancellation", AccountUsageUiSmoke.RunAsync),
+    ("combined weekly snapshot coverage and reset boundaries", CombinedUsageTests.RunAsync),
+    ("combined manager opening, refresh, cancellation and cleanup", CombinedUsageUiSmoke.RunAsync),
+    ("multi-account tooltip observations and refresh boundaries", UsageTooltipTests.RunAsync),
+    ("native light tooltip layout and focus", UsageTooltipUiSmoke.RunAsync),
     ("supervisor retries abnormal exits but respects normal Quit", TestSupervisorAsync),
     ("official Claude /usage output is parsed", TestObservedUsageOutputAsync),
     ("usage without reset times remains valid through client and tooltip", TestUsageWithoutResetsAsync),
