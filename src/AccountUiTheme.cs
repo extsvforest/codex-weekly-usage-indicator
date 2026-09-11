@@ -4,15 +4,15 @@ namespace WeeklyUsageIndicator;
 
 internal static class AccountUiTheme
 {
-    internal static readonly Color Background = Color.FromArgb(22, 24, 28);
-    internal static readonly Color Surface = Color.FromArgb(29, 32, 38);
-    internal static readonly Color Raised = Color.FromArgb(40, 44, 52);
-    internal static readonly Color Border = Color.FromArgb(58, 64, 74);
-    internal static readonly Color Text = Color.FromArgb(238, 241, 244);
-    internal static readonly Color Muted = Color.FromArgb(161, 172, 186);
-    internal static readonly Color Accent = Color.FromArgb(145, 218, 195);
-    internal static readonly Color Error = Color.FromArgb(255, 166, 158);
-    internal static readonly Color Warning = Color.FromArgb(243, 203, 137);
+    internal static readonly Color Background = Color.FromArgb(246, 247, 244);
+    internal static readonly Color Surface = Color.FromArgb(255, 255, 253);
+    internal static readonly Color Raised = Color.FromArgb(233, 237, 232);
+    internal static readonly Color Border = Color.FromArgb(210, 218, 211);
+    internal static readonly Color Text = Color.FromArgb(34, 43, 37);
+    internal static readonly Color Muted = Color.FromArgb(94, 108, 99);
+    internal static readonly Color Accent = Color.FromArgb(34, 115, 86);
+    internal static readonly Color Error = Color.FromArgb(171, 52, 42);
+    internal static readonly Color Warning = Color.FromArgb(143, 86, 13);
 
     internal static Label Label(string text, float size = 9.5f, bool bold = false, Color? color = null) => new()
     {
@@ -27,7 +27,7 @@ internal static class AccountUiTheme
         Padding = new Padding(12, 4, 12, 4), Margin = new Padding(0),
         FlatStyle = FlatStyle.Flat, BackColor = primary ? Accent : Raised,
         ForeColor = primary ? Background : Text, Cursor = Cursors.Hand,
-        UseVisualStyleBackColor = false, FlatAppearance = { BorderSize = 0, MouseOverBackColor = primary ? Color.FromArgb(175, 235, 216) : Color.FromArgb(56, 61, 72) }
+        UseVisualStyleBackColor = false, FlatAppearance = { BorderSize = 0, MouseOverBackColor = primary ? Color.FromArgb(26, 98, 72) : Color.FromArgb(220, 228, 221) }
     };
 
     internal static void SetForm(Form form)
@@ -62,63 +62,6 @@ internal sealed class AccountButton : Button
         e.Graphics.Clear(AccountUiTheme.Raised);
         TextRenderer.DrawText(e.Graphics, Text, Font, ClientRectangle, AccountUiTheme.Muted,
             TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
-    }
-}
-
-internal sealed class AccountListBox : ListBox
-{
-    internal AccountListBox()
-    {
-        DrawMode = DrawMode.OwnerDrawFixed;
-        BorderStyle = BorderStyle.None;
-        BackColor = AccountUiTheme.Surface;
-        ForeColor = AccountUiTheme.Text;
-        IntegralHeight = false;
-        ItemHeight = 82;
-        DoubleBuffered = true;
-    }
-
-    protected override void OnHandleCreated(EventArgs e)
-    {
-        base.OnHandleCreated(e);
-        ItemHeight = (int)Math.Round(82 * DeviceDpi / 96.0);
-    }
-
-    protected override void OnDpiChangedAfterParent(EventArgs e)
-    {
-        base.OnDpiChangedAfterParent(e);
-        ItemHeight = (int)Math.Round(82 * DeviceDpi / 96.0);
-    }
-
-    protected override void OnDrawItem(DrawItemEventArgs e)
-    {
-        if (e.Index < 0 || e.Index >= Items.Count || Items[e.Index] is not SavedCodexAccount account) return;
-        var selected = (e.State & DrawItemState.Selected) != 0;
-        var scale = DeviceDpi / 96f;
-        int S(int value) => (int)Math.Round(value * scale);
-        using var background = new SolidBrush(selected ? Color.FromArgb(43, 57, 57) : AccountUiTheme.Surface);
-        e.Graphics.FillRectangle(background, e.Bounds);
-        if (selected)
-        {
-            using var accent = new SolidBrush(AccountUiTheme.Accent);
-            e.Graphics.FillRectangle(accent, e.Bounds.Left, e.Bounds.Top + S(8), S(3), e.Bounds.Height - S(16));
-        }
-        var inset = S(16);
-        var badgeWidth = account.IsActive ? S(48) : 0;
-        var title = new Rectangle(e.Bounds.Left + inset, e.Bounds.Top + S(13), e.Bounds.Width - inset * 2 - badgeWidth, S(25));
-        using var titleFont = new Font(Font, FontStyle.Bold);
-        TextRenderer.DrawText(e.Graphics, account.Label, titleFont, title, AccountUiTheme.Text,
-            TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
-        if (account.IsActive)
-        {
-            var badge = new Rectangle(e.Bounds.Right - inset - badgeWidth, title.Top, badgeWidth, title.Height);
-            TextRenderer.DrawText(e.Graphics, "사용 중", Font, badge, AccountUiTheme.Accent,
-                TextFormatFlags.Right | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
-        }
-        var hint = new Rectangle(title.Left, e.Bounds.Top + S(43), e.Bounds.Width - inset * 2, S(24));
-        TextRenderer.DrawText(e.Graphics, account.IdentityHint, Font, hint, AccountUiTheme.Muted,
-            TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
-        if ((e.State & DrawItemState.Focus) != 0 && Focused) e.DrawFocusRectangle();
     }
 }
 
