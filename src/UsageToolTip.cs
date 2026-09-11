@@ -9,6 +9,7 @@ internal sealed class UsageToolTip : IDisposable
     private readonly System.Windows.Forms.Timer _hoverDelay = new();
     private Control? _hoverOwner;
     private string _hoverText = "";
+    private bool _dismissedForVisit;
     internal int InitialDelay { get; set; } = 350;
     internal bool IsVisible => _window is { Visible: true };
     internal Rectangle? VisibleBounds => IsVisible ? _window!.Bounds : null;
@@ -21,19 +22,31 @@ internal sealed class UsageToolTip : IDisposable
     internal void TrackHover(Control owner)
     {
         _hoverOwner = owner;
-        owner.MouseEnter += StartHover;
+        owner.MouseEnter += BeginVisit;
+        owner.MouseMove += StartHover;
         owner.MouseLeave += EndHover;
-        owner.MouseDown += EndHover;
+        owner.MouseDown += DismissHover;
         owner.LocationChanged += EndHover;
         owner.VisibleChanged += EndHover;
         _hoverDelay.Tick += ShowHover;
     }
+    private void BeginVisit(object? sender, EventArgs e)
+    {
+        _dismissedForVisit = false;
+        StartHover(sender, e);
+    }
     private void StartHover(object? sender, EventArgs e)
     {
-        _hoverDelay.Stop();
-        if (Control.MouseButtons != MouseButtons.None) return;
+        // Windows can retain its MouseEnter state across an owned popup or a
+        // relocated widget. MouseMove also arms a new hover, without restarting it.
+        if (_dismissedForVisit || IsVisible || _hoverDelay.Enabled || Control.MouseButtons != MouseButtons.None) return;
         _hoverDelay.Interval = Math.Max(1, InitialDelay);
         _hoverDelay.Start();
+    }
+    private void DismissHover(object? sender, EventArgs e)
+    {
+        _dismissedForVisit = true;
+        EndHover(sender, e);
     }
     private void EndHover(object? sender, EventArgs e)
     {
@@ -106,7 +119,8 @@ internal sealed class UsageToolTip : IDisposable
         _hoverDelay.Dispose(); _window?.Dispose();
         if (_hoverOwner is { } owner)
         {
-            owner.MouseEnter -= StartHover; owner.MouseLeave -= EndHover; owner.MouseDown -= EndHover;
+            owner.MouseEnter -= BeginVisit; owner.MouseMove -= StartHover;
+            owner.MouseLeave -= EndHover; owner.MouseDown -= DismissHover;
             owner.LocationChanged -= EndHover; owner.VisibleChanged -= EndHover;
         }
         _font.Dispose(); _heading.Dispose();
@@ -125,6 +139,12 @@ internal sealed class UsageToolTip : IDisposable
             DoubleBuffered = true;
         }
         protected override bool ShowWithoutActivation => true;
+        protected override void OnDpiChanged(DpiChangedEventArgs e)
+        {
+            // ShowHover already measures and places the window at the owner's DPI.
+            base.OnDpiChanged(e);
+            e.Cancel = true;
+        }
         protected override CreateParams CreateParams
         {
             get
