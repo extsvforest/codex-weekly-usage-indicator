@@ -80,6 +80,12 @@ internal static class UsageTooltipHoverSmoke
                             Check(tooltip.ShowCount - before == 1 && visibleSamples >= 50 && hiddenAfterShown == 0, "one continuous popup survives four seconds of actual hover and maintenance");
                             Check(GetForegroundWindow() == foreground && GetFocus() == focus && input.Focused, "hover preserves foreground and keyboard focus");
                         }
+                        var popup = (Form)typeof(UsageToolTip).GetField("_window", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(tooltip)!;
+                        var measuredBounds = popup.Bounds; var originalDpi = popup.DeviceDpi;
+                        SendDpiChange(popup, originalDpi == 96 ? 144 : 96);
+                        Check(popup.Bounds == measuredBounds, "DPI notification cannot replace bounds measured at the owner DPI");
+                        SendDpiChange(popup, originalDpi);
+                        Check(popup.Bounds == measuredBounds, "returning to the original DPI retains measured bounds");
                         var output = Environment.GetEnvironmentVariable("GFS_ACCOUNT_UI_CAPTURE");
                         if (!string.IsNullOrWhiteSpace(output) && tooltip.VisibleBounds is { } capture)
                         {
@@ -112,6 +118,17 @@ internal static class UsageTooltipHoverSmoke
         thread.SetApartmentState(ApartmentState.STA); thread.Start(); return done.Task;
     }
     private static FieldInfo Field(string name) => typeof(UsageIndicatorForm).GetField(name, BindingFlags.Instance | BindingFlags.NonPublic)!;
+    private static void SendDpiChange(Form popup, int dpi)
+    {
+        var rect = new Rect { Left = popup.Left + 20, Top = popup.Top + 20, Right = popup.Left + popup.Width * 2, Bottom = popup.Top + popup.Height * 2 };
+        var memory = Marshal.AllocHGlobal(Marshal.SizeOf<Rect>());
+        try
+        {
+            Marshal.StructureToPtr(rect, memory, false);
+            SendMessage(popup.Handle, 0x02E0, new IntPtr(dpi | (dpi << 16)), memory);
+        }
+        finally { Marshal.FreeHGlobal(memory); }
+    }
     private static void Check(bool value, string message) { if (!value) throw new InvalidOperationException("Tooltip hover: " + message); }
     private static Rectangle? VisibleTooltipBounds()
     {
@@ -134,4 +151,5 @@ internal static class UsageTooltipHoverSmoke
     [DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] private static extern IntPtr GetFocus();
     [DllImport("user32.dll")] private static extern IntPtr WindowFromPoint(Point point);
+    [DllImport("user32.dll")] private static extern IntPtr SendMessage(IntPtr window, int message, IntPtr wParam, IntPtr lParam);
 }

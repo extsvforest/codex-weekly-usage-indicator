@@ -142,8 +142,8 @@ internal sealed class UsageToolTip : IDisposable
         protected override void OnDpiChanged(DpiChangedEventArgs e)
         {
             // ShowHover already measures and places the window at the owner's DPI.
-            base.OnDpiChanged(e);
             e.Cancel = true;
+            base.OnDpiChanged(e);
         }
         protected override CreateParams CreateParams
         {
