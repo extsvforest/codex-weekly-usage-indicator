@@ -64,10 +64,7 @@ internal sealed class UsageIndicatorForm : Form
     private readonly System.Windows.Forms.Timer _codexStateTimer = new() { Interval = 1_000 };
     private readonly UsageToolTip _toolTip = new()
     {
-        InitialDelay = 350,
-        ReshowDelay = 100,
-        AutoPopDelay = 30_000,
-        ShowAlways = true
+        InitialDelay = 350
     };
     private readonly ContextMenuStrip _contextMenu = new();
     private readonly Font _valueFont = new("Segoe UI", 13f, FontStyle.Bold);
@@ -118,7 +115,8 @@ internal sealed class UsageIndicatorForm : Form
         _accountTray = new NotifyIcon { Icon = SystemIcons.Application, Text = "Codex 사용량 · 계정 관리", ContextMenuStrip = _contextMenu, Visible = !previewMode };
         _accountTray.DoubleClick += (_, _) => ShowAccountManager();
         ApplyRoundedRegion();
-        _toolTip.SetToolTip(this, "Codex 및 Claude 사용량을 불러오는 중…");
+        _toolTip.SetHoverText("Codex 및 Claude 사용량을 불러오는 중…");
+        _toolTip.TrackHover(this);
 
         _pollTimer.Tick += async (_, _) => await RefreshUsageAsync();
         _codexStateTimer.Tick += (_, _) =>
@@ -410,7 +408,7 @@ internal sealed class UsageIndicatorForm : Form
             catch (AccountStoreBusyException) { }
             catch (Exception) { }
         }
-        _toolTip.SetToolTip(this, BuildTooltipText(_codexSnapshot, _claudeUsage, _codexError, _claudeError,
+        _toolTip.SetHoverText(BuildTooltipText(_codexSnapshot, _claudeUsage, _codexError, _claudeError,
             _showClaude, _combinedUsage, accounts.FirstOrDefault(a => a.IsActive)?.Label));
     }
 
