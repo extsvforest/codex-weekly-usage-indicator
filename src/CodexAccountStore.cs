@@ -202,11 +202,12 @@ internal sealed partial class CodexAccountStore
     public void SaveUsage(string identityKey, UsageSnapshot snapshot)
     {
         // An isolated query owns the vault briefly; live polling may keep its in-memory value.
-        if (!IsEnabled || HasPendingRecovery || HasPendingUsageQuery) return;
+        if (!IsEnabled || HasPendingRecovery) return;
         IDisposable gate;
         try { gate = AcquireLock(); }
         catch (AccountStoreBusyException) { return; }
         using var ownedGate = gate;
+        if (GetUsageQueryStatusCore().State == UsageQueryState.RecoveryRequired) return;
         RequireNoRecovery();
         if (GetCurrentIdentity().Key != identityKey) return;
         var vault = LoadVault();
@@ -294,7 +295,8 @@ internal sealed partial class CodexAccountStore
     private void RequireNoRecovery()
     {
         if (HasPendingRecovery) throw new InvalidOperationException("미완료 계정 교체를 먼저 복구하세요.");
-        if (HasPendingUsageQuery) throw new InvalidOperationException("중단된 사용량 조회를 먼저 복구하세요.");
+        if (GetUsageQueryStatusCore().State == UsageQueryState.RecoveryRequired)
+            throw new InvalidOperationException("중단된 사용량 조회를 먼저 복구하세요.");
     }
 
     private void RequireSameAuth(byte[] expected)

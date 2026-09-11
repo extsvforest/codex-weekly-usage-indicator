@@ -340,6 +340,37 @@ internal sealed class CodexLoginJob : IDisposable
 
     public void Dispose() => _handle.Dispose();
 
+    internal async Task TerminateAndWaitAsync()
+    {
+        // Keep the handle open to confirm that every owned descendant has exited.
+        if (!TerminateJobObject(_handle, 1)) throw new IOException("조회 프로세스 그룹을 종료하지 못했습니다.");
+        var deadline = Stopwatch.StartNew();
+        while (true)
+        {
+            if (!QueryInformationJobObject(_handle, 1, out var info, (uint)Marshal.SizeOf<BasicAccountingInformation>(), IntPtr.Zero))
+                throw new IOException("조회 프로세스 그룹의 종료 상태를 확인하지 못했습니다.");
+            if (info.ActiveProcesses == 0) return;
+            if (deadline.Elapsed >= TimeSpan.FromSeconds(8)) throw new IOException("조회 프로세스 그룹의 종료 시간이 초과되었습니다.");
+            await Task.Delay(25).ConfigureAwait(false);
+        }
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct BasicAccountingInformation
+    {
+        internal long TotalUserTime, TotalKernelTime, ThisPeriodTotalUserTime, ThisPeriodTotalKernelTime;
+        internal uint TotalPageFaultCount, TotalProcesses, ActiveProcesses, TotalTerminatedProcesses;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool TerminateJobObject(SafeFileHandle job, uint exitCode);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool QueryInformationJobObject(SafeFileHandle job, int infoClass,
+        out BasicAccountingInformation info, uint length, IntPtr returnLength);
+
     [StructLayout(LayoutKind.Sequential)]
     private struct BasicLimitInformation
     {

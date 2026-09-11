@@ -15,6 +15,7 @@ internal static class AppServerLifecycleTests
             await CancelUsageAndResumeAsync(root);
             await CancelInitializeAsync(root);
             await AccountReadConsistencyAsync(root);
+            await DescendantExitAsync(root);
         }
         finally { Directory.Delete(root, recursive: true); }
     }
@@ -75,6 +76,36 @@ internal static class AppServerLifecycleTests
         Check(!IsRunning(pid), "Suspension during initialize must also stop the child before returning.");
     }
 
+    private static async Task DescendantExitAsync(string root)
+    {
+        using var limit = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+        var home = Directory.CreateDirectory(Path.Combine(root, "descendant-home")).FullName;
+        File.WriteAllBytes(Path.Combine(home, "auth.json"), AccountUsageQueryTests.Auth("a", "initial"));
+        var store = new CodexAccountStore(Path.Combine(root, "descendant-vault"), home);
+        store.RegisterCurrent("Current");
+        var imported = Path.Combine(root, "descendant-import.json");
+        File.WriteAllBytes(imported, AccountUsageQueryTests.Auth("b", "initial"));
+        var target = store.ImportLoginFile(imported, "Saved");
+        await Task.Run(() => store.QueryInactiveUsage(target.Id, async (stage, token) =>
+        {
+            var marker = Path.Combine(stage, "descendant.txt");
+            using var client = new AppServerClient(() => FakeServer(marker, "descendant", 0), ownJob: true);
+            var result = await client.GetWeeklyUsageWithAccountAsync(token);
+            var parent = await WaitForMarkerAsync(marker, token);
+            var child = await WaitForMarkerAsync(marker + ".child", token);
+            using var descendant = Process.GetProcessById(child);
+            _ = descendant.Handle;
+            while (IsRunning(parent)) await Task.Delay(25, token);
+            Check(!descendant.HasExited, "fixture leaves a child alive after the app-server parent exits");
+            await client.SuspendAsync().WaitAsync(token);
+            await descendant.WaitForExitAsync(token);
+            Check(descendant.HasExited, "owned job confirms descendants stopped even after parent exit");
+            return result;
+        }, limit.Token));
+        Check(!store.HasPendingUsageQuery && !Directory.Exists(Path.Combine(store.RootPath, "usage-query")),
+            "confirmed descendant exit and production bounded cleanup reclaim staging");
+    }
+
     private static ProcessStartInfo FakeServer(string marker, string delayAt, int delayMilliseconds)
     {
         const string script = """
@@ -84,6 +115,13 @@ internal static class AppServerLifecycleTests
                 $message = $line | ConvertFrom-Json
                 if ($message.method -eq 'initialized') { continue }
                 if ($message.method -eq 'initialize') {
+                    if ($env:GFS_FAKE_DELAY_AT -eq 'descendant') {
+                        $childScript = '$held = [IO.File]::Open($env:GFS_FAKE_MARKER + ".locked", [IO.FileMode]::Create, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None); [IO.File]::WriteAllText($env:GFS_FAKE_MARKER + ".child", [string]$PID); Start-Sleep -Seconds 60; $held.Dispose()'
+                        $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($childScript))
+                        $childProcess = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList @('-NoProfile', '-NonInteractive', '-EncodedCommand', $encoded) -WindowStyle Hidden -PassThru -RedirectStandardOutput ($env:GFS_FAKE_MARKER + '.stdout') -RedirectStandardError ($env:GFS_FAKE_MARKER + '.stderr')
+                        while (-not (Test-Path -LiteralPath ($env:GFS_FAKE_MARKER + '.child'))) { Start-Sleep -Milliseconds 25 }
+                        $childProcess.Dispose()
+                    }
                     if ($env:GFS_FAKE_DELAY_AT -eq 'initialize') {
                         [IO.File]::WriteAllText($env:GFS_FAKE_MARKER, [string]$PID)
                         Start-Sleep -Milliseconds ([int]$env:GFS_FAKE_DELAY_MS)
@@ -100,6 +138,7 @@ internal static class AppServerLifecycleTests
                     $result = @{ rateLimitsByLimitId = @{ codex = @{ limitId = 'codex'; primary = @{ usedPercent = 91; windowDurationMins = 300 }; secondary = @{ usedPercent = 23; windowDurationMins = 10080 } } } }
                 }
                 [Console]::WriteLine((@{id = $message.id; result = $result} | ConvertTo-Json -Compress -Depth 10))
+                if ($env:GFS_FAKE_DELAY_AT -eq 'descendant' -and $accountReads -eq 2) { break }
             }
             """;
         var info = new ProcessStartInfo
