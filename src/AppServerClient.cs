@@ -263,8 +263,8 @@ internal sealed class AppServerClient : IDisposable
         var session = _session;
         if (session is null) return;
         session.Lifetime.Cancel();
-        session.Job?.Dispose();
         try { session.Process.StandardInput.Close(); } catch { }
+        if (session.Job is not null) await session.Job.TerminateAndWaitAsync().ConfigureAwait(false);
         try
         {
             if (!session.Process.HasExited) session.Process.Kill(entireProcessTree: true);
@@ -279,6 +279,7 @@ internal sealed class AppServerClient : IDisposable
             throw new IOException("Codex helper did not exit. Account switching is blocked.");
         }
         await Task.WhenAll(session.Reader, session.ErrorReader).WaitAsync(TimeSpan.FromSeconds(3)).ConfigureAwait(false);
+        session.Job?.Dispose();
         session.Process.Dispose();
         session.Lifetime.Dispose();
         _session = null;

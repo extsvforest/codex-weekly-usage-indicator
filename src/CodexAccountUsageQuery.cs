@@ -10,6 +10,32 @@ internal sealed partial class CodexAccountStore
     private string UsageHome => Path.Combine(RootPath, "usage-query");
     public bool HasPendingUsageQuery => File.Exists(UsageJournalPath);
 
+    internal UsageQueryStatus GetUsageQueryStatus()
+    {
+        if (!HasPendingUsageQuery) return new(UsageQueryState.None);
+        using var gate = AcquireLock();
+        return GetUsageQueryStatusCore();
+    }
+
+    private UsageQueryStatus GetUsageQueryStatusCore()
+    {
+        if (!HasPendingUsageQuery) return new(UsageQueryState.None);
+        var journal = ReadEncrypted<UsageQueryJournal>(UsageJournalPath);
+        ValidateUsageJournal(journal);
+        return new(journal.Committed ? UsageQueryState.CleanupPending : UsageQueryState.RecoveryRequired,
+            journal.CleanupFailure);
+    }
+
+    internal void RetryUsageCleanup()
+    {
+        using var gate = AcquireLock();
+        if (!HasPendingUsageQuery) return;
+        var journal = ReadEncrypted<UsageQueryJournal>(UsageJournalPath);
+        ValidateUsageJournal(journal);
+        if (!journal.Committed) throw new InvalidOperationException("로그인 정보 복구를 먼저 완료해 주세요.");
+        TryCleanupUsageQuery(journal);
+    }
+
     // The worker owns the thread-affine Windows mutex for the entire transaction.
     // Never await inside this method. No API on this path writes the live auth file.
     internal void QueryInactiveUsage(string id, Func<string, CancellationToken, Task<CodexAccountUsage>> read,
@@ -19,6 +45,12 @@ internal sealed partial class CodexAccountStore
         using var gate = AcquireLock();
         RequireNoRecovery();
         cancellationToken.ThrowIfCancellationRequested();
+        if (HasPendingUsageQuery)
+        {
+            TryCleanupUsageQuery(ReadEncrypted<UsageQueryJournal>(UsageJournalPath));
+            if (HasPendingUsageQuery)
+                throw new InvalidOperationException("이전 임시 파일을 정리하지 못해 새 조회를 시작하지 못했습니다. 잠시 후 정리를 다시 시도하세요.");
+        }
         var vault = LoadVault();
         var entry = vault.Accounts.SingleOrDefault(a => a.Id == id) ?? throw CorruptStore();
         if (File.Exists(AuthPath) && GetCurrentIdentity().Key == entry.Key)
@@ -54,20 +86,20 @@ internal sealed partial class CodexAccountStore
     {
         // A parent crash can race the Job's process termination. In this exceptional
         // path require all potential writers to be gone before reclaiming any auth.
-        assertStopped();
         var journal = ReadEncrypted<UsageQueryJournal>(UsageJournalPath);
+        ValidateUsageJournal(journal);
+        if (!journal.Committed) assertStopped();
         CompleteUsageQuery(journal, null, recovery: true);
     }
 
     private void CompleteUsageQuery(UsageQueryJournal journal, UsageSnapshot? usage, bool recovery)
     {
-        if (journal.Version != 1 || !Guid.TryParseExact(journal.AccountId, "N", out _) ||
-            journal.BeforeDigest.Length != 64) throw CorruptStore();
-        var vault = LoadVault();
-        var entry = vault.Accounts.SingleOrDefault(a => a.Id == journal.AccountId && a.Key == journal.Key)
-            ?? throw CorruptStore();
+        ValidateUsageJournal(journal);
         if (!journal.Committed)
         {
+            var vault = LoadVault();
+            var entry = vault.Accounts.SingleOrDefault(a => a.Id == journal.AccountId && a.Key == journal.Key)
+                ?? throw CorruptStore();
             var stageAuthPath = Path.Combine(UsageHome, "auth.json");
             byte[]? refreshed = journal.CommitAuth ?? (File.Exists(stageAuthPath) ? ReadBounded(stageAuthPath, MaxAuthBytes) : null);
             if (journal.Prepared && refreshed is null) throw CorruptStore();
@@ -106,8 +138,44 @@ internal sealed partial class CodexAccountStore
             journal = journal with { Committed = true };
             WriteEncrypted(UsageJournalPath, journal);
         }
-        DeleteUsageHome();
-        DeleteChecked(UsageJournalPath);
+        TryCleanupUsageQuery(journal);
+    }
+
+    private static void ValidateUsageJournal(UsageQueryJournal journal)
+    {
+        if (journal.Version != 1 || !Guid.TryParseExact(journal.AccountId, "N", out _) ||
+            journal.BeforeDigest?.Length != 64 || journal.Key?.Length != 64) throw CorruptStore();
+    }
+
+    private void TryCleanupUsageQuery(UsageQueryJournal journal)
+    {
+        ValidateUsageJournal(journal);
+        if (!journal.Committed) throw CorruptStore();
+        // Committed means auth was saved and read back after confirmed writer exit.
+        // Never load the vault or replay CommitAuth here: the account may since have changed or been removed.
+        for (var attempt = 0; ; attempt++)
+        {
+            try
+            {
+                DeleteUsageHome();
+                DeleteChecked(UsageJournalPath);
+                return;
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException)
+            {
+                if (ex is IOException && attempt < 4)
+                {
+                    Thread.Sleep(new[] { 100, 200, 400, 800 }[attempt]);
+                    continue;
+                }
+                // Preserve only a category/code, never an exception message, path, or auth contents.
+                var kind = ex is InvalidOperationException ? "validation" : ex is UnauthorizedAccessException ? "access" : "io";
+                var pending = journal with { CleanupFailure = new(kind, ex.HResult) };
+                try { WriteEncrypted(UsageJournalPath, pending); }
+                catch (Exception writeFailure) when (writeFailure is IOException or UnauthorizedAccessException) { }
+                return; // Cleanup cannot turn a durable commit into a failed query or hide its original failure.
+            }
+        }
     }
 
     private void DeleteUsageHome()
@@ -128,14 +196,23 @@ internal sealed partial class CodexAccountStore
         }
         // Fixed direct child of the validated vault. Inspect before deleting; never follow a link.
         Collect(UsageHome);
-        foreach (var path in files) DeleteChecked(path);
-        foreach (var path in directories.AsEnumerable().Reverse()) Directory.Delete(path, false);
+        var auth = Path.Combine(UsageHome, "auth.json");
+        foreach (var path in files.OrderBy(path => string.Equals(path, auth, StringComparison.OrdinalIgnoreCase) ? 0 : 1)) DeleteChecked(path);
+        foreach (var path in directories.AsEnumerable().Reverse()) { RejectReparsePath(path); Directory.Delete(path, false); }
+        RejectReparsePath(UsageHome);
         Directory.Delete(UsageHome, false);
     }
 
     internal sealed record UsageQueryJournal(int Version, string AccountId, string Key, string BeforeDigest, bool Committed, bool Prepared,
-        byte[]? CommitAuth = null);
+        byte[]? CommitAuth = null, UsageCleanupFailure? CleanupFailure = null);
 }
+
+internal enum UsageQueryState { None, RecoveryRequired, CleanupPending }
+internal sealed record UsageCleanupFailure(string Kind, int Code)
+{
+    internal string Summary => $"{(Kind == "validation" ? "정리 경로 확인 필요" : Kind == "access" ? "파일 접근 제한" : (Code & 0xffff) is 32 or 33 ? "파일 사용 중" : "파일 정리 오류")} · 0x{Code:X8}";
+}
+internal sealed record UsageQueryStatus(UsageQueryState State, UsageCleanupFailure? Failure = null);
 
 internal sealed class UsageHelperShutdownException : IOException
 {
@@ -168,6 +245,10 @@ internal static class CodexAccountUsageReader
         start.ArgumentList.Add("--stdio");
         start.ArgumentList.Add("-c");
         start.ArgumentList.Add("cli_auth_credentials_store=\"file\"");
+        start.ArgumentList.Add("-c");
+        start.ArgumentList.Add("features.plugins=false");
+        start.ArgumentList.Add("-c");
+        start.ArgumentList.Add("skills.bundled.enabled=false");
         return start;
     }
 }

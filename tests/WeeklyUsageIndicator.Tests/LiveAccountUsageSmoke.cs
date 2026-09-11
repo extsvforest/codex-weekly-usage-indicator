@@ -17,9 +17,10 @@ internal static class LiveAccountUsageSmoke
                 var store = new CodexAccountStore();
                 if (store.HasPendingRecovery || store.HasPendingUsageQuery) throw new InvalidOperationException("Pending recovery; live smoke not started.");
                 var before = store.ListAccounts();
-                var target = before.Where(a => !a.IsActive).ToArray();
+                var label = Environment.GetEnvironmentVariable("GFS_LIVE_ACCOUNT_LABEL");
+                var target = before.Where(a => !a.IsActive && (label is null || a.Label == label)).ToArray();
                 if (target.Length != 1 || before.Count(a => a.IsActive) != 1)
-                    throw new InvalidOperationException("Live smoke requires exactly one active and one inactive registered account.");
+                    throw new InvalidOperationException("Live smoke requires one active account and one inactive target; set GFS_LIVE_ACCOUNT_LABEL if ambiguous.");
                 if (CodexAccountRuntime.CaptureDesktopLaunchPath() is null) throw new InvalidOperationException("Codex Desktop must remain running for this smoke.");
                 var authPath = Path.Combine(store.CodexHome, "auth.json");
                 var original = File.ReadAllBytes(authPath);

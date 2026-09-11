@@ -12,6 +12,9 @@ internal static class AccountUsageQueryTests
         await IdentityRaceAsync();
         await ExclusiveAsync();
         await UnconfirmedShutdownAsync();
+        await TransientCleanupAsync();
+        foreach (var outcome in new[] { "success", "failure", "cancel" }) await PendingCleanupAsync(outcome);
+        await PendingCleanupThenQueryAsync();
     }
 
     private static async Task RotationAsync(string outcome)
@@ -150,6 +153,87 @@ internal static class AccountUsageQueryTests
         f.Store.SwitchTo(f.Target.Id, () => { });
         Check(File.ReadAllBytes(f.LiveAuth).SequenceEqual(Auth("b", "rotated")), "recovery after confirmed stop preserves rotated auth");
     }
+
+    private static async Task TransientCleanupAsync()
+    {
+        using var f = new Fixture();
+        Task? unlock = null;
+        await Task.Run(() => f.Store.QueryInactiveUsage(f.Target.Id, (home, _) =>
+        {
+            var held = HoldFile(home);
+            unlock = Task.Run(async () => { await Task.Delay(300); held.Dispose(); });
+            return Task.FromResult(Result());
+        }, CancellationToken.None));
+        await unlock!;
+        Check(!f.Store.HasPendingUsageQuery, "short-lived file locks are retried to completion");
+    }
+
+    private static async Task PendingCleanupAsync(string outcome)
+    {
+        using var f = new Fixture();
+        FileStream? held = null;
+        var original = File.ReadAllBytes(f.LiveAuth);
+        try
+        {
+            Exception? error = null;
+            try
+            {
+                await Task.Run(() => f.Store.QueryInactiveUsage(f.Target.Id, (home, _) =>
+                {
+                    held = HoldFile(home);
+                    File.WriteAllBytes(Path.Combine(home, "auth.json"), Auth("b", "rotated"));
+                    if (outcome == "failure") throw new IOException("original request failure");
+                    if (outcome == "cancel") throw new OperationCanceledException("original cancellation");
+                    return Task.FromResult(Result());
+                }, CancellationToken.None));
+            }
+            catch (Exception ex) { error = ex; }
+            Check(outcome == "success" ? error is null : outcome == "failure" ? error?.Message == "original request failure"
+                : error is OperationCanceledException, "cleanup must preserve the original request outcome");
+            var status = f.Store.GetUsageQueryStatus();
+            Check(status.State == UsageQueryState.CleanupPending && status.Failure?.Kind == "io", "durable commit has a separate safe cleanup diagnosis");
+            Check(!File.Exists(Path.Combine(f.Store.RootPath, "usage-query", "auth.json")), "plaintext auth is removed before other locked files");
+            var saved = f.Store.ListAccounts().Single(a => a.Id == f.Target.Id);
+            Check(outcome == "success" ? saved.ObservedAt is not null : saved.ObservedAt is null, "committed auth alone never claims a usage observation");
+            f.Store.Rename(f.Target.Id, "Renamed");
+            f.Store.SaveUsage(f.Store.GetCurrentIdentity().Key, Result().Usage);
+            Check(f.Store.ListAccounts().Single(a => a.IsActive).ObservedAt is not null, "cleanup does not block active snapshot saves");
+            f.Store.Remove(f.Target.Id);
+            f.Store.RegisterCurrent("Current renamed");
+            var vaultBefore = File.ReadAllBytes(Path.Combine(f.Store.RootPath, "accounts.dpapi"));
+            held!.Dispose(); held = null;
+            // Reopen the durable journal, just as the application does after an upgrade.
+            var reopened = new CodexAccountStore(f.Store.RootPath, f.Home);
+            reopened.Recover(() => throw new Exception("cleanup must not require Desktop shutdown"));
+            Check(!reopened.HasPendingUsageQuery && !Directory.Exists(Path.Combine(f.Store.RootPath, "usage-query")), "cleanup works after its target account was removed");
+            Check(File.ReadAllBytes(Path.Combine(f.Store.RootPath, "accounts.dpapi")).SequenceEqual(vaultBefore)
+                && File.ReadAllBytes(f.LiveAuth).SequenceEqual(original), "cleanup never rewrites vault or live auth");
+        }
+        finally { held?.Dispose(); }
+    }
+
+    private static async Task PendingCleanupThenQueryAsync()
+    {
+        using var f = new Fixture();
+        FileStream? held = null;
+        try
+        {
+            await Task.Run(() => f.Store.QueryInactiveUsage(f.Target.Id, (home, _) =>
+            { held = HoldFile(home); return Task.FromResult(Result()); }, CancellationToken.None));
+            var calls = 0;
+            await ThrowsAsync(() => Task.Run(() => f.Store.QueryInactiveUsage(f.Target.Id, (_, _) =>
+            { calls++; return Task.FromResult(Result()); }, CancellationToken.None)));
+            Check(calls == 0, "a pending fixed home is never reused while cleanup still fails");
+            held!.Dispose(); held = null;
+            await Task.Run(() => f.Store.QueryInactiveUsage(f.Target.Id, (_, _) =>
+            { calls++; return Task.FromResult(Result()); }, CancellationToken.None));
+            Check(calls == 1 && !f.Store.HasPendingUsageQuery, "next explicit query first reclaims old staging");
+        }
+        finally { held?.Dispose(); }
+    }
+
+    internal static FileStream HoldFile(string home) => new(Path.Combine(home, "locked.sqlite"), FileMode.Create,
+        FileAccess.ReadWrite, FileShare.None);
 
     internal static CodexAccountUsage Result() => new(new UsageSnapshot(27, DateTimeOffset.UtcNow.AddDays(2), 10080, "codex",
         new UsageWindow(13, DateTimeOffset.UtcNow.AddHours(2), 300)), "b@example.invalid", "pro", true);

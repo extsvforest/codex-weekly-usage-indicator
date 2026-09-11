@@ -6,6 +6,11 @@ if (args.Contains("--live-account-usage-smoke"))
     await LiveAccountUsageSmoke.RunAsync();
     return;
 }
+if (args.Contains("--live-usage-cleanup-smoke"))
+{
+    await LiveUsageCleanupSmoke.RunAsync();
+    return;
+}
 
 var tests = new (string Name, Func<Task> Run)[]
 {

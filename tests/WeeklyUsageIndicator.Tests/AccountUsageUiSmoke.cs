@@ -25,12 +25,15 @@ internal static class AccountUsageUiSmoke
                 var target = store.ImportLoginFile(import, "Pro B · 저장된 계정");
                 var current = store.ListAccounts().Single(a => a.IsActive);
                 var calls = 0; var restarts = 0; var mode = "success";
+                FileStream? held = null;
                 using var form = new AccountManagerForm(store, () => { restarts++; return Task.CompletedTask; }, () => restarts++,
-                    queryUsage: (account, token) => Task.Run(() => store.QueryInactiveUsage(account.Id, async (_, ct) =>
+                    queryUsage: (account, token) => Task.Run(() => store.QueryInactiveUsage(account.Id, async (stage, ct) =>
                     {
                         Interlocked.Increment(ref calls);
+                        if (mode.StartsWith("cleanup", StringComparison.Ordinal)) held = AccountUsageQueryTests.HoldFile(stage);
                         await Task.Delay(mode == "cancel" ? 60000 : 100, ct).ConfigureAwait(false);
-                        if (mode == "failure") throw new IOException("synthetic failure");
+                        if (mode is "failure" or "cleanup-failure") throw new IOException("synthetic failure");
+                        if (mode == "cleanup-cancel") throw new OperationCanceledException();
                         return AccountUsageQueryTests.Result();
                     }, token), token));
                 T Find<T>(string name) where T : Control => (T)form.Controls.Find(name, true).Single();
@@ -64,10 +67,34 @@ internal static class AccountUsageUiSmoke
                         Find<Button>("CancelLoginButton").PerformClick(); await UntilAsync(() => !form.IsOperationInProgress);
                         Check(store.ListAccounts().Single(a => a.Id == target.Id) == queried && Find<Label>("StatusLabel").Text.Contains("조회를 취소"),
                             "cancel preserves last observation and completes cleanup");
+                        foreach (var pendingMode in new[] { "cleanup-success", "cleanup-failure", "cleanup-cancel" })
+                        {
+                            mode = pendingMode;
+                            button.PerformClick(); await UntilAsync(() => !form.IsOperationInProgress);
+                            var status = Find<Label>("StatusLabel");
+                            Check(status.Text.Contains("임시 파일 정리 대기") && !status.Text.Contains("복구가 필요"), "committed cleanup has an accurate nonblocking notice");
+                            var expected = mode == "cleanup-success" ? "사용량을 확인했습니다" : mode == "cleanup-failure" ? "가져오지 못했습니다" : "조회를 취소";
+                            Check(status.Text.Contains(expected) && button.Enabled && Find<Button>("RenameAccountButton").Enabled
+                                && Find<Button>("DeleteAccountButton").Enabled && Find<Button>("SwitchAccountButton").Enabled, "original outcome and normal account actions survive cleanup failure");
+                            // Exercise the actual 5-second reload that used to overwrite errors.
+                            if (mode == "cleanup-failure")
+                            {
+                                await Task.Delay(5200);
+                                Check(status.Text.Contains(expected), "periodic list reload preserves the original error");
+                                Capture(form);
+                            }
+                            held!.Dispose(); held = null;
+                            var recover = Find<Button>("RecoverAccountsButton");
+                            Check(recover.Visible && recover.Text == "임시 파일 정리", "cleanup uses a distinct explicit action");
+                            var callsBefore = calls;
+                            recover.PerformClick(); await UntilAsync(() => !form.IsOperationInProgress);
+                            Check(!store.HasPendingUsageQuery && restarts == 0 && calls == callsBefore && !recover.Visible,
+                                "cleanup neither restarts active helper nor queries usage nor opens the shutdown dialog");
+                        }
                         done.SetResult();
                     }
                     catch (Exception ex) { done.TrySetException(ex); }
-                    finally { form.Close(); }
+                    finally { held?.Dispose(); form.Close(); }
                 };
                 // Match the actual app's message loop and synchronization context.
                 Application.Run(form);

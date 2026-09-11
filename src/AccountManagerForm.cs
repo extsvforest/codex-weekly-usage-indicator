@@ -40,6 +40,10 @@ internal sealed class AccountManagerForm : Form
     private bool _busy;
     private bool _reloading;
     private string? _desktopPath;
+    private UsageQueryStatus _usageQueryStatus = new(UsageQueryState.None);
+    private string? _operationMessage;
+    private bool _operationError;
+    private bool _operationSuccess;
     internal bool IsOperationInProgress => _busy;
     private SavedCodexAccount? Selected => _accounts.SelectedItem as SavedCodexAccount;
 
@@ -59,7 +63,7 @@ internal sealed class AccountManagerForm : Form
         var root = AccountUiTheme.Stack(4);
         root.Padding = new Padding(24);
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 76));
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 78));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 100));
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
 
@@ -295,6 +299,18 @@ internal sealed class AccountManagerForm : Form
 
     private async Task RecoverAsync()
     {
+        if (!_store.HasPendingRecovery && _usageQueryStatus.State == UsageQueryState.CleanupPending)
+        {
+            await RunAsync(false, "임시 파일을 정리하고 있습니다…", async () =>
+            {
+                await Task.Run(_store.RetryUsageCleanup);
+                Reload();
+                SetStatus(_usageQueryStatus.State == UsageQueryState.None ? "임시 파일 정리를 마쳤습니다."
+                    : "임시 파일을 아직 정리하지 못했습니다. 잠시 후 다시 시도하세요.",
+                    success: _usageQueryStatus.State == UsageQueryState.None);
+            }, acquireGate: false);
+            return;
+        }
         await RunAsync(true, "복구 조건을 확인하고 있습니다…", async () =>
         {
             using var dialog = new AccountSwitchDialog("", "", recovery: true);
@@ -358,12 +374,11 @@ internal sealed class AccountManagerForm : Form
             }
             _count.Text = $"계정 {_items.Count}개";
             _empty.Visible = _items.Count == 0; _detail.Visible = _items.Count > 0;
+            _usageQueryStatus = _store.GetUsageQueryStatus();
+            if (!quiet) { _operationMessage = null; _operationError = false; _operationSuccess = false; }
             ShowSelected(); UpdateActions();
-            if (_store.HasPendingRecovery) SetStatus("미완료 전환이 있습니다. 복구를 완료하면 다시 사용할 수 있습니다.", error: true);
-            else if (_store.HasPendingUsageQuery) SetStatus("중단된 사용량 조회가 있습니다. 복구하여 로그인 정보를 보존해 주세요.", error: true);
-            else if (_items.Count > 0 && !_items.Any(a => a.IsActive)) SetStatus("현재 로그인은 아직 등록되지 않았습니다. 전환하려면 현재 계정을 먼저 등록하세요.");
-            else if (!quiet && _items.Count == 0) SetStatus("현재 계정을 먼저 등록하세요. 이름은 자동으로 지정됩니다.");
-            return !_store.HasPendingRecovery && !_store.HasPendingUsageQuery && (_items.Count == 0 || _items.Any(a => a.IsActive));
+            RenderStatus();
+            return !_store.HasPendingRecovery && _usageQueryStatus.State != UsageQueryState.RecoveryRequired && (_items.Count == 0 || _items.Any(a => a.IsActive));
         }
         catch (Exception ex) { SetStatus(ex.Message, error: true); return false; }
     }
@@ -391,7 +406,7 @@ internal sealed class AccountManagerForm : Form
 
     private void UpdateActions()
     {
-        var pending = _store.HasPendingRecovery || _store.HasPendingUsageQuery;
+        var pending = _store.HasPendingRecovery || _usageQueryStatus.State == UsageQueryState.RecoveryRequired;
         _accounts.Enabled = !_busy;
         _refresh.Enabled = !_busy;
         _readUsage.Enabled = !_busy && !pending && Selected is not null;
@@ -402,14 +417,29 @@ internal sealed class AccountManagerForm : Form
         _rename.Enabled = !_busy && !pending && Selected is not null;
         _switch.Enabled = !_busy && !pending && _items.Any(a => a.IsActive) && Selected is { IsActive: false };
         _delete.Enabled = !_busy && !pending && Selected is { IsActive: false };
-        _recover.Visible = pending; _recover.Enabled = !_busy;
-        _recover.Text = _store.HasPendingUsageQuery ? "중단된 조회 복구" : "미완료 전환 복구";
+        _recover.Visible = pending || _usageQueryStatus.State == UsageQueryState.CleanupPending; _recover.Enabled = !_busy;
+        _recover.Text = _store.HasPendingRecovery ? "미완료 전환 복구" : _usageQueryStatus.State == UsageQueryState.CleanupPending ? "임시 파일 정리" : "중단된 조회 복구";
     }
 
     private void SetStatus(string message, bool error = false, bool success = false)
     {
-        _status.Text = message;
-        _status.ForeColor = error ? AccountUiTheme.Error : success ? AccountUiTheme.Accent : AccountUiTheme.Text;
+        _operationMessage = message; _operationError = error; _operationSuccess = success;
+        RenderStatus();
+    }
+
+    private void RenderStatus()
+    {
+        var recovery = _store.HasPendingRecovery ? "미완료 전환이 있습니다. 복구를 완료해 주세요."
+            : _usageQueryStatus.State == UsageQueryState.RecoveryRequired ? "중단된 조회의 로그인 정보 복구가 필요합니다." : null;
+        var cleanup = _usageQueryStatus.State == UsageQueryState.CleanupPending
+            ? "로그인 정보 저장 완료 · 임시 파일 정리 대기" + (_usageQueryStatus.Failure is { } failure ? $" ({failure.Summary})" : "") : null;
+        var fallback = _items.Count == 0 ? "현재 계정을 먼저 등록하세요. 이름은 자동으로 지정됩니다."
+            : !_items.Any(a => a.IsActive) ? "현재 로그인은 아직 등록되지 않았습니다. 전환하려면 현재 계정을 먼저 등록하세요."
+            : "계정을 선택해 상태를 확인하세요.";
+        _status.Text = string.Join("\n", new[] { _operationMessage, recovery, cleanup }.Where(text => text is not null));
+        if (_status.Text.Length == 0) _status.Text = fallback;
+        _status.ForeColor = _operationError || recovery is not null ? AccountUiTheme.Error
+            : _operationSuccess && cleanup is null ? AccountUiTheme.Accent : AccountUiTheme.Text;
     }
 
     protected override void Dispose(bool disposing)
