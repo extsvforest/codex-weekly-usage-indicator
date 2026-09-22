@@ -3,8 +3,8 @@ namespace WeeklyUsageIndicator;
 // A non-activating hover window avoids native tooltip placement under the pointer.
 internal sealed class UsageToolTip : IDisposable
 {
-    private readonly Font _font = new("맑은 고딕", 9.5f);
-    private readonly Font _heading = new("맑은 고딕", 9.5f, FontStyle.Bold);
+    private readonly Font _font = AccountFonts.Create(9.5f);
+    private readonly Font _heading = AccountFonts.Create(9.5f, bold: true);
     private HoverWindow? _window;
     private readonly System.Windows.Forms.Timer _hoverDelay = new();
     private Control? _hoverOwner;
@@ -83,7 +83,7 @@ internal sealed class UsageToolTip : IDisposable
         return new(x, owner.Top >= area.Top + area.Height / 2 ? owner.Top - gap - size.Height : owner.Bottom + gap);
     }
     private static bool IsHeading(string line) => line.StartsWith("CODEX", StringComparison.Ordinal) ||
-        line.StartsWith("CLAUDE", StringComparison.Ordinal) || line.StartsWith("전체 계정", StringComparison.Ordinal);
+        line.StartsWith("CLAUDE", StringComparison.Ordinal) || line.StartsWith("전체 계정", StringComparison.Ordinal) || line.StartsWith("All accounts", StringComparison.Ordinal);
     internal Size Measure(string text, float scale, IDeviceContext? context = null)
     {
         var padding = (int)(16 * scale); var width = (int)(490 * scale); var height = padding * 2;
@@ -101,6 +101,7 @@ internal sealed class UsageToolTip : IDisposable
     }
     internal void Render(Graphics graphics, Rectangle bounds, string text, float scale)
     {
+        graphics.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
         using var background = new SolidBrush(AccountUiTheme.Surface); using var border = new Pen(AccountUiTheme.Border);
         graphics.FillRectangle(background, bounds); graphics.DrawRectangle(border, bounds.X, bounds.Y, bounds.Width - 1, bounds.Height - 1);
         var padding = (int)(16 * scale); var width = bounds.Width - padding * 2; var y = bounds.Top + padding;

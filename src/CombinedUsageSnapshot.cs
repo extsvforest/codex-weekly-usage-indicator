@@ -8,13 +8,13 @@ internal sealed record CombinedAccountUsage(SavedCodexAccount Account, CombinedR
         Account.ObservedAt is not null && Account.Usage!.ResetsAt is { } reset && reset > now;
     internal string Status(DateTimeOffset now)
     {
-        if (State == CombinedReadState.Failed) return Error ?? "조회 실패";
-        if (State == CombinedReadState.Canceled) return "조회 취소 · 이전 값";
-        if (State == CombinedReadState.Waiting) return "이번 전체 조회에서 미확인";
-        if (!HasWeeklyValue) return "주간 사용량 미확인";
-        if (Account.Usage!.ResetsAt is null) return "초기화 시각 미확인";
-        if (Account.Usage.ResetsAt <= now) return "초기화 시점 지남 · 갱신 필요";
-        return State == CombinedReadState.Saved ? "저장된 값 · 전체 갱신 필요" : "확인 완료";
+        if (State == CombinedReadState.Failed) return Error is { } error ? UiText.Message(error) : UiText.T("조회 실패");
+        if (State == CombinedReadState.Canceled) return UiText.T("조회 취소 · 이전 값");
+        if (State == CombinedReadState.Waiting) return UiText.T("이번 전체 조회에서 미확인");
+        if (!HasWeeklyValue) return UiText.T("주간 사용량 미확인");
+        if (Account.Usage!.ResetsAt is null) return UiText.T("초기화 시각 미확인");
+        if (Account.Usage.ResetsAt <= now) return UiText.T("초기화 시점 지남 · 갱신 필요");
+        return State == CombinedReadState.Saved ? UiText.T("저장된 값 · 전체 갱신 필요") : UiText.T("확인 완료");
     }
 }
 

@@ -30,6 +30,7 @@ internal static class AccountUiSmoke
                 using var form = new AccountManagerForm(store, () => { suspended++; return Task.CompletedTask; }, () => resumed++, refreshAllOnOpen: false);
                 form.Show();
                 Application.DoEvents();
+                Check(form.Font.Name == "Pretendard", "the portable manager uses its bundled Korean font");
                 Capture(form, output, "-empty");
                 Button(form, "RegisterCurrentButton").PerformClick();
                 Check(store.IsEnabled && store.ListAccounts().Single().Label == "계정 1", "registration needs no name entry");

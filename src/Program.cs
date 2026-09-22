@@ -34,6 +34,7 @@ internal static class Program
             argument.Equals("--preview", StringComparison.OrdinalIgnoreCase));
 
         ApplicationConfiguration.Initialize();
+        if (!previewMode) UiText.SetLanguage(IndicatorSettingsStore.LoadLanguage());
         Application.Run(new UsageIndicatorForm(previewMode, openAccounts));
         GC.KeepAlive(singleInstance);
         return 0;
@@ -74,6 +75,7 @@ internal sealed class UsageIndicatorForm : Form
     private ClaudeUsageResult? _claudeUsage;
     private string? _codexError;
     private string? _claudeError;
+    private Exception? _codexFailure, _claudeFailure;
     private bool _codexWasRunning;
     private bool _isRefreshing;
     private bool _isHovered;
@@ -81,6 +83,7 @@ internal sealed class UsageIndicatorForm : Form
     private bool _keepOnTop = true;
     private bool _showClaude;
     private bool _positionInitialized;
+    private ToolStripMenuItem? _languageMenu;
     private readonly CodexAccountStore _accountStore = new();
     private AccountManagerForm? _accountManager;
     private readonly CombinedUsageSnapshot _combinedUsage = new();
@@ -107,15 +110,16 @@ internal sealed class UsageIndicatorForm : Form
         ShowIcon = false;
         ShowInTaskbar = false;
         StartPosition = FormStartPosition.Manual;
-        Text = "Codex 및 Claude 사용량";
-        AccessibleName = "Codex 및 Claude Fable 사용량 인디케이터";
+        Text = UiText.T("Codex 및 Claude 사용량");
+        AccessibleName = UiText.T("Codex 및 Claude Fable 사용량 인디케이터");
         Opacity = 0;
 
         BuildContextMenu();
-        _accountTray = new NotifyIcon { Icon = SystemIcons.Application, Text = "Codex 사용량 · 계정 관리", ContextMenuStrip = _contextMenu, Visible = !previewMode };
+        _contextMenu.Opening += (_, _) => { if (_languageMenu is not null) _languageMenu.Enabled = CanChangeLanguage; };
+        _accountTray = new NotifyIcon { Icon = SystemIcons.Application, Text = UiText.T("Codex 사용량 · 계정 관리"), ContextMenuStrip = _contextMenu, Visible = !previewMode };
         _accountTray.DoubleClick += (_, _) => ShowAccountManager();
         ApplyRoundedRegion();
-        _toolTip.SetHoverText("Codex 및 Claude 사용량을 불러오는 중…");
+        _toolTip.SetHoverText(UiText.T("Codex 및 Claude 사용량을 불러오는 중…"));
         _toolTip.TrackHover(this);
 
         _pollTimer.Tick += async (_, _) => await RefreshUsageAsync();
@@ -195,12 +199,14 @@ internal sealed class UsageIndicatorForm : Form
 
     private void BuildContextMenu()
     {
-        var accountsItem = new ToolStripMenuItem("Codex 계정 관리…");
+        foreach (var item in _contextMenu.Items.Cast<ToolStripItem>().ToArray()) item.Dispose();
+        _contextMenu.Items.Clear();
+        var accountsItem = new ToolStripMenuItem(UiText.T("Codex 계정 관리…"));
         accountsItem.Click += (_, _) => ShowAccountManager();
-        var refreshItem = new ToolStripMenuItem("새로고침");
+        var refreshItem = new ToolStripMenuItem(UiText.T("새로고침"));
         refreshItem.Click += async (_, _) => await RefreshUsageAsync(force: true);
 
-        var showClaudeItem = new ToolStripMenuItem("Claude 사용량 표시")
+        var showClaudeItem = new ToolStripMenuItem(UiText.T("Claude 사용량 표시"))
         {
             Checked = _showClaude,
             CheckOnClick = true
@@ -208,9 +214,9 @@ internal sealed class UsageIndicatorForm : Form
         showClaudeItem.CheckedChanged += async (_, _) =>
             await SetClaudeVisibilityAsync(showClaudeItem.Checked);
 
-        var topMostItem = new ToolStripMenuItem("항상 위에 표시")
+        var topMostItem = new ToolStripMenuItem(UiText.T("항상 위에 표시"))
         {
-            Checked = true,
+            Checked = _keepOnTop,
             CheckOnClick = true
         };
         topMostItem.CheckedChanged += (_, _) =>
@@ -219,7 +225,7 @@ internal sealed class UsageIndicatorForm : Form
             if (IsHandleCreated) _ = NativeWindow.TrySetTopMost(Handle, _keepOnTop);
         };
 
-        var copyItem = new ToolStripMenuItem("현재 상태 복사");
+        var copyItem = new ToolStripMenuItem(UiText.T("현재 상태 복사"));
         copyItem.Click += (_, _) =>
         {
             Clipboard.SetText(BuildClipboardText(
@@ -230,8 +236,16 @@ internal sealed class UsageIndicatorForm : Form
                 _showClaude));
         };
 
-        var exitItem = new ToolStripMenuItem("닫기");
+        var exitItem = new ToolStripMenuItem(UiText.T("닫기"));
         exitItem.Click += (_, _) => Close();
+
+        _languageMenu = new ToolStripMenuItem("Language / 언어") { Name = "LanguageMenu" };
+        foreach (var (language, label) in new[] { ("ko", "한국어"), ("en", "English") })
+        {
+            var choice = new ToolStripMenuItem(label) { Name = "Language-" + language, Checked = UiText.Language == language };
+            choice.Click += (_, _) => BeginInvoke((Action)(() => ChangeLanguage(language)));
+            _languageMenu.DropDownItems.Add(choice);
+        }
 
         _contextMenu.Items.AddRange([
             refreshItem,
@@ -239,9 +253,42 @@ internal sealed class UsageIndicatorForm : Form
             topMostItem,
             copyItem,
             accountsItem,
+            _languageMenu,
             new ToolStripSeparator(),
             exitItem
         ]);
+    }
+
+    private bool CanChangeLanguage => !_accountBusy && _accountManager is not { IsOperationInProgress: true } &&
+        _accountManager is not { Enabled: false } &&
+        !(_accountManager?.OwnedForms.Any(f => f.Visible) ?? false);
+
+    internal bool ChangeLanguage(string language)
+    {
+        if (!CanChangeLanguage || !UiText.IsSupported(language)) return false;
+        if (UiText.Language == language) return true;
+        var previousManager = _accountManager;
+        Rectangle? bounds = previousManager is { Visible: true } manager ? manager.Bounds : null;
+        _accountManager?.Close(); _accountManager?.Dispose(); _accountManager = null;
+        UiText.SetLanguage(language);
+        if (!_previewMode) IndicatorSettingsStore.SaveLanguage(language);
+        Text = UiText.T("Codex 및 Claude 사용량");
+        AccessibleName = UiText.T("Codex 및 Claude Fable 사용량 인디케이터");
+        if (_accountTray is not null) _accountTray.Text = UiText.T("Codex 사용량 · 계정 관리");
+        if (_codexFailure is not null) _codexError = FriendlyCodexError(_codexFailure);
+        if (_claudeFailure is not null) _claudeError = FriendlyClaudeError(_claudeFailure);
+        BuildContextMenu(); UpdateToolTip();
+        if (bounds is { } previous)
+        {
+            _accountManager = previousManager!.CreateLocalizedCopy();
+            var recreated = _accountManager;
+            recreated.StartPosition = FormStartPosition.Manual;
+            // Restore physical bounds after WinForms applies the monitor DPI,
+            // while still inside Load so no intermediate size reaches the screen.
+            recreated.Load += (_, _) => recreated.Bounds = previous;
+            _accountManager.Show();
+        }
+        return true;
     }
 
     private async Task SetClaudeVisibilityAsync(bool showClaude)
@@ -252,13 +299,13 @@ internal sealed class UsageIndicatorForm : Form
         if (!showClaude)
         {
             _claudeUsage = null;
-            _claudeError = null;
+            _claudeError = null; _claudeFailure = null;
             UpdateToolTip();
             Invalidate();
             return;
         }
 
-        _claudeError = null;
+        _claudeError = null; _claudeFailure = null;
         await RefreshUsageAsync(force: true);
     }
 
@@ -355,7 +402,7 @@ internal sealed class UsageIndicatorForm : Form
         if (_previewMode)
         {
             _codexSnapshot = new UsageSnapshot(38, DateTimeOffset.Now.AddDays(3), 10080, "codex");
-            _codexError = null;
+            _codexError = null; _codexFailure = null;
             UpdateToolTip();
             Invalidate();
             return;
@@ -379,7 +426,7 @@ internal sealed class UsageIndicatorForm : Form
             else
             {
                 _claudeUsage = null;
-                _claudeError = null;
+                _claudeError = null; _claudeFailure = null;
             }
 
             await Task.WhenAll(refreshTasks);
@@ -438,13 +485,13 @@ internal sealed class UsageIndicatorForm : Form
             if (generation != _accountGeneration || _accountBusy) return;
             if (identity is not null && identity != _accountStore.GetCurrentIdentity().Key) return;
             _codexSnapshot = snapshot;
-            _codexError = null;
+            _codexError = null; _codexFailure = null;
             if (identity is not null && snapshot is not null) _accountStore.SaveUsage(identity, snapshot);
         }
         catch (Exception ex)
         {
             if (generation != _accountGeneration || _accountBusy) return;
-            _codexError = FriendlyCodexError(ex);
+            _codexFailure = ex; _codexError = FriendlyCodexError(ex);
         }
     }
 
@@ -452,11 +499,13 @@ internal sealed class UsageIndicatorForm : Form
     {
         if (_previewMode) return;
         if (_accountManager is null || _accountManager.IsDisposed)
-            _accountManager = new AccountManagerForm(_accountStore, SuspendAccountsAsync, ResumeAccounts,
-                queryUsage: QueryAccountUsageAsync, combined: _combinedUsage, usageChanged: UpdateToolTip);
+            _accountManager = CreateAccountManager(refreshAllOnOpen: true);
         _accountManager.Show();
         _accountManager.Activate();
     }
+
+    private AccountManagerForm CreateAccountManager(bool refreshAllOnOpen) => new(_accountStore, SuspendAccountsAsync, ResumeAccounts,
+        queryUsage: QueryAccountUsageAsync, combined: _combinedUsage, usageChanged: UpdateToolTip, refreshAllOnOpen: refreshAllOnOpen);
 
     private async Task QueryAccountUsageAsync(SavedCodexAccount account, CancellationToken token)
     {
@@ -482,7 +531,7 @@ internal sealed class UsageIndicatorForm : Form
             _accountStore.GetCurrentIdentity().Key != identity)
             throw new InvalidOperationException("조회 중 현재 계정이 변경되었습니다. 목록을 갱신한 뒤 다시 조회하세요.");
         _accountStore.SaveUsage(identity, result.Usage);
-        _codexSnapshot = result.Usage; _codexError = null;
+        _codexSnapshot = result.Usage; _codexError = null; _codexFailure = null;
         UpdateToolTip(); Invalidate();
     }
 
@@ -499,7 +548,7 @@ internal sealed class UsageIndicatorForm : Form
         _accountBusy = _accountStore.HasPendingRecovery;
         _codexSnapshot = null;
         _helperIdentityKey = null;
-        _codexError = null;
+        _codexError = null; _codexFailure = null;
         _codexWasRunning = false;
         if (!_accountBusy) SyncCodexVisibility();
         Invalidate();
@@ -511,12 +560,12 @@ internal sealed class UsageIndicatorForm : Form
         {
             using var timeout = new CancellationTokenSource(ClaudeRefreshTimeout);
             _claudeUsage = await _claudeClient.GetUsageAsync(timeout.Token);
-            _claudeError = null;
+            _claudeError = null; _claudeFailure = null;
         }
         catch (Exception ex)
         {
             _claudeUsage = null;
-            _claudeError = FriendlyClaudeError(ex);
+            _claudeFailure = ex; _claudeError = FriendlyClaudeError(ex);
         }
     }
 
@@ -661,7 +710,7 @@ internal sealed class UsageIndicatorForm : Form
     {
         var builder = new StringBuilder();
         builder.AppendLine("CODEX");
-        AppendUsageWindow(builder, "주간", codex?.UsedPercent, codex?.ResetsAt);
+        AppendUsageWindow(builder, UiText.T("주간"), codex?.UsedPercent, codex?.ResetsAt);
         AppendRefreshError(builder, codexError);
 
         if (showClaude)
@@ -671,12 +720,12 @@ internal sealed class UsageIndicatorForm : Form
             builder.AppendLine("CLAUDE");
             AppendUsageWindow(
                 builder,
-                "5시간",
+                UiText.T("5시간"),
                 claudeSnapshot?.FiveHour?.UsedPercent,
                 claudeSnapshot?.FiveHour?.ResetsAt);
             AppendUsageWindow(
                 builder,
-                "주간",
+                UiText.T("주간"),
                 claudeSnapshot?.Weekly?.UsedPercent,
                 claudeSnapshot?.Weekly?.ResetsAt);
             AppendUsageWindow(
@@ -691,7 +740,7 @@ internal sealed class UsageIndicatorForm : Form
         if (includeControls)
         {
             builder.AppendLine();
-            builder.Append("드래그: 이동 · 더블클릭: 새로고침 · 우클릭: 메뉴");
+            builder.Append(UiText.T("드래그: 이동 · 더블클릭: 새로고침 · 우클릭: 메뉴"));
         }
 
         return builder.ToString().TrimEnd();
@@ -705,21 +754,21 @@ internal sealed class UsageIndicatorForm : Form
     {
         if (usedPercent is null)
         {
-            builder.AppendLine($"{label}: 정보 없음");
+            builder.AppendLine(UiText.F($"{label}: 정보 없음"));
             return;
         }
 
         var used = (int)Math.Round(
             Math.Clamp(usedPercent.Value, 0d, 100d),
             MidpointRounding.AwayFromZero);
-        builder.AppendLine($"{label}: {100 - used}% 남음 ({used}% 사용)");
-        builder.AppendLine($"  초기화: {FormatResetTime(resetsAt)}");
+        builder.AppendLine(UiText.F($"{label}: {100 - used}% 남음 ({used}% 사용)"));
+        builder.AppendLine(UiText.F($"  초기화: {FormatResetTime(resetsAt)}"));
     }
 
     private static void AppendRefreshError(StringBuilder builder, string? error)
     {
         if (error is null) return;
-        builder.AppendLine($"업데이트 실패: {error}");
+        builder.AppendLine(UiText.F($"업데이트 실패: {UiText.Message(error)}"));
     }
 
     private static void AppendClaudeRefreshState(
@@ -729,16 +778,16 @@ internal sealed class UsageIndicatorForm : Form
         if (claude is not { IsStale: true }) return;
 
         builder.AppendLine(
-            $"업데이트 지연: 마지막 성공 {claude.LastUpdatedAt.ToLocalTime():yyyy-MM-dd HH:mm}");
+            UiText.F($"업데이트 지연: 마지막 성공 {claude.LastUpdatedAt.ToLocalTime():yyyy-MM-dd HH:mm}"));
         if (claude.RetryAfter is { } retryAfter)
         {
-            builder.AppendLine($"  다음 시도: {FormatResetTime(retryAfter)}");
+            builder.AppendLine(UiText.F($"  다음 시도: {FormatResetTime(retryAfter)}"));
         }
     }
 
     private static string FormatResetTime(DateTimeOffset? resetsAt)
     {
-        if (resetsAt is null) return "정보 없음";
+        if (resetsAt is null) return UiText.T("정보 없음");
 
         var localReset = resetsAt.Value.ToLocalTime();
         var remaining = localReset - DateTimeOffset.Now;
@@ -747,46 +796,46 @@ internal sealed class UsageIndicatorForm : Form
 
     private static string FormatTimeRemaining(TimeSpan remaining)
     {
-        if (remaining <= TimeSpan.Zero) return "지금";
+        if (remaining <= TimeSpan.Zero) return UiText.T("지금");
 
         var days = (int)remaining.TotalDays;
-        if (days > 0) return $"{days}일 {remaining.Hours}시간 후";
-        if (remaining.Hours > 0) return $"{remaining.Hours}시간 {remaining.Minutes}분 후";
-        return $"{Math.Max(0, remaining.Minutes)}분 후";
+        if (days > 0) return UiText.F($"{days}일 {remaining.Hours}시간 후");
+        if (remaining.Hours > 0) return UiText.F($"{remaining.Hours}시간 {remaining.Minutes}분 후");
+        return UiText.F($"{Math.Max(0, remaining.Minutes)}분 후");
     }
 
     private static string FriendlyCodexError(Exception exception)
     {
         if (exception is TimeoutException or TaskCanceledException)
-            return "Codex 응답 시간이 초과되었습니다.";
+            return UiText.T("Codex 응답 시간이 초과되었습니다.");
         if (exception.Message.Contains("codex.exe", StringComparison.OrdinalIgnoreCase))
-            return "Codex 실행 파일을 찾지 못했습니다.";
+            return UiText.T("Codex 실행 파일을 찾지 못했습니다.");
         if (exception.Message.Contains("not logged", StringComparison.OrdinalIgnoreCase))
-            return "Codex 로그인이 필요합니다.";
-        return TruncateError(exception.Message);
+            return UiText.T("Codex 로그인이 필요합니다.");
+        return TruncateError(UiText.Message(exception.Message));
     }
 
     internal static string FriendlyClaudeError(Exception exception)
     {
         if (exception is TimeoutException or TaskCanceledException)
-            return "Claude 응답 시간이 초과되었습니다.";
+            return UiText.T("Claude 응답 시간이 초과되었습니다.");
         if (exception is UnauthorizedAccessException)
-            return "Claude Code 로그인이 만료되었습니다.";
+            return UiText.T("Claude Code 로그인이 만료되었습니다.");
         if (exception is ClaudeUsageTemporarilyUnavailableException unavailable)
         {
-            return $"Claude 사용량 조회가 지연되었습니다. 다음 시도: {FormatResetTime(unavailable.RetryAfter)}";
+            return UiText.F($"Claude 사용량 조회가 지연되었습니다. 다음 시도: {FormatResetTime(unavailable.RetryAfter)}");
         }
         if (exception is FileNotFoundException ||
             exception.Message.Contains("executable", StringComparison.OrdinalIgnoreCase))
         {
-            return "Claude Code 실행 파일을 찾지 못했습니다.";
+            return UiText.T("Claude Code 실행 파일을 찾지 못했습니다.");
         }
         if (exception.Message.Contains("credentials", StringComparison.OrdinalIgnoreCase) ||
             exception.Message.Contains("login", StringComparison.OrdinalIgnoreCase))
         {
-            return "Claude Code 로그인이 필요합니다.";
+            return UiText.T("Claude Code 로그인이 필요합니다.");
         }
-        return TruncateError(exception.Message);
+        return TruncateError(UiText.Message(exception.Message));
     }
 
     private static string TruncateError(string message) => message.Length > 120
@@ -845,7 +894,7 @@ internal sealed class UsageIndicatorForm : Form
     }
 }
 
-internal sealed record IndicatorSettings(int? X, int? Y, bool? ShowClaude);
+internal sealed record IndicatorSettings(int? X, int? Y, bool? ShowClaude, string? Language = null);
 
 internal static class IndicatorSettingsStore
 {
@@ -855,37 +904,50 @@ internal static class IndicatorSettingsStore
 
     private static readonly string SettingsPath = Path.Combine(SettingsDirectory, "settings.json");
 
-    public static Point? LoadPosition()
+    public static Point? LoadPosition(string? path = null)
     {
-        var settings = LoadSettings();
+        var settings = LoadSettings(path);
         return settings?.X is { } x && settings.Y is { } y
             ? new Point(x, y)
             : null;
     }
 
-    public static bool LoadShowClaude() => LoadSettings()?.ShowClaude ?? true;
+    public static bool LoadShowClaude(string? path = null) => LoadSettings(path)?.ShowClaude ?? true;
 
-    public static void SavePosition(Point position)
+    public static string LoadLanguage(string? path = null)
     {
-        var current = LoadSettings();
+        var settings = LoadSettings(path);
+        return UiText.IsSupported(settings?.Language) ? settings!.Language! : settings is not null ? "ko" : UiText.SystemLanguage;
+    }
+
+    public static void SaveLanguage(string language, string? path = null)
+    {
+        if (!UiText.IsSupported(language)) throw new ArgumentException("Unsupported UI language.", nameof(language));
+        var current = LoadSettings(path);
+        SaveSettings(new IndicatorSettings(current?.X, current?.Y, current?.ShowClaude ?? true, language), path);
+    }
+
+    public static void SavePosition(Point position, string? path = null)
+    {
+        var current = LoadSettings(path);
         SaveSettings(new IndicatorSettings(
             position.X,
             position.Y,
-            current?.ShowClaude ?? true));
+            current?.ShowClaude ?? true, current?.Language ?? LoadLanguage(path)), path);
     }
 
-    public static void SaveShowClaude(bool showClaude)
+    public static void SaveShowClaude(bool showClaude, string? path = null)
     {
-        var current = LoadSettings();
-        SaveSettings(new IndicatorSettings(current?.X, current?.Y, showClaude));
+        var current = LoadSettings(path);
+        SaveSettings(new IndicatorSettings(current?.X, current?.Y, showClaude, current?.Language ?? LoadLanguage(path)), path);
     }
 
-    private static IndicatorSettings? LoadSettings()
+    private static IndicatorSettings? LoadSettings(string? path = null)
     {
         try
         {
-            return File.Exists(SettingsPath)
-                ? JsonSerializer.Deserialize<IndicatorSettings>(File.ReadAllText(SettingsPath))
+            return File.Exists(path ?? SettingsPath)
+                ? JsonSerializer.Deserialize<IndicatorSettings>(File.ReadAllText(path ?? SettingsPath))
                 : null;
         }
         catch
@@ -894,17 +956,18 @@ internal static class IndicatorSettingsStore
         }
     }
 
-    private static void SaveSettings(IndicatorSettings settings)
+    private static void SaveSettings(IndicatorSettings settings, string? path = null)
     {
         try
         {
-            Directory.CreateDirectory(SettingsDirectory);
-            var temporaryPath = SettingsPath + ".tmp";
+            path ??= SettingsPath;
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            var temporaryPath = path + ".tmp";
             var json = JsonSerializer.Serialize(
                 settings,
                 new JsonSerializerOptions { WriteIndented = true });
             File.WriteAllText(temporaryPath, json);
-            File.Move(temporaryPath, SettingsPath, overwrite: true);
+            File.Move(temporaryPath, path, overwrite: true);
         }
         catch
         {

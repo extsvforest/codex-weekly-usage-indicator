@@ -47,8 +47,13 @@ internal static class AccountUsageUiSmoke
                         form.MenuAction("RefreshAccountsButton").PerformClick();
                         Check(calls == 0 && button.Enabled, "opening/selecting/reloading never makes a remote request");
                         button.PerformClick();
-                        Check(form.IsOperationInProgress && !button.Enabled && !list.Enabled && !form.SelectedSwitchButton!.Enabled,
+                        var rowActions = list.Items.SelectMany(account => new[] { "SwitchAccount-" + account.Id, "ManageAccount-" + account.Id })
+                            .Select(name => Find<Button>(name)).ToArray();
+                        Check(form.IsOperationInProgress && !button.Enabled && rowActions.All(action => !action.Enabled)
+                            && !form.MenuAction("RenameAccountButton").Enabled && !form.MenuAction("DeleteAccountButton").Enabled
+                            && !Find<Button>("AddAccountButton").Enabled,
                             "in-flight query blocks duplicates and mutations");
+                        foreach (var action in rowActions) action.PerformClick();
                         button.PerformClick();
                         await UntilAsync(() => !form.IsOperationInProgress);
                         Check(calls == 1 && button.Enabled, "one click makes one query and restores buttons");

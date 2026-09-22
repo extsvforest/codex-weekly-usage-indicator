@@ -5,14 +5,14 @@ internal sealed partial class AccountManagerForm
     private async Task ReadAllUsageAsync()
     {
         if (_busy || _items.Count == 0) return;
-        await RunAsync(false, "전체 계정의 주간 사용량을 확인하고 있습니다…", async () =>
+        await RunAsync(false, UiText.T("전체 계정의 주간 사용량을 확인하고 있습니다…"), async () =>
         {
             var original = _store.ListAccounts();
             var activeId = original.SingleOrDefault(a => a.IsActive)?.Id;
             _combined.Initialize(original, batch: true);
             _batchQuerying = true; _batchCompleted = 0;
             using var cancellation = new CancellationTokenSource();
-            _loginCancellation = cancellation; _cancel.Text = "전체 조회 취소"; _cancel.Visible = true; _cancel.Enabled = true;
+            _loginCancellation = cancellation; _cancel.Text = UiText.T("전체 조회 취소"); _cancel.Visible = true; _cancel.Enabled = true;
             UpdateActions();
             try
             {
@@ -65,8 +65,8 @@ internal sealed partial class AccountManagerForm
                     throw new InvalidOperationException("조회 중 계정 구성이 바뀌었습니다. 전체 갱신이 필요합니다.");
                 _combined.CompletedAt = DateTimeOffset.UtcNow;
                 var complete = _combined.IsComplete(DateTimeOffset.UtcNow);
-                SetStatus(complete ? $"{original.Count}개 계정의 주간 잔여량을 확인했습니다."
-                    : "일부 계정의 확인이 필요합니다. 계정별 상태를 확인하고 다시 갱신하세요.", success: complete);
+                SetStatus(complete ? UiText.F($"{original.Count}개 계정의 주간 잔여량을 확인했습니다.")
+                    : UiText.T("일부 계정의 확인이 필요합니다. 계정별 상태를 확인하고 다시 갱신하세요."), success: complete);
             }
             catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
             { _combined.WasCanceled = true; throw; }
@@ -76,7 +76,7 @@ internal sealed partial class AccountManagerForm
                 _batchQuerying = false; _loginCancellation = null;
                 _combined.CompletedAt ??= DateTimeOffset.UtcNow;
             }
-        }, acquireGate: false, canceledMessage: "전체 조회를 취소했습니다. 확인된 값과 이전 값은 보존했습니다.");
+        }, acquireGate: false, canceledMessage: UiText.T("전체 조회를 취소했습니다. 확인된 값과 이전 값은 보존했습니다."));
     }
 
     private async Task QueryBatchMemberAsync(SavedCodexAccount account, CancellationToken token)
