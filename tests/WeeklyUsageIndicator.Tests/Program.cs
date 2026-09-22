@@ -1,6 +1,12 @@
 using System.Text.Json;
 using WeeklyUsageIndicator;
 
+if (args.Contains("--english")) UiText.SetLanguage("en");
+if (args.Contains("--language-ui-smoke")) { await LanguageUiSmoke.RunAsync(); return; }
+if (args.Contains("--localization-tests")) { await LocalizationTests.RunAsync(); return; }
+if (args.Contains("--account-style-preview")) { await AccountStylePreview.RunAsync(args.Contains("--hold"), args.Contains("--standard-dpi")); return; }
+if (args.Contains("--account-opening-smoke")) { await AccountOpeningSmoke.RunAsync(args.Contains("--trace-only")); return; }
+
 if (args.Contains("--live-account-usage-smoke"))
 {
     await LiveAccountUsageSmoke.RunAsync();
@@ -21,6 +27,11 @@ if (args.Contains("--tooltip-hover-smoke")) { await UsageTooltipHoverSmoke.RunAs
 
 var tests = new (string Name, Func<Task> Run)[]
 {
+    // Run the brief cursor-driven check first so a local user can resume using the
+    // mouse while the slower credential and lifecycle fixtures continue.
+    ("stable light tooltip hover, placement and focus", UsageTooltipHoverSmoke.RunAsync),
+    ("language switching preserves bounds, snapshots and account data", LanguageUiSmoke.RunAsync),
+    ("translation catalogs, known errors and language preferences", LocalizationTests.RunAsync),
     ("Codex app-server lifecycle isolation", AppServerLifecycleTests.RunAsync),
     ("Codex account vault and crash recovery", AccountStoreTests.RunAsync),
     ("manual inactive usage, rotated credentials and recovery", AccountUsageQueryTests.RunAsync),
@@ -29,8 +40,8 @@ var tests = new (string Name, Func<Task> Run)[]
     ("manual usage buttons, async failure and cancellation", AccountUsageUiSmoke.RunAsync),
     ("combined weekly snapshot coverage and reset boundaries", CombinedUsageTests.RunAsync),
     ("combined manager opening, refresh, cancellation and cleanup", CombinedUsageUiSmoke.RunAsync),
+    ("account manager first paint and stable partial updates", () => AccountOpeningSmoke.RunAsync()),
     ("multi-account tooltip observations and refresh boundaries", UsageTooltipTests.RunAsync),
-    ("stable light tooltip hover, placement and focus", UsageTooltipHoverSmoke.RunAsync),
     ("supervisor retries abnormal exits but respects normal Quit", TestSupervisorAsync),
     ("official Claude /usage output is parsed", TestObservedUsageOutputAsync),
     ("usage without reset times remains valid through client and tooltip", TestUsageWithoutResetsAsync),

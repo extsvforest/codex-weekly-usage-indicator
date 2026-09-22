@@ -5,7 +5,7 @@ Codex + Claude Usage Indicator reads Codex rate-limit windows from the locally i
 The application:
 
 - does not store a timeline of usage history; optional Codex account management retains each account's latest usage snapshot;
-- stores the last window coordinates and the Claude visibility preference in a local `settings.json` file;
+- stores the last window coordinates, Claude visibility preference and UI language in a local `settings.json` file;
 - stores one latest successful Claude snapshot in local `claude-usage-cache.json`, containing only usage percentages, reset times, and the update time;
 - does not read, print, log, copy, or persist Claude authentication tokens;
 - reads Codex account identifiers only after optional account registration, and stores them with labels and login snapshots in a Windows CurrentUser DPAPI encrypted vault;

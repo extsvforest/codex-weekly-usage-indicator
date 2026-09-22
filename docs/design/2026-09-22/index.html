@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Codex 계정 · 두 가지 디자인 방향</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <nav class="review" aria-label="시안 비교">
+    <div><strong>계정 관리 · 디자인 비교</strong><span>가상 데이터 · 실제 로그인에 영향 없음</span></div>
+    <div class="segmented"><button data-view="a" aria-pressed="true">A · 정돈된 목록</button><button data-view="b" aria-pressed="false">B · 세 장의 카드</button></div>
+    <label>상태 <select id="state"><option value="ready">확인 완료</option><option value="loading">조회 중</option><option value="partial">일부 조회 실패</option></select></label>
+  </nav>
+  <div class="stage">
+    <article class="window direction-a" id="app">
+      <div class="titlebar"><span>Codex 계정 관리</span><div aria-hidden="true">─　 □　 ×</div></div>
+      <main>
+        <header class="pagehead"><div><div class="eyebrow">CODEX / ACCOUNTS</div><h1>계정 관리</h1></div><div class="head-actions"><button class="plain" data-action="add"><span class="plus">＋</span> 계정 추가</button><button class="primary" data-action="refresh"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5M6.3 7.3A7 7 0 0 1 20 12M4 12a7 7 0 0 0 13.7 4.7"/></svg><span id="refresh-text">전체 갱신</span></button></div></header>
+        <section class="summary" aria-label="전체 사용량">
+          <div class="balance"><div class="sectionlabel">전체 주간 잔여</div><div class="total"><strong id="total">168</strong><span>%</span><small id="capacity">/ 300%</small></div><div class="balance-meta" id="coverage">3개 계정 모두 확인 <span>·</span> 계정당 100% 기준</div></div>
+          <div class="schedule"><div class="next-label"><span class="tiny-dot"></span> 다음 초기화</div><div class="next-time">2일 6시간 <span>뒤</span></div><p>메인 계정 <span>·</span> 09.24 20:40</p><div class="last-reset">가장 늦은 초기화 <b>09.28 20:40</b></div></div>
+        </section>
+        <div class="statusline" aria-live="polite"><span id="status-text"><span class="check">✓</span> 오늘 14:30에 전체 확인</span><button class="text-action" id="status-action" hidden data-action="cancel">조회 취소</button></div>
+        <section class="accounts-section" aria-label="저장된 계정">
+          <div class="sectionhead"><h2>내 계정 <span>3</span></h2><span>초기화가 가까운 순</span></div>
+          <div class="columnhead"><span>계정</span><span>주간 잔여</span><span>초기화</span><span></span></div>
+          <div class="accounts" id="accounts"></div>
+        </section>
+        <footer><span class="footer-dot"></span><span>창을 열 때 한 번 확인하며, 이후에는 직접 갱신합니다.</span><button class="text-action" data-action="reload">목록 다시 읽기</button></footer>
+      </main>
+      <div class="popover" id="menu" hidden><strong id="menu-name"></strong><button data-menu="rename">이름 변경</button><button data-menu="usage">이 계정 사용량 조회</button><button data-menu="details">상세 정보</button><hr><button class="danger" data-menu="delete">저장된 로그인 삭제</button></div>
+      <div class="modal-layer" id="modal" hidden><section role="dialog" aria-modal="true" aria-labelledby="dialog-title"><div class="eyebrow">CODEX ACCOUNTS</div><h2 id="dialog-title"></h2><p id="dialog-body"></p><label id="name-label" hidden>계정 이름<input id="alias" maxlength="40"></label><div class="dialog-actions"><button id="dismiss" class="secondary">닫기</button><button id="confirm" class="primary">저장</button></div></section></div>
+    </article>
+  </div>
+  <aside class="critique" id="critique"><b>A · 추천</b><span>한 장의 밝은 바탕, 일정한 열, 가벼운 동작 버튼. 전체 잔여량을 보고 곧바로 계정을 비교하기 좋습니다.</span></aside>
+  <script src="app.js"></script>
+</body>
+</html>

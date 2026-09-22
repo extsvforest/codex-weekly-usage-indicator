@@ -109,7 +109,10 @@ internal static class CombinedUsageUiSmoke
                         mode = "success"; refresh.PerformClick(); await Until(() => !form.IsOperationInProgress);
                         Check(calls == 15 && form.CombinedUsage.IsComplete(DateTimeOffset.Now), "manual retry after recovery produces a complete new batch");
                         Check(File.ReadAllBytes(authPath).SequenceEqual(originalAuth) && restarts == 0, "batch never writes active auth or suspends the active helper");
-                        form.ClientSize = new Size(850, 520); Capture(form, "combined-small.png");
+                        // Resize the outer window to its DPI-scaled minimum, as a
+                        // user would. An impossible ClientSize below that minimum
+                        // leaves WinForms reporting a request the native HWND rejected.
+                        form.Size = form.MinimumSize; await Task.Delay(100); Capture(form, "combined-small.png");
                         mode = "no-save"; refresh.PerformClick(); await Until(() => !form.IsOperationInProgress);
                         Check(calls == 18 && !form.CombinedUsage.IsComplete(DateTimeOffset.Now) && form.CombinedUsage.Accounts.Single(row => row.Account.IsActive).State == CombinedReadState.Failed,
                             "returning without saving a fresh observation cannot certify a previous value");
@@ -154,7 +157,17 @@ internal static class CombinedUsageUiSmoke
         bitmap.Save(Path.Combine(Path.GetDirectoryName(output)!, name), ImageFormat.Png);
         IEnumerable<Control> Walk(Control c) => c.Controls.Cast<Control>().SelectMany(child => new[] { child }.Concat(Walk(child)));
         foreach (var label in Walk(form).OfType<Label>().Where(l => l.Visible && l.Text.Length > 0 && !l.Text.Contains('\n')))
+        {
             Check(label.Height >= TextRenderer.MeasureText(label.Text, label.Font, new Size(int.MaxValue, int.MaxValue), TextFormatFlags.SingleLine).Height,
                 "visible text has enough height at the current DPI: " + label.Name);
+            Check(label.Parent!.ClientRectangle.Contains(label.Bounds),
+                "text is not clipped by its parent at the current DPI: " + label.Name);
+        }
+        foreach (var button in Walk(form).OfType<Button>().Where(b => b.Visible))
+            Check(button.Parent!.ClientRectangle.Contains(button.Bounds),
+                "the complete action target fits its parent at the current DPI: " + button.Name);
+        foreach (var control in Walk(form).Where(c => c.Visible && c.Parent is not ScrollableControl { AutoScroll: true }))
+            Check(control.Parent!.ClientRectangle.Contains(control.Bounds),
+                $"content stays within every non-scrolling ancestor in {name}: {control.Name} ({control.GetType().Name}) {control.Bounds} in {control.Parent.Name} ({control.Parent.GetType().Name}) {control.Parent.ClientRectangle}");
     }
 }
