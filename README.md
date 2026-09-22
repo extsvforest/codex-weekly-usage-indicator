@@ -16,7 +16,7 @@ The blue bar is Codex; the orange bar is Claude Fable. The numbers show how much
 
 Screenshots use synthetic accounts and usage. This is an unofficial community project.
 
-[Download the Windows release](https://github.com/GiantForestStudio/codex-weekly-usage-indicator/releases/latest) · [Installation](#install-from-a-release) · [Language](#language)
+[Download the Windows release](https://github.com/extsvforest/codex-weekly-usage-indicator/releases/latest) · [Installation](#install-from-a-release) · [Language](#language)
 
 ## What it does
 
@@ -104,7 +104,7 @@ The choice is saved locally. Existing installations with a settings file keep Ko
 
 ## Install from a release
 
-1. Download and extract the Windows zip from [Releases](https://github.com/GiantForestStudio/codex-weekly-usage-indicator/releases).
+1. Download and extract the Windows zip from [Releases](https://github.com/extsvforest/codex-weekly-usage-indicator/releases).
 2. Review the included PowerShell scripts.
 3. Open a standalone Windows PowerShell window (outside packaged apps such as Codex), change to the extracted directory, and run:
 
