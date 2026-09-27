@@ -33,6 +33,8 @@ There is currently no second Claude account available. Interactive login of an a
 
 Native visual evidence uses synthetic data: [Codex](design/2026-09-28/100/manager.png), [Claude](design/2026-09-28/100/claude.png), [three Claude accounts at 175%](design/2026-09-28/175/claude-states.png), [one account before its first check](design/2026-09-28/175/claude-single.png), and [English](design/2026-09-28/en-175/claude.png). The original Codex and Claude work remains under the existing accounts; no live switch was performed for these captures.
 
+The local normal-user installation was verified on September 28 from implementation commit `34fc4b8`. The installed `1.9.0-preview.2` executable matches SHA-256 `1fd68470ae73704be8572c4bc025d0d7fa75e598c3f89cc47d1c5fc6bdfe44b9`. The normal-privilege scheduled task runs one supervisor and one widget. The existing Claude profile remained selected, and a fresh identity-bound overall weekly observation was saved after restart. The temporary installer task was removed; previous executables remain available locally for rollback. This is a local candidate, not a GitHub release.
+
 ## Profile sharing details
 
 Local project conversations, skills and supported working directories are referenced in place. Authentication and account-specific runtime files remain separate. Removing a profile from the manager does not delete its files or the linked original directories. Ordinary terminal `claude` continues to use its existing configuration; the selected extra profile is used by **Open Claude** in this panel and by the widget.
