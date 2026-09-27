@@ -1,121 +1,121 @@
 # Codex + Claude Usage Indicator
 
-Keep your remaining Codex and Claude usage in sight, then check and switch your saved Codex accounts from one place.
+See how much weekly usage you have left, then choose the account for your next session. A compact Windows widget and one account manager bring Codex, Claude Code and connected WSL Codex environments together.
 
 **Windows · 한국어 / English · Manual account switching**
 
-<img src="docs/design/2026-09-22/native/widget.png" alt="Compact widget showing 62% Codex and 60% Claude Fable remaining" width="272">
+<img src="docs/design/2026-09-28/100/widget.png" alt="Compact widget showing Codex and Claude weekly remaining percentages" width="272">
 
-The blue bar is Codex; the orange bar is Claude Fable. The numbers show how much weekly usage remains. The widget stays visible while Codex is open, so you can check without leaving your work.
+Blue is Codex; orange is Claude. Choose **all-model weekly** or **Fable weekly** for the Claude number from the right-click menu.
 
-![A light account manager showing 168% remaining across three accounts, reset times and manual switch actions](docs/design/2026-09-22/native/en-manager-100.png)
+![A light account manager showing combined Codex usage, reset times and manual switch actions](docs/design/2026-09-28/100/manager.png)
 
-- **See what is left across your accounts.** The manager adds their remaining weekly percentages and shows which account resets next.
-- **Check another account without switching.** Refresh one account or all accounts when you need an update.
-- **Switch when you choose.** Pick an account, finish your Codex work and confirm the switch. The tool saves your logins for the next time.
+- **See what is left across your Codex accounts.** Check their remaining weekly percentages and the next reset without signing out of your current account.
+- **Choose the account you want to use.** Switch Codex manually, or open Claude Code with a selected profile and your existing local conversations and skills.
+- **Keep Windows and WSL Codex in step.** Connect an installed WSL environment once, then include it when you switch accounts.
 
 Screenshots use synthetic accounts and usage. This is an unofficial community project.
 
-[Download the Windows release](https://github.com/extsvforest/codex-weekly-usage-indicator/releases/latest) · [Installation](#install-from-a-release) · [Language](#language)
+[Download the Windows release](https://github.com/extsvforest/codex-weekly-usage-indicator/releases/latest) · [Installation](#install-from-a-release) · [Privacy](PRIVACY.md)
 
-## What it does
+## Widget
+
+The widget appears while Codex Desktop is running and hides when Codex exits or another app is fullscreen. Drag it to move; double-click to refresh; right-click for account management, display choices, language and other controls. Its hover details stay in place while you read and never take keyboard focus.
+
+Choose **Claude display → All models · weekly remaining / Fable · weekly remaining** to change the right-hand number. This changes the display immediately without requesting usage. A new installation starts with all-model weekly; existing installations keep Fable until you choose otherwise. If the selected limit is absent or has passed its reset, the number is **—**. It never silently substitutes another limit. Turning Claude off leaves a single Codex panel and stops Claude usage requests.
+
+Codex refreshes every minute while active. Claude usage requests are at least ten minutes apart across all profiles, including manual refreshes and failed attempts. The tooltip lists the selected Claude window first, followed by the other weekly window and the five-hour limit. Overall and Fable percentages are separate limits; they are not added together.
+
+Temporary Claude failures can keep a recent, unexpired value visible with its last check time and retry time. Each window expires independently, and no recovery value is used after 24 hours. Missing reset times stay unknown. Account verification or response-format failures clear the affected cached value.
+
+## Codex accounts
+
+Open **Account manager… / 계정 관리…** from the widget or tray menu, or double-click the tray icon. Choose the **Codex** tab.
+
+1. **Save your current account.** Choose **Save current account**. Rename it from its **···** menu whenever you like.
+2. **Add another account.** Choose **+ Add account** and complete the official browser sign-in. Your current Codex session stays signed in.
+3. **Check the balances.** Opening a new manager window checks saved Codex accounts once. Use **Refresh all** for another complete check or a row's **···** menu to refresh just that account.
+4. **Switch when ready.** Choose **Switch**, save your work, and close Codex Desktop and its terminal or IDE sessions. Confirm the switch once they have stopped. The tool applies the saved login and tries to reopen Codex; check the account there.
+
+The list puts the soonest reset first. Three accounts fit in the default window on a sufficiently tall display. Names appear in the manager and hover details, keeping the small widget focused on percentages.
+
+In the screenshot, **63% + 81% + 24% = 168% out of 300%**. Each account contributes 100% when full. Different plans can have different actual quotas, so this sum does not represent an equal number of messages or tokens. A connected Windows/WSL pair counts as one account.
+
+**Next reset** identifies the first account to reset. **Latest reset** gives the last reset among the accounts; it is not a deadline for spending the entire combined balance. Each account follows its own reset time.
+
+Changing tabs, language or focus does not request another full refresh. If a query fails, an account changes or a reset passes, the manager distinguishes previous values from current observations and withholds an incomplete total. Refreshing one account does not certify a new full total.
 
 <details>
-<summary>Widget behavior and refresh details</summary>
+<summary>Saved Codex logins and interrupted operations</summary>
 
-- Appears while Codex Desktop is running and hides when Codex exits.
-- Keeps the existing 272 × 64 window and uses one or two fluid panels depending on which providers are available.
-- Shows only white remaining percentages: Codex is identified by a blue bar and Claude Fable by a terracotta-orange bar.
-- Expands one successful provider to the full width when the other provider is unavailable.
-- Shows Codex weekly reset details plus Claude 5-hour, weekly, and Fable reset details in a hover tooltip.
-- Reads the weekly usage window from the local Codex app-server.
-- Reads Claude limits through Claude Code's built-in `/usage` command with a ten-minute in-memory cache.
-- Keeps one credential-free successful Claude snapshot locally for up to 24 hours so a rate-limited cold start does not blank the panel.
-- Keeps the last successful Claude value visible during temporary rate limits or service errors and reports the delay in the tooltip.
-- Refreshes every 60 seconds; double-click to refresh Codex immediately while Claude continues to honor its ten-minute cache.
-- Supports dragging, copying the current values, toggling always-on-top, and turning the Claude panel on or off from the right-click menu.
-- Remembers the last dragged position and restores it on the next launch.
-- Switches the interface between Korean and English from **Language / 언어** in the widget or tray menu.
-- Hides while another foreground app is fullscreen, then returns at the saved position.
-- Uses a per-user Windows scheduled task at sign-in, so the widget runs independently of Codex. A lightweight supervisor restarts the widget after an abnormal exit, waiting one minute (up to 999 retries per supervisor run).
+Saved logins are encrypted for your Windows user. Inactive-account usage checks use the official local app-server in a private temporary `CODEX_HOME`; they do not replace the active login. If the official client refreshes credentials, the new credentials are saved even when the usage request fails or is canceled.
+
+An interrupted credential operation offers recovery. Recovery compares the actual current account before proceeding and does not overwrite a newer, different sign-in. If credentials are already saved and only temporary files remain, **Clean up temporary files** can finish cleanup while Codex stays open. Closing the manager during a batch cancels the request and waits for safe cleanup.
+
+Local file-based ChatGPT authentication is supported. Keyring and managed authentication configurations are not changed. See [PRIVACY.md](PRIVACY.md) for storage and recovery details.
 
 </details>
 
-You can use the widget on its own. Saving accounts is optional; it adds the account manager shown above. Saved Codex logins are encrypted for your Windows user. Claude Code handles its own login. See [PRIVACY.md](PRIVACY.md) for storage details.
+## Claude Code accounts
 
-## Manual Codex accounts
+![Claude account tab with a selected profile, weekly usage and launch actions](docs/design/2026-09-28/100/claude.png)
 
-Right-click the widget and open **Codex accounts… / Codex 계정 관리…**, or double-click its tray icon.
+1. Open the **Claude** tab and choose **Connect existing account** to register the Claude Code account you already use.
+2. Choose **+ Add account** and sign in through the official Claude Code login window. Each additional account gets its own official login profile.
+3. Press **Select** on the account you want. The widget and new Claude launches from this panel now use that profile.
+4. Press **Open Claude…**, choose your project folder, and continue working in the new terminal.
 
-1. **Save the account you already use.** Choose **Save current account**. Open its **···** menu to give it a name you recognize.
-2. **Add another account.** Choose **+ Add account** and complete the official sign-in in your browser. Your current Codex session stays signed in.
-3. **Check the balances.** Opening the manager checks your saved accounts once. Press **Refresh all** for another complete check, or use a row's **···** menu to check just that account.
-4. **Switch when you are ready.** Press **Switch** on the account you want. Save your work and close Codex Desktop and any Codex terminal or IDE sessions. The confirmation button becomes available when they have stopped; it applies the saved login and tries to reopen Codex. Check that Codex shows the intended account.
+**Use the panel to launch an additional profile.** Selecting one here does not change a plain `claude` command in an ordinary terminal or an already open IDE session. Existing sessions keep their current account; no running work is stopped or switched underneath you.
 
-The list puts the soonest reset first. Three accounts fit in the default window on a sufficiently tall display; a smaller window can scroll. Names appear here and in hover details, while the small widget stays focused on percentages.
+Your original Claude folder stays in place. Additional profiles share the existing local conversation, skill and other working directories through folder links. User instructions and settings are passed to the official CLI; local plugin installations are reused where supported. Account-specific configuration, cloud connections and authentication stay separate. Prompt recall history is shared where Windows file links are available; conversation files remain shared independently of that capability.
 
-Hover details open outside the widget after a short delay and stay in place while you read. New observations appear on the next hover; moving away, dragging, or opening the context menu closes the details. The hover window never takes keyboard focus.
+The summary shows the selected account's overall weekly balance and reset time. Use its **Refresh** button or the small refresh action beside another account's balance to check usage. These checks share the same ten-minute request limit as the widget. Other Claude accounts are not polled in the background. The **···** menu provides rename, sign in again, sign out and removal from the list. **Remove from list** keeps that profile's login and conversation files; use **Sign out** first if you want the official CLI to end its login.
 
-<img src="docs/design/2026-09-22/native/en-tooltip.png" alt="Hover details with the active account, combined weekly remaining usage and each account's reset time" width="640">
+## Connect WSL Codex
 
-In the example above, the accounts have **63%, 81% and 24%** left. Adding them gives **168% out of 300%**. Each full account contributes 100%, so this helps you compare the saved balances. Accounts on different plans can have different actual quotas; the sum does not measure an equal number of messages or tokens.
+Choose **Windows · WSL** in the Codex tab, start the WSL distribution you want to use, and press **Find environments**. Only a running environment with a native Linux Codex CLI and supported personal file-based authentication can be connected. The tool does not install a missing CLI, start unrelated distributions or change unsupported authentication settings. If the official login does not open your browser, use **Open sign-in page**. The temporary link stays in memory and is cleared when login ends or is canceled.
 
-**Next reset** tells you which account resets first. **Latest reset** shows the last reset among the accounts. Each balance still follows its own reset time, so the latest date is not a deadline for spending the whole 168%.
+For each account you want to switch:
 
-Other accounts are checked when you open the manager or request a refresh. Moving the mouse, changing the language or returning to the window does not request another check. If a check fails or a reset has passed, the manager marks what needs attention instead of presenting an old balance as a current total.
+1. Select the WSL environment and its corresponding saved Windows account.
+2. If WSL already uses that account, finish and close its Codex jobs, then choose **Connect current WSL login**. Otherwise choose **Sign in to selected account** and complete the official login. This additional login is isolated and can be prepared while existing jobs continue.
+3. Enable **Switch together with Windows** after connecting the logins.
 
-<details>
-<summary>Refresh rules, saved logins and recovery</summary>
+Before the first switch, connect **both the current WSL account and the destination account**. WSL logins are saved independently from Windows logins; Windows credential files are not copied over as a shortcut. An identity check must match the selected account before a binding is saved.
 
-Opening a new manager window starts one sequential usage query for all registered accounts. After that, **전체 갱신** is the only way to refresh the whole observation set. Restoring focus, changing selection, the local five-second UI timer, and the active widget's own polling do not trigger another batch or change this snapshot. Closing the window during a batch cancels the request and waits for safe cleanup. Failure, cancellation, missing/expired weekly data, or changed membership withholds the total and distinguishes the confirmed subtotal from previous values. Cleanup or credential recovery stops the remaining batch.
+Actual capture and switching require WSL Codex processes, including app and IDE connections, to be stopped. The tool does not kill those processes. If Windows is already on the account you want, its row's **···** menu can apply that account to the connected WSL environments without switching Windows again.
 
-Choose **현재 계정 등록** to save the current login with a default name. The **···** menu on each account contains **이름 변경**, **이 계정 사용량 조회**, **상세 정보**, and **저장된 로그인 삭제**. Enter saves a name and Escape cancels. Renaming only changes local metadata. The detail dialog contains the masked identity and latest 5-hour observation. An individual usage read updates that row and marks the overall total for a new full refresh; other observations retain their check times, while the total requires a full refresh so separate checks cannot silently masquerade as one complete batch. A background active-account poll does not alter the manager's observation set.
-
-Choose **+ 계정 추가**, optionally name the account, then select **브라우저에서 로그인**. Complete the official browser login using the additional account. This login uses an isolated private `CODEX_HOME` and does not log the desktop out; **로그인 취소** stops only the login process owned by this tool. If you sign into an unregistered account directly in Codex, the manager offers registration above the list.
-
-Click **전환** on the desired account. The preparation dialog shows the source and target names and waits while you finish your work and close Codex Desktop and other Codex CLI/engine processes. **전환하고 Codex 열기** becomes available when they have stopped; cancellation keeps the current login. The widget suspends its own helper, checks for remaining writers, preserves the latest current login and applies the selected login, then attempts to reopen Codex. Confirm the account there; file application and desktop login verification are separate outcomes. The widget's show/re-show and topmost maintenance preserve keyboard focus in other apps.
-
-Inactive usage reads use a short-lived official app-server in a private isolated home. Codex Desktop and the current account stay signed in, and the current helper is not suspended. Active-account reads reuse that helper and require Codex Desktop to be open. A timeout, cancellation or failed request preserves the last successful observation; refreshed credentials are saved even when usage retrieval fails. Expired inactive logins can be renewed through **+ 계정 추가** with that same account; renew the active login in Codex. The manager's background context menu can reload the saved account list without requesting usage.
-
-Only explicit selections cause a switch. There is no automatic quota rotation, proxy, inactive-account background polling, quota pooling, usage history, or per-person attribution. Values past their reset time are marked **갱신 필요**. A pending switch transaction blocks polling until **미완료 전환 복구** reconciles it with actual live authentication. A query interrupted before credentials are safely saved offers **중단된 조회 복구**; finish Codex work and close remaining Codex writers before this exceptional recovery. Its encrypted journal preserves refreshed credentials before staging is removed. Recovery never overwrites newer live authentication.
-
-If credentials are already saved and only temporary files remain, the manager instead shows **임시 파일 정리 대기** with an **임시 파일 정리** button. This cleanup can run while Codex stays open and does not block account editing or switching. The next inactive usage request also retries cleanup before starting. A temporary file lock is retried automatically; a persistent failure displays its category and code. Cleanup does not turn a failed or canceled usage request into a success, and periodic list refresh preserves the original result. The management window supports display scaling, and its account list scrolls when the window is made smaller.
-
-The first version supports local Windows file-based ChatGPT authentication. Unsupported keyring/managed configurations fail closed. The vault is stored separately at `%LOCALAPPDATA%\CodexWeeklyUsageIndicator.Accounts`; uninstall preserves it. Delete inactive accounts from the manager before removing the app if you no longer want their saved credentials. This convenience tool does not establish that any particular multi-account usage pattern is permitted by the service terms.
-
-</details>
-
-> [!IMPORTANT]
-> This is an unofficial community project. It relies on an experimental local Codex app-server method (`account/rateLimits/read`) and the text output of Claude Code's built-in `/usage` command. Either may change without notice.
+Windows and WSL cannot be updated in one atomic filesystem operation. If a switch is interrupted, the manager keeps an encrypted recovery record and shows what still needs attention. **Recover account switch** completes verification where possible. **Stop WSL linking** instead leaves every environment's current login untouched, disables linked switching and archives the encrypted recovery record. It does not roll back or write authentication files.
 
 ## Language
 
-Right-click the widget or tray icon, then choose **Language / 언어 → 한국어 / English**. Menus, account management, dialogs, usage details and known application errors change immediately. An open idle account manager keeps its size and last usage observation when the language changes; changing language does not request usage or sign you in again. Finish or cancel an account operation or close its dialog before changing language.
+Choose **Language / 언어 → 한국어 / English** in the widget or tray menu. Menus, account management, dialogs, usage details and known application errors change immediately. An idle manager keeps its size and latest observations. Finish or cancel a running account operation before changing language.
 
-The choice is saved locally. Existing installations with a settings file keep Korean; a new installation starts in Korean on Korean Windows and English otherwise. Account names, identities, credentials and usage values are not translated. Windows-provided confirmation buttons follow the Windows display language. Diagnostic text supplied by the operating system or an external tool may remain in its original language.
+The choice is saved locally. Existing installations keep Korean; new installations use Korean on Korean Windows and English otherwise. Account names, identities and usage values are not translated. Windows dialogs and external diagnostic text can follow their own language settings.
 
 ## Requirements
 
-- Windows 10 or 11
+- Windows 10 or 11 and [.NET 8 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/8.0)
 - Codex Desktop installed and signed in
-- Optional: a recent native Claude Code for Windows that supports `/usage` and `--safe-mode`, installed and signed in, to add Claude/Fable usage
-- [.NET 8 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/8.0)
+- Optional Claude support: a current native Claude Code for Windows with `/usage`, `auth` and `--safe-mode`
+- Optional WSL switching: a running WSL distribution with native Linux Codex CLI and supported file-based ChatGPT authentication
 - .NET 8 SDK only when building from source
 
 ## Install from a release
 
 1. Download and extract the Windows zip from [Releases](https://github.com/extsvforest/codex-weekly-usage-indicator/releases).
 2. Review the included PowerShell scripts.
-3. Open a standalone Windows PowerShell window (outside packaged apps such as Codex), change to the extracted directory, and run:
+3. Open a standalone Windows PowerShell window outside packaged apps such as Codex, change to the extracted directory, and run:
 
 ```powershell
 .\scripts\install.ps1
 ```
 
-The app is installed to `%LOCALAPPDATA%\CodexWeeklyUsageIndicator`. A per-user `CodexWeeklyUsageIndicator-<Windows SID>` scheduled task starts its supervisor at sign-in, using the signed-in user's normal privileges without storing a password. The supervisor launches and watches the widget; two processes from the same EXE are expected, but only one window. Installation also starts the task immediately, checks that both processes appear, and then removes the old Startup shortcut. Windows Task Scheduler must be available; an installation error must be resolved before relying on automatic recovery.
-The saved window position, Claude visibility preference and UI language are kept locally in `settings.json` inside that install directory. One sanitized Claude recovery snapshot may be kept in `claude-usage-cache.json` and is ignored after 24 hours or after its Fable reset.
+The app is installed to `%LOCALAPPDATA%\CodexWeeklyUsageIndicator`. A per-user `CodexWeeklyUsageIndicator-<Windows SID>` scheduled task starts its supervisor at sign-in with normal user privileges and no stored password. Installation starts the task immediately. Two processes from the same EXE are expected: the supervisor and one widget.
 
-Run installation and removal outside packaged app terminals: Windows can redirect their AppData writes into an app-private folder that Task Scheduler cannot see, causing `0x80070002` even when that terminal reports the EXE exists. Both scripts check the real directory path and refuse redirected locations before changing tasks or running widgets.
+The supervisor retries an abnormal widget exit after one minute. Choosing **Close** from the widget menu ends both normally. To start again before your next Windows sign-in, run the scheduled task or the installer. Launching the EXE directly does not enable supervision.
+
+Run installation and removal outside packaged app terminals. Windows can redirect their AppData writes into a location Task Scheduler cannot see; both scripts check the actual directory before changing tasks or processes. Release binaries are unsigned, and SHA-256 checksums are included with each release.
 
 To uninstall:
 
@@ -123,9 +123,17 @@ To uninstall:
 .\scripts\uninstall.ps1
 ```
 
-Release binaries are currently unsigned, so Windows may display a warning. SHA-256 checksums are included with each release.
+Uninstall removes the app and scheduled task. It **preserves saved Codex accounts, WSL recovery records and Claude profile folders**, so reinstalling does not discard your logins. Claude profile folders can contain official CLI credentials and links to your original work; do not recursively delete their linked contents. See [PRIVACY.md](PRIVACY.md) before removing saved data.
 
-Choosing **종료** from the widget menu exits normally and also ends the supervisor. It starts again at your next Windows sign-in. To start it sooner with recovery enabled, run its `CodexWeeklyUsageIndicator-<Windows SID>` task in Windows Task Scheduler or run `scripts\install.ps1` again. Launching the EXE directly does not enable supervision for that process. Stopping the scheduled task or killing the supervisor also stops automatic recovery until the task is started again. Uninstall removes the scheduled task before deleting the app.
+## How it works
+
+The WinForms widget reads `account/rateLimits/read` through the official local Codex app-server and selects the window closest to seven days. Claude usage comes from the official CLI's built-in `/usage`, run in safe mode without a shell, browser integration or persistent session and with `--max-turns 0`. Responses reporting a model turn or nonzero cost are rejected. The app does not read Claude tokens or implement its own OAuth flow.
+
+One local Claude recovery snapshot holds percentages, reset times, its check time and an opaque profile/account key. It cannot be reused for a different verified account. A new process attempts a live request first; temporary failures may use the matching snapshot for up to 24 hours, with each expired window withheld independently. Claude's own last-known output is not relabeled as a fresh check.
+
+Account changes are manual. There is no quota-based rotation, request proxy, pooled subscription quota, usage timeline or per-person attribution. This convenience tool does not establish that any particular multi-account usage pattern is permitted by the service terms.
+
+The local Codex app-server method and Claude Code's usage text are changeable interfaces. An upstream change can require an app update.
 
 ## Build from source
 
@@ -133,31 +141,7 @@ Choosing **종료** from the widget menu exits normally and also ends the superv
 .\scripts\build.ps1
 ```
 
-The executable is written to `dist\WeeklyUsageIndicator.exe`. Release builds omit debug paths and symbols.
-
-## How it works
-
-The WinForms process checks for the packaged Codex Desktop host. While Codex is active, it launches `codex app-server --stdio`, initializes the local JSONL protocol, and reads `account/rateLimits/read`. It selects the rate-limit window closest to seven days and renders the remaining percentage.
-
-For Claude, it runs the local native executable with `claude -p --safe-mode --no-session-persistence --no-chrome /usage --output-format json --max-turns 0`. Safe mode prevents personal hooks, plugins, MCP servers, and project instructions from affecting the lookup. Claude Code handles its own authentication and token refresh, while the widget parses the returned 5-hour, all-model weekly, and Fable weekly windows. Agentic turns are disabled, the widget also rejects any response that reports a model turn or non-zero cost, and successful results are cached in memory for ten minutes.
-
-The latest successful percentages, reset times, and update time are also written to `claude-usage-cache.json` without credentials or account identifiers. A new process still invokes Claude Code immediately; the local snapshot is used only when that command is temporarily unavailable, and is rejected after 24 hours or after its Fable reset. Authentication or response-schema failures delete it rather than showing data Claude Code has rejected.
-
-If the account does not expose a Fable-specific weekly limit, or one provider fails to refresh, that provider is omitted from the compact surface. Turning off **Claude 사용량 표시** also skips the Claude command until it is turned on again.
-
-Claude percentages remain valid when `/usage` omits reset times (for example, `Current session: 0% used`). Missing or unrecognized reset times appear as unknown. The 5-hour and all-model weekly windows are parsed independently, so an unavailable optional window does not hide a valid Fable percentage.
-
-Temporary Claude Code, network, or service failures keep the last successful Claude value visible while the tooltip shows the last update and next retry time.
-
-The app-server child process is stopped whenever Codex is no longer running.
-
-## Project files
-
-- `src/` — WinForms application
-- `scripts/` — build, install, and uninstall helpers
-- `wireframes/` — compact widget UI specification
-- `.github/workflows/` — clean Windows builds and tagged releases
-- `AGENTS.md` — guidance for coding agents
+The executable is written to `dist\WeeklyUsageIndicator.exe`. The script runs the regression suite before publishing; release builds omit debug paths and symbols. Synthetic design captures live under `docs/design/`.
 
 ## License
 

@@ -80,6 +80,11 @@ internal sealed class ClaudeCodeUsageSource : IClaudeUsageSource
 
     internal static ClaudeUsageSnapshot ParseUsageText(string text, DateTimeOffset now)
     {
+        // The official CLI can fall back to its own cached output. Its observation
+        // time is unavailable here, so do not label that response as a fresh check.
+        if (text.Contains("Showing last-known usage", StringComparison.OrdinalIgnoreCase))
+            throw new IOException("Claude Code returned last-known usage instead of a fresh check.");
+
         ClaudeUsageWindow? fiveHour = null;
         ClaudeUsageWindow? weekly = null;
         ClaudeUsageWindow? fable = null;
@@ -94,10 +99,10 @@ internal sealed class ClaudeCodeUsageSource : IClaudeUsageSource
                 fable = window;
         }
 
-        // Only Fable drives the compact panel. An absent or malformed optional
-        // window must not discard other independently valid limits.
-        if (fable is null)
-            throw new InvalidDataException("Claude Code /usage did not return a valid Fable limit.");
+        // Each limit is independent. Plans without a model-scoped window still
+        // have an all-model weekly window; never substitute one for another.
+        if (fiveHour is null && weekly is null && fable is null)
+            throw new InvalidDataException("Claude Code /usage did not return a valid usage limit.");
 
         return new ClaudeUsageSnapshot(fiveHour, weekly, fable);
     }
@@ -241,11 +246,20 @@ internal sealed class ClaudeCodeProcessRunner : IClaudeCommandRunner
 {
     internal static readonly TimeSpan CommandTimeout = TimeSpan.FromSeconds(20);
     private const int MaximumOutputCharacters = 128 * 1024;
+    private readonly string? _configDirectory;
+    private readonly Action<ProcessStartInfo>? _configureProcess;
+
+    internal ClaudeCodeProcessRunner(string? configDirectory = null, Action<ProcessStartInfo>? configureProcess = null)
+    {
+        _configDirectory = configDirectory;
+        _configureProcess = configureProcess;
+    }
 
     public async Task<ClaudeCommandResult> RunUsageAsync(CancellationToken cancellationToken)
     {
         var executablePath = FindClaudeExecutable();
-        var startInfo = CreateStartInfo(executablePath);
+        var startInfo = CreateStartInfo(executablePath, _configDirectory);
+        _configureProcess?.Invoke(startInfo);
         using var process = new Process { StartInfo = startInfo };
         try
         {
@@ -281,7 +295,7 @@ internal sealed class ClaudeCodeProcessRunner : IClaudeCommandRunner
         }
     }
 
-    internal static ProcessStartInfo CreateStartInfo(string executablePath)
+    internal static ProcessStartInfo CreateStartInfo(string executablePath, string? configDirectory = null)
     {
         var startInfo = new ProcessStartInfo
         {
@@ -308,7 +322,25 @@ internal sealed class ClaudeCodeProcessRunner : IClaudeCommandRunner
         {
             startInfo.ArgumentList.Add(argument);
         }
+        if (configDirectory is not null)
+        {
+            ConfigureProfileEnvironment(startInfo, configDirectory);
+        }
         return startInfo;
+    }
+
+    internal static void ConfigureProfileEnvironment(ProcessStartInfo startInfo, string configDirectory)
+    {
+        if (!Path.IsPathFullyQualified(configDirectory))
+            throw new ArgumentException("Claude profile directory must be an absolute path.", nameof(configDirectory));
+        startInfo.Environment["CLAUDE_CONFIG_DIR"] = configDirectory;
+        foreach (var variable in new[]
+        {
+            "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR", "ANTHROPIC_PROFILE", "ANTHROPIC_BASE_URL",
+            "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
+            "CLAUDE_CODE_SKIP_BEDROCK_AUTH", "CLAUDE_CODE_SKIP_VERTEX_AUTH", "CLAUDE_CODE_SKIP_FOUNDRY_AUTH"
+        }) startInfo.Environment.Remove(variable);
     }
 
     private static string FindClaudeExecutable()

@@ -13,7 +13,9 @@ Assert-WidgetInstallPath -Path $installDirectory
 # encrypted journal remains recoverable after an abnormal widget exit.
 $accountTransactionMutex = [Threading.Mutex]::new($false, 'Local\CodexWeeklyUsageIndicator.AccountTransaction')
 $accountTransactionOwned = $false
+$accountOperationLease = $null
 try {
+    $accountOperationLease = Enter-WidgetAccountOperation
     try { $accountTransactionOwned = $accountTransactionMutex.WaitOne(0) }
     catch [Threading.AbandonedMutexException] { $accountTransactionOwned = $true }
     if (-not $accountTransactionOwned) { throw 'An account operation is in progress. Finish it before installing or uninstalling.' }
@@ -48,6 +50,7 @@ if ((Test-Path -LiteralPath $resolvedInstall -PathType Container) -and
 Write-Host 'Codex + Claude Usage Indicator uninstalled.'
 
 } finally {
+    if ($null -ne $accountOperationLease) { $accountOperationLease.Dispose() }
     if ($accountTransactionOwned) { $accountTransactionMutex.ReleaseMutex() }
     $accountTransactionMutex.Dispose()
 }

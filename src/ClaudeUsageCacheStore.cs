@@ -4,7 +4,11 @@ namespace WeeklyUsageIndicator;
 
 internal sealed record ClaudeUsageCacheEntry(
     ClaudeUsageSnapshot Snapshot,
-    DateTimeOffset LastUpdatedAt);
+    DateTimeOffset LastUpdatedAt,
+    string ProfileKey = ClaudeUsageCacheEntry.DefaultProfileKey)
+{
+    internal const string DefaultProfileKey = "default";
+}
 
 internal interface IClaudeUsageCacheStore
 {
@@ -78,14 +82,22 @@ internal sealed class ClaudeUsageFileCacheStore(string cachePath) : IClaudeUsage
             !updatedElement.TryGetDateTimeOffset(out var lastUpdatedAt) ||
             !TryReadWindow(snapshotElement, "FiveHour", allowNull: true, out var fiveHour) ||
             !TryReadWindow(snapshotElement, "Weekly", allowNull: true, out var weekly) ||
-            !TryReadWindow(snapshotElement, "Fable", allowNull: false, out var fable))
+            !TryReadWindow(snapshotElement, "Fable", allowNull: true, out var fable) ||
+            (fiveHour is null && weekly is null && fable is null))
         {
             return false;
         }
 
+        var profileKey = ClaudeUsageCacheEntry.DefaultProfileKey;
+        if (root.TryGetProperty("ProfileKey", out var profileElement))
+        {
+            if (profileElement.ValueKind != JsonValueKind.String ||
+                string.IsNullOrWhiteSpace(profileElement.GetString())) return false;
+            profileKey = profileElement.GetString()!;
+        }
         entry = new ClaudeUsageCacheEntry(
             new ClaudeUsageSnapshot(fiveHour, weekly, fable),
-            lastUpdatedAt);
+            lastUpdatedAt, profileKey);
         return true;
     }
 

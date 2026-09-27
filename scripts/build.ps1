@@ -1,3 +1,5 @@
+param([switch]$SkipLivePointerCheck)
+
 $ErrorActionPreference = 'Stop'
 
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
@@ -6,7 +8,13 @@ $testProjectPath = Join-Path $repositoryRoot 'tests\WeeklyUsageIndicator.Tests\W
 $distributionPath = Join-Path $repositoryRoot 'dist'
 $pathMap = "$repositoryRoot=/_/"
 
-dotnet run --project $testProjectPath -c Release --nologo
+if ($SkipLivePointerCheck) {
+    # An interactive workstation may reuse a separately passed hover/focus check
+    # when only backend code changed. CI and ordinary builds still run it.
+    dotnet run --project $testProjectPath -c Release --nologo -- --skip-live-pointer-check
+} else {
+    dotnet run --project $testProjectPath -c Release --nologo
+}
 if ($LASTEXITCODE -ne 0) {
     throw "Usage and account regression tests failed with exit code $LASTEXITCODE."
 }

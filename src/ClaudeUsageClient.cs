@@ -23,6 +23,25 @@ internal sealed class ClaudeUsageTemporarilyUnavailableException(
     public DateTimeOffset RetryAfter { get; } = retryAfter;
 }
 
+internal sealed class ClaudeUsageRequestThrottle
+{
+    internal static readonly TimeSpan MinimumInterval = TimeSpan.FromMinutes(10);
+    internal static ClaudeUsageRequestThrottle Shared { get; } = new();
+    private readonly object _gate = new();
+    private DateTimeOffset _nextAllowedAt = DateTimeOffset.MinValue;
+
+    internal bool TryStart(DateTimeOffset now, out DateTimeOffset retryAfter)
+    {
+        lock (_gate)
+        {
+            retryAfter = _nextAllowedAt;
+            if (now < _nextAllowedAt) return false;
+            _nextAllowedAt = now + MinimumInterval;
+            return true;
+        }
+    }
+}
+
 internal sealed class ClaudeUsageClient : IDisposable
 {
     private static readonly TimeSpan CacheLifetime = TimeSpan.FromMinutes(10);
@@ -32,6 +51,8 @@ internal sealed class ClaudeUsageClient : IDisposable
     private readonly IClaudeUsageSource _usageSource;
     private readonly TimeProvider _timeProvider;
     private readonly IClaudeUsageCacheStore _cacheStore;
+    private readonly string _profileKey;
+    private readonly ClaudeUsageRequestThrottle _throttle;
     private readonly SemaphoreSlim _requestGate = new(1, 1);
     private ClaudeUsageSnapshot? _cachedSnapshot;
     private DateTimeOffset _lastFetchedAt = DateTimeOffset.MinValue;
@@ -43,23 +64,33 @@ internal sealed class ClaudeUsageClient : IDisposable
     public ClaudeUsageClient()
         : this(
             new ClaudeCodeUsageSource(),
-            TimeProvider.System,
-            ClaudeUsageFileCacheStore.CreateDefault())
+            ClaudeUsageCacheEntry.DefaultProfileKey)
+    {
+    }
+
+    internal ClaudeUsageClient(IClaudeUsageSource usageSource, string profileKey)
+        : this(usageSource, TimeProvider.System, ClaudeUsageFileCacheStore.CreateDefault(),
+            profileKey, ClaudeUsageRequestThrottle.Shared)
     {
     }
 
     internal ClaudeUsageClient(
         IClaudeUsageSource usageSource,
         TimeProvider timeProvider,
-        IClaudeUsageCacheStore? cacheStore = null)
+        IClaudeUsageCacheStore? cacheStore = null,
+        string profileKey = ClaudeUsageCacheEntry.DefaultProfileKey,
+        ClaudeUsageRequestThrottle? throttle = null)
     {
+        if (string.IsNullOrWhiteSpace(profileKey)) throw new ArgumentException("A Claude profile key is required.", nameof(profileKey));
         _usageSource = usageSource;
         _timeProvider = timeProvider;
         _cacheStore = cacheStore ?? ClaudeUsageNullCacheStore.Instance;
+        _profileKey = profileKey;
+        _throttle = throttle ?? new ClaudeUsageRequestThrottle();
 
         var persisted = _cacheStore.Load();
         var now = _timeProvider.GetUtcNow();
-        if (persisted is not null &&
+        if (persisted is not null && persisted.ProfileKey == _profileKey &&
             IsCacheUsable(persisted.Snapshot, persisted.LastUpdatedAt, now))
         {
             _cachedSnapshot = persisted.Snapshot;
@@ -92,6 +123,17 @@ internal sealed class ClaudeUsageClient : IDisposable
                 return CreateCachedResult(isStale: false);
             }
 
+            // The throttle is shared by production clients, including clients
+            // recreated after a profile change. Failed and canceled attempts
+            // count too; no UI action can turn them into rapid repeated calls.
+            if (!_throttle.TryStart(now, out var nextAllowedAt))
+            {
+                _retryAfter = nextAllowedAt;
+                return HasUsableCache(now)
+                    ? CreateCachedResult(isStale: true)
+                    : throw new ClaudeUsageTemporarilyUnavailableException(_retryAfter);
+            }
+
             ClaudeUsageSnapshot snapshot;
             try
             {
@@ -119,7 +161,7 @@ internal sealed class ClaudeUsageClient : IDisposable
             if (!IsCacheUsable(snapshot, fetchedAt, fetchedAt))
             {
                 ClearCachedSnapshot(clearPersisted: true);
-                throw new InvalidDataException("Claude Code did not return a usable Fable limit.");
+                throw new InvalidDataException("Claude Code did not return a usable usage limit.");
             }
 
             _cachedSnapshot = snapshot;
@@ -128,7 +170,7 @@ internal sealed class ClaudeUsageClient : IDisposable
             _consecutiveTransientFailures = 0;
             _hasLiveSnapshot = true;
 
-            _cacheStore.Save(new ClaudeUsageCacheEntry(snapshot, fetchedAt));
+            _cacheStore.Save(new ClaudeUsageCacheEntry(snapshot, fetchedAt, _profileKey));
             return new ClaudeUsageResult(snapshot, fetchedAt, null, IsStale: false);
         }
         finally
@@ -162,17 +204,15 @@ internal sealed class ClaudeUsageClient : IDisposable
         var age = now - lastUpdatedAt;
         if (age < TimeSpan.Zero ||
             age > PersistentCacheLifetime ||
-            snapshot?.Fable is not { } fable ||
-            !IsValidPercent(fable.UsedPercent))
+            snapshot is null)
         {
             return false;
         }
 
-        return fable.ResetsAt is not { } resetsAt || resetsAt > now;
+        return ClaudeDisplayMetrics.IsUsable(snapshot.FiveHour, now) ||
+            ClaudeDisplayMetrics.IsUsable(snapshot.Weekly, now) ||
+            ClaudeDisplayMetrics.IsUsable(snapshot.Fable, now);
     }
-
-    private static bool IsValidPercent(double value) =>
-        double.IsFinite(value) && value is >= 0d and <= 100d;
 
     private void ClearCachedSnapshot(bool clearPersisted)
     {
@@ -190,6 +230,8 @@ internal sealed class ClaudeUsageClient : IDisposable
         var duration = exponential > TimeSpan.FromMinutes(15)
             ? TimeSpan.FromMinutes(15)
             : exponential;
+        if (duration < ClaudeUsageRequestThrottle.MinimumInterval)
+            duration = ClaudeUsageRequestThrottle.MinimumInterval;
         _retryAfter = now + duration;
     }
 

@@ -47,7 +47,7 @@ internal static class LanguageUiSmoke
                 manager.Enabled = true;
                 Check(widget.ChangeLanguage("en"), "idle manager changes to English"); Application.DoEvents();
                 var english = Get<AccountManagerForm>(widget, "_accountManager");
-                Check(manager.IsDisposed && english.Visible && english.Text == "Codex accounts", "manager is recreated in English");
+                Check(manager.IsDisposed && english.Visible && english.Text == "Account manager", "manager is recreated in English");
                 Check(english.Bounds == bounds, "physical bounds stay unchanged across DPI-aware recreation");
                 Check(ReferenceEquals(english.CombinedUsage, combined) && combined.CompletedAt == completedAt && combined.IsComplete(DateTimeOffset.Now), "complete batch remains intact");
                 Check(Walk(english).Any(c => c.Text == account.Label), "account alias stays exact in the English UI");
@@ -56,7 +56,7 @@ internal static class LanguageUiSmoke
                 Check(((ToolStripMenuItem)languages.DropDownItems.Find("Language-en", false).Single()).Checked, "English menu choice is checked");
                 Check(widget.ChangeLanguage("ko"), "language can return to Korean"); Application.DoEvents();
                 var korean = Get<AccountManagerForm>(widget, "_accountManager");
-                Check(korean.Text == "Codex 계정 관리" && korean.Bounds == bounds, "Korean layout returns at the same bounds");
+                Check(korean.Text == "계정 관리" && korean.Bounds == bounds, "Korean layout returns at the same bounds");
                 Check(queryCount == 0 && File.ReadAllBytes(authPath).SequenceEqual(auth), "switching language never queries or changes authentication");
                 Check(store.ListAccounts().Single().Label == account.Label, "alias stays unchanged in storage");
                 korean.Close(); widget.Close(); done.TrySetResult();

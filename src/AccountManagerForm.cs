@@ -19,14 +19,26 @@ internal sealed partial class AccountManagerForm : Form
     private readonly ToolStripMenuItem _delete = new(UiText.T("저장된 로그인 삭제")) { Name = "DeleteAccountButton" };
     private readonly ToolStripMenuItem _refresh = new(UiText.T("저장된 계정 목록 다시 읽기")) { Name = "RefreshAccountsButton" };
     private readonly ToolStripMenuItem _info = new(UiText.T("상세 정보")) { Name = "AccountInfoMenuItem" };
+    private readonly ToolStripMenuItem _applyEnvironments = new(UiText.T("현재 계정을 WSL에 적용")) { Name = "ApplyCurrentToEnvironments" };
+    private readonly ToolStripMenuItem _abandonEnvironments = new(UiText.T("미완료 WSL 연동 중단…")) { Name = "AbandonEnvironmentSwitch" };
     private readonly ContextMenuStrip _menu = new();
     private readonly ContextMenuStrip _pageMenu = new();
     private readonly Button _recover = AccountUiTheme.Button("RecoverAccountsButton", UiText.T("미완료 전환 복구"));
+    private readonly Button _abandonWslRecovery = AccountUiTheme.Button("AbandonWslRecoveryButton", UiText.T("WSL 연동 중단…"));
     private readonly Button _cancel = AccountUiTheme.Button("CancelLoginButton", UiText.T("조회 취소"));
     private readonly Panel _empty = new() { Dock = DockStyle.Fill, BackColor = AccountUiTheme.Surface };
     private readonly ProgressBar _progress = new() { Dock = DockStyle.Bottom, Height = 3, Style = ProgressBarStyle.Marquee, Visible = false };
     private readonly System.Windows.Forms.Timer _refreshTimer = new() { Interval = 5000 };
     private readonly TableLayoutPanel _root = AccountUiTheme.Stack(6);
+    private readonly TableLayoutPanel _shell = AccountUiTheme.Stack(3);
+    private readonly Panel _pageHost = new() { Dock = DockStyle.Fill, Margin = new Padding(0) };
+    private readonly Label _checkedAt = AccountUiTheme.Label("", 9, color: AccountUiTheme.Muted);
+    private readonly Button _codexTab = AccountUiTheme.Button("CodexProviderTab", "Codex", true);
+    private readonly Button _claudeTab = AccountUiTheme.Button("ClaudeProviderTab", "Claude");
+    private readonly Button _environments = AccountUiTheme.Button("CodexEnvironmentsButton", UiText.T("Windows · WSL 연결"));
+    private readonly ClaudeAccountController? _claudeAccounts;
+    private readonly ClaudeAccountPanel? _claudePanel;
+    private bool _showingClaude;
     private readonly TableLayoutPanel _notice = new() { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1, Margin = new Padding(0, 0, 0, 12), Padding = new Padding(12, 6, 8, 6), BackColor = AccountUiTheme.Raised };
     private readonly CombinedUsagePanel _overview = new() { Dock = DockStyle.Fill, Margin = new Padding(0) };
     private readonly CombinedUsageSnapshot _combined;
@@ -40,38 +52,56 @@ internal sealed partial class AccountManagerForm : Form
     private readonly bool _refreshAllOnOpen;
     private UsageQueryStatus _usageQueryStatus = new(UsageQueryState.None);
     internal CombinedUsageSnapshot CombinedUsage => _combined;
-    internal bool IsOperationInProgress => _busy;
-    internal AccountManagerForm CreateLocalizedCopy() => new(_store, _suspend, _resume, _accountsChanged,
-        _queryUsage, refreshAllOnOpen: false, combined: _combined, usageChanged: _usageChanged);
+    internal bool IsOperationInProgress => _busy || _claudePanel?.IsBusy == true;
+    internal AccountManagerForm CreateLocalizedCopy()
+    {
+        var copy = new AccountManagerForm(_store, _suspend, _resume, _accountsChanged,
+            _queryUsage, refreshAllOnOpen: false, combined: _combined, usageChanged: _usageChanged, claudeAccounts: _claudeAccounts);
+        copy.ShowProvider(_showingClaude);
+        return copy;
+    }
     internal ToolStripItem MenuAction(string name) => _menu.Items.Cast<ToolStripItem>().Concat(_pageMenu.Items.Cast<ToolStripItem>()).Single(i => i.Name == name);
     internal Button? SelectedSwitchButton => _accounts.SelectedSwitchButton;
     private SavedCodexAccount? Selected => _accounts.SelectedItem as SavedCodexAccount;
 
     public AccountManagerForm(CodexAccountStore store, Func<Task> suspend, Action resume, Action? accountsChanged = null,
-        Func<SavedCodexAccount, CancellationToken, Task>? queryUsage = null, bool refreshAllOnOpen = true, CombinedUsageSnapshot? combined = null, Action? usageChanged = null)
+        Func<SavedCodexAccount, CancellationToken, Task>? queryUsage = null, bool refreshAllOnOpen = true, CombinedUsageSnapshot? combined = null, Action? usageChanged = null,
+        ClaudeAccountController? claudeAccounts = null)
     {
         SuspendLayout(); _store = store; _suspend = suspend; _resume = resume; _accountsChanged = accountsChanged;
         _queryUsage = queryUsage ?? ((account, token) => CodexAccountUsageReader.ReadInactiveAsync(store, account.Id, token));
-        _combined = combined ?? new(); _usageChanged = usageChanged;
+        _combined = combined ?? new(); _usageChanged = usageChanged; _claudeAccounts = claudeAccounts;
         _refreshAllOnOpen = refreshAllOnOpen; Name = "AccountManagerForm";
-        AccountUiTheme.SetForm(this); Text = UiText.T("Codex 계정 관리");
-        ClientSize = new Size(920, 740); MinimumSize = new Size(780, 550); StartPosition = FormStartPosition.CenterScreen; KeyPreview = true;
-        _root.Padding = new Padding(30, 30, 30, 20);
-        foreach (var h in new[] { 82, 154, 0, 56 }) _root.RowStyles.Add(new RowStyle(SizeType.Absolute, h));
+        AccountUiTheme.SetForm(this); Text = UiText.T("계정 관리");
+        ClientSize = new Size(920, 780); MinimumSize = new Size(780, 600); StartPosition = FormStartPosition.CenterScreen; KeyPreview = true;
+        _shell.Padding = new Padding(30, 24, 30, 20);
+        _shell.RowStyles.Add(new RowStyle(SizeType.Absolute, 62));
+        _shell.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
+        _shell.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        _root.Padding = new Padding(0);
+        foreach (var h in new[] { 0, 172, 0, 48 }) _root.RowStyles.Add(new RowStyle(SizeType.Absolute, h));
         _root.RowStyles.Add(new RowStyle(SizeType.Percent, 100)); _root.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
         var header = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 3, RowCount = 1, Margin = new Padding(0) };
         header.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100)); header.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize)); header.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         header.Controls.Add(AccountUiTheme.Label(UiText.T("계정 관리"), 26, true), 0, 0);
         _add.AutoSize = _refreshAll.AutoSize = false;
-        _add.Size = _refreshAll.Size = _add.MinimumSize = _refreshAll.MinimumSize = new Size(110, 38);
+        _add.Size = _add.MinimumSize = new Size(130, 38); _refreshAll.Size = _refreshAll.MinimumSize = new Size(110, 38);
         _add.Anchor = _refreshAll.Anchor = AnchorStyles.Top | AnchorStyles.Right; _add.Margin = new Padding(0, 0, 10, 0);
-        header.Controls.Add(_add, 1, 0); header.Controls.Add(_refreshAll, 2, 0);
-        _root.Controls.Add(header, 0, 0); _root.Controls.Add(_overview, 0, 1);
+        _checkedAt.Name = "CombinedCheckedAtLabel";
+        _checkedAt.Anchor = AnchorStyles.Top | AnchorStyles.Right; _checkedAt.Margin = new Padding(0, 12, 16, 0);
+        header.Controls.Add(_checkedAt, 1, 0); header.Controls.Add(_refreshAll, 2, 0);
+        _shell.Controls.Add(header, 0, 0);
+        var tabs = new FlowLayoutPanel { Dock = DockStyle.Fill, Margin = new Padding(0), WrapContents = false };
+        foreach (var tab in new[] { _codexTab, _claudeTab }) { tab.AutoSize = false; tab.Size = new Size(100, 32); tab.MinimumSize = tab.Size; tab.Margin = new Padding(0, 0, 8, 0); tabs.Controls.Add(tab); }
+        _claudeTab.Visible = claudeAccounts is not null;
+        _shell.Controls.Add(tabs, 0, 1);
+        _root.Controls.Add(_overview, 0, 1);
+        _overview.SummaryChanged += (_, _) => _checkedAt.Text = _overview.CheckedAtText;
         _status.Name = "StatusLabel"; _status.Dock = DockStyle.Fill; _status.AutoSize = false; _status.TextAlign = ContentAlignment.MiddleLeft;
         _notice.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100)); _notice.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         var noticeActions = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = false, Margin = new Padding(8, 0, 0, 0), FlowDirection = FlowDirection.RightToLeft };
-        _cancel.Visible = _recover.Visible = _registerActive.Visible = false;
-        noticeActions.Controls.AddRange(new Control[] { _cancel, _recover, _registerActive });
+        _cancel.Visible = _recover.Visible = _registerActive.Visible = _abandonWslRecovery.Visible = false;
+        noticeActions.Controls.AddRange(new Control[] { _cancel, _abandonWslRecovery, _recover, _registerActive });
         _notice.Controls.Add(_status, 0, 0); _notice.Controls.Add(noticeActions, 1, 0); _root.Controls.Add(_notice, 0, 2);
         var listHeader = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1, Margin = new Padding(0) };
         listHeader.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100)); listHeader.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
@@ -80,9 +110,25 @@ internal sealed partial class AccountManagerForm : Form
         listHeader.Controls.Add(order, 1, 0); _root.Controls.Add(listHeader, 0, 3);
         var body = new Panel { Dock = DockStyle.Fill, Margin = new Padding(0) }; BuildEmpty(); body.Controls.Add(_accounts); body.Controls.Add(_empty); _root.Controls.Add(body, 0, 4);
         var footer = AccountUiTheme.Label(UiText.T("ⓘ  창을 열 때 한 번 확인하며, 이후에는 직접 갱신합니다."), 9, color: AccountUiTheme.Muted);
-        footer.Margin = new Padding(0, 10, 0, 0); _root.Controls.Add(footer, 0, 5); Controls.Add(_root); Controls.Add(_progress);
+        var footerRow = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1, Margin = new Padding(0) };
+        footerRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100)); footerRow.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        footer.Margin = new Padding(0, 8, 0, 0); footerRow.Controls.Add(footer, 0, 0);
+        _environments.Font = AccountFonts.Create(9); _environments.MinimumSize = new Size(0, 26); _environments.Height = 26; _environments.Padding = new Padding(8, 2, 8, 2);
+        footerRow.Controls.Add(_environments, 1, 0); _root.Controls.Add(footerRow, 0, 5);
+        _accounts.SetAddButton(_add);
+        _pageHost.Controls.Add(_root);
+        if (claudeAccounts is not null)
+        {
+            _claudePanel = new ClaudeAccountPanel(claudeAccounts) { Dock = DockStyle.Fill, Visible = false };
+            _claudePanel.BusyChanged += (_, _) => { _codexTab.Enabled = _claudeTab.Enabled = !IsOperationInProgress; };
+            _pageHost.Controls.Add(_claudePanel);
+        }
+        _shell.Controls.Add(_pageHost, 0, 2); Controls.Add(_shell); Controls.Add(_progress);
+        _codexTab.Click += (_, _) => ShowProvider(false); _claudeTab.Click += (_, _) => ShowProvider(true);
+        _environments.Click += async (_, _) => await ShowEnvironmentsAsync();
         foreach (var menu in new[] { _menu, _pageMenu }) { menu.BackColor = AccountUiTheme.Surface; menu.ForeColor = AccountUiTheme.Text; menu.Font = Font; menu.ShowImageMargin = false; menu.Renderer = new ToolStripProfessionalRenderer(new AccountMenuColors()); }
-        _menu.Items.AddRange(new ToolStripItem[] { _readUsage, _rename, _info, new ToolStripSeparator(), _delete }); _pageMenu.Items.Add(_refresh); ContextMenuStrip = _pageMenu;
+        _menu.Items.AddRange(new ToolStripItem[] { _readUsage, _rename, _info, _applyEnvironments, new ToolStripSeparator(), _delete });
+        _pageMenu.Items.AddRange(new ToolStripItem[] { _refresh, _abandonEnvironments }); ContextMenuStrip = _pageMenu;
         _accounts.ManageRequested += (_, anchor) => { UpdateActions(); _menu.Show(anchor, new Point(0, anchor.Height)); };
         _accounts.SwitchRequested += async _ => await SwitchSelectedAsync();
         _accounts.SelectedIndexChanged += (_, _) => { if (!_reloading) UpdateActions(); };
@@ -90,6 +136,9 @@ internal sealed partial class AccountManagerForm : Form
         _refreshAll.Click += async (_, _) => await ReadAllUsageAsync();
         _readUsage.Click += async (_, _) => await ReadSelectedUsageAsync(); _rename.Click += (_, _) => RenameSelected();
         _info.Click += (_, _) => ShowAccountInfo(); _delete.Click += (_, _) => DeleteSelected();
+        _applyEnvironments.Click += async (_, _) => await ApplyCurrentToEnvironmentsAsync();
+        _abandonEnvironments.Click += async (_, _) => await AbandonEnvironmentSwitchAsync();
+        _abandonWslRecovery.Click += async (_, _) => await AbandonEnvironmentSwitchAsync();
         _register.Click += async (_, _) => await RegisterCurrentAsync(); _registerActive.Click += async (_, _) => await RegisterCurrentAsync();
         _add.Click += async (_, _) => await AddAccountAsync(); _recover.Click += async (_, _) => await RecoverAsync();
         _cancel.Click += (_, _) => { _loginCancellation?.Cancel(); _cancel.Enabled = false; SetStatus(UiText.T("요청을 취소하고 로그인 정보를 안전하게 정리하고 있습니다…")); };
@@ -105,12 +154,13 @@ internal sealed partial class AccountManagerForm : Form
                 var area = Screen.FromControl(this).WorkingArea; Size = new Size(Math.Min(Width, area.Width), Math.Min(Height, area.Height));
                 Location = new Point(Math.Clamp(Left, area.Left, Math.Max(area.Left, area.Right - Width)), Math.Clamp(Top, area.Top, Math.Max(area.Top, area.Bottom - Height)));
                 _desktopPath = CodexAccountRuntime.CaptureDesktopLaunchPath(); Reload(); _refreshTimer.Start();
-                if (_refreshAllOnOpen && _items.Count > 0 && !_store.HasPendingRecovery && _usageQueryStatus.State == UsageQueryState.None) initialRead = ReadAllUsageAsync();
+                if (_refreshAllOnOpen && _items.Count > 0 && !_store.HasPendingRecovery && !HasLinkedRecovery && _usageQueryStatus.State == UsageQueryState.None) initialRead = ReadAllUsageAsync();
             });
             await initialRead;
         };
         FormClosing += (_, e) =>
         {
+            if (_claudePanel?.IsBusy == true) { e.Cancel = true; return; }
             if (!_busy) return; e.Cancel = true;
             if (_batchQuerying) { _closeAfterBatch = true; _loginCancellation?.Cancel(); SetStatus(UiText.T("전체 조회를 취소하고 안전하게 정리한 뒤 닫습니다…")); }
             else SetStatus(UiText.T("진행 중인 작업이 있습니다. 취소 버튼으로 요청을 마친 뒤 닫아주세요."));
@@ -151,7 +201,7 @@ internal sealed partial class AccountManagerForm : Form
     private void UpdateNotice()
     {
         var show = (_status.Text.Length > 0 && !_operationSuccess) || _loginCancellation is not null ||
-            _store.HasPendingRecovery || _usageQueryStatus.State != UsageQueryState.None || (_items.Count > 0 && !_items.Any(a => a.IsActive));
+            _store.HasPendingRecovery || HasLinkedRecovery || _usageQueryStatus.State != UsageQueryState.None || (_items.Count > 0 && !_items.Any(a => a.IsActive));
         _notice.Visible = show;
         var height = show ? (int)Math.Round((_operationError || _usageQueryStatus.State != UsageQueryState.None ? 100 : 72) * DeviceDpi / 96f) : 0;
         if (_root.RowStyles.Count > 2 && _root.RowStyles[2].Height != height) _root.RowStyles[2].Height = height;
@@ -159,12 +209,14 @@ internal sealed partial class AccountManagerForm : Form
     private void UpdateActions() => Present(UpdateActionState);
     private void Present(Action update)
     {
-        using var layout = AccountUiTheme.DeferLayout(_root);
+        using var layout = AccountUiTheme.DeferLayout(_shell);
         update();
     }
     private void UpdateActionState()
     {
-        var pending = _store.HasPendingRecovery || _usageQueryStatus.State == UsageQueryState.RecoveryRequired;
+        var pending = _store.HasPendingRecovery || HasLinkedRecovery || _usageQueryStatus.State == UsageQueryState.RecoveryRequired;
+        _codexTab.Enabled = _claudeTab.Enabled = !_busy && _claudePanel?.IsBusy != true;
+        _environments.Enabled = !_busy && !pending;
         // Disable actions individually. Disabling the entire table recursively
         // forces every transparent label to repaint its ancestors immediately.
         _refresh.Enabled = !_busy; _readUsage.Enabled = !_busy && !pending && Selected is not null;
@@ -172,8 +224,14 @@ internal sealed partial class AccountManagerForm : Form
         _registerActive.Visible = _items.Count > 0 && !_items.Any(a => a.IsActive) && !pending; _registerActive.Enabled = !_busy;
         _rename.Enabled = _info.Enabled = !_busy && !pending && Selected is not null;
         _delete.Enabled = !_busy && !pending && Selected is { IsActive: false };
+        _applyEnvironments.Visible = Selected is { IsActive: true } && new WslCodexConnections(_store.RootPath).EnabledKeys().Count > 0;
+        _applyEnvironments.Enabled = !_busy && !pending;
+        _abandonEnvironments.Visible = HasLinkedRecovery;
+        _abandonEnvironments.Enabled = !_busy;
+        _abandonWslRecovery.Visible = HasLinkedRecovery;
+        _abandonWslRecovery.Enabled = !_busy;
         _recover.Visible = pending || _usageQueryStatus.State == UsageQueryState.CleanupPending; _recover.Enabled = !_busy;
-        _recover.Text = _store.HasPendingRecovery ? UiText.T("미완료 전환 복구") : _usageQueryStatus.State == UsageQueryState.CleanupPending ? UiText.T("임시 파일 정리") : UiText.T("중단된 조회 복구");
+        _recover.Text = _store.HasPendingRecovery || HasLinkedRecovery ? UiText.T("미완료 전환 복구") : _usageQueryStatus.State == UsageQueryState.CleanupPending ? UiText.T("임시 파일 정리") : UiText.T("중단된 조회 복구");
         _refreshAll.Enabled = !_busy && !pending && _items.Count > 0;
         _overview.Display(_combined, _busy || pending, _batchCompleted, _batchQuerying);
         _accounts.Display(_combined, _busy, !pending, _items.Any(a => a.IsActive), keepOrder: _batchQuerying); UpdateNotice(); _usageChanged?.Invoke();
@@ -254,18 +312,19 @@ internal sealed partial class AccountManagerForm : Form
         if (_busy || Selected is not { IsActive: false } target) return;
         await RunAsync(true, UiText.T("전환 조건을 확인하고 있습니다…"), async () =>
         {
+            await PreflightSelectedTargetsAsync(target.Id);
             var source = _items.FirstOrDefault(a => a.IsActive)?.Label ?? UiText.T("현재 로그인");
             using var dialog = new AccountSwitchDialog(source, target.Label);
             if (dialog.ShowDialog(this) != DialogResult.OK) { SetStatus(UiText.T("전환을 취소했습니다. 현재 계정은 유지됩니다.")); return; }
             CodexAccountRuntime.AssertWritersStopped();
             CodexAccountRuntime.ClearStaleLoginDirectories(_store.RootPath);
-            _store.SwitchTo(target.Id, CodexAccountRuntime.AssertWritersStopped);
+            if (!await ApplySelectedEnvironmentsAsync(target)) { Reload(target.Id, quiet: true); return; }
             Reload(target.Id); _accountsChanged?.Invoke();
             SetStatus(UiText.F($"‘{target.Label}’ 적용 완료. 열린 Codex에서 계정을 확인하세요."), success: true);
             try { CodexAccountRuntime.LaunchDesktop(_desktopPath); }
             catch { SetStatus(UiText.F($"‘{target.Label}’은 적용되었습니다. 시작 메뉴에서 Codex를 열어주세요.")); }
             await Task.CompletedTask;
-        });
+        }, acquireGate: false);
     }
 
     private void DeleteSelected()
@@ -279,7 +338,7 @@ internal sealed partial class AccountManagerForm : Form
 
     private async Task RecoverAsync()
     {
-        if (!_store.HasPendingRecovery && _usageQueryStatus.State == UsageQueryState.CleanupPending)
+        if (!_store.HasPendingRecovery && !HasLinkedRecovery && _usageQueryStatus.State == UsageQueryState.CleanupPending)
         {
             await RunAsync(false, UiText.T("임시 파일을 정리하고 있습니다…"), async () =>
             {
@@ -293,13 +352,17 @@ internal sealed partial class AccountManagerForm : Form
         }
         await RunAsync(true, UiText.T("복구 조건을 확인하고 있습니다…"), async () =>
         {
-            using var dialog = new AccountSwitchDialog("", "", recovery: true);
-            if (dialog.ShowDialog(this) != DialogResult.OK) { SetStatus(UiText.T("복구를 취소했습니다. 미완료 기록은 보존됩니다.")); return; }
-            if (_store.IsEnabled) CodexAccountRuntime.ClearStaleLoginDirectories(_store.RootPath);
-            _store.Recover(CodexAccountRuntime.AssertWritersStopped);
+            if (_store.HasPendingRecovery || _usageQueryStatus.State == UsageQueryState.RecoveryRequired)
+            {
+                using var dialog = new AccountSwitchDialog("", "", recovery: true);
+                if (dialog.ShowDialog(this) != DialogResult.OK) { SetStatus(UiText.T("복구를 취소했습니다. 미완료 기록은 보존됩니다.")); return; }
+                if (_store.IsEnabled) CodexAccountRuntime.ClearStaleLoginDirectories(_store.RootPath);
+                _store.Recover(CodexAccountRuntime.AssertWritersStopped);
+            }
+            await RecoverLinkedEnvironmentsAsync();
             Reload(); _accountsChanged?.Invoke(); SetStatus(UiText.T("중단된 계정 작업을 복구했습니다."), success: true);
             await Task.CompletedTask;
-        });
+        }, acquireGate: false);
     }
 
     private async Task RunAsync(bool suspend, string message, Func<Task> action, bool acquireGate = true,
@@ -309,8 +372,10 @@ internal sealed partial class AccountManagerForm : Form
         Present(() => { _busy = true; _progress.Visible = true; SetStatus(message); UpdateActions(); });
         using var gate = new Mutex(false, CodexAccountStore.TransactionMutexName);
         var ownsGate = false;
+        IDisposable? operationLease = null;
         try
         {
+            operationLease = AccountOperationLease.Acquire(_store.RootPath);
             _desktopPath ??= CodexAccountRuntime.CaptureDesktopLaunchPath();
             if (suspend) await _suspend();
             if (acquireGate)
@@ -325,6 +390,7 @@ internal sealed partial class AccountManagerForm : Form
         finally
         {
             if (ownsGate) gate.ReleaseMutex();
+            operationLease?.Dispose();
             Present(() =>
             {
                 _busy = false; _cancel.Visible = false; _progress.Visible = false;
@@ -364,7 +430,7 @@ internal sealed partial class AccountManagerForm : Form
             if (!quiet) { _operationMessage = null; _operationError = false; _operationSuccess = false; }
             UpdateActions();
             RenderStatus();
-            return !_store.HasPendingRecovery && _usageQueryStatus.State != UsageQueryState.RecoveryRequired && (_items.Count == 0 || _items.Any(a => a.IsActive));
+            return !_store.HasPendingRecovery && !HasLinkedRecovery && _usageQueryStatus.State != UsageQueryState.RecoveryRequired && (_items.Count == 0 || _items.Any(a => a.IsActive));
         }
         catch (Exception ex) { SetStatus(ex.Message, error: true); return false; }
     }
@@ -378,7 +444,7 @@ internal sealed partial class AccountManagerForm : Form
     private void RenderStatus() => Present(RenderStatusState);
     private void RenderStatusState()
     {
-        var recovery = _store.HasPendingRecovery ? UiText.T("미완료 전환이 있습니다. 복구를 완료해 주세요.")
+        var recovery = _store.HasPendingRecovery || HasLinkedRecovery ? UiText.T("미완료 전환이 있습니다. 복구를 완료해 주세요.")
             : _usageQueryStatus.State == UsageQueryState.RecoveryRequired ? UiText.T("중단된 조회의 로그인 정보 복구가 필요합니다.") : null;
         var cleanup = _usageQueryStatus.State == UsageQueryState.CleanupPending
             ? UiText.T("로그인 정보 저장 완료 · 임시 파일 정리 대기") + (_usageQueryStatus.Failure is { } failure ? $" ({UiText.Message(failure.Summary)})" : "") : null;

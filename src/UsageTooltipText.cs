@@ -5,7 +5,8 @@ namespace WeeklyUsageIndicator;
 internal static class UsageTooltipText
 {
     internal static string Build(UsageSnapshot? codex, ClaudeUsageResult? claude, string? codexError,
-        string? claudeError, bool showClaude, CombinedUsageSnapshot? combined = null, string? activeLabel = null)
+        string? claudeError, bool showClaude, CombinedUsageSnapshot? combined = null, string? activeLabel = null,
+        ClaudeDisplayMetric claudeMetric = ClaudeDisplayMetric.OverallWeekly, string? claudeLabel = null)
     {
         var now = DateTimeOffset.Now; var text = new StringBuilder();
         text.AppendLine("CODEX · " + (activeLabel is null ? UiText.T("현재 계정") : Name(activeLabel)));
@@ -37,11 +38,11 @@ internal static class UsageTooltipText
         }
         if (showClaude)
         {
-            text.AppendLine(); text.AppendLine("CLAUDE");
+            text.AppendLine(); text.AppendLine("CLAUDE" + (claudeLabel is null ? "" : " · " + Name(claudeLabel)));
+            text.AppendLine(claudeMetric == ClaudeDisplayMetric.OverallWeekly ? UiText.T("표시 중: 전체 주간 잔여량") : UiText.T("표시 중: Fable 주간 잔여량"));
             var snapshot = claudeError is null ? claude?.Snapshot : null;
-            text.AppendLine(Window("Fable", snapshot?.Fable?.UsedPercent, snapshot?.Fable?.ResetsAt, now));
-            text.AppendLine(Window(UiText.T("5시간"), snapshot?.FiveHour?.UsedPercent, snapshot?.FiveHour?.ResetsAt, now));
-            text.AppendLine(Window(UiText.T("전체 주간"), snapshot?.Weekly?.UsedPercent, snapshot?.Weekly?.ResetsAt, now));
+            foreach (var (label, window) in ClaudeWindows(snapshot, claudeMetric))
+                text.AppendLine(Window(label, window?.UsedPercent, window?.ResetsAt, now));
             if (claudeError is not null) text.AppendLine(UiText.T("확인 필요: ") + UiText.Message(claudeError));
             else if (claude is { IsStale: true })
             {
@@ -49,14 +50,25 @@ internal static class UsageTooltipText
                 if (claude.RetryAfter is { } retry) text.AppendLine(UiText.F($"다음 시도 {Reset(retry, now)}"));
             }
         }
-        text.AppendLine(); text.Append(UiText.T("우클릭 → Codex 계정 관리 · 전체 갱신 / 계정 전환"));
+        text.AppendLine(); text.Append(UiText.T("우클릭 → 계정 관리 · 사용량 확인 / 계정 선택"));
         return text.ToString();
     }
     private static string Window(string label, double? used, DateTimeOffset? reset, DateTimeOffset now)
     {
-        if (used is null) return label + UiText.T(": 정보 없음");
-        var value = reset <= now ? UiText.T("갱신 필요") : UiText.F($"{100 - (int)Math.Round(Math.Clamp(used.Value, 0, 100), MidpointRounding.AwayFromZero)}% 남음");
+        var remaining = UsagePercentage.Remaining(used);
+        if (remaining is null) return label + UiText.T(": 정보 없음");
+        var value = reset <= now ? UiText.T("갱신 필요") : UiText.F($"{remaining.Value}% 남음");
         return UiText.F($"{label}: {value} · 초기화: {Reset(reset, now)}");
+    }
+
+    internal static IEnumerable<(string Label, ClaudeUsageWindow? Window)> ClaudeWindows(
+        ClaudeUsageSnapshot? snapshot, ClaudeDisplayMetric metric)
+    {
+        var weekly = (UiText.T("전체 주간"), snapshot?.Weekly);
+        var fable = ("Fable", snapshot?.Fable);
+        yield return metric == ClaudeDisplayMetric.OverallWeekly ? weekly : fable;
+        yield return metric == ClaudeDisplayMetric.OverallWeekly ? fable : weekly;
+        yield return (UiText.T("5시간"), snapshot?.FiveHour);
     }
     private static string Reset(DateTimeOffset? reset, DateTimeOffset now) => reset is { } at
         ? $"{at.ToLocalTime():MM/dd HH:mm} ({CombinedUsagePanel.TimeUntil(at, now)})" : UiText.T("정보 없음");

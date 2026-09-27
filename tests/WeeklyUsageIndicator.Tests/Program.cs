@@ -2,6 +2,7 @@ using System.Text.Json;
 using WeeklyUsageIndicator;
 
 if (args.Contains("--english")) UiText.SetLanguage("en");
+if (args.Contains("--live-environment-smoke")) { await LiveEnvironmentSmoke.RunAsync(); return; }
 if (args.Contains("--language-ui-smoke")) { await LanguageUiSmoke.RunAsync(); return; }
 if (args.Contains("--localization-tests")) { await LocalizationTests.RunAsync(); return; }
 if (args.Contains("--account-style-preview")) { await AccountStylePreview.RunAsync(args.Contains("--hold"), args.Contains("--standard-dpi")); return; }
@@ -30,6 +31,11 @@ var tests = new (string Name, Func<Task> Run)[]
     // Run the brief cursor-driven check first so a local user can resume using the
     // mouse while the slower credential and lifecycle fixtures continue.
     ("stable light tooltip hover, placement and focus", UsageTooltipHoverSmoke.RunAsync),
+    ("Claude weekly metric, independent expiry and profile cache", ClaudeMetricTests.RunAll),
+    ("Claude official profile identity and shared local work", ClaudeProfileTests.RunAsync),
+    ("Claude login waits, transient observation and identity invalidation", ClaudeControllerTests.RunAsync),
+    ("account operation lease blocks lifecycle replacement across awaits", AccountOperationLeaseTests.RunAsync),
+    ("WSL native targets, independent login and joint recovery", WslCodexTests.RunAsync),
     ("language switching preserves bounds, snapshots and account data", LanguageUiSmoke.RunAsync),
     ("translation catalogs, known errors and language preferences", LocalizationTests.RunAsync),
     ("Codex app-server lifecycle isolation", AppServerLifecycleTests.RunAsync),
@@ -65,6 +71,8 @@ var tests = new (string Name, Func<Task> Run)[]
 
 foreach (var test in tests)
 {
+    if (args.Contains("--skip-live-pointer-check") && test.Name == "stable light tooltip hover, placement and focus")
+    { Console.WriteLine("SKIP: live pointer check (explicit flag; run separately)"); continue; }
     await test.Run();
     Console.WriteLine($"PASS: {test.Name}");
 }
@@ -174,9 +182,10 @@ static Task TestInvalidFableAsync()
     var now = DateTimeOffset.UtcNow;
     foreach (var fable in new[] { "", "Current week (Fable): unavailable", "Current week (Fable): 101% used", "Current week (Fable): -1% used", "Current week (Fable): NaN% used", "Current week (Fable): 30% used garbage" })
     {
-        AssertThrows<InvalidDataException>(() => ClaudeCodeUsageSource.ParseUsageText(
-            "Current session: 10% used\nCurrent week (all models): 20% used\n" + fable, now),
-            "invalid Fable usage must not become zero usage or another limit");
+        var result = ClaudeCodeUsageSource.ParseUsageText(
+            "Current session: 10% used\nCurrent week (all models): 20% used\n" + fable, now);
+        Assert(result.Fable is null && result.Weekly?.UsedPercent == 20,
+            "invalid Fable stays missing while an independently valid weekly value survives");
     }
     return Task.CompletedTask;
 }
@@ -281,13 +290,13 @@ static async Task TestTransientRecoveryAsync()
     await client.GetUsageAsync(CancellationToken.None);
     clock.Advance(TimeSpan.FromMinutes(10));
     var first = await client.GetUsageAsync(CancellationToken.None);
-    Assert(first.IsStale && first.RetryAfter == clock.GetUtcNow().AddMinutes(5),
-        "the first transient failure should keep the cache and wait five minutes");
+    Assert(first.IsStale && first.RetryAfter == clock.GetUtcNow().AddMinutes(10),
+        "the first transient failure keeps the cache and observes the ten-minute floor");
 
     var suppressed = await client.GetUsageAsync(CancellationToken.None);
     Assert(suppressed.IsStale && source.ReadCount == 2, "backoff should suppress repeated commands");
 
-    clock.Advance(TimeSpan.FromMinutes(5));
+    clock.Advance(TimeSpan.FromMinutes(10));
     var second = await client.GetUsageAsync(CancellationToken.None);
     Assert(second.RetryAfter == clock.GetUtcNow().AddMinutes(10), "the second failure should wait ten minutes");
 
@@ -391,15 +400,15 @@ static async Task TestExpiredPersistedCacheAsync()
         new SequenceUsageSource(new IOException("offline")),
         new ManualTimeProvider(start),
         resetStore);
-    await AssertThrowsAsync<ClaudeUsageTemporarilyUnavailableException>(
-        () => resetClient.GetUsageAsync(CancellationToken.None),
-        "a snapshot past its Fable reset should not be shown");
-    Assert(resetStore.Entry is null, "a snapshot past its reset should be deleted");
+    var independentlyValid = await resetClient.GetUsageAsync(CancellationToken.None);
+    Assert(ClaudeDisplayMetric.FableWeekly.SelectUsedPercent(independentlyValid.Snapshot, start) is null &&
+        ClaudeDisplayMetric.OverallWeekly.SelectUsedPercent(independentlyValid.Snapshot, start) == 20,
+        "expired Fable is hidden while the still-valid overall window remains visible");
 }
 
 static Task TestFileCacheAsync()
 {
-    var temporaryDirectory = Path.Combine(Path.GetTempPath(), $"WeeklyUsageIndicator.Tests-{Guid.NewGuid():N}");
+    var temporaryDirectory = Path.Combine(Environment.GetEnvironmentVariable("GFS_ACCOUNT_TEST_ROOT") ?? Path.Combine(Path.GetTempPath(), "gfs-agent", "indicator-tests"), $"cache-{Guid.NewGuid():N}");
     Directory.CreateDirectory(temporaryDirectory);
     try
     {
@@ -412,8 +421,8 @@ static Task TestFileCacheAsync()
         using (var document = JsonDocument.Parse(File.ReadAllText(cachePath)))
         {
             var fields = document.RootElement.EnumerateObject().Select(property => property.Name).ToArray();
-            Assert(fields.SequenceEqual(["Snapshot", "LastUpdatedAt"]),
-                "the cache should contain only snapshot and update time");
+            Assert(fields.SequenceEqual(["Snapshot", "LastUpdatedAt", "ProfileKey"]),
+                "the cache contains only sanitized usage and a nonsecret attribution key");
         }
         Assert(store.Load() == entry, "the file cache should round-trip the sanitized snapshot");
 

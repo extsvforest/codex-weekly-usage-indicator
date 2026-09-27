@@ -61,5 +61,11 @@
   "Codex 조회 프로세스의 ChatGPT 로그인을 확인할 수 없습니다.": "The Codex helper's ChatGPT login could not be verified.",
   "현재 계정의 사용량을 조회하려면 Codex 앱을 열어 주세요.": "Open Codex Desktop to check the current account's usage.",
   "현재 계정이 변경되었습니다. 목록을 갱신한 뒤 다시 조회하세요.": "The current account changed. Reload the list and try again.",
-  "조회 중 현재 계정이 변경되었습니다. 목록을 갱신한 뒤 다시 조회하세요.": "The current account changed during the query. Reload the list and try again."
+  "조회 중 현재 계정이 변경되었습니다. 목록을 갱신한 뒤 다시 조회하세요.": "The current account changed during the query. Reload the list and try again.",
+  "{0}: 갱신 필요": "{0}: Refresh needed",
+  "Codex 및 Claude 사용량 인디케이터": "Codex and Claude usage indicator",
+  "Claude 표시": "Claude display",
+  "Fable 주간 잔여량": "Fable · weekly remaining",
+  "전체 주간 잔여량": "All models · weekly remaining",
+  "사용량 표시": "Show usage"
 }

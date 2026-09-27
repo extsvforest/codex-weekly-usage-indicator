@@ -59,7 +59,9 @@ internal sealed class UsageIndicatorForm : Form
     private const int WidgetHeight = 64;
 
     private readonly AppServerClient _codexClient = new();
-    private readonly ClaudeUsageClient _claudeClient = new();
+    private readonly ClaudeUsageClient? _claudeClient;
+    private readonly ClaudeAccountController? _claudeAccounts;
+    private long _claudeGeneration;
     private readonly CodexDesktopStateReader _codexStateReader = new();
     private readonly System.Windows.Forms.Timer _pollTimer = new() { Interval = 60_000 };
     private readonly System.Windows.Forms.Timer _codexStateTimer = new() { Interval = 1_000 };
@@ -82,6 +84,8 @@ internal sealed class UsageIndicatorForm : Form
     private bool _isDragging;
     private bool _keepOnTop = true;
     private bool _showClaude;
+    private ClaudeDisplayMetric _claudeMetric;
+    private readonly Dictionary<ClaudeDisplayMetric, ToolStripMenuItem> _claudeMetricItems = new();
     private bool _positionInitialized;
     private ToolStripMenuItem? _languageMenu;
     private readonly CodexAccountStore _accountStore = new();
@@ -90,15 +94,33 @@ internal sealed class UsageIndicatorForm : Form
     private NotifyIcon? _accountTray;
     private bool _accountBusy;
     private long _accountGeneration;
+    private readonly CancellationTokenSource _claudeLifetime = new();
     private string? _helperIdentityKey;
     private readonly EventWaitHandle _openAccountsSignal = new(false, EventResetMode.AutoReset, @"Local\CodexWeeklyUsageIndicator.OpenAccounts");
     private Point _dragCursorStart;
     private Point _dragFormStart;
 
-    public UsageIndicatorForm(bool previewMode, bool openAccounts = false)
+    public UsageIndicatorForm(bool previewMode, bool openAccounts = false, ClaudeUsageClient? claudeClient = null)
     {
         _previewMode = previewMode;
+        _claudeClient = claudeClient ?? (previewMode ? new ClaudeUsageClient(new ClaudeCodeUsageSource(), TimeProvider.System) : null);
+        if (!previewMode && claudeClient is null)
+        {
+            _claudeAccounts = new ClaudeAccountController();
+            _claudeAccounts.SelectionChanged += OnClaudeSelectionChanged;
+            _claudeAccounts.UsageChanged += (_, observation) =>
+            {
+                if (!IsDisposed && IsHandleCreated) BeginInvoke((Action)(() =>
+                {
+                    if (IsDisposed || observation.ProfileId != _claudeAccounts.SelectionKey) return;
+                    _claudeUsage = _claudeAccounts.LastUsage(observation.ProfileId);
+                    _claudeError = _claudeUsage is null ? UiText.T("Claude 계정을 다시 확인해 주세요.") : null;
+                    _claudeFailure = null; UpdateToolTip(); Invalidate();
+                }));
+            };
+        }
         _showClaude = !previewMode && IndicatorSettingsStore.LoadShowClaude();
+        _claudeMetric = previewMode ? ClaudeDisplayMetric.OverallWeekly : IndicatorSettingsStore.LoadClaudeMetric();
         AutoScaleMode = AutoScaleMode.Dpi;
         BackColor = Color.FromArgb(24, 24, 28);
         ClientSize = new Size(WidgetWidth, WidgetHeight);
@@ -111,7 +133,7 @@ internal sealed class UsageIndicatorForm : Form
         ShowInTaskbar = false;
         StartPosition = FormStartPosition.Manual;
         Text = UiText.T("Codex 및 Claude 사용량");
-        AccessibleName = UiText.T("Codex 및 Claude Fable 사용량 인디케이터");
+        AccessibleName = UiText.T("Codex 및 Claude 사용량 인디케이터");
         Opacity = 0;
 
         BuildContextMenu();
@@ -138,7 +160,7 @@ internal sealed class UsageIndicatorForm : Form
                 return;
             }
 
-            if (_accountStore.HasPendingRecovery)
+            if (_accountStore.HasPendingRecovery || _accountStore.HasPendingEnvironmentSwitch)
             {
                 _accountBusy = true;
                 ShowAccountManager();
@@ -169,7 +191,9 @@ internal sealed class UsageIndicatorForm : Form
             _pollTimer.Stop();
             _codexStateTimer.Stop();
             _codexClient.Dispose();
-            _claudeClient.Dispose();
+            _claudeClient?.Dispose();
+            _claudeLifetime.Cancel();
+            _claudeAccounts?.Dispose();
             _toolTip.Dispose();
             _contextMenu.Dispose();
             _valueFont.Dispose();
@@ -201,18 +225,38 @@ internal sealed class UsageIndicatorForm : Form
     {
         foreach (var item in _contextMenu.Items.Cast<ToolStripItem>().ToArray()) item.Dispose();
         _contextMenu.Items.Clear();
-        var accountsItem = new ToolStripMenuItem(UiText.T("Codex 계정 관리…"));
+        _claudeMetricItems.Clear();
+        var accountsItem = new ToolStripMenuItem(UiText.T("계정 관리…"));
         accountsItem.Click += (_, _) => ShowAccountManager();
         var refreshItem = new ToolStripMenuItem(UiText.T("새로고침"));
         refreshItem.Click += async (_, _) => await RefreshUsageAsync(force: true);
 
-        var showClaudeItem = new ToolStripMenuItem(UiText.T("Claude 사용량 표시"))
+        var claudeMenu = new ToolStripMenuItem(UiText.T("Claude 표시")) { Name = "ClaudeDisplayMenu" };
+        var showClaudeItem = new ToolStripMenuItem(UiText.T("사용량 표시"))
         {
+            Name = "ShowClaudeUsage",
             Checked = _showClaude,
             CheckOnClick = true
         };
         showClaudeItem.CheckedChanged += async (_, _) =>
             await SetClaudeVisibilityAsync(showClaudeItem.Checked);
+        claudeMenu.DropDownItems.Add(showClaudeItem);
+        claudeMenu.DropDownItems.Add(new ToolStripSeparator());
+        foreach (var (metric, label) in new[]
+        {
+            (ClaudeDisplayMetric.OverallWeekly, UiText.T("전체 주간 잔여량")),
+            (ClaudeDisplayMetric.FableWeekly, UiText.T("Fable 주간 잔여량"))
+        })
+        {
+            var choice = new ToolStripMenuItem(label)
+            {
+                Name = "ClaudeMetric-" + metric.SettingsValue(),
+                Checked = metric == _claudeMetric
+            };
+            choice.Click += (_, _) => SetClaudeDisplayMetric(metric);
+            _claudeMetricItems.Add(metric, choice);
+            claudeMenu.DropDownItems.Add(choice);
+        }
 
         var topMostItem = new ToolStripMenuItem(UiText.T("항상 위에 표시"))
         {
@@ -233,7 +277,7 @@ internal sealed class UsageIndicatorForm : Form
                 _claudeUsage,
                 _codexError,
                 _claudeError,
-                _showClaude));
+                _showClaude, _claudeMetric));
         };
 
         var exitItem = new ToolStripMenuItem(UiText.T("닫기"));
@@ -249,7 +293,7 @@ internal sealed class UsageIndicatorForm : Form
 
         _contextMenu.Items.AddRange([
             refreshItem,
-            showClaudeItem,
+            claudeMenu,
             topMostItem,
             copyItem,
             accountsItem,
@@ -273,7 +317,7 @@ internal sealed class UsageIndicatorForm : Form
         UiText.SetLanguage(language);
         if (!_previewMode) IndicatorSettingsStore.SaveLanguage(language);
         Text = UiText.T("Codex 및 Claude 사용량");
-        AccessibleName = UiText.T("Codex 및 Claude Fable 사용량 인디케이터");
+        AccessibleName = UiText.T("Codex 및 Claude 사용량 인디케이터");
         if (_accountTray is not null) _accountTray.Text = UiText.T("Codex 사용량 · 계정 관리");
         if (_codexFailure is not null) _codexError = FriendlyCodexError(_codexFailure);
         if (_claudeFailure is not null) _claudeError = FriendlyClaudeError(_claudeFailure);
@@ -307,6 +351,19 @@ internal sealed class UsageIndicatorForm : Form
 
         _claudeError = null; _claudeFailure = null;
         await RefreshUsageAsync(force: true);
+    }
+
+    internal ClaudeDisplayMetric SelectedClaudeMetric => _claudeMetric;
+
+    internal void SetClaudeDisplayMetric(ClaudeDisplayMetric metric)
+    {
+        if (!Enum.IsDefined(metric)) throw new ArgumentOutOfRangeException(nameof(metric));
+        _claudeMetric = metric;
+        if (!_previewMode) IndicatorSettingsStore.SaveClaudeMetric(metric);
+        foreach (var (choice, item) in _claudeMetricItems) item.Checked = choice == metric;
+        // Display selection reuses the same snapshot and never starts a query.
+        UpdateToolTip();
+        Invalidate();
     }
 
     private void PlaceNearTaskbar()
@@ -455,8 +512,10 @@ internal sealed class UsageIndicatorForm : Form
             catch (AccountStoreBusyException) { }
             catch (Exception) { }
         }
+        string? claudeLabel = null;
+        try { claudeLabel = _claudeAccounts?.SelectedProfile.Label; } catch { }
         _toolTip.SetHoverText(BuildTooltipText(_codexSnapshot, _claudeUsage, _codexError, _claudeError,
-            _showClaude, _combinedUsage, accounts.FirstOrDefault(a => a.IsActive)?.Label));
+            _showClaude, _combinedUsage, accounts.FirstOrDefault(a => a.IsActive)?.Label, _claudeMetric, claudeLabel));
     }
 
     private async Task RefreshCodexAsync()
@@ -505,7 +564,7 @@ internal sealed class UsageIndicatorForm : Form
     }
 
     private AccountManagerForm CreateAccountManager(bool refreshAllOnOpen) => new(_accountStore, SuspendAccountsAsync, ResumeAccounts,
-        queryUsage: QueryAccountUsageAsync, combined: _combinedUsage, usageChanged: UpdateToolTip, refreshAllOnOpen: refreshAllOnOpen);
+        queryUsage: QueryAccountUsageAsync, combined: _combinedUsage, usageChanged: UpdateToolTip, refreshAllOnOpen: refreshAllOnOpen, claudeAccounts: _claudeAccounts);
 
     private async Task QueryAccountUsageAsync(SavedCodexAccount account, CancellationToken token)
     {
@@ -545,7 +604,7 @@ internal sealed class UsageIndicatorForm : Form
 
     private void ResumeAccounts()
     {
-        _accountBusy = _accountStore.HasPendingRecovery;
+        _accountBusy = _accountStore.HasPendingRecovery || _accountStore.HasPendingEnvironmentSwitch;
         _codexSnapshot = null;
         _helperIdentityKey = null;
         _codexError = null; _codexFailure = null;
@@ -556,17 +615,31 @@ internal sealed class UsageIndicatorForm : Form
 
     private async Task RefreshClaudeAsync()
     {
+        var generation = _claudeGeneration;
         try
         {
             using var timeout = new CancellationTokenSource(ClaudeRefreshTimeout);
-            _claudeUsage = await _claudeClient.GetUsageAsync(timeout.Token);
+            var result = _claudeAccounts is not null
+                ? await _claudeAccounts.ReadUsageAsync(null, _claudeLifetime.Token, timeout: ClaudeRefreshTimeout)
+                : await _claudeClient!.GetUsageAsync(timeout.Token);
+            if (generation != _claudeGeneration || IsDisposed) return;
+            _claudeUsage = result;
             _claudeError = null; _claudeFailure = null;
         }
         catch (Exception ex)
         {
+            if (generation != _claudeGeneration || IsDisposed) return;
             _claudeUsage = null;
             _claudeFailure = ex; _claudeError = FriendlyClaudeError(ex);
         }
+    }
+
+    private async void OnClaudeSelectionChanged(object? sender, EventArgs e)
+    {
+        _claudeGeneration++;
+        _claudeUsage = null; _claudeError = null; _claudeFailure = null;
+        UpdateToolTip(); Invalidate();
+        if (_showClaude && !IsDisposed) { await RefreshClaudeAsync(); if (!IsDisposed) { UpdateToolTip(); Invalidate(); } }
     }
 
     protected override void OnPaint(PaintEventArgs e)
@@ -585,40 +658,16 @@ internal sealed class UsageIndicatorForm : Form
         using var borderPath = RoundedRectangle(new RectangleF(0.5f, 0.5f, Width - 1f, Height - 1f), 15f);
         graphics.DrawPath(borderPen, borderPath);
 
-        var codexAvailable = _codexSnapshot is not null && _codexError is null;
-        var claudeAvailable = _showClaude &&
-            _claudeUsage?.Snapshot.Fable is not null &&
-            _claudeError is null;
+        var codexUsed = _codexError is null ? (double?)_codexSnapshot?.UsedPercent : null;
+        var claudeUsed = _claudeError is null
+            ? _claudeMetric.SelectUsedPercent(_claudeUsage?.Snapshot, DateTimeOffset.UtcNow)
+            : null;
         var codexAccent = Color.FromArgb(124, 156, 255);
-        var claudeAccent = Color.FromArgb(217, 119, 87);
 
-        if (codexAvailable && claudeAvailable)
-        {
-            DrawDualProviders(
-                graphics,
-                _codexSnapshot!.UsedPercent,
-                _claudeUsage!.Snapshot.Fable!.UsedPercent);
-        }
-        else if (codexAvailable)
-        {
-            DrawProvider(graphics, new RectangleF(0, 0, Width, Height), _codexSnapshot!.UsedPercent, codexAccent);
-        }
-        else if (claudeAvailable)
-        {
-            DrawProvider(
-                graphics,
-                new RectangleF(0, 0, Width, Height),
-                _claudeUsage!.Snapshot.Fable!.UsedPercent,
-                claudeAccent);
-        }
-        else if (_isRefreshing && _showClaude)
-        {
-            DrawDualProviders(graphics, null, null);
-        }
+        if (_showClaude)
+            DrawDualProviders(graphics, codexUsed, claudeUsed);
         else
-        {
-            DrawProvider(graphics, new RectangleF(0, 0, Width, Height), null, codexAccent);
-        }
+            DrawProvider(graphics, new RectangleF(0, 0, Width, Height), codexUsed, codexAccent);
     }
 
     private void DrawDualProviders(Graphics graphics, double? codexUsed, double? claudeUsed)
@@ -645,12 +694,7 @@ internal sealed class UsageIndicatorForm : Form
         double? usedPercent,
         Color accent)
     {
-        var clampedUsed = usedPercent is null
-            ? (double?)null
-            : Math.Clamp(usedPercent.Value, 0d, 100d);
-        var remaining = clampedUsed is null
-            ? (int?)null
-            : (int)Math.Round(100d - clampedUsed.Value, MidpointRounding.AwayFromZero);
+        var remaining = UsagePercentage.Remaining(usedPercent);
 
         using var valueBrush = new SolidBrush(Color.FromArgb(244, 244, 247));
         using var unavailableBrush = new SolidBrush(Color.FromArgb(151, 151, 162));
@@ -687,17 +731,19 @@ internal sealed class UsageIndicatorForm : Form
     }
 
     internal static string BuildTooltipText(UsageSnapshot? codex, ClaudeUsageResult? claude,
-        string? codexError, string? claudeError, bool showClaude, CombinedUsageSnapshot? combined = null, string? activeLabel = null)
-        => UsageTooltipText.Build(codex, claude, codexError, claudeError, showClaude, combined, activeLabel);
+        string? codexError, string? claudeError, bool showClaude, CombinedUsageSnapshot? combined = null,
+        string? activeLabel = null, ClaudeDisplayMetric claudeMetric = ClaudeDisplayMetric.OverallWeekly, string? claudeLabel = null)
+        => UsageTooltipText.Build(codex, claude, codexError, claudeError, showClaude, combined, activeLabel, claudeMetric, claudeLabel);
 
     private static string BuildClipboardText(
         UsageSnapshot? codex,
         ClaudeUsageResult? claude,
         string? codexError,
         string? claudeError,
-        bool showClaude)
+        bool showClaude,
+        ClaudeDisplayMetric claudeMetric)
     {
-        return BuildDetailsText(codex, claude, codexError, claudeError, showClaude, includeControls: false);
+        return BuildDetailsText(codex, claude, codexError, claudeError, showClaude, includeControls: false, claudeMetric);
     }
 
     private static string BuildDetailsText(
@@ -706,7 +752,8 @@ internal sealed class UsageIndicatorForm : Form
         string? codexError,
         string? claudeError,
         bool showClaude,
-        bool includeControls)
+        bool includeControls,
+        ClaudeDisplayMetric claudeMetric)
     {
         var builder = new StringBuilder();
         builder.AppendLine("CODEX");
@@ -718,21 +765,8 @@ internal sealed class UsageIndicatorForm : Form
             var claudeSnapshot = claudeError is null ? claude?.Snapshot : null;
             builder.AppendLine();
             builder.AppendLine("CLAUDE");
-            AppendUsageWindow(
-                builder,
-                UiText.T("5시간"),
-                claudeSnapshot?.FiveHour?.UsedPercent,
-                claudeSnapshot?.FiveHour?.ResetsAt);
-            AppendUsageWindow(
-                builder,
-                UiText.T("주간"),
-                claudeSnapshot?.Weekly?.UsedPercent,
-                claudeSnapshot?.Weekly?.ResetsAt);
-            AppendUsageWindow(
-                builder,
-                "Fable",
-                claudeSnapshot?.Fable?.UsedPercent,
-                claudeSnapshot?.Fable?.ResetsAt);
+            foreach (var (label, window) in UsageTooltipText.ClaudeWindows(claudeSnapshot, claudeMetric))
+                AppendUsageWindow(builder, label, window?.UsedPercent, window?.ResetsAt);
             if (claudeError is null) AppendClaudeRefreshState(builder, claude);
             AppendRefreshError(builder, claudeError);
         }
@@ -752,16 +786,16 @@ internal sealed class UsageIndicatorForm : Form
         double? usedPercent,
         DateTimeOffset? resetsAt)
     {
-        if (usedPercent is null)
+        var remaining = UsagePercentage.Remaining(usedPercent);
+        if (remaining is null)
         {
             builder.AppendLine(UiText.F($"{label}: 정보 없음"));
             return;
         }
 
-        var used = (int)Math.Round(
-            Math.Clamp(usedPercent.Value, 0d, 100d),
-            MidpointRounding.AwayFromZero);
-        builder.AppendLine(UiText.F($"{label}: {100 - used}% 남음 ({used}% 사용)"));
+        builder.AppendLine(resetsAt <= DateTimeOffset.Now
+            ? UiText.F($"{label}: 갱신 필요")
+            : UiText.F($"{label}: {remaining.Value}% 남음 ({100 - remaining.Value}% 사용)"));
         builder.AppendLine(UiText.F($"  초기화: {FormatResetTime(resetsAt)}"));
     }
 
@@ -894,7 +928,7 @@ internal sealed class UsageIndicatorForm : Form
     }
 }
 
-internal sealed record IndicatorSettings(int? X, int? Y, bool? ShowClaude, string? Language = null);
+internal sealed record IndicatorSettings(int? X, int? Y, bool? ShowClaude, string? Language = null, string? ClaudeMetric = null);
 
 internal static class IndicatorSettingsStore
 {
@@ -914,6 +948,12 @@ internal static class IndicatorSettingsStore
 
     public static bool LoadShowClaude(string? path = null) => LoadSettings(path)?.ShowClaude ?? true;
 
+    public static ClaudeDisplayMetric LoadClaudeMetric(string? path = null)
+    {
+        var settings = LoadSettings(path);
+        return ClaudeDisplayMetrics.FromSettings(settings?.ClaudeMetric, settings is not null);
+    }
+
     public static string LoadLanguage(string? path = null)
     {
         var settings = LoadSettings(path);
@@ -923,23 +963,31 @@ internal static class IndicatorSettingsStore
     public static void SaveLanguage(string language, string? path = null)
     {
         if (!UiText.IsSupported(language)) throw new ArgumentException("Unsupported UI language.", nameof(language));
-        var current = LoadSettings(path);
-        SaveSettings(new IndicatorSettings(current?.X, current?.Y, current?.ShowClaude ?? true, language), path);
+        SaveSettings(CurrentOrDefault(path) with { Language = language }, path);
     }
 
     public static void SavePosition(Point position, string? path = null)
     {
-        var current = LoadSettings(path);
-        SaveSettings(new IndicatorSettings(
-            position.X,
-            position.Y,
-            current?.ShowClaude ?? true, current?.Language ?? LoadLanguage(path)), path);
+        SaveSettings(CurrentOrDefault(path) with { X = position.X, Y = position.Y }, path);
     }
 
     public static void SaveShowClaude(bool showClaude, string? path = null)
     {
+        SaveSettings(CurrentOrDefault(path) with { ShowClaude = showClaude }, path);
+    }
+
+    public static void SaveClaudeMetric(ClaudeDisplayMetric metric, string? path = null) =>
+        SaveSettings(CurrentOrDefault(path) with { ClaudeMetric = metric.SettingsValue() }, path);
+
+    private static IndicatorSettings CurrentOrDefault(string? path)
+    {
         var current = LoadSettings(path);
-        SaveSettings(new IndicatorSettings(current?.X, current?.Y, showClaude, current?.Language ?? LoadLanguage(path)), path);
+        return (current ?? new IndicatorSettings(null, null, true)) with
+        {
+            ShowClaude = current?.ShowClaude ?? true,
+            Language = UiText.IsSupported(current?.Language) ? current!.Language : current is null ? UiText.SystemLanguage : "ko",
+            ClaudeMetric = ClaudeDisplayMetrics.FromSettings(current?.ClaudeMetric, current is not null).SettingsValue()
+        };
     }
 
     private static IndicatorSettings? LoadSettings(string? path = null)

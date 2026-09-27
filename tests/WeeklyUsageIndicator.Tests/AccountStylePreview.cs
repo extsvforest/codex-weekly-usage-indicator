@@ -34,8 +34,20 @@ internal static class AccountStylePreview
                 snapshot.Initialize(accounts, batch: true);
                 foreach (var account in accounts) snapshot.SetResult(account.Id, account, CombinedReadState.Success);
                 snapshot.CompletedAt = now;
+                var claudeHome = Directory.CreateDirectory(Path.Combine(root, "claude-original")).FullName;
+                var claudeStore = new ClaudeProfileStore(Path.Combine(root, "claude-profiles"), claudeHome, false);
+                var identity = new ClaudeProfileIdentity(new string('A', 64), "m*** · PREVIEW", "max");
+                var claudeMain = claudeStore.RegisterDefault("메인 Claude", identity);
+                var claudeOther = claudeStore.CreateProfile("서브 Claude");
+                claudeOther = claudeStore.RecordVerifiedIdentity(claudeOther.Id, new(new string('B', 64), "s*** · PREVIEW", "max"));
+                using var claudeController = new ClaudeAccountController(claudeStore,
+                    new ClaudeProfileRuntime(claudeStore, new PreviewClaudeRunner(), "preview-claude.exe"));
+                var observations = (Dictionary<string, ClaudeUsageResult>)typeof(ClaudeAccountController).GetField("_observations", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.GetValue(claudeController)!;
+                observations[claudeMain.Id] = new(new(new(10, now.AddHours(2)), new(32, now.AddDays(3)), new(15, now.AddDays(3))), now, null, false);
+                observations[claudeOther.Id] = new(new(new(20, now.AddHours(2)), new(57, now.AddDays(4)), new(25, now.AddDays(4))), now, null, false);
                 using var form = new AccountManagerForm(store, () => Task.CompletedTask, () => { },
                     refreshAllOnOpen: false, combined: snapshot,
+                    claudeAccounts: claudeController,
                     queryUsage: (_, _) => throw new InvalidOperationException("디자인 미리보기에서는 실제 계정을 조회하지 않습니다."));
                 form.Text += UiText.IsEnglish ? " · Design preview" : " · 디자인 미리보기";
                 form.Shown += async (_, _) =>
@@ -43,6 +55,23 @@ internal static class AccountStylePreview
                     try
                     {
                         await Task.Delay(200); Capture(form, "manager.png");
+                        ((Button)form.Controls.Find("ClaudeProviderTab", true).Single()).PerformClick();
+                        await Task.Delay(100); Capture(form, "claude.png");
+                        var claudePanel = (ClaudeAccountPanel)form.Controls.Find("ClaudeAccountPanel", true).Single();
+                        var claudeThird = claudeStore.CreateProfile("Claude · 추가 로그인 대기");
+                        claudeStore.Rename(claudeMain.Id, "메인 Claude · 긴 계정 이름과 English 0123456789");
+                        observations[claudeMain.Id] = observations[claudeMain.Id] with { IsStale = true, RetryAfter = now.AddMinutes(10) };
+                        claudePanel.Reload();
+                        await Task.Delay(100); Capture(form, "claude-states.png");
+                        if (Walk(claudePanel).OfType<ScrollableControl>().Any(c => c.AutoScroll && c.VerticalScroll.Visible))
+                            throw new InvalidOperationException("Three Claude profiles must fit without vertical scrolling.");
+                        claudeStore.Rename(claudeMain.Id, "메인 Claude");
+                        claudeStore.Remove(claudeOther.Id); claudeStore.Remove(claudeThird.Id);
+                        observations.Remove(claudeMain.Id); claudePanel.Reload();
+                        await Task.Delay(100); Capture(form, "claude-single.png");
+                        ((Button)form.Controls.Find("CodexProviderTab", true).Single()).PerformClick();
+                        using (var environments = new WslCodexConnectionsDialog(store, new WslCodexService(Path.Combine(root, "wsl-preview"), new PreviewWslBridge()), new WslCodexConnections(Path.Combine(root, "wsl-preview"))))
+                        { environments.Show(form); await Task.Delay(100); Capture(environments, "environments.png"); environments.Close(); }
                         using (var widget = new UsageIndicatorForm(previewMode: true))
                         {
                             typeof(UsageIndicatorForm).GetField("_showClaude", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.SetValue(widget, true);
@@ -97,11 +126,31 @@ internal static class AccountStylePreview
         using var bitmap = new Bitmap(form.Width, form.Height);
         form.DrawToBitmap(bitmap, new Rectangle(Point.Empty, bitmap.Size));
         bitmap.Save(Path.Combine(Path.GetDirectoryName(output)!, name), ImageFormat.Png);
-        IEnumerable<Control> Walk(Control c) => new[] { c }.Concat(c.Controls.Cast<Control>().SelectMany(Walk));
         foreach (var c in Walk(form).Where(c => c.Visible && c.Parent is not null && c.Parent is not ScrollableControl { AutoScroll: true }))
             if (!c.Parent!.ClientRectangle.Contains(c.Bounds))
-                throw new InvalidOperationException($"Native preview clips {c.Name} ({c.GetType().Name}) at {c.DeviceDpi} DPI.");
+                throw new InvalidOperationException($"Native preview clips {c.Name} ({c.GetType().Name}) at {c.DeviceDpi} DPI: {c.Bounds} in {c.Parent.ClientRectangle} ({c.Parent.Name}).");
         File.WriteAllText(Path.ChangeExtension(Path.Combine(Path.GetDirectoryName(output)!, name), ".json"),
             System.Text.Json.JsonSerializer.Serialize(Walk(form).Select(c => new { c.Name, Type = c.GetType().Name, c.Text, Bounds = c.Bounds.ToString(), c.DeviceDpi, Font = c.Font.Size, Parent = c.Parent?.GetType().Name })));
+    }
+
+    private static IEnumerable<Control> Walk(Control c) => new[] { c }.Concat(c.Controls.Cast<Control>().SelectMany(Walk));
+
+    private sealed class PreviewClaudeRunner : IClaudeProfileCommandRunner
+    {
+        private static Exception NoAccess() => new InvalidOperationException("A visual fixture must never invoke Claude.");
+        public Task<ClaudeProfileCommandResult> RunStatusAsync(System.Diagnostics.ProcessStartInfo start, CancellationToken token) => throw NoAccess();
+        public Task<int> RunInteractiveAsync(System.Diagnostics.ProcessStartInfo start, CancellationToken token) => throw NoAccess();
+        public Task<int> RunQuietAsync(System.Diagnostics.ProcessStartInfo start, CancellationToken token) => throw NoAccess();
+        public int Launch(System.Diagnostics.ProcessStartInfo start) => throw NoAccess();
+    }
+    private sealed class PreviewWslBridge : IWslCodexBridge
+    {
+        public Task<IReadOnlyList<string>> ListRunningDistributionsAsync(CancellationToken token) => Task.FromResult<IReadOnlyList<string>>(["Ubuntu"]);
+        public Task<WslCodexProbe> ProbeAsync(string distribution, WslCodexTarget? expected, CancellationToken token) => Task.FromResult(new WslCodexProbe(distribution, WslCodexAvailability.Ready,
+            new(distribution, 1000, "user", "/home/user", "/home/user/.codex", "/usr/local/bin/codex", "codex-cli 0.153.2"), 0, "ready"));
+        public Task<byte[]> ReadAuthAsync(WslCodexTarget target, CancellationToken token) => throw new InvalidOperationException("No fixture authentication access.");
+        public Task ReplaceAuthAsync(WslCodexTarget target, string digest, byte[] auth, CancellationToken token) => throw new InvalidOperationException("No fixture authentication access.");
+        public Task<bool> VerifyOfficialClientAsync(WslCodexTarget target, CancellationToken token) => throw new InvalidOperationException("No fixture authentication access.");
+        public Task<byte[]> LoginAsync(WslCodexTarget target, CancellationToken token, Action<Uri>? onAuthorizationUrl = null) => throw new InvalidOperationException("No fixture authentication access.");
     }
 }
