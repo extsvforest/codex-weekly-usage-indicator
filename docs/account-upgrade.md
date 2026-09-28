@@ -29,7 +29,7 @@ Verification completed for the previous `1.9.0-preview.2` installation:
 - A read-only WSL probe found a native Codex installation and active writers, so no real switch was attempted. Synthetic fixtures exercise missing CLI, rotation, cancellation, crashes, third-account preservation and encrypted recovery abandonment.
 - The production Claude launch method was exercised through disposable Windows scheduled tasks with a harmless child process. The child survived task stop, normal widget/supervisor exit, and the uninstall stop/kill sequence. Test tasks and processes were removed.
 
-Interactive login of an additional managed Claude profile and resuming a real conversation through that profile remain future acceptance checks. A real WSL account switch also remains unverified; finish running WSL Codex work before attempting it, since the app never stops that work automatically. No public release or successful live cross-account verification is claimed here.
+An additional managed Claude profile is now registered, and its live usage reads are verified in the preview 4 and 5 checks below. Launching and resuming a real conversation through that profile remains an acceptance check. A real WSL account switch also remains unverified; finish running WSL Codex work before attempting it, since the app never stops that work automatically. The installed previews have not been publicly released.
 
 Native visual evidence uses synthetic data: [Codex](design/2026-09-28/100/manager.png), [Claude](design/2026-09-28/100/claude.png), [three Claude accounts at 175%](design/2026-09-28/175/claude-states.png), [one account before its first check](design/2026-09-28/175/claude-single.png), and [English](design/2026-09-28/en-175/claude.png). The original Codex and Claude work remains under the existing accounts; no live switch was performed for these captures.
 
@@ -66,6 +66,8 @@ The user approved changing the ten-minute interval from one global timer to a ti
 The ten-minute value is the widget's conservative polling choice, not a published Claude requirement. Other profiles remain manual-only. Existing credential handling, selected-account behavior and profile-bound recovery storage are unchanged.
 
 All 38 non-pointer regression groups passed after the change. New checks cover consecutive main/additional-account reads, duplicate profiles, cached repeat reads, the ten-minute boundary, longer shared failure backoff, cancellations and client recreation. Controller coverage also verifies that a changed identity cannot inherit its previous account's observation when the new usage request fails.
+
+Preview 5 was installed locally from `b2e3e67` on September 28 at 15:36 KST. Its executable matches SHA-256 `f42714733af3724c3174dc035cc4b44df8686772521650adc755c38b32af68ce` and passed the private-build-path scan. The installed app obtained the selected account's usage at 15:36 and the additional account's usage at 15:43, within the same ten-minute interval. Both balances were visible together in the native manager. Repeating the additional-account action reused its observation, the selected account and aliases stayed unchanged, and saving an existing alias through the installed rename dialog succeeded. One supervisor and one widget remain running; disposable verification tasks were removed. This remains a local preview with no public release in this step.
 
 ## Profile sharing details
 
