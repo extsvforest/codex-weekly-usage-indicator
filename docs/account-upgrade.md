@@ -77,6 +77,8 @@ Refresh and session-launch explanations live with their respective actions inste
 
 All 38 non-pointer regression groups passed. Native previews passed in Korean and English at 100% and 175% scaling, including the shared-copy assertions and existing recovery/long-name checks. The live-pointer check was attempted but could not certify hover stability because the physical cursor moved; it is not counted as a pass. Final synthetic examples: [Codex](design/2026-09-28/copy-preview6/codex-ko.png) and [Claude](design/2026-09-28/copy-preview6/claude-ko.png). Real-account captures remain private.
 
+Preview 6 was installed locally from `e89110c` on September 28 at 16:31 KST. The installed executable matched SHA-256 `f3726f6336d09c530057c555855a5fdc6bdb3512382d4002b4d95596f48b20e4` and passed the private-build-path scan. Read-back of both installed tabs confirmed the same summary title and observation-time format, with no healthy-row timestamps or permanent explanatory footer. One manual refresh restored the additional Claude account's display after restart; the selection was preserved. One supervisor and one widget are running, and the disposable stop/install tasks were removed. This is a local preview, with no public release in this step.
+
 ## Profile sharing details
 
 Local project conversations, skills and supported working directories are referenced in place. Authentication and account-specific runtime files remain separate. Removing a profile from the manager does not delete its files or the linked original directories. Ordinary terminal `claude` continues to use its existing configuration; the selected extra profile is used by **Open Claude** in this panel and by the widget.
