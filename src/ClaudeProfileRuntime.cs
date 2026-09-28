@@ -11,6 +11,8 @@ using Microsoft.Win32.SafeHandles;
 namespace WeeklyUsageIndicator;
 
 internal sealed record ClaudeProfileCommandResult(int ExitCode, string StandardOutput);
+internal sealed class ClaudeLoginRequiredException() : UnauthorizedAccessException("Claude Code 로그인이 필요합니다.");
+internal sealed class ClaudeIdentityChangedException() : UnauthorizedAccessException("저장된 Claude 계정과 다른 계정이 로그인되어 있습니다. 원래 계정으로 다시 로그인하세요.");
 internal sealed record ClaudeProfileSharing(IReadOnlyList<string> SharedDirectories,
     bool PromptHistoryShared, bool InstructionsShared, bool InstructionsCopied);
 
@@ -98,7 +100,7 @@ internal sealed class ClaudeProfileRuntime
         var result = await _runner.RunStatusAsync(start, cancellationToken).ConfigureAwait(false);
         var identity = ParseStatus(result, profile);
         if (profile.Identity is not null && identity.Key != profile.Identity.Key)
-            throw new UnauthorizedAccessException("저장된 Claude 계정과 현재 로그인이 다릅니다. 계정을 새로 등록하세요.");
+            throw new ClaudeIdentityChangedException();
         return identity;
     }
 
@@ -206,8 +208,9 @@ internal sealed class ClaudeProfileRuntime
             using var document = JsonDocument.Parse(result.StandardOutput);
             var root = document.RootElement;
             if (root.ValueKind != JsonValueKind.Object) throw InvalidStatus();
-            if (!root.TryGetProperty("loggedIn", out var loggedIn) || loggedIn.ValueKind != JsonValueKind.True)
-                throw new UnauthorizedAccessException("Claude Code 로그인이 필요합니다.");
+            if (!root.TryGetProperty("loggedIn", out var loggedIn)
+                || loggedIn.ValueKind is not (JsonValueKind.True or JsonValueKind.False)) throw InvalidStatus();
+            if (loggedIn.ValueKind == JsonValueKind.False) throw new ClaudeLoginRequiredException();
             if (result.ExitCode != 0) throw InvalidStatus();
             if (ReadSafeString(root, "authMethod", 32) != "claude.ai"
                 || ReadSafeString(root, "apiProvider", 32) is { } provider && provider != "firstParty")

@@ -8,6 +8,7 @@
   "이 프로필은 Claude 구독 로그인을 사용하지 않습니다. API 키나 외부 제공자 설정을 확인하세요.": "This profile is not signed in with a Claude subscription. Check its API key or external provider settings.",
   "이 Claude 플러그인 등록 방식은 자동으로 공유할 수 없습니다. 기존 설정은 보존했습니다.": "This type of Claude plugin registration cannot be shared automatically. Your existing settings have been kept.",
   "저장된 Claude 계정과 현재 로그인이 다릅니다. 계정을 새로 등록하세요.": "The current sign-in differs from the saved Claude account. Register the account again.",
+  "저장된 Claude 계정과 다른 계정이 로그인되어 있습니다. 원래 계정으로 다시 로그인하세요.": "A different Claude account is signed in. Sign in again with the original account.",
   "Claude 계정 확인 시간이 초과되었습니다.": "Claude account verification timed out.",
   "Claude 로그아웃 상태를 확인하지 못했습니다.": "Claude sign-out could not be verified.",
   "Claude 로그아웃을 완료하지 못했습니다.": "Claude sign-out could not be completed.",

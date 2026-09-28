@@ -11,6 +11,7 @@ internal static class ClaudeControllerTests
         await LoginWaitKeepsOtherAccountAsync();
         await TransientStatusFailureKeepsVerifiedObservationAsync();
         await RejectedIdentityImmediatelyInvalidatesAsync();
+        await LoginFailureRemainsVisibleUntilRecoveryAsync();
         await ChangedBindingCannotReuseObservationAsync();
         await DisposalCancelsWaitersWithoutDisposingTheirGateAsync();
     }
@@ -45,9 +46,20 @@ internal static class ClaudeControllerTests
             { if (fixture.Controller.LastUsage(update.ProfileId) is null) invalidations++; };
 
             fixture.Runner.Email = "changed@example.test";
-            var registered = await fixture.Controller.RegisterDefaultAsync(CancellationToken.None);
-            Check(registered.Identity?.Key == Fixture.Identity(fixture.Store.DefaultProfile, fixture.Runner.Email).Key
-                  && fixture.Controller.LastUsage("default") is null && fixture.CacheClears == 1 && invalidations == 1,
+            if (alreadyRegistered)
+            {
+                var before = fixture.Store.SelectedProfile;
+                await ThrowsAsync<ClaudeIdentityChangedException>(() => fixture.Controller.RegisterDefaultAsync(CancellationToken.None));
+                Check(fixture.Store.SelectedProfile == before,
+                    "reconnecting cannot silently replace a saved default with an accidentally signed-in account");
+            }
+            else
+            {
+                var registered = await fixture.Controller.RegisterDefaultAsync(CancellationToken.None);
+                Check(registered.Identity?.Key == Fixture.Identity(fixture.Store.DefaultProfile, fixture.Runner.Email).Key,
+                    "the first explicit registration adopts the verified current account");
+            }
+            Check(fixture.Controller.LastUsage("default") is null && fixture.CacheClears == 1 && invalidations == 1,
                 "a different default identity invalidates previous usage, including an unregistered observation binding");
             Check(fixture.SourceCalls == 1, "registration verifies identity but does not add a usage request");
         }
@@ -154,6 +166,56 @@ internal static class ClaudeControllerTests
             "even an unregistered default never keeps usage from the account it just identified as replaced");
     }
 
+    private static async Task LoginFailureRemainsVisibleUntilRecoveryAsync()
+    {
+        using var fixture = new Fixture();
+        await fixture.Controller.ReadUsageAsync(null, CancellationToken.None);
+        Exception? observedFailure = null;
+        fixture.Controller.UsageChanged += (_, update) =>
+            observedFailure = fixture.Controller.LastFailure(update.ProfileId);
+        fixture.Runner.LoggedOut = true;
+        await ThrowsAsync<ClaudeLoginRequiredException>(() =>
+            fixture.Controller.ReadUsageAsync(null, CancellationToken.None));
+        Check(observedFailure is ClaudeLoginRequiredException
+              && fixture.Controller.LastFailure("default") is ClaudeLoginRequiredException
+              && fixture.Controller.LastFailure("another-profile") is null,
+            "a background authentication failure is retained per profile for a manager opened later");
+        Check(fixture.Controller.LastUsage("default") is null && fixture.SourceCalls == 1,
+            "a logged-out profile cannot publish old data or run usage under an unverified identity");
+        Check(UsageIndicatorForm.FriendlyClaudeError(observedFailure!) == UiText.T("Claude Code 로그인이 필요합니다."),
+            "the widget reports required CLI login without inventing an expiry cause");
+
+        using (var canceledLogin = new CancellationTokenSource())
+        {
+            var login = fixture.Controller.LoginAsync(fixture.Store.SelectedProfile!, canceledLogin.Token);
+            await fixture.Runner.LoginStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            canceledLogin.Cancel();
+            await ThrowsAsync<OperationCanceledException>(() => login);
+            Check(fixture.Controller.LastFailure("default") is ClaudeLoginRequiredException,
+                "canceling the official login keeps its recoverable error visible");
+        }
+
+        fixture.Runner.LoggedOut = false;
+        await fixture.Controller.RegisterDefaultAsync(CancellationToken.None);
+        Check(fixture.Controller.LastFailure("default") is null,
+            "successful identity verification clears a resolved authentication error before usage is available");
+        fixture.Clock.Now += TimeSpan.FromMinutes(11);
+        await fixture.Controller.ReadUsageAsync(null, CancellationToken.None);
+        Check(fixture.Controller.LastFailure("default") is null && observedFailure is null
+              && fixture.Controller.LastUsage("default") is not null,
+            "a successful verified observation clears the retained error and notifies open surfaces");
+
+        fixture.Runner.Email = "changed@example.test";
+        await ThrowsAsync<ClaudeIdentityChangedException>(() =>
+            fixture.Controller.ReadUsageAsync(null, CancellationToken.None));
+        Check(fixture.Controller.LastFailure("default") is ClaudeIdentityChangedException,
+            "another logged-in identity remains distinct from a missing login");
+        fixture.Runner.MalformedStatus = true;
+        await ThrowsAsync<InvalidDataException>(() => fixture.Controller.ReadUsageAsync(null, CancellationToken.None));
+        Check(fixture.Controller.LastFailure("default") is InvalidDataException,
+            "schema failures cannot advertise reauthentication as their remedy");
+    }
+
     private static async Task DisposalCancelsWaitersWithoutDisposingTheirGateAsync()
     {
         using var fixture = new Fixture();
@@ -239,6 +301,7 @@ internal static class ClaudeControllerTests
         internal string Email = "main@example.test";
         internal Exception? StatusFailure;
         internal bool MalformedStatus;
+        internal bool LoggedOut;
         internal int StatusCalls;
 
         public Task<ClaudeProfileCommandResult> RunStatusAsync(ProcessStartInfo start, CancellationToken token)
@@ -247,6 +310,7 @@ internal static class ClaudeControllerTests
             StatusCalls++;
             if (StatusFailure is not null) return Task.FromException<ClaudeProfileCommandResult>(StatusFailure);
             return Task.FromResult(MalformedStatus ? new ClaudeProfileCommandResult(0, "{invalid")
+                : LoggedOut ? new ClaudeProfileCommandResult(1, "{\"loggedIn\":false,\"authMethod\":\"none\"}")
                 : Status(start.Environment["CLAUDE_CONFIG_DIR"]!, Email));
         }
 

@@ -43,6 +43,7 @@ internal static class AccountStylePreview
                 using var claudeController = new ClaudeAccountController(claudeStore,
                     new ClaudeProfileRuntime(claudeStore, new PreviewClaudeRunner(), "preview-claude.exe"));
                 var observations = (Dictionary<string, ClaudeUsageResult>)typeof(ClaudeAccountController).GetField("_observations", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.GetValue(claudeController)!;
+                var failures = (Dictionary<string, Exception>)typeof(ClaudeAccountController).GetField("_failures", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.GetValue(claudeController)!;
                 observations[claudeMain.Id] = new(new(new(10, now.AddHours(2)), new(32, now.AddDays(3)), new(15, now.AddDays(3))), now, null, false);
                 observations[claudeOther.Id] = new(new(new(20, now.AddHours(2)), new(57, now.AddDays(4)), new(25, now.AddDays(4))), now, null, false);
                 using var form = new AccountManagerForm(store, () => Task.CompletedTask, () => { },
@@ -65,6 +66,15 @@ internal static class AccountStylePreview
                         await Task.Delay(100); Capture(form, "claude-states.png");
                         if (Walk(claudePanel).OfType<ScrollableControl>().Any(c => c.AutoScroll && c.VerticalScroll.Visible))
                             throw new InvalidOperationException("Three Claude profiles must fit without vertical scrolling.");
+                        observations.Remove(claudeMain.Id);
+                        failures[claudeMain.Id] = new ClaudeLoginRequiredException(); claudePanel.Reload();
+                        await Task.Delay(100); Capture(form, "claude-login-required.png");
+                        AssertClaudeRecovery(form, claudePanel, claudeMain.Id);
+                        failures[claudeMain.Id] = new ClaudeIdentityChangedException(); claudePanel.Reload();
+                        await Task.Delay(100); Capture(form, "claude-identity-changed.png");
+                        AssertClaudeRecovery(form, claudePanel, claudeMain.Id);
+                        failures.Clear();
+                        AssertClaudeUsageRecovery(claudePanel, observations, failures, claudeMain.Id, claudeOther.Id, now);
                         claudeStore.Rename(claudeMain.Id, "메인 Claude");
                         claudeStore.Remove(claudeOther.Id); claudeStore.Remove(claudeThird.Id);
                         observations.Remove(claudeMain.Id); claudePanel.Reload();
@@ -134,6 +144,42 @@ internal static class AccountStylePreview
     }
 
     private static IEnumerable<Control> Walk(Control c) => new[] { c }.Concat(c.Controls.Cast<Control>().SelectMany(Walk));
+
+    private static void AssertClaudeRecovery(Form form, ClaudeAccountPanel panel, string profileId)
+    {
+        if (Walk(panel).OfType<ScrollableControl>().Any(control => control.AutoScroll && control.VerticalScroll.Visible))
+            throw new InvalidOperationException("Three Claude profiles and recovery must fit without vertical scrolling.");
+        var recovery = (Button)form.Controls.Find("ClaudeRecoverAccountButton", true).Single();
+        var rowAction = (Button)form.Controls.Find("ClaudeSelect-" + profileId, true).Single();
+        if (!recovery.Visible || !recovery.Enabled || recovery.Text != UiText.T("다시 로그인") || !rowAction.Enabled || rowAction.Text != UiText.T("로그인"))
+            throw new InvalidOperationException("Claude authentication recovery must be explicit and available in both the notice and row.");
+        if (form.Controls.Find("ClaudeSelectedWeeklyRemainingLabel", true).Single().Text != "—")
+            throw new InvalidOperationException("An unauthenticated or changed identity must never display another account's usage.");
+    }
+
+    private static void AssertClaudeUsageRecovery(ClaudeAccountPanel panel, Dictionary<string, ClaudeUsageResult> observations,
+        Dictionary<string, Exception> failures, string profileId, string otherId, DateTimeOffset now)
+    {
+        // Set only fixture state: no login, verification or usage process is invoked.
+        observations[profileId] = new(new(null, new(32, now.AddDays(3)), null), now.AddMinutes(-3), null, true);
+        failures[profileId] = new IOException("fixture usage failure");
+        var setStatus = typeof(ClaudeAccountPanel).GetMethod("SetStatus", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
+        setStatus.Invoke(panel, new object?[] { UiText.T("조회 실패"), true, false, profileId });
+        observations[otherId] = observations[otherId] with { LastUpdatedAt = now.AddMinutes(-2), IsStale = false };
+        panel.Reload();
+        if (!panel.Controls.Find("ClaudeNotice", true).Single().Visible)
+            throw new InvalidOperationException("Another profile's success must not clear a tracked usage failure.");
+        failures.Remove(profileId);
+        observations[profileId] = observations[profileId] with { LastUpdatedAt = now.AddMinutes(-2), IsStale = false };
+        panel.Reload();
+        if (panel.Controls.Find("ClaudeNotice", true).Single().Visible)
+            throw new InvalidOperationException("A new accepted observation must clear that profile's old manual usage failure.");
+        setStatus.Invoke(panel, new object?[] { "fixture non-usage action failure", true, false, null });
+        observations[profileId] = observations[profileId] with { LastUpdatedAt = now.AddMinutes(-1) }; panel.Reload();
+        if (!panel.Controls.Find("ClaudeNotice", true).Single().Visible)
+            throw new InvalidOperationException("An observation must not dismiss errors from other account actions.");
+        setStatus.Invoke(panel, new object?[] { "", false, true, null });
+    }
 
     private sealed class PreviewClaudeRunner : IClaudeProfileCommandRunner
     {

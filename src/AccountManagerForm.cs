@@ -96,7 +96,7 @@ internal sealed partial class AccountManagerForm : Form
         _claudeTab.Visible = claudeAccounts is not null;
         _shell.Controls.Add(tabs, 0, 1);
         _root.Controls.Add(_overview, 0, 1);
-        _overview.SummaryChanged += (_, _) => _checkedAt.Text = _overview.CheckedAtText;
+        _overview.SummaryChanged += (_, _) => UpdateProviderHeader();
         _status.Name = "StatusLabel"; _status.Dock = DockStyle.Fill; _status.AutoSize = false; _status.TextAlign = ContentAlignment.MiddleLeft;
         _notice.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100)); _notice.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         var noticeActions = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = false, Margin = new Padding(8, 0, 0, 0), FlowDirection = FlowDirection.RightToLeft };
@@ -120,7 +120,8 @@ internal sealed partial class AccountManagerForm : Form
         if (claudeAccounts is not null)
         {
             _claudePanel = new ClaudeAccountPanel(claudeAccounts) { Dock = DockStyle.Fill, Visible = false };
-            _claudePanel.BusyChanged += (_, _) => { _codexTab.Enabled = _claudeTab.Enabled = !IsOperationInProgress; };
+            _claudePanel.BusyChanged += (_, _) => { _codexTab.Enabled = _claudeTab.Enabled = !IsOperationInProgress; UpdateProviderHeader(); };
+            _claudePanel.SummaryChanged += (_, _) => UpdateProviderHeader();
             _pageHost.Controls.Add(_claudePanel);
         }
         _shell.Controls.Add(_pageHost, 0, 2); Controls.Add(_shell); Controls.Add(_progress);
@@ -133,7 +134,11 @@ internal sealed partial class AccountManagerForm : Form
         _accounts.SwitchRequested += async _ => await SwitchSelectedAsync();
         _accounts.SelectedIndexChanged += (_, _) => { if (!_reloading) UpdateActions(); };
         _refresh.Click += (_, _) => { if (!_busy && Reload()) SetStatus(UiText.T("저장된 계정 목록을 다시 읽었습니다.")); };
-        _refreshAll.Click += async (_, _) => await ReadAllUsageAsync();
+        _refreshAll.Click += async (_, _) =>
+        {
+            if (_showingClaude && _claudePanel is not null) await _claudePanel.RefreshSelectedUsageAsync();
+            else await ReadAllUsageAsync();
+        };
         _readUsage.Click += async (_, _) => await ReadSelectedUsageAsync(); _rename.Click += (_, _) => RenameSelected();
         _info.Click += (_, _) => ShowAccountInfo(); _delete.Click += (_, _) => DeleteSelected();
         _applyEnvironments.Click += async (_, _) => await ApplyCurrentToEnvironmentsAsync();
@@ -232,7 +237,7 @@ internal sealed partial class AccountManagerForm : Form
         _abandonWslRecovery.Enabled = !_busy;
         _recover.Visible = pending || _usageQueryStatus.State == UsageQueryState.CleanupPending; _recover.Enabled = !_busy;
         _recover.Text = _store.HasPendingRecovery || HasLinkedRecovery ? UiText.T("미완료 전환 복구") : _usageQueryStatus.State == UsageQueryState.CleanupPending ? UiText.T("임시 파일 정리") : UiText.T("중단된 조회 복구");
-        _refreshAll.Enabled = !_busy && !pending && _items.Count > 0;
+        UpdateProviderHeader();
         _overview.Display(_combined, _busy || pending, _batchCompleted, _batchQuerying);
         _accounts.Display(_combined, _busy, !pending, _items.Any(a => a.IsActive), keepOrder: _batchQuerying); UpdateNotice(); _usageChanged?.Invoke();
     }

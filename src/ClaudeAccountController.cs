@@ -13,6 +13,7 @@ internal sealed class ClaudeAccountController : IDisposable
     internal ClaudeProfileRuntime Runtime { get; }
     private readonly Dictionary<string, ClaudeUsageClient> _clients = new(StringComparer.Ordinal);
     private readonly Dictionary<string, ClaudeUsageResult> _observations = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, Exception> _failures = new(StringComparer.Ordinal);
     private readonly Dictionary<string, ObservationBinding> _observationBindings = new(StringComparer.Ordinal);
     private readonly object _observationGate = new();
     private readonly SemaphoreSlim _gate = new(1, 1);
@@ -50,6 +51,11 @@ internal sealed class ClaudeAccountController : IDisposable
                 ? UsableObservation(result, _timeProvider.GetUtcNow()) : null;
     }
 
+    internal Exception? LastFailure(string profileId)
+    {
+        lock (_observationGate) return _failures.GetValueOrDefault(profileId);
+    }
+
     internal async Task<ClaudeProfile> RegisterDefaultAsync(CancellationToken token)
     {
         using var operation = BeginOperation(token);
@@ -59,17 +65,21 @@ internal sealed class ClaudeAccountController : IDisposable
             var profile = Store.DefaultProfile;
             var identity = await Runtime.VerifyAsync(profile, operation.Token);
             var previous = Store.ListProfiles().SingleOrDefault(saved => saved.Id == profile.Id);
-            var changedIdentity = previous?.Identity is { } stored && stored.Key != identity.Key;
+            if (previous?.Identity is { } stored && stored.Key != identity.Key)
+                throw new ClaudeIdentityChangedException();
+            var changedIdentity = false;
             lock (_observationGate)
                 changedIdentity |= _observationBindings.TryGetValue(profile.Id, out var binding)
                     && !binding.Matches(profile, identity.Key);
             // Connecting the already-used default account only adds its row and label. Keep its
             // accepted usage/client: dropping them would leave it blank until the global throttle expires.
             if (changedIdentity) Forget(profile.Id);
-            return Store.RegisterDefault(UiText.T("기존 Claude 계정"), identity);
+            var registered = Store.RegisterDefault(previous?.Label ?? UiText.T("기존 Claude 계정"), identity);
+            ClearAuthenticationFailure(profile.Id);
+            return registered;
         }
         catch (Exception exception) when (exception is UnauthorizedAccessException or InvalidDataException)
-        { Forget(Store.DefaultProfile.Id); throw; }
+        { Forget(Store.DefaultProfile.Id, exception); throw; }
         finally { _gate.Release(); }
     }
 
@@ -90,6 +100,7 @@ internal sealed class ClaudeAccountController : IDisposable
     {
         using var operation = BeginOperation(token);
         await _gate.WaitAsync(operation.Token);
+        var previousFailure = LastFailure(profile.Id);
         try
         {
             // This profile's login is about to change. Other profiles may continue displaying their
@@ -97,6 +108,14 @@ internal sealed class ClaudeAccountController : IDisposable
             Forget(profile.Id);
             var identity = await Runtime.LoginAsync(profile, operation.Token);
             Store.RecordVerifiedIdentity(profile.Id, identity);
+        }
+        catch (Exception exception) when (exception is UnauthorizedAccessException or InvalidDataException)
+        { Forget(profile.Id, exception); throw; }
+        catch (Exception exception) when (exception is OperationCanceledException or InvalidOperationException)
+        {
+            if (previousFailure is not null) PublishFailure(profile.Id, previousFailure);
+            else if (exception is not OperationCanceledException) PublishFailure(profile.Id, exception);
+            throw;
         }
         finally { _gate.Release(); }
     }
@@ -114,9 +133,10 @@ internal sealed class ClaudeAccountController : IDisposable
             if (identity.Key != usageIdentity.Key)
                 throw new InvalidOperationException("Claude 실행과 사용량 조회의 계정이 다릅니다. 로그인 설정을 확인해 주세요.");
             Store.Select(profile.Id, identity);
+            ClearAuthenticationFailure(profile.Id);
         }
         catch (Exception exception) when (exception is UnauthorizedAccessException or InvalidDataException)
-        { Forget(profile.Id); throw; }
+        { Forget(profile.Id, exception); throw; }
         finally { _gate.Release(); }
         if (!_disposed) SelectionChanged?.Invoke(this, EventArgs.Empty);
     }
@@ -141,7 +161,7 @@ internal sealed class ClaudeAccountController : IDisposable
             requestedProfile = profile;
             var identity = await Runtime.VerifyAsync(profile, operation.Token, safeMode: true);
             if (profile.Identity is not null && profile.Identity.Key != identity.Key)
-                throw new UnauthorizedAccessException("Claude 프로필의 로그인 계정이 바뀌었습니다. 계정 목록에서 다시 확인해 주세요.");
+                throw new ClaudeIdentityChangedException();
             var key = profile.Id + ":" + identity.Key;
             // Once verification identifies a different account, an older observation is no longer a
             // fallback, even if the subsequent usage request fails transiently.
@@ -165,7 +185,7 @@ internal sealed class ClaudeAccountController : IDisposable
         }
         catch (Exception ex) when (ex is UnauthorizedAccessException or InvalidDataException)
         {
-            Forget(requestedProfile.Id);
+            Forget(requestedProfile.Id, ex);
             throw;
         }
         catch (Exception ex) when (IsTransientStatusFailure(ex)
@@ -177,8 +197,11 @@ internal sealed class ClaudeAccountController : IDisposable
             var retryAfter = ex is ClaudeUsageTemporarilyUnavailableException unavailable
                 ? unavailable.RetryAfter : _timeProvider.GetUtcNow() + StatusRetryDelay;
             if (TryUseStaleObservation(requestedProfile, profileId is null, retryAfter, out var cached)) return cached;
-            throw new ClaudeUsageTemporarilyUnavailableException(retryAfter, ex);
+            var failure = new ClaudeUsageTemporarilyUnavailableException(retryAfter, ex);
+            PublishFailure(requestedProfile.Id, failure);
+            throw failure;
         }
+        catch (FileNotFoundException ex) { Forget(requestedProfile.Id, ex); throw; }
         finally { if (entered) _gate.Release(); }
     }
 
@@ -193,24 +216,45 @@ internal sealed class ClaudeAccountController : IDisposable
             Forget(profile.Id);
             await Runtime.LogoutAsync(profile, operation.Token);
             Store.MarkLoggedOut(profile.Id);
+            PublishFailure(profile.Id, new ClaudeLoginRequiredException());
         }
         finally { _gate.Release(); }
         if (wasSelected && !_disposed) SelectionChanged?.Invoke(this, EventArgs.Empty);
     }
 
-    private void Forget(string id)
+    private void Forget(string id, Exception? failure = null)
     {
-        InvalidateObservation(id);
+        InvalidateObservation(id, failure);
         foreach (var key in _clients.Keys.Where(key => key.StartsWith(id + ":", StringComparison.Ordinal)).ToArray())
         { _clients[key].Dispose(); _clients.Remove(key); }
         _clearRecoveryCache();
     }
 
-    private void InvalidateObservation(string id)
+    private void InvalidateObservation(string id, Exception? failure = null)
     {
         lock (_observationGate)
-        { _observations.Remove(id); _observationBindings.Remove(id); }
+        {
+            _observations.Remove(id); _observationBindings.Remove(id);
+            if (failure is null) _failures.Remove(id);
+            else _failures[id] = failure;
+        }
         // Null is an explicit invalidation, not an absent update. A selected widget must clear it now.
+        if (!_disposed) UsageChanged?.Invoke(this, new ClaudeUsageObservedEventArgs(id));
+    }
+
+    private void PublishFailure(string id, Exception failure)
+    {
+        lock (_observationGate) _failures[id] = failure;
+        if (!_disposed) UsageChanged?.Invoke(this, new ClaudeUsageObservedEventArgs(id));
+    }
+
+    private void ClearAuthenticationFailure(string id)
+    {
+        lock (_observationGate)
+        {
+            if (_failures.GetValueOrDefault(id) is not UnauthorizedAccessException) return;
+            _failures.Remove(id);
+        }
         if (!_disposed) UsageChanged?.Invoke(this, new ClaudeUsageObservedEventArgs(id));
     }
 
@@ -240,6 +284,7 @@ internal sealed class ClaudeAccountController : IDisposable
                 if (usable.RetryAfter is { } existingRetry && existingRetry > retryAfter) retryAfter = existingRetry;
                 cached = usable with { IsStale = true, RetryAfter = retryAfter };
                 _observations[current.Id] = cached;
+                _failures.Remove(current.Id);
             }
         }
         if (invalid)
@@ -256,6 +301,7 @@ internal sealed class ClaudeAccountController : IDisposable
         lock (_observationGate)
         {
             _observations[profile.Id] = result;
+            _failures.Remove(profile.Id);
             _observationBindings[profile.Id] = new ObservationBinding(identityKey, profile.ConfigDirectory, profile.UseDefaultHome);
         }
         if (!_disposed) UsageChanged?.Invoke(this, new ClaudeUsageObservedEventArgs(profile.Id));

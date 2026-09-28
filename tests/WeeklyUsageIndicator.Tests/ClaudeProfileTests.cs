@@ -152,8 +152,10 @@ internal static class ClaudeProfileTests
 
     private static void ValidateStatusFailures(ClaudeProfile profile)
     {
-        MustThrow<UnauthorizedAccessException>(() => ClaudeProfileRuntime.ParseStatus(
+        MustThrow<ClaudeLoginRequiredException>(() => ClaudeProfileRuntime.ParseStatus(
             new ClaudeProfileCommandResult(1, "{\"loggedIn\":false,\"authMethod\":\"none\"}"), profile));
+        foreach (var invalid in new[] { "{}", "{\"loggedIn\":\"false\"}", "{\"loggedIn\":null}" })
+            MustThrow<System.IO.InvalidDataException>(() => ClaudeProfileRuntime.ParseStatus(new(0, invalid), profile));
         MustThrow<System.IO.InvalidDataException>(() => ClaudeProfileRuntime.ParseStatus(new(0, "{broken"), profile));
         MustThrow<System.IO.InvalidDataException>(() => ClaudeProfileRuntime.ParseStatus(
             Status(profile with { ConfigDirectory = Path.Combine(profile.ConfigDirectory, "unexpected") }, "first@example.test"), profile));

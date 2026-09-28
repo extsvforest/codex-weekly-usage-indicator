@@ -42,7 +42,7 @@ internal sealed class ClaudeCodeUsageSource : IClaudeUsageSource
             if (LooksLikeAuthenticationFailure(result.StandardError) ||
                 LooksLikeAuthenticationFailure(result.StandardOutput))
             {
-                throw new UnauthorizedAccessException("Claude Code login is required.");
+                throw new ClaudeLoginRequiredException();
             }
 
             throw new IOException($"Claude Code /usage exited with code {result.ExitCode}.");
@@ -67,7 +67,7 @@ internal sealed class ClaudeCodeUsageSource : IClaudeUsageSource
         if (isError)
         {
             if (LooksLikeAuthenticationFailure(resultText))
-                throw new UnauthorizedAccessException("Claude Code login is required.");
+                throw new ClaudeLoginRequiredException();
             throw new IOException("Claude Code could not retrieve /usage.");
         }
 

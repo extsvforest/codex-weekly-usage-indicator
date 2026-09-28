@@ -114,8 +114,10 @@ internal sealed class UsageIndicatorForm : Form
                 {
                     if (IsDisposed || observation.ProfileId != _claudeAccounts.SelectionKey) return;
                     _claudeUsage = _claudeAccounts.LastUsage(observation.ProfileId);
-                    _claudeError = _claudeUsage is null ? UiText.T("Claude 계정을 다시 확인해 주세요.") : null;
-                    _claudeFailure = null; UpdateToolTip(); Invalidate();
+                    _claudeFailure = _claudeAccounts.LastFailure(observation.ProfileId);
+                    _claudeError = _claudeFailure is not null ? FriendlyClaudeError(_claudeFailure)
+                        : _claudeUsage is null ? UiText.T("Claude 계정을 다시 확인해 주세요.") : null;
+                    UpdateToolTip(); Invalidate();
                 }));
             };
         }
@@ -853,8 +855,10 @@ internal sealed class UsageIndicatorForm : Form
     {
         if (exception is TimeoutException or TaskCanceledException)
             return UiText.T("Claude 응답 시간이 초과되었습니다.");
+        if (exception is ClaudeLoginRequiredException)
+            return UiText.T("Claude Code 로그인이 필요합니다.");
         if (exception is UnauthorizedAccessException)
-            return UiText.T("Claude Code 로그인이 만료되었습니다.");
+            return TruncateError(UiText.Message(exception.Message));
         if (exception is ClaudeUsageTemporarilyUnavailableException unavailable)
         {
             return UiText.F($"Claude 사용량 조회가 지연되었습니다. 다음 시도: {FormatResetTime(unavailable.RetryAfter)}");

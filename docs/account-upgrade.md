@@ -12,7 +12,7 @@ The September 28 upgrade combines the approved compact account-table layout with
 
 ## Review and validation
 
-The candidate is version `1.9.0-preview.2`. The approved compact table and two-column summary are implemented as native controls with the warm paper palette and texture. Codex and Claude have their own pages; inactive profiles never contribute to the wrong provider's number. Claude's summary shows the selected profile's overall weekly balance and reset time, above its account list; it does not combine accounts or query every profile automatically.
+The candidate is version `1.9.0-preview.3`. The approved compact table and two-column summary are implemented as native controls with the warm paper palette and texture. Codex and Claude have their own pages; inactive profiles never contribute to the wrong provider's number. Claude's summary shows the selected profile's overall weekly balance and reset time, above its account list; it does not combine accounts or query every profile automatically.
 
 An Opus review during implementation found recovery paths that could lock the manager, a missing WSL-only action for the current Windows account, and unnecessarily blocked isolated logins. The candidate now offers explicit WSL unlinking that preserves live authentication, archives encrypted recovery data, and disables linked switching. Unowned recovery records cannot apply a login. A durable marker distinguishes preparation from an attempted write. Rotated source credentials are preserved in the encrypted vault before a recovery record is archived, without replacing newer stored credentials.
 
@@ -20,7 +20,7 @@ An independent Claude-controller review reproduced and then verified fixes for t
 
 Connecting the already active default Claude account now keeps its accepted usage and client cache. A newly verified identity still invalidates the previous account's values. Regression fixtures cover first registration, repeated registration, identity changes, and the absence of an additional usage request.
 
-Verification completed before installation:
+Verification completed for the previous `1.9.0-preview.2` installation:
 
 - All 37 regression groups passed on the final candidate, including the four-corner tooltip hover and foreground-focus checks. Opening-layout tracing observed 78 events with no violations.
 - Synthetic native previews at 100% and 175% scaling, including English, checked control bounds and were visually inspected. Fractional-DPI row sizing and the WSL dialog's initial scaling were corrected.
@@ -29,11 +29,21 @@ Verification completed before installation:
 - A read-only WSL probe found a native Codex installation and active writers, so no real switch was attempted. Synthetic fixtures exercise missing CLI, rotation, cancellation, crashes, third-account preservation and encrypted recovery abandonment.
 - The production Claude launch method was exercised through disposable Windows scheduled tasks with a harmless child process. The child survived task stop, normal widget/supervisor exit, and the uninstall stop/kill sequence. Test tasks and processes were removed.
 
-There is currently no second Claude account available. Interactive login of an additional account and resuming a real conversation through that profile remain future acceptance checks. A real WSL account switch also remains unverified; finish running WSL Codex work before attempting it, since the app never stops that work automatically. No public release or successful live cross-account verification is claimed here.
+Interactive login of an additional managed Claude profile and resuming a real conversation through that profile remain future acceptance checks. A real WSL account switch also remains unverified; finish running WSL Codex work before attempting it, since the app never stops that work automatically. No public release or successful live cross-account verification is claimed here.
 
 Native visual evidence uses synthetic data: [Codex](design/2026-09-28/100/manager.png), [Claude](design/2026-09-28/100/claude.png), [three Claude accounts at 175%](design/2026-09-28/175/claude-states.png), [one account before its first check](design/2026-09-28/175/claude-single.png), and [English](design/2026-09-28/en-175/claude.png). The original Codex and Claude work remains under the existing accounts; no live switch was performed for these captures.
 
 The local normal-user installation was verified on September 28 from implementation commit `34fc4b8`. The installed `1.9.0-preview.2` executable matches SHA-256 `1fd68470ae73704be8572c4bc025d0d7fa75e598c3f89cc47d1c5fc6bdfe44b9`. The normal-privilege scheduled task runs one supervisor and one widget. The existing Claude profile remained selected, and a fresh identity-bound overall weekly observation was saved after restart. The temporary installer task was removed; previous executables remain available locally for rollback. This is a local candidate, not a GitHub release.
+
+## Preview 3: missing usage and consistent tabs
+
+An unavailable Claude login previously cleared the number but left the account page saying only that usage had not been checked. The controller now retains the failure for each profile and publishes it to both surfaces. A missing CLI login and a different signed-in account have distinct messages and an official sign-in action. Invalid status data is not classified as an expired login. Connecting the default account again preserves its original identity and alias; it cannot silently replace that row with a different account.
+
+Codex and Claude now share the header refresh control and checked-time placement. Their summaries, table columns, account rows, add-account actions and footer follow the same dimensions. Claude's per-account refresh and details are in its overflow menu; the launch action is in the footer. A successful fresh observation clears an earlier usage error only for the profile that recovered.
+
+The preview passed 36 regression groups and native capture assertions at 100% and 175% scaling, including English, three-account layouts, missing login, changed identity and recovery from a usage failure. English row actions use a short label that fits the shared button width. The separate pointer-driven hover check could not establish a continuous hover because the cursor moved during the attempt; it is not recorded as a new pass. The previous preview's hover result remains historical evidence only.
+
+An Opus 5.5 review checked the authentication changes in two rounds. Its adopted findings are covered by tests for refusing a different default identity, preserving a recoverable error after canceled login, clearing authentication errors after successful verification, and classifying official command authentication failures consistently. The final round found no remaining defect in those protections. Official normal and safe-mode identity verification passed again on the normal Windows user environment. Actual post-login usage and the new local installation still require a fresh accepted observation before completion is claimed.
 
 ## Profile sharing details
 

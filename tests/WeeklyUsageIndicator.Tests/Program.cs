@@ -223,9 +223,15 @@ static async Task TestSourceHardFailuresAsync()
     var loginRunner = new SequenceCommandRunner(
         new ClaudeCommandResult(1, string.Empty, "Not logged in. Please login."));
     var loginSource = new ClaudeCodeUsageSource(loginRunner, clock);
-    await AssertThrowsAsync<UnauthorizedAccessException>(
+    await AssertThrowsAsync<ClaudeLoginRequiredException>(
         () => loginSource.ReadAsync(CancellationToken.None),
         "a Claude Code login failure should remain a hard failure");
+
+    var loginEnvelope = JsonSerializer.Serialize(new { is_error = true, num_turns = 0,
+        total_cost_usd = 0, result = "Not logged in. Please login." });
+    await AssertThrowsAsync<ClaudeLoginRequiredException>(
+        () => Task.FromResult(ClaudeCodeUsageSource.ParseEnvelope(loginEnvelope, clock.GetUtcNow())),
+        "usage authentication failures expose the same recovery action as auth status");
 
     var malformedSource = new ClaudeCodeUsageSource(
         new SequenceCommandRunner(new ClaudeCommandResult(0, "not-json", string.Empty)),
