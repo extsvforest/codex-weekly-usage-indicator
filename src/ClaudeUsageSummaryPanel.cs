@@ -63,7 +63,7 @@ internal sealed class ClaudeUsageSummaryPanel : UserControl
         _bar.Remaining = remaining;
         _bar.FillColor = AccountUiTheme.Accent;
         _profile.Text = profile is null ? UiText.T("Claude 계정 연결") : loginRequired
-            ? UiText.T("CLI 로그인 필요") + " · " + profile.Label : UiText.F($"다음 실행 · {profile.Label}");
+            ? UiText.T("CLI 로그인 필요") + " · " + profile.Label : UiText.F($"사용 중 · {profile.Label}");
         _profile.ForeColor = loginRequired ? AccountUiTheme.Warning : AccountUiTheme.Muted;
         _reset.Text = window?.ResetsAt is { } reset ? CombinedUsagePanel.TimeUntil(reset, now) : UiText.T("초기화 미확인");
         _resetDate.Text = window?.ResetsAt is { } date ? date.ToLocalTime().ToString("MM.dd HH:mm") : "—";

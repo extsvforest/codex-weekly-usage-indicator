@@ -13,10 +13,11 @@ internal sealed class ClaudeAccountPanel : UserControl
     private readonly TableLayoutPanel _rows = AccountUiTheme.Stack(0);
     private readonly FlowLayoutPanel _actions = new() { Dock = DockStyle.Fill, Margin = new Padding(0), WrapContents = false, BackColor = Color.Transparent };
     private readonly Dictionary<string, ProfileRow> _profileRows = new(StringComparer.Ordinal);
+    private ContextMenuStrip? _profileMenu;
     private readonly Label _empty = AccountUiTheme.Label(UiText.T("지금 사용하는 Claude 계정을 먼저 연결하세요.\n추가 계정도 Claude의 공식 로그인으로 등록합니다."), 12, color: AccountUiTheme.Muted);
     private readonly Label _count = AccountUiTheme.Label("", 14, true);
     private readonly Label _status = AccountUiTheme.Label("", color: AccountUiTheme.Muted);
-    private readonly Label _footer = AccountUiTheme.Label(UiText.T("선택한 계정으로 Claude를 새로 엽니다. 기존 대화와 스킬은 그대로 이어집니다."), 9, color: AccountUiTheme.Muted);
+    private readonly Label _footer = AccountUiTheme.Label(UiText.T("여기서 새로 여는 Claude에 적용됩니다. 이미 열린 작업은 바뀌지 않습니다."), 9, color: AccountUiTheme.Muted);
     private readonly Button _register = AccountUiTheme.Button("ClaudeRegisterDefaultButton", UiText.T("기존 계정 연결"));
     private readonly Button _add = AccountUiTheme.Button("ClaudeAddAccountButton", UiText.T("+ 계정 추가"));
     private readonly Button _cancel = AccountUiTheme.Button("ClaudeCancelButton", UiText.T("취소"));
@@ -252,7 +253,7 @@ internal sealed class ClaudeAccountPanel : UserControl
             if (row.RequiresLogin) { await SignInAgainAsync(row.Profile); return; }
             if (row.IsSelected) return;
             await RunAsync(UiText.T("Claude 계정을 확인하고 있습니다…"), async token =>
-            { await _controller.SelectAsync(row.Profile, token); return UiText.T("다음 실행 계정을 바꿨습니다. 이미 열린 작업은 기존 계정을 유지합니다."); });
+            { await _controller.SelectAsync(row.Profile, token); return UiText.T("사용할 계정을 전환했습니다. 이미 열린 작업은 기존 계정을 유지합니다."); });
         };
         row.MoreButton.Click += (_, _) => ShowMenu(row.Profile, row.MoreButton);
         return row;
@@ -352,7 +353,7 @@ internal sealed class ClaudeAccountPanel : UserControl
             _resetRelative.Text = window?.ResetsAt is { } reset ? CombinedUsagePanel.TimeUntil(reset, now) : UiText.T("초기화 미확인");
             _resetDate.Text = window?.ResetsAt is { } date ? date.ToLocalTime().ToString("MM.dd HH:mm") : "—";
             ((AccountButton)SelectButton).ActiveBadge = IsSelected && !RequiresLogin && !identityChanged;
-            SelectButton.Text = RequiresLogin ? UiText.T("로그인") : IsSelected ? identityChanged ? UiText.T("확인 필요") : UiText.T("다음 실행") : UiText.T("선택");
+            SelectButton.Text = RequiresLogin ? UiText.T("로그인") : IsSelected ? identityChanged ? UiText.T("확인 필요") : UiText.T("사용 중") : UiText.T("전환");
             SelectButton.Enabled = !_busy && (RequiresLogin || !IsSelected);
             SelectButton.AccessibleName = Profile.Label + " · " + SelectButton.Text;
             var details = (Profile.Identity?.Hint ?? UiText.T("로그인 필요")) + (usage is null ? "" : UiText.F($"\n마지막 확인 {usage.LastUpdatedAt.ToLocalTime():MM.dd HH:mm}"));
@@ -368,14 +369,22 @@ internal sealed class ClaudeAccountPanel : UserControl
 
     private void ShowMenu(ClaudeProfile profile, Control anchor)
     {
-        var menu = new ContextMenuStrip { Font = Font, ShowImageMargin = false, BackColor = AccountUiTheme.Surface, ForeColor = AccountUiTheme.Text,
+        // Closed fires while WinForms is still hiding the dropdown. Disposing it
+        // there can crash both menu actions and outside-click dismissal.
+        _profileMenu?.Dispose();
+        var menu = _profileMenu = new ContextMenuStrip { Font = Font, ShowImageMargin = false, BackColor = AccountUiTheme.Surface, ForeColor = AccountUiTheme.Text,
             Renderer = new ToolStripProfessionalRenderer(new AccountMenuColors()) };
-        menu.Closed += (_, _) => menu.Dispose();
         menu.Items.Add(UiText.T("이 계정 사용량 조회"), null, async (_, _) => await ReadUsageAsync(profile.Id));
         menu.Items.Add(UiText.T("이름 변경"), null, (_, _) =>
         {
             using var dialog = new AccountNameDialog(profile.Label);
-            if (dialog.ShowDialog(FindForm()) == DialogResult.OK) { _controller.Store.Rename(profile.Id, dialog.AccountName); Reload(); }
+            if (dialog.ShowDialog(FindForm()) != DialogResult.OK) { SetStatus(UiText.T("이름 변경을 취소했습니다.")); return; }
+            try
+            {
+                _controller.Store.Rename(profile.Id, dialog.AccountName);
+                Reload(); SetStatus(UiText.T("계정 이름을 변경했습니다."), success: true);
+            }
+            catch (Exception ex) { SetStatus(ex.Message, true); }
         });
         menu.Items.Add(UiText.T("상세 정보"), null, (_, _) => ShowAccountInfo(profile));
         menu.Items.Add(UiText.T("다시 로그인"), null, async (_, _) => await SignInAgainAsync(profile));
@@ -451,6 +460,7 @@ internal sealed class ClaudeAccountPanel : UserControl
     {
         if (disposing)
         {
+            _profileMenu?.Dispose();
             _controller.UsageChanged -= OnUsageChanged;
             if (_empty.Parent is null) _empty.Dispose();
         }

@@ -12,7 +12,7 @@ The September 28 upgrade combines the approved compact account-table layout with
 
 ## Review and validation
 
-The candidate is version `1.9.0-preview.3`. The approved compact table and two-column summary are implemented as native controls with the warm paper palette and texture. Codex and Claude have their own pages; inactive profiles never contribute to the wrong provider's number. Claude's summary shows the selected profile's overall weekly balance and reset time, above its account list; it does not combine accounts or query every profile automatically.
+The candidate is version `1.9.0-preview.4`. The approved compact table and two-column summary are implemented as native controls with the warm paper palette and texture. Codex and Claude have their own pages; inactive profiles never contribute to the wrong provider's number. Claude's summary shows the selected profile's overall weekly balance and reset time, above its account list; it does not combine accounts or query every profile automatically.
 
 An Opus review during implementation found recovery paths that could lock the manager, a missing WSL-only action for the current Windows account, and unnecessarily blocked isolated logins. The candidate now offers explicit WSL unlinking that preserves live authentication, archives encrypted recovery data, and disables linked switching. Unowned recovery records cannot apply a login. A durable marker distinguishes preparation from an attempted write. Rotated source credentials are preserved in the encrypted vault before a recovery record is archived, without replacing newer stored credentials.
 
@@ -50,6 +50,12 @@ The first local preview 3 installation from `840738f` still could not obtain usa
 The usage command now requests verbose JSON and checks both the final zero-turn, zero-cost result and the assistant's structured quota report. This rejects a newer CLI fallback that prints old percentages without a last-known label but omits structured limits. Local session-behavior percentages never become quota balances. The official CLI can reuse a successful observation less than 60 seconds old; the app's displayed check time does not certify a new endpoint request. An additional Opus review found no blocking defect in this repair. Regression fixtures cover the traffic settings, fallback rejection, malformed reports and retained turn/cost guards. Installation and live recovery are checked separately from those fixtures.
 
 The corrected local installation was verified on September 28 at 14:49 KST from commit `c5062cd`. Its executable matches SHA-256 `9c91944b2cdf728f58000322b3fc05089e05a4aca4ea48d958caf8ed5d70af70`. All 37 non-pointer regression groups passed, and the native opening trace reported no violations. The actual installed app obtained overall and Fable weekly limits bound to the original selected account; its account page displayed the current balance and reset time without a failure notice. The normal-user environment had no inherited blanket traffic restriction. One supervisor and one widget are running, the disposable installation task was removed, and the prior executable is retained locally for rollback. This remains a locally installed preview, with no public release in this step.
+
+## Preview 4: Claude account menu actions
+
+Closing the Claude overflow menu could terminate the widget with an `ObjectDisposedException`: its `Closed` handler disposed the menu while WinForms was still hiding it. Rename and manual usage actions shared that path. The panel now owns the menu until the next opening or panel disposal. Rename also handles storage failures within the panel instead of allowing an unhandled exception.
+
+Both providers use **In use** and **Switch** for account state and actions. Claude's footer explains that the choice applies to new sessions opened from the panel; existing sessions retain their account. Native interaction coverage opens and closes the actual menu, saves active and inactive profile names, cancels a rename, simulates a blocked metadata write and queries the inactive profile without changing the selection. A separate opt-in check exercises the same controls with an already registered real additional Claude profile.
 
 ## Profile sharing details
 

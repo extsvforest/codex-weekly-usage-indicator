@@ -3,6 +3,8 @@ using WeeklyUsageIndicator;
 
 if (args.Contains("--english")) UiText.SetLanguage("en");
 if (args.Contains("--live-environment-smoke")) { await LiveEnvironmentSmoke.RunAsync(); return; }
+if (args.Contains("--claude-menu-smoke")) { await ClaudeAccountMenuSmoke.RunAsync(); return; }
+if (args.Contains("--live-claude-menu-smoke")) { await ClaudeAccountMenuSmoke.RunAsync(live: true); return; }
 if (args.Contains("--language-ui-smoke")) { await LanguageUiSmoke.RunAsync(); return; }
 if (args.Contains("--localization-tests")) { await LocalizationTests.RunAsync(); return; }
 if (args.Contains("--account-style-preview")) { await AccountStylePreview.RunAsync(args.Contains("--hold"), args.Contains("--standard-dpi")); return; }
@@ -34,6 +36,7 @@ var tests = new (string Name, Func<Task> Run)[]
     ("Claude weekly metric, independent expiry and profile cache", ClaudeMetricTests.RunAll),
     ("Claude official profile identity and shared local work", ClaudeProfileTests.RunAsync),
     ("Claude login waits, transient observation and identity invalidation", ClaudeControllerTests.RunAsync),
+    ("Claude account menu actions and inactive-profile usage", () => ClaudeAccountMenuSmoke.RunAsync()),
     ("account operation lease blocks lifecycle replacement across awaits", AccountOperationLeaseTests.RunAsync),
     ("WSL native targets, independent login and joint recovery", WslCodexTests.RunAsync),
     ("language switching preserves bounds, snapshots and account data", LanguageUiSmoke.RunAsync),
