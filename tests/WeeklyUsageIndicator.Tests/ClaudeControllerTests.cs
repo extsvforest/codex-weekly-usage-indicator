@@ -7,6 +7,7 @@ internal static class ClaudeControllerTests
     internal static async Task RunAsync()
     {
         await RegisteringSameDefaultKeepsAcceptedUsageAsync();
+        await AccountIntervalsUseVerifiedIdentityAsync();
         await RegisteringChangedDefaultInvalidatesAcceptedUsageAsync();
         await LoginWaitKeepsOtherAccountAsync();
         await TransientStatusFailureKeepsVerifiedObservationAsync();
@@ -14,6 +15,30 @@ internal static class ClaudeControllerTests
         await LoginFailureRemainsVisibleUntilRecoveryAsync();
         await ChangedBindingCannotReuseObservationAsync();
         await DisposalCancelsWaitersWithoutDisposingTheirGateAsync();
+    }
+
+    private static async Task AccountIntervalsUseVerifiedIdentityAsync()
+    {
+        using var fixture = new Fixture();
+        var selected = fixture.Store.SelectedProfileId;
+        var main = await fixture.Controller.ReadUsageAsync(null, CancellationToken.None);
+        var duplicate = fixture.Store.CreateProfile("Same account, separate profile");
+        duplicate = fixture.Store.RecordVerifiedIdentity(duplicate.Id, Fixture.Identity(duplicate, fixture.Runner.Email));
+        await ThrowsAsync<ClaudeUsageTemporarilyUnavailableException>(() =>
+            fixture.Controller.ReadUsageAsync(duplicate.Id, CancellationToken.None));
+        Check(fixture.SourceCalls == 1, "controller passes the verified account identity rather than the profile ID to the limiter");
+
+        var second = fixture.Store.CreateProfile("Second account");
+        fixture.Runner.Email = "second@example.test";
+        second = fixture.Store.RecordVerifiedIdentity(second.Id, Fixture.Identity(second, fixture.Runner.Email));
+        var additional = await fixture.Controller.ReadUsageAsync(second.Id, CancellationToken.None);
+        Check(!additional.IsStale && fixture.SourceCalls == 2
+            && fixture.Controller.LastUsage("default") == main
+            && fixture.Controller.LastUsage(second.Id) == additional
+            && fixture.Store.SelectedProfileId == selected,
+            "main and additional account reads succeed in sequence while preserving selection and separate observations");
+        await fixture.Controller.ReadUsageAsync(second.Id, CancellationToken.None);
+        Check(fixture.SourceCalls == 2, "repeating the additional account read reuses its accepted value");
     }
 
     private static async Task RegisteringSameDefaultKeepsAcceptedUsageAsync()
@@ -160,9 +185,10 @@ internal static class ClaudeControllerTests
         unregistered.Controller.UsageChanged += (_, update) =>
         { if (unregistered.Controller.LastUsage(update.ProfileId) is null) invalidations++; };
         unregistered.Runner.Email = "changed@example.test";
+        unregistered.UsageFailure = new IOException("synthetic usage failure after account changed");
         await ThrowsAsync<ClaudeUsageTemporarilyUnavailableException>(() =>
             unregistered.Controller.ReadUsageAsync(null, CancellationToken.None));
-        Check(unregistered.Controller.LastUsage("default") is null && invalidations >= 1,
+        Check(unregistered.Controller.LastUsage("default") is null && invalidations >= 1 && unregistered.SourceCalls == 2,
             "even an unregistered default never keeps usage from the account it just identified as replaced");
     }
 
@@ -232,6 +258,7 @@ internal static class ClaudeControllerTests
 
     private sealed class Fixture : IDisposable
     {
+        internal Exception? UsageFailure;
         private readonly string _root;
         private readonly ClaudeUsageRequestThrottle _throttle = new();
         internal readonly FixtureClock Clock = new();
@@ -253,12 +280,13 @@ internal static class ClaudeControllerTests
             if (registerDefault) Store.RegisterDefault("Main", Identity(Store.DefaultProfile, Runner.Email));
             var runtime = new ClaudeProfileRuntime(Store, Runner, "fixture-claude.exe");
             Controller = new ClaudeAccountController(Store, runtime, Clock,
-                (_, key) => new ClaudeUsageClient(new FixtureSource(() =>
+                (_, key, accountKey) => new ClaudeUsageClient(new FixtureSource(() =>
                 {
                     SourceCalls++;
+                    if (UsageFailure is not null) throw UsageFailure;
                     return new ClaudeUsageSnapshot(new(10, Clock.Now.AddHours(1)),
                         new(25, Clock.Now.AddDays(7)), new(30, Clock.Now.AddDays(3)));
-                }), Clock, ClaudeUsageNullCacheStore.Instance, key, _throttle),
+                }), Clock, ClaudeUsageNullCacheStore.Instance, key, _throttle, accountKey),
                 () => CacheClears++);
         }
 

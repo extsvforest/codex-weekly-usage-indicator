@@ -12,7 +12,7 @@ The September 28 upgrade combines the approved compact account-table layout with
 
 ## Review and validation
 
-The candidate is version `1.9.0-preview.4`. The approved compact table and two-column summary are implemented as native controls with the warm paper palette and texture. Codex and Claude have their own pages; inactive profiles never contribute to the wrong provider's number. Claude's summary shows the selected profile's overall weekly balance and reset time, above its account list; it does not combine accounts or query every profile automatically.
+The candidate is version `1.9.0-preview.5`. The approved compact table and two-column summary are implemented as native controls with the warm paper palette and texture. Codex and Claude have their own pages; inactive profiles never contribute to the wrong provider's number. Claude's summary shows the selected profile's overall weekly balance and reset time, above its account list; it does not combine accounts or query every profile automatically.
 
 An Opus review during implementation found recovery paths that could lock the manager, a missing WSL-only action for the current Windows account, and unnecessarily blocked isolated logins. The candidate now offers explicit WSL unlinking that preserves live authentication, archives encrypted recovery data, and disables linked switching. Unowned recovery records cannot apply a login. A durable marker distinguishes preparation from an attempted write. Rotated source credentials are preserved in the encrypted vault before a recovery record is archived, without replacing newer stored credentials.
 
@@ -56,6 +56,16 @@ The corrected local installation was verified on September 28 at 14:49 KST from 
 Closing the Claude overflow menu could terminate the widget with an `ObjectDisposedException`: its `Closed` handler disposed the menu while WinForms was still hiding it. Rename and manual usage actions shared that path. The panel now owns the menu until the next opening or panel disposal. Rename also handles storage failures within the panel instead of allowing an unhandled exception.
 
 Both providers use **In use** and **Switch** for account state and actions. Claude's footer explains that the choice applies to new sessions opened from the panel; existing sessions retain their account. Native interaction coverage opens and closes the actual menu, saves active and inactive profile names, cancels a rename, simulates a blocked metadata write and queries the inactive profile without changing the selection. A separate opt-in check exercises the same controls with an already registered real additional Claude profile.
+
+All 38 non-pointer regression groups passed. The opt-in native check obtained a fresh weekly observation for the actual registered additional account while preserving the selected account and both aliases. Preview 4 was installed locally from `29feff5` on September 28 at 15:18 KST. The executable matched SHA-256 `1d4798cf8e5018018d4594abbed549923eb2b6e7c4f95b0f1d50833844080e3e`; the installed app obtained a fresh main-account observation and displayed the unified state labels. This was a local preview, not a public release.
+
+## Preview 5: independent Claude account refresh intervals
+
+The user approved changing the ten-minute interval from one global timer to a timer for each verified account. A main-account lookup no longer blocks the first manual lookup of an additional account. Duplicate profiles with the same official account identity share their interval and transient-failure backoff. Manual refreshes reuse each profile's accepted observation during the interval; failures and cancellations still consume that account's request slot. The timer key is passed separately from the profile-specific cache key, so account throttling does not loosen observation isolation.
+
+The ten-minute value is the widget's conservative polling choice, not a published Claude requirement. Other profiles remain manual-only. Existing credential handling, selected-account behavior and profile-bound recovery storage are unchanged.
+
+All 38 non-pointer regression groups passed after the change. New checks cover consecutive main/additional-account reads, duplicate profiles, cached repeat reads, the ten-minute boundary, longer shared failure backoff, cancellations and client recreation. Controller coverage also verifies that a changed identity cannot inherit its previous account's observation when the new usage request fails.
 
 ## Profile sharing details
 

@@ -28,16 +28,25 @@ internal sealed class ClaudeUsageRequestThrottle
     internal static readonly TimeSpan MinimumInterval = TimeSpan.FromMinutes(10);
     internal static ClaudeUsageRequestThrottle Shared { get; } = new();
     private readonly object _gate = new();
-    private DateTimeOffset _nextAllowedAt = DateTimeOffset.MinValue;
+    private readonly Dictionary<string, DateTimeOffset> _nextAllowedByAccount = new(StringComparer.Ordinal);
 
-    internal bool TryStart(DateTimeOffset now, out DateTimeOffset retryAfter)
+    internal bool TryStart(string accountKey, DateTimeOffset now, out DateTimeOffset retryAfter)
     {
         lock (_gate)
         {
-            retryAfter = _nextAllowedAt;
-            if (now < _nextAllowedAt) return false;
-            _nextAllowedAt = now + MinimumInterval;
+            retryAfter = _nextAllowedByAccount.GetValueOrDefault(accountKey, DateTimeOffset.MinValue);
+            if (now < retryAfter) return false;
+            _nextAllowedByAccount[accountKey] = now + MinimumInterval;
             return true;
+        }
+    }
+
+    internal void DeferUntil(string accountKey, DateTimeOffset retryAfter)
+    {
+        lock (_gate)
+        {
+            if (retryAfter > _nextAllowedByAccount.GetValueOrDefault(accountKey, DateTimeOffset.MinValue))
+                _nextAllowedByAccount[accountKey] = retryAfter;
         }
     }
 }
@@ -52,6 +61,7 @@ internal sealed class ClaudeUsageClient : IDisposable
     private readonly TimeProvider _timeProvider;
     private readonly IClaudeUsageCacheStore _cacheStore;
     private readonly string _profileKey;
+    private readonly string _accountKey;
     private readonly ClaudeUsageRequestThrottle _throttle;
     private readonly SemaphoreSlim _requestGate = new(1, 1);
     private ClaudeUsageSnapshot? _cachedSnapshot;
@@ -64,13 +74,13 @@ internal sealed class ClaudeUsageClient : IDisposable
     public ClaudeUsageClient()
         : this(
             new ClaudeCodeUsageSource(),
-            ClaudeUsageCacheEntry.DefaultProfileKey)
+            ClaudeUsageCacheEntry.DefaultProfileKey, ClaudeUsageCacheEntry.DefaultProfileKey)
     {
     }
 
-    internal ClaudeUsageClient(IClaudeUsageSource usageSource, string profileKey)
+    internal ClaudeUsageClient(IClaudeUsageSource usageSource, string profileKey, string accountKey)
         : this(usageSource, TimeProvider.System, ClaudeUsageFileCacheStore.CreateDefault(),
-            profileKey, ClaudeUsageRequestThrottle.Shared)
+            profileKey, ClaudeUsageRequestThrottle.Shared, accountKey)
     {
     }
 
@@ -79,13 +89,17 @@ internal sealed class ClaudeUsageClient : IDisposable
         TimeProvider timeProvider,
         IClaudeUsageCacheStore? cacheStore = null,
         string profileKey = ClaudeUsageCacheEntry.DefaultProfileKey,
-        ClaudeUsageRequestThrottle? throttle = null)
+        ClaudeUsageRequestThrottle? throttle = null,
+        string? accountKey = null)
     {
         if (string.IsNullOrWhiteSpace(profileKey)) throw new ArgumentException("A Claude profile key is required.", nameof(profileKey));
+        if (accountKey is not null && string.IsNullOrWhiteSpace(accountKey))
+            throw new ArgumentException("A Claude account key cannot be empty.", nameof(accountKey));
         _usageSource = usageSource;
         _timeProvider = timeProvider;
         _cacheStore = cacheStore ?? ClaudeUsageNullCacheStore.Instance;
         _profileKey = profileKey;
+        _accountKey = accountKey ?? profileKey;
         _throttle = throttle ?? new ClaudeUsageRequestThrottle();
 
         var persisted = _cacheStore.Load();
@@ -123,10 +137,10 @@ internal sealed class ClaudeUsageClient : IDisposable
                 return CreateCachedResult(isStale: false);
             }
 
-            // The throttle is shared by production clients, including clients
-            // recreated after a profile change. Failed and canceled attempts
-            // count too; no UI action can turn them into rapid repeated calls.
-            if (!_throttle.TryStart(now, out var nextAllowedAt))
+            // Verified account identity owns the interval, not the profile row.
+            // Other accounts can read immediately; duplicate profiles and
+            // recreated clients retain the same failed/canceled attempt limit.
+            if (!_throttle.TryStart(_accountKey, now, out var nextAllowedAt))
             {
                 _retryAfter = nextAllowedAt;
                 return HasUsableCache(now)
@@ -233,6 +247,7 @@ internal sealed class ClaudeUsageClient : IDisposable
         if (duration < ClaudeUsageRequestThrottle.MinimumInterval)
             duration = ClaudeUsageRequestThrottle.MinimumInterval;
         _retryAfter = now + duration;
+        _throttle.DeferUntil(_accountKey, _retryAfter);
     }
 
     private static bool IsTransientException(

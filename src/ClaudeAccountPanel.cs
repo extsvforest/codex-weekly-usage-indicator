@@ -434,7 +434,7 @@ internal sealed class ClaudeAccountPanel : UserControl
             SetStatus(await action(cancellation.Token), success: true);
         }
         catch (OperationCanceledException) { SetStatus(UiText.T("취소했습니다. 선택한 계정은 유지됩니다.")); }
-        catch (ClaudeUsageTemporarilyUnavailableException ex) { SetStatus(UiText.F($"다음 확인 가능 {ex.RetryAfter.ToLocalTime():HH:mm} · Claude 사용량은 10분 간격으로 확인합니다."), usageFailureProfileId: usageProfileId); }
+        catch (ClaudeUsageTemporarilyUnavailableException ex) { SetStatus(UiText.F($"다음 확인 가능 {ex.RetryAfter.ToLocalTime():HH:mm} · Claude 사용량은 계정별로 10분 간격으로 확인합니다."), usageFailureProfileId: usageProfileId); }
         catch (Exception ex) { SetStatus(UsageIndicatorForm.FriendlyClaudeError(ex), true, usageFailureProfileId: usageProfileId); }
         finally { _cancellation = null; Reload(); BusyChanged?.Invoke(this, EventArgs.Empty); }
     }

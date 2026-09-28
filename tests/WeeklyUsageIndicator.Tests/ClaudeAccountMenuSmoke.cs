@@ -36,9 +36,9 @@ internal static class ClaudeAccountMenuSmoke
                 var runtime = live ? new ClaudeProfileRuntime(store)
                     : new ClaudeProfileRuntime(store, runner, "fixture-claude.exe");
                 using var controller = live ? new ClaudeAccountController(store, runtime)
-                    : new ClaudeAccountController(store, runtime, clientFactory: (profile, key) =>
+                    : new ClaudeAccountController(store, runtime, clientFactory: (profile, key, accountKey) =>
                         new ClaudeUsageClient(new FixtureSource(() => sourceCalls.Add(profile.Id)),
-                            TimeProvider.System, ClaudeUsageNullCacheStore.Instance, key), clearRecoveryCache: () => { });
+                            TimeProvider.System, ClaudeUsageNullCacheStore.Instance, key, accountKey: accountKey), clearRecoveryCache: () => { });
                 using var form = new Form { ClientSize = new(960, 650), Text = "Claude account interaction check" };
                 AccountUiTheme.SetForm(form);
                 using var panel = new ClaudeAccountPanel(controller) { Dock = DockStyle.Fill };

@@ -27,7 +27,7 @@ This repository contains a small Windows WinForms utility with optional WSL Code
 - Do not add telemetry or direct provider usage network calls. Do not commit absolute local paths, real-account screenshots, pet assets, build output or credentials.
 - Treat `account/rateLimits/read` and Claude Code `/usage` text as changeable contracts; fail gracefully without substituting a different limit.
 - Run Claude usage in safe mode without a shell, browser integration or session persistence and with `--max-turns 0`. Require `num_turns == 0` and `total_cost_usd == 0`. Official last-known output must not become a fresh observation.
-- Actual Claude usage calls must remain at least ten minutes apart across profiles, including manual refreshes, failures and cancellations. Metric selection reuses the snapshot. A new install defaults to overall weekly; existing settings without a metric preserve Fable.
+- Actual Claude usage calls must remain at least ten minutes apart per verified account, including manual refreshes, failures and cancellations. Different accounts have independent intervals; profiles with the same verified identity share request spacing and transient backoff. Metric selection reuses the snapshot. A new install defaults to overall weekly; existing settings without a metric preserve Fable.
 - Keep the enabled Claude half visible when data is missing or fails. The selected window alone drives its number; show `—` when absent or expired. Parse and expire five-hour, overall-weekly and Fable-weekly windows independently. Share rounding across widget, tooltip and copy text.
 - Persist at most one credential-free Claude recovery snapshot containing percentages, resets, check time and an opaque profile/account key. Reject another identity's cache; use matching data only after a transient live failure, expire it after 24 hours or when all windows expire, and clear it on authentication/schema failure. A saved snapshot must not suppress the first live request in a new process. Cached in-memory observations obey the same identity and expiry boundaries.
 - Opening a new manager performs one sequential Codex batch; only explicit full refresh starts another. Active polling and individual reads do not silently certify a new aggregate. Missing, expired, failed or canceled rows withhold the full total.
@@ -50,7 +50,7 @@ Run:
 
 Keep regression coverage for:
 
-1. Settings migration, metric selection without a query, independent window expiry, consistent rounding, global request spacing and profile-bound recovery values.
+1. Settings migration, metric selection without a query, independent window expiry, consistent rounding, per-account request spacing across duplicate profiles and profile-bound recovery values.
 2. Claude official process arguments, identity checks, shared-data preservation and default-home semantics. Fixture tests do not establish a successful real second-account login or launch.
 3. WSL missing/unsupported environments, busy writers, independent login binding, partial failure, restart-safe recovery, identity mismatch and authentication-write-free abandonment.
 4. Native account/tooltip UI at supported scales and both languages: stable first paint, preserved focus, selectable controls and no clipped primary actions. Preserve the existing `AccountUiSmoke` focus/topmost and hover regressions.

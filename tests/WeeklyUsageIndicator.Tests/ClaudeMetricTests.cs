@@ -12,6 +12,7 @@ internal static class ClaudeMetricTests
         SettingsMigration();
         await IndependentExpiryAsync();
         await MinimumAttemptIntervalAsync();
+        await AccountSpecificIntervalAsync();
         await ProfileCacheIsolationAsync();
         await SelectionDoesNotQueryAsync();
     }
@@ -137,18 +138,6 @@ internal static class ClaudeMetricTests
         Check(!(await client.GetUsageAsync(CancellationToken.None)).IsStale && source.ReadCount == 2,
             "a fresh query is allowed when the minimum interval elapses");
 
-        var sharedThrottle = new ClaudeUsageRequestThrottle();
-        var firstSource = new SequenceUsageSource(new ClaudeUsageSnapshot(null, new(10, now.AddDays(1)), null));
-        var secondSource = new SequenceUsageSource(new ClaudeUsageSnapshot(null, new(20, now.AddDays(1)), null));
-        using var first = new ClaudeUsageClient(firstSource, clock, profileKey: "a", throttle: sharedThrottle);
-        using var second = new ClaudeUsageClient(secondSource, clock, profileKey: "b", throttle: sharedThrottle);
-        await first.GetUsageAsync(CancellationToken.None);
-        await ThrowsAsync<ClaudeUsageTemporarilyUnavailableException>(() => second.GetUsageAsync(CancellationToken.None));
-        Check(secondSource.ReadCount == 0, "changing profiles does not bypass the shared request interval");
-        clock.Advance(TimeSpan.FromMinutes(10));
-        Check((await second.GetUsageAsync(CancellationToken.None)).Snapshot.Weekly?.UsedPercent == 20,
-            "the next permitted request reads the selected profile");
-
         var resetClock = new ManualTimeProvider(now);
         var resetSource = new SequenceUsageSource(new ClaudeUsageSnapshot(null, new(10, now.AddMinutes(1)), null));
         using var resetClient = new ClaudeUsageClient(resetSource, resetClock);
@@ -156,6 +145,62 @@ internal static class ClaudeMetricTests
         resetClock.Advance(TimeSpan.FromMinutes(2));
         await ThrowsAsync<ClaudeUsageTemporarilyUnavailableException>(() => resetClient.GetUsageAsync(CancellationToken.None));
         Check(resetSource.ReadCount == 1, "a window reset does not turn refresh into an early command");
+    }
+
+    private static async Task AccountSpecificIntervalAsync()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var clock = new ManualTimeProvider(now);
+        var throttle = new ClaudeUsageRequestThrottle();
+        ClaudeUsageSnapshot Snapshot(double used) => new(null, new(used, now.AddDays(1)), null);
+        var firstSource = new SequenceUsageSource(Snapshot(10));
+        var secondSource = new SequenceUsageSource(Snapshot(20), Snapshot(21));
+        var duplicateSource = new SequenceUsageSource(Snapshot(11));
+        using var first = new ClaudeUsageClient(firstSource, clock, profileKey: "main", throttle: throttle, accountKey: "account-a");
+        using var second = new ClaudeUsageClient(secondSource, clock, profileKey: "sub", throttle: throttle, accountKey: "account-b");
+        using var duplicate = new ClaudeUsageClient(duplicateSource, clock, profileKey: "duplicate", throttle: throttle, accountKey: "account-a");
+        await first.GetUsageAsync(CancellationToken.None);
+        Check((await second.GetUsageAsync(CancellationToken.None)).Snapshot.Weekly?.UsedPercent == 20,
+            "a different account can read immediately after the main account");
+        await ThrowsAsync<ClaudeUsageTemporarilyUnavailableException>(() => duplicate.GetUsageAsync(CancellationToken.None));
+        clock.Advance(TimeSpan.FromMinutes(9));
+        await ThrowsAsync<ClaudeUsageTemporarilyUnavailableException>(() => duplicate.GetUsageAsync(CancellationToken.None));
+        Check((await first.GetUsageAsync(CancellationToken.None)).Snapshot.Weekly?.UsedPercent == 10
+            && firstSource.ReadCount == 1 && duplicateSource.ReadCount == 0,
+            "repeated checks reuse their own observation and duplicate profiles cannot bypass the account interval");
+        clock.Advance(TimeSpan.FromMinutes(1));
+        Check((await duplicate.GetUsageAsync(CancellationToken.None)).Snapshot.Weekly?.UsedPercent == 11
+            && (await second.GetUsageAsync(CancellationToken.None)).Snapshot.Weekly?.UsedPercent == 21,
+            "each account becomes eligible independently after ten minutes");
+        Check((await first.GetUsageAsync(CancellationToken.None)).IsStale && firstSource.ReadCount == 1,
+            "a recreated or duplicate client consumes the same account's next request slot");
+
+        var failingSource = new SequenceUsageSource(new IOException("offline"), new IOException("offline"), new IOException("offline"));
+        using var failing = new ClaudeUsageClient(failingSource, clock, profileKey: "failing", throttle: throttle, accountKey: "account-c");
+        for (var attempt = 0; attempt < 3; attempt++)
+        {
+            await ThrowsAsync<ClaudeUsageTemporarilyUnavailableException>(() => failing.GetUsageAsync(CancellationToken.None));
+            clock.Advance(TimeSpan.FromMinutes(10));
+        }
+        var retrySource = new SequenceUsageSource(Snapshot(30));
+        using var retry = new ClaudeUsageClient(retrySource, clock, profileKey: "failing-duplicate", throttle: throttle, accountKey: "account-c");
+        await ThrowsAsync<ClaudeUsageTemporarilyUnavailableException>(() => retry.GetUsageAsync(CancellationToken.None));
+        Check(retrySource.ReadCount == 0, "duplicate profiles also honor the longer transient-failure backoff");
+        using var unaffected = new ClaudeUsageClient(new SequenceUsageSource(Snapshot(40)), clock,
+            profileKey: "unaffected", throttle: throttle, accountKey: "account-d");
+        Check((await unaffected.GetUsageAsync(CancellationToken.None)).Snapshot.Weekly?.UsedPercent == 40,
+            "one account's failed attempts and backoff do not delay another account");
+
+        using var cancel = new CancellationTokenSource();
+        using var canceled = new ClaudeUsageClient(new CallbackUsageSource(_ =>
+        { cancel.Cancel(); throw new OperationCanceledException(cancel.Token); }), clock,
+            profileKey: "canceled", throttle: throttle, accountKey: "account-e");
+        await ThrowsAsync<OperationCanceledException>(() => canceled.GetUsageAsync(cancel.Token));
+        var canceledRetrySource = new SequenceUsageSource(Snapshot(50));
+        using var canceledRetry = new ClaudeUsageClient(canceledRetrySource, clock,
+            profileKey: "canceled-duplicate", throttle: throttle, accountKey: "account-e");
+        await ThrowsAsync<ClaudeUsageTemporarilyUnavailableException>(() => canceledRetry.GetUsageAsync(CancellationToken.None));
+        Check(canceledRetrySource.ReadCount == 0, "canceled attempts retain the account interval across client recreation");
     }
 
     private static async Task ProfileCacheIsolationAsync()

@@ -22,7 +22,7 @@
   "Claude 사용량을 확인하고 있습니다…": "Checking Claude usage…",
   "Claude 사용량을 확인했습니다.": "Claude usage checked.",
   "이전 확인값 · 다음 확인 가능 {0:HH:mm}": "Previous value · Next check at {0:HH:mm}",
-  "다음 확인 가능 {0:HH:mm} · Claude 사용량은 10분 간격으로 확인합니다.": "Next check at {0:HH:mm} · Claude usage is checked at least 10 minutes apart.",
+  "다음 확인 가능 {0:HH:mm} · Claude 사용량은 계정별로 10분 간격으로 확인합니다.": "Next check at {0:HH:mm} · Claude usage checks are at least 10 minutes apart per account.",
   "Claude 열기…": "Open Claude…",
   "선택": "Select",
   "Claude 계정을 확인하고 있습니다…": "Verifying Claude account…",

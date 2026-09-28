@@ -19,7 +19,7 @@ internal sealed class ClaudeAccountController : IDisposable
     private readonly SemaphoreSlim _gate = new(1, 1);
     private readonly CancellationTokenSource _lifetime = new();
     private readonly TimeProvider _timeProvider;
-    private readonly Func<ClaudeProfile, string, ClaudeUsageClient> _clientFactory;
+    private readonly Func<ClaudeProfile, string, string, ClaudeUsageClient> _clientFactory;
     private readonly Action _clearRecoveryCache;
     private volatile bool _disposed;
     internal event EventHandler? SelectionChanged;
@@ -29,17 +29,17 @@ internal sealed class ClaudeAccountController : IDisposable
     internal string SelectionKey => SelectedProfile.Id;
 
     internal ClaudeAccountController(ClaudeProfileStore? store = null, ClaudeProfileRuntime? runtime = null,
-        TimeProvider? timeProvider = null, Func<ClaudeProfile, string, ClaudeUsageClient>? clientFactory = null,
+        TimeProvider? timeProvider = null, Func<ClaudeProfile, string, string, ClaudeUsageClient>? clientFactory = null,
         Action? clearRecoveryCache = null)
     {
         Store = store ?? new();
         Runtime = runtime ?? new(Store);
         _timeProvider = timeProvider ?? TimeProvider.System;
-        _clientFactory = clientFactory ?? ((profile, key) =>
+        _clientFactory = clientFactory ?? ((profile, key, accountKey) =>
         {
             var runner = new ClaudeCodeProcessRunner(configureProcess: start =>
                 ClaudeProfileRuntime.ApplyProfileEnvironment(start, profile));
-            return new ClaudeUsageClient(new ClaudeCodeUsageSource(runner, _timeProvider), key);
+            return new ClaudeUsageClient(new ClaudeCodeUsageSource(runner, _timeProvider), key, accountKey);
         });
         _clearRecoveryCache = clearRecoveryCache ?? (() => ClaudeUsageFileCacheStore.CreateDefault().Clear());
     }
@@ -72,7 +72,7 @@ internal sealed class ClaudeAccountController : IDisposable
                 changedIdentity |= _observationBindings.TryGetValue(profile.Id, out var binding)
                     && !binding.Matches(profile, identity.Key);
             // Connecting the already-used default account only adds its row and label. Keep its
-            // accepted usage/client: dropping them would leave it blank until the global throttle expires.
+            // accepted usage/client: dropping them would leave it blank until this account's throttle expires.
             if (changedIdentity) Forget(profile.Id);
             var registered = Store.RegisterDefault(previous?.Label ?? UiText.T("기존 Claude 계정"), identity);
             ClearAuthenticationFailure(profile.Id);
@@ -175,7 +175,7 @@ internal sealed class ClaudeAccountController : IDisposable
             { _clients[previous].Dispose(); _clients.Remove(previous); }
             if (!_clients.TryGetValue(key, out var client))
             {
-                client = _clientFactory(profile, key);
+                client = _clientFactory(profile, key, identity.Key);
                 _clients.Add(key, client);
             }
             var result = UsableObservation(await client.GetUsageAsync(operation.Token), _timeProvider.GetUtcNow())
