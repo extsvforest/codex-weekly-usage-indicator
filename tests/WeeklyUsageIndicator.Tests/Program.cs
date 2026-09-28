@@ -50,6 +50,7 @@ var tests = new (string Name, Func<Task> Run)[]
     ("multi-account tooltip observations and refresh boundaries", UsageTooltipTests.RunAsync),
     ("supervisor retries abnormal exits but respects normal Quit", TestSupervisorAsync),
     ("official Claude /usage output is parsed", TestObservedUsageOutputAsync),
+    ("verbose official usage rejects seeded fallback and local behavior percentages", TestVerboseUsageOutputAsync),
     ("usage without reset times remains valid through client and tooltip", TestUsageWithoutResetsAsync),
     ("optional limits fail independently", TestIndependentLimitsAsync),
     ("unknown reset format preserves verified percentages", TestUnknownResetFormatAsync),
@@ -121,6 +122,48 @@ static Task TestObservedUsageOutputAsync()
     Assert(snapshot.Fable?.UsedPercent == 24, "the Fable weekly percentage should be parsed");
     Assert(snapshot.FiveHour?.ResetsAt == new DateTimeOffset(2026, 9, 1, 18, 19, 0, TimeSpan.FromHours(9)),
         "the reset should preserve the reported time zone");
+    return Task.CompletedTask;
+}
+
+static Task TestVerboseUsageOutputAsync()
+{
+    var now = DateTimeOffset.UtcNow;
+    object current = new { rate_limits = new { limits = new[] { new { kind = "weekly", percent = 20 } } } };
+    string Envelope(object? report, string? text = null, int turns = 0, double cost = 0) =>
+        JsonSerializer.Serialize(new object[]
+        {
+            new { type = "system", subtype = "init" },
+            new { type = "assistant", usage_report = report },
+            new { type = "result", is_error = false, num_turns = turns,
+                total_cost_usd = cost, result = text ?? SampleUsageText() }
+        });
+
+    var accepted = ClaudeCodeUsageSource.ParseEnvelope(Envelope(current), now);
+    Assert(accepted.Weekly?.UsedPercent == 20 && accepted.Fable?.UsedPercent == 30,
+        "verbose output retains independently parsed official quota windows");
+    foreach (var unavailable in new object[]
+    {
+        new { rate_limits = (object?)null },
+        new { rate_limits = new { extra_usage = (object?)null } },
+        new { rate_limits = new { limits = Array.Empty<object>() } }
+    })
+    {
+        AssertThrows<IOException>(() => ClaudeCodeUsageSource.ParseEnvelope(Envelope(unavailable), now),
+            "a seeded headless response must not relabel old text percentages as a new observation");
+    }
+    AssertThrows<IOException>(() => ClaudeCodeUsageSource.ParseEnvelope(
+        Envelope(new { rate_limits = (object?)null }, "Last 7d\n87% of your usage was at >150k context"), now),
+        "local behavior percentages are not quota availability");
+    AssertThrows<InvalidDataException>(() => ClaudeCodeUsageSource.ParseEnvelope(Envelope(null), now),
+        "an unknown verbose report schema is rejected");
+    AssertThrows<InvalidDataException>(() => ClaudeCodeUsageSource.ParseEnvelope(Envelope(current, turns: 1), now),
+        "verbose results retain the no-model-turn guard");
+    AssertThrows<InvalidDataException>(() => ClaudeCodeUsageSource.ParseEnvelope(Envelope(current, cost: 0.01), now),
+        "verbose results retain the zero-cost guard");
+    var duplicateResult = "[" + UsageEnvelope(SampleUsageText()).Replace("{", "{\"type\":\"result\",", StringComparison.Ordinal)
+        + "," + UsageEnvelope(SampleUsageText()).Replace("{", "{\"type\":\"result\",", StringComparison.Ordinal) + "]";
+    AssertThrows<InvalidDataException>(() => ClaudeCodeUsageSource.ParseEnvelope(duplicateResult, now),
+        "ambiguous final results are rejected");
     return Task.CompletedTask;
 }
 
@@ -258,7 +301,7 @@ static Task TestProcessArgumentsAsync()
     Assert(arguments.Contains("--no-session-persistence"), "the lookup must not leave a resumable session");
     Assert(arguments.Contains("--no-chrome"), "the lookup must not open browser integration");
     Assert(arguments.SequenceEqual([
-        "-p", "--safe-mode", "--no-session-persistence", "--no-chrome", "/usage", "--output-format", "json", "--max-turns", "0"]),
+        "-p", "--safe-mode", "--no-session-persistence", "--no-chrome", "/usage", "--output-format", "json", "--verbose", "--max-turns", "0"]),
         "the command contract should remain exact and reviewable");
     Assert(UsageIndicatorForm.ClaudeRefreshTimeout > ClaudeCodeProcessRunner.CommandTimeout,
         "the UI timeout must leave the process runner time to classify a slow command as transient");

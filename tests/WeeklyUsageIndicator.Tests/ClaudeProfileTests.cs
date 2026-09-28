@@ -117,6 +117,7 @@ internal static class ClaudeProfileTests
 
             var defaultHome = store.DefaultProfile with { UseDefaultHome = true };
             var environment = new ProcessStartInfo("fixture.exe");
+            environment.Environment.Remove("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC");
             environment.Environment["ANTHROPIC_API_KEY"] = "synthetic sentinel";
             environment.Environment["ANTHROPIC_BASE_URL"] = "https://invalid.test";
             environment.Environment["CLAUDE_CODE_USE_BEDROCK"] = "1";
@@ -128,9 +129,17 @@ internal static class ClaudeProfileTests
                   || key.StartsWith("CLAUDE_CODE_USE_", StringComparison.OrdinalIgnoreCase))
                   && !environment.Environment.ContainsKey("CLAUDE_CONFIG_DIR"),
                 "default home removes overrides without relocating the default .claude.json");
+            Check(!environment.Environment.ContainsKey("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC")
+                  && environment.Environment["DISABLE_TELEMETRY"] == "1"
+                  && environment.Environment["DISABLE_ERROR_REPORTING"] == "1"
+                  && environment.Environment["DISABLE_AUTOUPDATER"] == "1",
+                "usage remains available while telemetry, crash reporting and automatic updates are disabled");
+            environment.Environment["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1";
             ClaudeProfileRuntime.ApplyProfileEnvironment(environment, second);
             Check(environment.Environment["CLAUDE_CONFIG_DIR"] == second.ConfigDirectory,
                 "additional profiles receive only their explicit home");
+            Check(environment.Environment["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] == "1",
+                "an inherited user traffic restriction is not silently lifted");
 
             var unavailable = store.CreateProfile("Conflict");
             Directory.CreateDirectory(Path.Combine(unavailable.ConfigDirectory, "projects"));

@@ -55,6 +55,30 @@ internal sealed class ClaudeCodeUsageSource : IClaudeUsageSource
     {
         using var document = JsonDocument.Parse(json);
         var root = document.RootElement;
+        JsonElement? usageReport = null;
+        var verbose = root.ValueKind == JsonValueKind.Array;
+        if (verbose)
+        {
+            JsonElement? finalResult = null;
+            foreach (var entry in root.EnumerateArray())
+            {
+                if (entry.ValueKind != JsonValueKind.Object ||
+                    !TryReadString(entry, "type", out var type)) continue;
+                if (type == "result")
+                {
+                    if (finalResult is not null)
+                        throw new InvalidDataException("Claude Code returned multiple /usage results.");
+                    finalResult = entry;
+                }
+                else if (type == "assistant" && entry.TryGetProperty("usage_report", out var report))
+                {
+                    if (usageReport is not null)
+                        throw new InvalidDataException("Claude Code returned multiple /usage reports.");
+                    usageReport = report;
+                }
+            }
+            root = finalResult ?? throw new InvalidDataException("Claude Code returned no /usage result.");
+        }
         if (root.ValueKind != JsonValueKind.Object ||
             !TryReadBoolean(root, "is_error", out var isError) ||
             !TryReadInt32(root, "num_turns", out var numTurns) ||
@@ -75,7 +99,30 @@ internal sealed class ClaudeCodeUsageSource : IClaudeUsageSource
         if (numTurns != 0 || Math.Abs(totalCost) > double.Epsilon)
             throw new InvalidDataException("Claude Code /usage unexpectedly consumed a model turn.");
 
+        if (verbose) RequireCurrentLimits(usageReport);
         return ParseUsageText(resultText, now);
+    }
+
+    private static void RequireCurrentLimits(JsonElement? report)
+    {
+        if (report is not { ValueKind: JsonValueKind.Object } usage ||
+            !usage.TryGetProperty("rate_limits", out var rateLimits))
+            throw new InvalidDataException("Claude Code returned no structured /usage report.");
+
+        // Current CLIs render old fallback percentages without a last-known label,
+        // but omit their structured limits. Reject that fallback. An official
+        // successful snapshot up to 60 seconds old may still be returned here;
+        // this is a check time, not proof of a new network request.
+        if (rateLimits.ValueKind == JsonValueKind.Null)
+            throw new IOException("Claude Code could not retrieve current usage limits.");
+        if (rateLimits.ValueKind != JsonValueKind.Object)
+            throw new InvalidDataException("Claude Code returned invalid structured usage limits.");
+        if (!rateLimits.TryGetProperty("limits", out var limits))
+            throw new IOException("Claude Code returned last-known usage instead of current limits.");
+        if (limits.ValueKind != JsonValueKind.Array)
+            throw new InvalidDataException("Claude Code returned invalid structured usage limits.");
+        if (limits.GetArrayLength() == 0)
+            throw new IOException("Claude Code did not return current usage limits.");
     }
 
     internal static ClaudeUsageSnapshot ParseUsageText(string text, DateTimeOffset now)
@@ -316,6 +363,7 @@ internal sealed class ClaudeCodeProcessRunner : IClaudeCommandRunner
             "/usage",
             "--output-format",
             "json",
+            "--verbose",
             "--max-turns",
             "0"
         })

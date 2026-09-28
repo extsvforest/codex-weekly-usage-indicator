@@ -197,7 +197,13 @@ internal sealed class ClaudeProfileRuntime
                 start.Environment.Remove(name);
         }
         if (!profile.UseDefaultHome) start.Environment["CLAUDE_CONFIG_DIR"] = Path.GetFullPath(profile.ConfigDirectory);
-        start.Environment["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1";
+        // Recent official CLIs classify /usage as nonessential traffic. The blanket
+        // switch can therefore block the read this utility was started to perform.
+        // Disable background reporting and updates individually instead; preserve
+        // any blanket restriction explicitly inherited from the user's environment.
+        start.Environment["DISABLE_TELEMETRY"] = "1";
+        start.Environment["DISABLE_ERROR_REPORTING"] = "1";
+        start.Environment["DISABLE_AUTOUPDATER"] = "1";
     }
 
     internal static ClaudeProfileIdentity ParseStatus(ClaudeProfileCommandResult result, ClaudeProfile profile)
