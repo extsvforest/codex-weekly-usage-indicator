@@ -30,7 +30,9 @@ internal sealed class CombinedUsagePanel : UserControl
         totalLine.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 150)); totalLine.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         _total.Dock = _capacity.Dock = DockStyle.Fill; _capacity.AutoSize = false; _capacity.TextAlign = ContentAlignment.MiddleLeft;
         totalLine.Controls.Add(_total, 0, 0); totalLine.Controls.Add(_capacity, 1, 0);
-        _totalColumn = Column(AccountUiTheme.Label(UiText.T("전체 주간 잔여"), color: AccountUiTheme.Muted), totalLine, _coverage, _bar);
+        var title = AccountUiTheme.Label(UiText.T("주간 잔여"), color: AccountUiTheme.Muted);
+        title.Name = "UsageSummaryTitle";
+        _totalColumn = Column(title, totalLine, _coverage, _bar);
         var nextDetail = _nextDetail = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1, Margin = new Padding(0), BackColor = Color.Transparent };
         nextDetail.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 150)); nextDetail.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         nextDetail.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
@@ -76,9 +78,10 @@ internal sealed class CombinedUsagePanel : UserControl
         _totalLine.ColumnStyles[0].Width = _total.ContentWidth + 4 * scale;
         _capacity.Text = snapshot.Accounts.Count > 0 ? $"/ {snapshot.Accounts.Count * 100}%" : "";
         _total.ForeColor = complete ? AccountUiTheme.Text : AccountUiTheme.Muted;
-        _coverage.Text = complete ? UiText.F($"{snapshot.Accounts.Count}개 계정 · 계정당 100% 기준") : !snapshot.IsBatch ? (snapshot.CompletedAt is null ? UiText.T("저장된 값 · 전체 갱신 필요") : UiText.T("개별 확인값 · 전체 갱신 필요")) : count > 0
+        _coverage.Text = complete ? UiText.F($"{snapshot.Accounts.Count}개 계정 합계") : !snapshot.IsBatch ? (snapshot.CompletedAt is null ? UiText.T("저장된 값 · 전체 갱신 필요") : UiText.T("개별 확인값 · 전체 갱신 필요")) : count > 0
             ? UiText.F($"확인된 잔여 {snapshot.ConfirmedRemaining(now)}% · {count}/{snapshot.Accounts.Count}개") : UiText.T("전체 합계 확인 필요");
         _coverage.ForeColor = complete ? AccountUiTheme.Muted : AccountUiTheme.Warning;
+        _coverage.AccessibleDescription = complete ? UiText.F($"{snapshot.Accounts.Count}개 계정 · 계정당 100% 기준") : _coverage.Text;
         _bar.Remaining = complete ? (int)Math.Round(snapshot.ConfirmedRemaining(now) / (double)snapshot.Accounts.Count) : null;
         _bar.Dock = DockStyle.None; _bar.Anchor = AnchorStyles.Left | AnchorStyles.Right; _bar.Height = (int)(6 * scale);
         _bar.MinimumSize = new Size((int)(30 * scale), (int)(6 * scale));
@@ -99,13 +102,8 @@ internal sealed class CombinedUsagePanel : UserControl
         CheckedAtText = querying ? UiText.F($"전체 조회 중 · {completed}/{snapshot.Accounts.Count}개 확인") : snapshot.MembershipChanged ? UiText.T("계정 구성 변경 · 전체 갱신 필요")
             : snapshot.WasCanceled ? UiText.T("전체 조회 취소 · 다시 갱신해 주세요.") : snapshot.Interrupted ? UiText.T("전체 조회 중단 · 확인 필요")
             : !snapshot.IsBatch && count > 0 ? UiText.T("개별 확인 · 전체 합계 갱신 필요")
-            : snapshot.CompletedAt is { } checkedAt ? FormatCheckedAt(checkedAt, now, complete) : UiText.T("저장된 값 · 전체 갱신 필요");
+            : snapshot.CompletedAt is { } checkedAt ? complete ? AccountUsageText.LastUpdated(checkedAt, now) : AccountUsageText.PartiallyUpdated(checkedAt, now) : UiText.T("저장된 값 · 전체 갱신 필요");
         AccessibleDescription = CheckedAtText; SummaryChanged?.Invoke(this, EventArgs.Empty);
-    }
-    private static string FormatCheckedAt(DateTimeOffset checkedAt, DateTimeOffset now, bool complete)
-    {
-        var day = checkedAt.LocalDateTime.Date == now.LocalDateTime.Date ? UiText.T("오늘") : checkedAt.ToLocalTime().ToString("MM.dd");
-        return complete ? UiText.F($"{day} {checkedAt.ToLocalTime():HH:mm}에 전체 확인") : UiText.F($"{day} {checkedAt.ToLocalTime():HH:mm}에 일부 확인");
     }
     internal static string TimeUntil(DateTimeOffset reset, DateTimeOffset now)
     {

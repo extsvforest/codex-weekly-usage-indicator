@@ -104,7 +104,7 @@ internal static class ClaudeAccountMenuSmoke
                 }
 
                 var queryMenu = OpenMenu(second.Id);
-                var query = queryMenu.Items.Cast<ToolStripItem>().Single(item => item.Text == UiText.T("이 계정 사용량 조회"));
+                var query = queryMenu.Items.Cast<ToolStripItem>().Single(item => item.Text == UiText.T("사용량 갱신"));
                 queryMenu.Close(ToolStripDropDownCloseReason.ItemClicked); query.PerformClick();
                 var deadline = DateTime.UtcNow.AddSeconds(35);
                 while (panel.IsBusy && DateTime.UtcNow < deadline) { Application.DoEvents(); Thread.Sleep(15); }

@@ -141,6 +141,7 @@ internal sealed class AccountTable : UserControl
         {
             AutoScaleMode = AutoScaleMode.Dpi; AutoScaleDimensions = new SizeF(96, 96);
             Name = "AccountRow-" + id; Dock = DockStyle.Fill; AutoSize = false; Height = 66; Margin = new Padding(0); BackColor = Color.Transparent;
+            _observed.Name = "AccountReadState-" + id;
             Switch = AccountUiTheme.Button("SwitchAccount-" + id, UiText.T("전환"));
             Manage = new AccountButton { Quiet = true, Name = "ManageAccount-" + id, Text = "···", Font = AccountFonts.Create(14, true), FlatStyle = FlatStyle.Flat, FlatAppearance = { BorderSize = 0 }, Cursor = Cursors.Hand };
             Switch.AutoSize = Manage.AutoSize = false; Switch.Size = Switch.MinimumSize = new Size(84, 30); Manage.Size = Manage.MinimumSize = new Size(32, 30);
@@ -182,21 +183,21 @@ internal sealed class AccountTable : UserControl
             Manage.Size = Manage.MinimumSize = new Size((int)(32 * scale), (int)(30 * scale));
             var now = DateTimeOffset.Now; var a = value.Account; var expired = a.Usage?.ResetsAt is { } at && at <= now;
             _layout.Active = a.IsActive; _layout.Invalidate(); _name.Text = a.Label;
-            _observed.Text = value.State == CombinedReadState.Success && a.ObservedAt is { } observed
-                ? UiText.F($"{observed.ToLocalTime().ToString(observed.LocalDateTime.Date == now.LocalDateTime.Date ? "HH:mm" : "MM.dd")} 확인") : value.State switch
+            _observed.Text = value.State switch
                 {
+                    CombinedReadState.Success => value.IsCurrent(now) ? "" : UiText.T("갱신 필요"),
                     CombinedReadState.Failed => UiText.T("조회 실패"), CombinedReadState.Canceled => UiText.T("조회 취소됨"),
                     CombinedReadState.Waiting => UiText.T("확인 대기"), _ => UiText.T("저장된 값")
                 };
             if (expired) _observed.Text = UiText.T("갱신 필요");
-            // Fresh members of the same batch share the header's check time.
-            // Preserve row-level age and failure status when that is no longer true.
-            var showObserved = !isBatch || !value.IsCurrent(now);
+            // Healthy rows stay quiet; per-account observation times remain in details.
+            var showObserved = _observed.Text.Length > 0;
             _observed.Visible = showObserved;
             _identity.RowStyles[0].SizeType = SizeType.Percent; _identity.RowStyles[0].Height = 100;
             _identity.RowStyles[1].SizeType = SizeType.Absolute; _identity.RowStyles[1].Height = showObserved ? 18 * scale : 0;
-            var details = value.Status(now) + (a.ObservedAt is { } savedAt ? UiText.F($"\n마지막 확인 {savedAt.ToLocalTime():MM.dd HH:mm}") : "");
-            _details.SetToolTip(_observed, details); _observed.AccessibleDescription = details;
+            var details = value.Status(now) + (a.ObservedAt is { } savedAt ? "\n" + AccountUsageText.LastUpdated(savedAt, now) : "");
+            foreach (var label in new Label[] { _name, _remaining, _observed })
+            { _details.SetToolTip(label, details); label.AccessibleDescription = details; }
             _observed.ForeColor = value.State is CombinedReadState.Failed or CombinedReadState.Canceled ? AccountUiTheme.Warning : AccountUiTheme.Muted;
             _remaining.Text = expired ? UiText.T("갱신 필요") : !value.HasWeeklyValue ? "—"
                 : value.State != CombinedReadState.Success ? UiText.F($"이전 {100 - a.Usage!.UsedPercent}%") : $"{100 - a.Usage!.UsedPercent}%";
@@ -205,7 +206,7 @@ internal sealed class AccountTable : UserControl
             _bar.TrackColor = a.IsActive ? Color.FromArgb(244, 226, 212) : AccountUiTheme.Raised;
             _bar.Remaining = !expired && value.HasWeeklyValue ? 100 - a.Usage!.UsedPercent : null;
             _relative.Text = a.Usage?.ResetsAt is { } r ? CombinedUsagePanel.TimeUntil(r, now) : UiText.T("초기화 미확인");
-            _reset.Text = a.Usage?.ResetsAt is { } reset ? $"{reset.ToLocalTime():MM.dd HH:mm}" : UiText.T("전체 갱신으로 확인");
+            _reset.Text = a.Usage?.ResetsAt is { } reset ? $"{reset.ToLocalTime():MM.dd HH:mm}" : "—";
             ((AccountButton)Switch).ActiveBadge = a.IsActive;
             Switch.Text = a.IsActive ? UiText.T("사용 중") : UiText.T("전환"); Switch.Enabled = !busy && mutationsAllowed && hasActive && !a.IsActive;
             Switch.AccessibleName = a.IsActive ? UiText.F($"{a.Label} 사용 중") : UiText.F($"{a.Label} 계정으로 전환");

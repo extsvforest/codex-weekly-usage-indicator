@@ -19,8 +19,10 @@ internal sealed partial class AccountManagerForm
     private void UpdateProviderHeader()
     {
         _refreshAll.Visible = _checkedAt.Visible = true;
-        _refreshAll.Text = _showingClaude ? UiText.T("갱신") : UiText.T("전체 갱신");
-        _refreshAll.AccessibleName = _showingClaude ? UiText.T("이 계정 사용량 조회") : UiText.T("전체 갱신");
+        _refreshAll.Text = UiText.T("갱신");
+        _refreshAll.AccessibleName = _showingClaude ? UiText.T("사용 중인 계정 사용량 갱신") : UiText.T("모든 계정 사용량 갱신");
+        var details = _refreshAll.AccessibleName + (_showingClaude ? "" : "\n" + UiText.T("창을 열 때 한 번 갱신합니다."));
+        _headerDetails.SetToolTip(_refreshAll, details); _refreshAll.AccessibleDescription = details;
         _checkedAt.Text = _showingClaude ? _claudePanel?.CheckedAtText ?? "" : _overview.CheckedAtText;
         _refreshAll.Enabled = _showingClaude ? !_busy && _claudePanel?.CanRefreshSelected == true
             : !_busy && !_store.HasPendingRecovery && !HasLinkedRecovery && _usageQueryStatus.State != UsageQueryState.RecoveryRequired && _items.Count > 0;

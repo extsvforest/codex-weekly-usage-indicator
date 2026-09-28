@@ -56,8 +56,10 @@ internal static class AccountStylePreview
                     try
                     {
                         await Task.Delay(200); Capture(form, "manager.png");
+                        AssertSharedCopy(form, now);
                         ((Button)form.Controls.Find("ClaudeProviderTab", true).Single()).PerformClick();
                         await Task.Delay(100); Capture(form, "claude.png");
+                        AssertSharedCopy(form, now);
                         var claudePanel = (ClaudeAccountPanel)form.Controls.Find("ClaudeAccountPanel", true).Single();
                         var claudeThird = claudeStore.CreateProfile("Claude · 추가 로그인 대기");
                         claudeStore.Rename(claudeMain.Id, "메인 Claude · 긴 계정 이름과 English 0123456789");
@@ -144,6 +146,21 @@ internal static class AccountStylePreview
     }
 
     private static IEnumerable<Control> Walk(Control c) => new[] { c }.Concat(c.Controls.Cast<Control>().SelectMany(Walk));
+
+    private static void AssertSharedCopy(Form form, DateTimeOffset checkedAt)
+    {
+        var visible = Walk(form).Where(control => control.Visible).ToArray();
+        if (visible.Single(control => control.Name == "UsageSummaryTitle").Text != UiText.T("주간 잔여")
+            || visible.Single(control => control.Name == "RefreshAllUsageButton").Text != UiText.T("갱신")
+            || visible.Single(control => control.Name == "CombinedCheckedAtLabel").Text != AccountUsageText.LastUpdated(checkedAt, DateTimeOffset.Now))
+            throw new InvalidOperationException("Both provider tabs must share the summary title, refresh label and observation-time format.");
+        if (visible.Any(control => control.Name.StartsWith("AccountReadState-", StringComparison.Ordinal)
+            || control.Name.StartsWith("ClaudeProfileState-", StringComparison.Ordinal)))
+            throw new InvalidOperationException("Healthy account rows must not repeat their observation time below the name.");
+        if (visible.Any(control => control is Label && (control.Text == UiText.T("여기서 새로 여는 Claude에 적용됩니다. 이미 열린 작업은 바뀌지 않습니다.")
+            || control.Text == UiText.T("ⓘ  창을 열 때 한 번 확인하며, 이후에는 직접 갱신합니다."))))
+            throw new InvalidOperationException("Action-specific guidance belongs with the relevant action, not in a permanent footer.");
+    }
 
     private static void AssertClaudeRecovery(Form form, ClaudeAccountPanel panel, string profileId)
     {

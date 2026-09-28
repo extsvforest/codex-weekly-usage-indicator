@@ -11,11 +11,12 @@ internal sealed partial class AccountManagerForm : Form
     private readonly Label _count = AccountUiTheme.Label(UiText.T("내 계정"), 14, true);
     private readonly Label _status = AccountUiTheme.Label("");
     private readonly Button _add = AccountUiTheme.Button("AddAccountButton", UiText.T("+ 계정 추가"));
-    private readonly Button _refreshAll = AccountUiTheme.Button("RefreshAllUsageButton", UiText.T("전체 갱신"), true);
+    private readonly Button _refreshAll = AccountUiTheme.Button("RefreshAllUsageButton", UiText.T("갱신"), true);
+    private readonly ToolTip _headerDetails = new() { InitialDelay = 500, ReshowDelay = 100, AutoPopDelay = 10000 };
     private readonly Button _register = AccountUiTheme.Button("RegisterCurrentButton", UiText.T("현재 계정 등록"), true);
     private readonly Button _registerActive = AccountUiTheme.Button("RegisterActiveAccountButton", UiText.T("현재 계정 등록"));
     private readonly ToolStripMenuItem _rename = new(UiText.T("이름 변경")) { Name = "RenameAccountButton" };
-    private readonly ToolStripMenuItem _readUsage = new(UiText.T("이 계정 사용량 조회")) { Name = "ReadAccountUsageButton" };
+    private readonly ToolStripMenuItem _readUsage = new(UiText.T("사용량 갱신")) { Name = "ReadAccountUsageButton" };
     private readonly ToolStripMenuItem _delete = new(UiText.T("저장된 로그인 삭제")) { Name = "DeleteAccountButton" };
     private readonly ToolStripMenuItem _refresh = new(UiText.T("저장된 계정 목록 다시 읽기")) { Name = "RefreshAccountsButton" };
     private readonly ToolStripMenuItem _info = new(UiText.T("상세 정보")) { Name = "AccountInfoMenuItem" };
@@ -109,10 +110,8 @@ internal sealed partial class AccountManagerForm : Form
         var order = AccountUiTheme.Label(UiText.T("초기화가 가까운 순"), 9, color: AccountUiTheme.Muted); order.Anchor = AnchorStyles.Right;
         listHeader.Controls.Add(order, 1, 0); _root.Controls.Add(listHeader, 0, 3);
         var body = new Panel { Dock = DockStyle.Fill, Margin = new Padding(0) }; BuildEmpty(); body.Controls.Add(_accounts); body.Controls.Add(_empty); _root.Controls.Add(body, 0, 4);
-        var footer = AccountUiTheme.Label(UiText.T("ⓘ  창을 열 때 한 번 확인하며, 이후에는 직접 갱신합니다."), 9, color: AccountUiTheme.Muted);
         var footerRow = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1, Margin = new Padding(0) };
         footerRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100)); footerRow.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-        footer.Margin = new Padding(0, 8, 0, 0); footerRow.Controls.Add(footer, 0, 0);
         _environments.Font = AccountFonts.Create(9); _environments.MinimumSize = new Size(0, 26); _environments.Height = 26; _environments.Padding = new Padding(8, 2, 8, 2);
         footerRow.Controls.Add(_environments, 1, 0); _root.Controls.Add(footerRow, 0, 5);
         _accounts.SetAddButton(_add);
@@ -199,7 +198,7 @@ internal sealed partial class AccountManagerForm : Form
         var shortWindow = account.Usage?.ShortWindow; var now = DateTimeOffset.Now;
         var remaining = shortWindow is null ? UiText.T("정보 없음") : shortWindow.ResetsAt <= now ? UiText.T("갱신 필요") : $"{100 - shortWindow.UsedPercent}%";
         layout.Controls.Add(AccountUiTheme.Label(UiText.F($"5시간 잔여  {remaining}\n초기화  {(shortWindow?.ResetsAt is { } reset ? reset.ToLocalTime().ToString("MM/dd HH:mm") : "—")}")), 0, 2);
-        layout.Controls.Add(AccountUiTheme.Label(account.ObservedAt is { } observed ? UiText.F($"개별 조회의 마지막 확인  {observed.ToLocalTime():MM/dd HH:mm}\n전체 잔여량은 마지막 전체 확인 기준입니다.") : UiText.T("아직 사용량을 확인하지 않았습니다."), color: AccountUiTheme.Muted), 0, 3);
+        layout.Controls.Add(AccountUiTheme.Label(account.ObservedAt is { } observed ? AccountUsageText.LastUpdated(observed, now) + "\n" + UiText.T("합계는 마지막 전체 갱신 기준입니다.") : UiText.T("사용량 미확인"), color: AccountUiTheme.Muted), 0, 3);
         var close = AccountUiTheme.Button("CloseAccountInfoButton", UiText.T("닫기")); close.DialogResult = DialogResult.OK; layout.Controls.Add(close, 0, 4); dialog.AcceptButton = dialog.CancelButton = close;
         dialog.Controls.Add(layout); dialog.ShowDialog(this);
     }
@@ -465,7 +464,7 @@ internal sealed partial class AccountManagerForm : Form
 
     protected override void Dispose(bool disposing)
     {
-        if (disposing) { _refreshTimer.Dispose(); _menu.Dispose(); _pageMenu.Dispose(); }
+        if (disposing) { _refreshTimer.Dispose(); _menu.Dispose(); _pageMenu.Dispose(); _headerDetails.Dispose(); }
         base.Dispose(disposing);
     }
 

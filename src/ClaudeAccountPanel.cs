@@ -17,7 +17,7 @@ internal sealed class ClaudeAccountPanel : UserControl
     private readonly Label _empty = AccountUiTheme.Label(UiText.T("지금 사용하는 Claude 계정을 먼저 연결하세요.\n추가 계정도 Claude의 공식 로그인으로 등록합니다."), 12, color: AccountUiTheme.Muted);
     private readonly Label _count = AccountUiTheme.Label("", 14, true);
     private readonly Label _status = AccountUiTheme.Label("", color: AccountUiTheme.Muted);
-    private readonly Label _footer = AccountUiTheme.Label(UiText.T("여기서 새로 여는 Claude에 적용됩니다. 이미 열린 작업은 바뀌지 않습니다."), 9, color: AccountUiTheme.Muted);
+    private readonly ToolTip _actionDetails = new() { InitialDelay = 500, ReshowDelay = 100, AutoPopDelay = 10000 };
     private readonly Button _register = AccountUiTheme.Button("ClaudeRegisterDefaultButton", UiText.T("기존 계정 연결"));
     private readonly Button _add = AccountUiTheme.Button("ClaudeAddAccountButton", UiText.T("+ 계정 추가"));
     private readonly Button _cancel = AccountUiTheme.Button("ClaudeCancelButton", UiText.T("취소"));
@@ -64,9 +64,10 @@ internal sealed class ClaudeAccountPanel : UserControl
         var footerRow = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1, Margin = new Padding(0), BackColor = Color.Transparent };
         footerRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100)); footerRow.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         footerRow.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        _footer.Margin = new Padding(0, 8, 0, 0); _footer.AutoSize = false; _footer.Dock = DockStyle.Fill; _footer.AutoEllipsis = true;
+        _launch.AccessibleDescription = UiText.T("여기서 새로 여는 Claude에 적용됩니다. 이미 열린 작업은 바뀌지 않습니다.");
+        _actionDetails.SetToolTip(_launch, _launch.AccessibleDescription);
         _launch.Font = AccountFonts.Create(9); _launch.MinimumSize = new Size(0, 26); _launch.Height = 26; _launch.Padding = new Padding(8, 2, 8, 2);
-        footerRow.Controls.Add(_footer, 0, 0); footerRow.Controls.Add(_launch, 1, 0); _layout.Controls.Add(footerRow, 0, 4); Controls.Add(_layout);
+        footerRow.Controls.Add(_launch, 1, 0); _layout.Controls.Add(footerRow, 0, 4); Controls.Add(_layout);
         _summary.SummaryChanged += (_, _) => SummaryChanged?.Invoke(this, EventArgs.Empty);
         _register.Click += async (_, _) => await ConnectCurrentLoginAsync();
         _add.Click += async (_, _) =>
@@ -236,7 +237,6 @@ internal sealed class ClaudeAccountPanel : UserControl
         }
         foreach (var button in new[] { _cancel, _repair })
         { button.MinimumSize = new Size(Pixels(92), Pixels(38)); button.Padding = new Padding(Pixels(12), Pixels(4), Pixels(12), Pixels(4)); }
-        _footer.Margin = new Padding(0, Pixels(8), 0, 0);
         _launch.MinimumSize = new Size(0, Pixels(26)); _launch.Height = Pixels(26); _launch.Padding = new Padding(Pixels(8), Pixels(2), Pixels(8), Pixels(2));
         foreach (var row in _profileRows.Values) row.ApplyGeometry(scale);
         RenderNotice();
@@ -344,8 +344,7 @@ internal sealed class ClaudeAccountPanel : UserControl
             _bar.TrackColor = IsSelected ? Color.FromArgb(244, 226, 212) : AccountUiTheme.Raised;
             _state.Text = failure is ClaudeLoginRequiredException ? UiText.T("CLI 로그인 필요") : failure is not null ? UsageIndicatorForm.FriendlyClaudeError(failure)
                 : Profile.Identity is null ? UiText.T("로그인 필요") : usage is null ? UiText.T("사용량 미확인")
-                : usage.IsStale ? UiText.F($"이전 확인 {usage.LastUpdatedAt.ToLocalTime():MM.dd HH:mm}")
-                : !IsSelected ? UiText.F($"{usage.LastUpdatedAt.ToLocalTime().ToString(usage.LastUpdatedAt.LocalDateTime.Date == now.LocalDateTime.Date ? "HH:mm" : "MM.dd")} 확인") : "";
+                : usage.IsStale || window?.ResetsAt <= now ? UiText.T("갱신 필요") : "";
             var showState = _state.Text.Length > 0;
             _state.Visible = showState; _state.ForeColor = stale ? AccountUiTheme.Warning : AccountUiTheme.Muted;
             _identity.RowStyles[0].SizeType = SizeType.Percent; _identity.RowStyles[0].Height = 100;
@@ -356,10 +355,12 @@ internal sealed class ClaudeAccountPanel : UserControl
             SelectButton.Text = RequiresLogin ? UiText.T("로그인") : IsSelected ? identityChanged ? UiText.T("확인 필요") : UiText.T("사용 중") : UiText.T("전환");
             SelectButton.Enabled = !_busy && (RequiresLogin || !IsSelected);
             SelectButton.AccessibleName = Profile.Label + " · " + SelectButton.Text;
-            var details = (Profile.Identity?.Hint ?? UiText.T("로그인 필요")) + (usage is null ? "" : UiText.F($"\n마지막 확인 {usage.LastUpdatedAt.ToLocalTime():MM.dd HH:mm}"));
+            var details = (Profile.Identity?.Hint ?? UiText.T("로그인 필요")) + (usage is null ? "" : "\n" + AccountUsageText.LastUpdated(usage.LastUpdatedAt, now));
             if (failure is not null) details += "\n" + UsageIndicatorForm.FriendlyClaudeError(failure);
             else if (usage?.IsStale == true && usage.RetryAfter is { } retry) details += "\n" + UiText.F($"이전 확인값 · 다음 확인 가능 {retry.ToLocalTime():HH:mm}");
             _details.SetToolTip(_name, details); _details.SetToolTip(_state, details); _details.SetToolTip(_remaining, details);
+            SelectButton.AccessibleDescription = UiText.T("여기서 새로 여는 Claude에 적용됩니다. 이미 열린 작업은 바뀌지 않습니다.");
+            _details.SetToolTip(SelectButton, SelectButton.AccessibleDescription);
             _name.AccessibleDescription = _state.AccessibleDescription = _remaining.AccessibleDescription = details;
             ApplyGeometry(DeviceDpi / 96f);
         }
@@ -374,7 +375,7 @@ internal sealed class ClaudeAccountPanel : UserControl
         _profileMenu?.Dispose();
         var menu = _profileMenu = new ContextMenuStrip { Font = Font, ShowImageMargin = false, BackColor = AccountUiTheme.Surface, ForeColor = AccountUiTheme.Text,
             Renderer = new ToolStripProfessionalRenderer(new AccountMenuColors()) };
-        menu.Items.Add(UiText.T("이 계정 사용량 조회"), null, async (_, _) => await ReadUsageAsync(profile.Id));
+        menu.Items.Add(UiText.T("사용량 갱신"), null, async (_, _) => await ReadUsageAsync(profile.Id));
         menu.Items.Add(UiText.T("이름 변경"), null, (_, _) =>
         {
             using var dialog = new AccountNameDialog(profile.Label);
@@ -416,7 +417,7 @@ internal sealed class ClaudeAccountPanel : UserControl
         var value = remaining is { } percent ? $"{percent}%" : "—";
         var reset = window?.ResetsAt is { } date ? date.ToLocalTime().ToString("MM.dd HH:mm") : "—";
         layout.Controls.Add(AccountUiTheme.Label(UiText.T("주간 잔여") + "  " + value + "\n" + UiText.T("초기화") + "  " + reset), 0, 2);
-        var observed = usage is null ? UiText.T("아직 사용량을 확인하지 않았습니다.") : UiText.F($"\n마지막 확인 {usage.LastUpdatedAt.ToLocalTime():MM.dd HH:mm}").TrimStart();
+        var observed = usage is null ? UiText.T("사용량 미확인") : AccountUsageText.LastUpdated(usage.LastUpdatedAt, DateTimeOffset.Now);
         if (failure is not null) observed = UsageIndicatorForm.FriendlyClaudeError(failure) + "\n" + observed;
         var details = AccountUiTheme.Label(observed, color: AccountUiTheme.Muted); details.AutoSize = false; details.Dock = DockStyle.Fill; layout.Controls.Add(details, 0, 3);
         var close = AccountUiTheme.Button("CloseClaudeAccountInfoButton", UiText.T("닫기")); close.DialogResult = DialogResult.OK; layout.Controls.Add(close, 0, 4); dialog.AcceptButton = dialog.CancelButton = close;
@@ -460,7 +461,7 @@ internal sealed class ClaudeAccountPanel : UserControl
     {
         if (disposing)
         {
-            _profileMenu?.Dispose();
+            _profileMenu?.Dispose(); _actionDetails.Dispose();
             _controller.UsageChanged -= OnUsageChanged;
             if (_empty.Parent is null) _empty.Dispose();
         }

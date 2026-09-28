@@ -12,7 +12,7 @@ The September 28 upgrade combines the approved compact account-table layout with
 
 ## Review and validation
 
-The candidate is version `1.9.0-preview.5`. The approved compact table and two-column summary are implemented as native controls with the warm paper palette and texture. Codex and Claude have their own pages; inactive profiles never contribute to the wrong provider's number. Claude's summary shows the selected profile's overall weekly balance and reset time, above its account list; it does not combine accounts or query every profile automatically.
+The candidate is version `1.9.0-preview.6`. The approved compact table and two-column summary are implemented as native controls with the warm paper palette and texture. Codex and Claude have their own pages; inactive profiles never contribute to the wrong provider's number. Claude's summary shows the selected profile's overall weekly balance and reset time, above its account list; it does not combine accounts or query every profile automatically.
 
 An Opus review during implementation found recovery paths that could lock the manager, a missing WSL-only action for the current Windows account, and unnecessarily blocked isolated logins. The candidate now offers explicit WSL unlinking that preserves live authentication, archives encrypted recovery data, and disables linked switching. Unowned recovery records cannot apply a login. A durable marker distinguishes preparation from an attempted write. Rotated source credentials are preserved in the encrypted vault before a recovery record is archived, without replacing newer stored credentials.
 
@@ -68,6 +68,14 @@ The ten-minute value is the widget's conservative polling choice, not a publishe
 All 38 non-pointer regression groups passed after the change. New checks cover consecutive main/additional-account reads, duplicate profiles, cached repeat reads, the ten-minute boundary, longer shared failure backoff, cancellations and client recreation. Controller coverage also verifies that a changed identity cannot inherit its previous account's observation when the new usage request fails.
 
 Preview 5 was installed locally from `b2e3e67` on September 28 at 15:36 KST. Its executable matches SHA-256 `f42714733af3724c3174dc035cc4b44df8686772521650adc755c38b32af68ce` and passed the private-build-path scan. The installed app obtained the selected account's usage at 15:36 and the additional account's usage at 15:43, within the same ten-minute interval. Both balances were visible together in the native manager. Repeating the additional-account action reused its observation, the selected account and aliases stayed unchanged, and saving an existing alias through the installed rename dialog succeeded. One supervisor and one widget remain running; disposable verification tasks were removed. This remains a local preview with no public release in this step.
+
+## Preview 6: consistent account-page language
+
+Both tabs use **Weekly remaining**, **Refresh**, and **Last updated · Today HH:mm**. The line below the balance identifies its scope: all Codex accounts combined or the selected Claude account. The underlying read scope and per-account request interval stay unchanged. Healthy account rows no longer repeat observation times; hover details and account details retain them. Failure, expired-data and incomplete-total states remain explicit.
+
+Refresh and session-launch explanations live with their respective actions instead of permanent footer sentences. Both overflow menus use **Refresh usage**. A shared observation-time formatter keeps the Korean and English pages aligned. Native fixtures check the shared labels, quiet healthy rows, long aliases and authentication-recovery states.
+
+All 38 non-pointer regression groups passed. Native previews passed in Korean and English at 100% and 175% scaling, including the shared-copy assertions and existing recovery/long-name checks. The live-pointer check was attempted but could not certify hover stability because the physical cursor moved; it is not counted as a pass. Final synthetic examples: [Codex](design/2026-09-28/copy-preview6/codex-ko.png) and [Claude](design/2026-09-28/copy-preview6/claude-ko.png). Real-account captures remain private.
 
 ## Profile sharing details
 

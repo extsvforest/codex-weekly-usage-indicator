@@ -23,7 +23,8 @@ internal sealed class ClaudeUsageSummaryPanel : UserControl
         AutoScaleMode = AutoScaleMode.Dpi; AutoScaleDimensions = new SizeF(96, 96);
         _layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50)); _layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
         _layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        var title = AccountUiTheme.Label(UiText.T("선택한 계정 · 전체 주간 잔여"), color: AccountUiTheme.Muted);
+        var title = AccountUiTheme.Label(UiText.T("주간 잔여"), color: AccountUiTheme.Muted);
+        title.Name = "UsageSummaryTitle";
         title.Dock = DockStyle.Fill; title.AutoSize = false; title.TextAlign = ContentAlignment.MiddleLeft;
         _profile.Name = "ClaudeSelectedProfileLabel"; _resetDate.Name = "ClaudeSelectedResetDateLabel"; _checkedAt.Name = "ClaudeSelectedCheckedAtLabel";
         foreach (var label in new[] { _profile, _resetDate, _checkedAt })
@@ -63,19 +64,19 @@ internal sealed class ClaudeUsageSummaryPanel : UserControl
         _bar.Remaining = remaining;
         _bar.FillColor = AccountUiTheme.Accent;
         _profile.Text = profile is null ? UiText.T("Claude 계정 연결") : loginRequired
-            ? UiText.T("CLI 로그인 필요") + " · " + profile.Label : UiText.F($"사용 중 · {profile.Label}");
+            ? UiText.T("CLI 로그인 필요") + " · " + profile.Label : UiText.F($"{profile.Label} 기준");
         _profile.ForeColor = loginRequired ? AccountUiTheme.Warning : AccountUiTheme.Muted;
         _reset.Text = window?.ResetsAt is { } reset ? CombinedUsagePanel.TimeUntil(reset, now) : UiText.T("초기화 미확인");
         _resetDate.Text = window?.ResetsAt is { } date ? date.ToLocalTime().ToString("MM.dd HH:mm") : "—";
-        _checkedAt.Text = usage?.IsStale == true ? UiText.F($"이전 확인 {usage.LastUpdatedAt.ToLocalTime():MM.dd HH:mm}") : "";
+        _checkedAt.Text = usage?.IsStale == true ? UiText.T("갱신 필요") : "";
         _checkedAt.ForeColor = AccountUiTheme.Warning;
         var details = usage?.IsStale == true && usage.RetryAfter is { } retry
             ? UiText.F($"이전 확인값 · 다음 확인 가능 {retry.ToLocalTime():HH:mm}") : _checkedAt.Text;
         _details.SetToolTip(_checkedAt, details); _checkedAt.AccessibleDescription = details;
         CheckedAtText = loginRequired ? UiText.T("CLI 로그인 필요")
             : usage is null ? failure is null ? UiText.T("사용량 미확인") : UiText.T("조회 실패")
-            : usage.IsStale || failure is not null ? UiText.F($"이전 확인 {usage.LastUpdatedAt.ToLocalTime():MM.dd HH:mm}")
-            : UiText.F($"{usage.LastUpdatedAt.ToLocalTime().ToString("MM.dd HH:mm")} 확인");
+            : usage.IsStale || failure is not null ? AccountUsageText.PreviousValue(usage.LastUpdatedAt, now)
+            : AccountUsageText.LastUpdated(usage.LastUpdatedAt, now);
         AccessibleDescription = CheckedAtText;
         ApplyGeometry(); SummaryChanged?.Invoke(this, EventArgs.Empty);
     }
