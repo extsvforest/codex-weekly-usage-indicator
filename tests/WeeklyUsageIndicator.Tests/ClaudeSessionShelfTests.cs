@@ -474,6 +474,7 @@ internal static class ClaudeSessionShelfTests
 
         // A rotated file whose last line is unfinished is a gap. However often the run is replayed, no account is
         // confirmed from lines before it; the complete lines written after it can (R4).
+        File.AppendAllLines(main, [InitB(56)]); // evidence a replay must not revive
         File.AppendAllText(main, SignOut(60, AccountB)); // cut off before its newline
         Rotate(Line(65, "unrelated"));
         Check(fresh.Update(start, [A, B]).Status == ClaudeDesktopAccountStatus.Unknown, "an unfinished last line in a rotated file is a gap");
