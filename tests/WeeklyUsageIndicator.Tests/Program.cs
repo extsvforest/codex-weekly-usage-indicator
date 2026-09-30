@@ -2,6 +2,18 @@ using System.Text.Json;
 using WeeklyUsageIndicator;
 
 if (args.Contains("--english")) UiText.SetLanguage("en");
+if (args.Contains("--claude-cli-routing-tests") || args.Contains("--claude-logic-tests"))
+{
+    await ClaudeCliRoutingTests.RunAsync(); await ClaudeDesktopDirectoryTests.RunAsync(); await ClaudeAccountSwitchTests.RunAsync();
+    Console.WriteLine("PASS: Claude ordinary CLI routing, settings, Desktop directory and coordinated switch recovery");
+    if (args.Contains("--claude-logic-tests"))
+    {
+        await ClaudeMetricTests.RunAll(); await ClaudeProfileTests.RunAsync(); await ClaudeControllerTests.RunAsync();
+        await LocalizationTests.RunAsync();
+        Console.WriteLine("PASS: Claude metric, profile, controller and localization regressions (no native UI)");
+    }
+    return;
+}
 if (args.Contains("--live-environment-smoke")) { await LiveEnvironmentSmoke.RunAsync(); return; }
 if (args.Contains("--claude-menu-smoke")) { await ClaudeAccountMenuSmoke.RunAsync(); return; }
 if (args.Contains("--live-claude-menu-smoke")) { await ClaudeAccountMenuSmoke.RunAsync(live: true); return; }
@@ -35,6 +47,9 @@ var tests = new (string Name, Func<Task> Run)[]
     ("stable light tooltip hover, placement and focus", UsageTooltipHoverSmoke.RunAsync),
     ("Claude weekly metric, independent expiry and profile cache", ClaudeMetricTests.RunAll),
     ("Claude official profile identity and shared local work", ClaudeProfileTests.RunAsync),
+    ("Claude ordinary CLI routing and recovery", ClaudeCliRoutingTests.RunAsync),
+    ("Claude opaque Desktop directory recovery", ClaudeDesktopDirectoryTests.RunAsync),
+    ("Claude coordinated account switch and recovery", ClaudeAccountSwitchTests.RunAsync),
     ("Claude login waits, transient observation and identity invalidation", ClaudeControllerTests.RunAsync),
     ("Claude account menu actions and inactive-profile usage", () => ClaudeAccountMenuSmoke.RunAsync()),
     ("account operation lease blocks lifecycle replacement across awaits", AccountOperationLeaseTests.RunAsync),

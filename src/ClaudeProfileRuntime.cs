@@ -104,6 +104,23 @@ internal sealed class ClaudeProfileRuntime
         return identity;
     }
 
+    internal void PrepareOrdinaryProfile(ClaudeProfile profile)
+    {
+        PrepareProfile(profile);
+        new ClaudeSharedSettings(_store).Prepare(profile);
+    }
+
+    internal async Task<string> ReadVerifiedEmailHashAsync(ClaudeProfile profile, CancellationToken token)
+    {
+        var start = CreateStartInfo(profile, null, visible: false, safeMode: true);
+        foreach (var argument in new[] { "auth", "status", "--json" }) start.ArgumentList.Add(argument);
+        var result = await _runner.RunStatusAsync(start, token).ConfigureAwait(false);
+        var identity = ParseStatus(result, profile);
+        if (profile.Identity?.Key != identity.Key) throw new ClaudeIdentityChangedException();
+        using var json = JsonDocument.Parse(result.StandardOutput);
+        return ClaudeDesktopRuntime.EmailHash(json.RootElement.GetProperty("email").GetString()!);
+    }
+
     public async Task<ClaudeProfileIdentity> LoginAsync(ClaudeProfile profile, CancellationToken cancellationToken)
     {
         PrepareProfile(profile);

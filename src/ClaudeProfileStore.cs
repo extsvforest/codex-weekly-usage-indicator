@@ -38,13 +38,17 @@ internal sealed class ClaudeProfileStore
         RootPath = Path.GetFullPath(root ?? Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "CodexWeeklyUsageIndicator.ClaudeProfiles"));
+        _metadataPath = Path.Combine(RootPath, "profiles.json");
+        // A managed user-level route is the selected account, never the original home.
+        // Existing v1 default rows already contain the information needed to pin that home.
+        var original = ReadOriginalLocation();
         var configuredDirectory = Environment.GetEnvironmentVariable("CLAUDE_CONFIG_DIR");
-        var suppliedDirectory = defaultConfigDirectory ?? configuredDirectory;
-        _defaultUsesHome = defaultUsesHome ?? string.IsNullOrWhiteSpace(suppliedDirectory);
+        var suppliedDirectory = defaultConfigDirectory ?? original?.Directory ?? configuredDirectory;
+        _defaultUsesHome = defaultUsesHome ?? (defaultConfigDirectory is null ? original?.UsesHome : null)
+            ?? string.IsNullOrWhiteSpace(suppliedDirectory);
         DefaultConfigDirectory = Path.GetFullPath(string.IsNullOrWhiteSpace(suppliedDirectory)
             ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude")
             : suppliedDirectory);
-        _metadataPath = Path.Combine(RootPath, "profiles.json");
         _mutexName = @"Local\CodexWeeklyUsageIndicator.ClaudeProfiles."
             + Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(RootPath.ToUpperInvariant())))[..20];
         if (IsWithin(DefaultConfigDirectory, RootPath) || IsWithin(RootPath, DefaultConfigDirectory))
@@ -58,6 +62,14 @@ internal sealed class ClaudeProfileStore
         {
             IsSelected = profile.Id == metadata.SelectedProfileId
         }).ToArray();
+    }
+
+    internal void PinOriginalLocation()
+    {
+        using var gate = AcquireLock();
+        var metadata = Read();
+        if (metadata.OriginalConfigDirectory is null || metadata.OriginalUsesHome is null)
+            Write(metadata);
     }
 
     public ClaudeProfile RegisterDefault(string label, ClaudeProfileIdentity identity,
@@ -201,6 +213,8 @@ internal sealed class ClaudeProfileStore
 
     private void Write(Metadata metadata)
     {
+        metadata.OriginalConfigDirectory = DefaultConfigDirectory;
+        metadata.OriginalUsesHome = _defaultUsesHome;
         CreatePrivateDirectory(RootPath);
         var temporary = Path.Combine(RootPath, ".profiles-" + Guid.NewGuid().ToString("N") + ".tmp");
         try
@@ -215,6 +229,30 @@ internal sealed class ClaudeProfileStore
             else File.Move(temporary, _metadataPath);
         }
         finally { if (File.Exists(temporary)) File.Delete(temporary); }
+    }
+
+    private (string Directory, bool UsesHome)? ReadOriginalLocation()
+    {
+        if (!File.Exists(_metadataPath)) return null;
+        if (new FileInfo(_metadataPath).Length is <= 0 or > MaxMetadataBytes
+            || (File.GetAttributes(_metadataPath) & FileAttributes.ReparsePoint) != 0) throw InvalidMetadata();
+        try
+        {
+            using var stream = File.OpenRead(_metadataPath);
+            var metadata = JsonSerializer.Deserialize<Metadata>(stream) ?? throw InvalidMetadata();
+            if (metadata.Version != 1 || metadata.Profiles is null) throw InvalidMetadata();
+            var defaults = metadata.Profiles.Where(profile => profile?.IsDefault == true).ToArray();
+            if (defaults.Length > 1) throw InvalidMetadata();
+            var directory = metadata.OriginalConfigDirectory ?? defaults.FirstOrDefault()?.ConfigDirectory;
+            var usesHome = metadata.OriginalUsesHome ?? defaults.FirstOrDefault()?.UseDefaultHome;
+            if (directory is null && usesHome is null) return null;
+            if (directory is null || usesHome is null || !Path.IsPathFullyQualified(directory)) throw InvalidMetadata();
+            if (defaults.FirstOrDefault() is { } original
+                && (!PathsEqual(original.ConfigDirectory, directory) || original.UseDefaultHome != usesHome))
+                throw InvalidMetadata();
+            return (directory, usesHome.Value);
+        }
+        catch (JsonException) { throw InvalidMetadata(); }
     }
 
     internal static void CreatePrivateDirectory(string path)
@@ -282,6 +320,8 @@ internal sealed class ClaudeProfileStore
     private sealed class Metadata
     {
         public int Version { get; set; } = 1;
+        public string? OriginalConfigDirectory { get; set; }
+        public bool? OriginalUsesHome { get; set; }
         public string? SelectedProfileId { get; set; }
         public List<ClaudeProfile> Profiles { get; set; } = [];
     }

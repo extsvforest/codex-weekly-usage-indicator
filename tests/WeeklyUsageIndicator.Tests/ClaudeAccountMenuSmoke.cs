@@ -115,8 +115,14 @@ internal static class ClaudeAccountMenuSmoke
                 Check(Find<Label>(panel, "ClaudeWeeklyRemaining-" + second.Id).Text != "—", "the added account's row shows a percentage");
                 Check(store.SelectedProfileId == selectedBefore, "checking an inactive account does not switch the selected account");
                 if (!live) Check(sourceCalls.SequenceEqual(new[] { second.Id }), "only the requested profile is queried");
-                Check(Find<Button>(panel, "ClaudeSelect-" + main.Id).Text == UiText.T("사용 중")
-                    && Find<Button>(panel, "ClaudeSelect-" + second.Id).Text == UiText.T("전환"), "both providers use the same account-state vocabulary");
+                foreach (var profile in new[] { main, second })
+                {
+                    var applied = controller.Switcher.IsApplied(profile);
+                    var button = Find<Button>(panel, "ClaudeSelect-" + profile.Id);
+                    Check(button.Text == UiText.T(applied ? "사용 중" : "전환"),
+                        "only a verified app and CLI application uses the In use label");
+                    Check(button.Enabled == !applied, "a legacy selected account must still allow real switching");
+                }
                 Console.WriteLine(live ? "PASS: live Claude menu dismissal, same-label saves and inactive-profile weekly lookup; selection preserved"
                     : "PASS: Claude menu lifecycle, active/inactive rename, inactive usage and shared status labels");
                 var capture = Environment.GetEnvironmentVariable("GFS_CLAUDE_MENU_CAPTURE");

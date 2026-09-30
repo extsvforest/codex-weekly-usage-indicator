@@ -11,6 +11,7 @@ internal sealed class ClaudeAccountController : IDisposable
     private static readonly TimeSpan StatusRetryDelay = TimeSpan.FromMinutes(1);
     internal ClaudeProfileStore Store { get; }
     internal ClaudeProfileRuntime Runtime { get; }
+    internal IClaudeAccountSwitcher Switcher { get; }
     private readonly Dictionary<string, ClaudeUsageClient> _clients = new(StringComparer.Ordinal);
     private readonly Dictionary<string, ClaudeUsageResult> _observations = new(StringComparer.Ordinal);
     private readonly Dictionary<string, Exception> _failures = new(StringComparer.Ordinal);
@@ -30,10 +31,11 @@ internal sealed class ClaudeAccountController : IDisposable
 
     internal ClaudeAccountController(ClaudeProfileStore? store = null, ClaudeProfileRuntime? runtime = null,
         TimeProvider? timeProvider = null, Func<ClaudeProfile, string, string, ClaudeUsageClient>? clientFactory = null,
-        Action? clearRecoveryCache = null)
+        Action? clearRecoveryCache = null, IClaudeAccountSwitcher? switcher = null)
     {
         Store = store ?? new();
         Runtime = runtime ?? new(Store);
+        Switcher = switcher ?? new ClaudeAccountSwitch(Store, Runtime);
         _timeProvider = timeProvider ?? TimeProvider.System;
         _clientFactory = clientFactory ?? ((profile, key, accountKey) =>
         {
@@ -120,25 +122,32 @@ internal sealed class ClaudeAccountController : IDisposable
         finally { _gate.Release(); }
     }
 
-    internal async Task SelectAsync(ClaudeProfile profile, CancellationToken token)
+    internal async Task<bool> SelectAsync(ClaudeProfile profile, CancellationToken token)
     {
         using var operation = BeginOperation(token);
         await _gate.WaitAsync(operation.Token);
         try
         {
-            var identity = await Runtime.VerifyAsync(profile, operation.Token);
-            // Both modes must identify the same subscription. The usage command
-            // ignores extensions and launch settings; selection cannot conceal that.
-            var usageIdentity = await Runtime.VerifyAsync(profile, operation.Token, safeMode: true);
-            if (identity.Key != usageIdentity.Key)
-                throw new InvalidOperationException("Claude 실행과 사용량 조회의 계정이 다릅니다. 로그인 설정을 확인해 주세요.");
-            Store.Select(profile.Id, identity);
+            var completed = await Switcher.SwitchAsync(profile, operation.Token);
+            if (!completed) return false;
             ClearAuthenticationFailure(profile.Id);
         }
         catch (Exception exception) when (exception is UnauthorizedAccessException or InvalidDataException)
         { Forget(profile.Id, exception); throw; }
-        finally { _gate.Release(); }
-        if (!_disposed) SelectionChanged?.Invoke(this, EventArgs.Empty);
+        finally { _gate.Release(); if (!_disposed) SelectionChanged?.Invoke(this, EventArgs.Empty); }
+        return true;
+    }
+
+    internal async Task<bool> ContinueSwitchAsync(bool restore, CancellationToken token)
+    {
+        using var operation = BeginOperation(token);
+        await _gate.WaitAsync(operation.Token);
+        try
+        {
+            var completed = await Switcher.ContinueAsync(restore, operation.Token);
+            return completed;
+        }
+        finally { _gate.Release(); if (!_disposed) SelectionChanged?.Invoke(this, EventArgs.Empty); }
     }
 
     internal async Task<ClaudeUsageResult> ReadUsageAsync(string? profileId, CancellationToken token,
@@ -155,6 +164,8 @@ internal sealed class ClaudeAccountController : IDisposable
         {
             await _gate.WaitAsync(operation.Token);
             entered = true;
+            if (profileId is null && Switcher.HasPending)
+                throw new InvalidOperationException("Claude 전환이 중단되었습니다. 전환을 확인하거나 되돌리세요.");
             var profile = ResolveProfile(profileId);
             if (profile.Id != requestedProfile.Id)
                 throw new OperationCanceledException("Claude account selection changed during the request.");
