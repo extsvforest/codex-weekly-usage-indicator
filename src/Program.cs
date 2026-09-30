@@ -61,6 +61,11 @@ internal sealed class UsageIndicatorForm : Form
     private readonly AppServerClient _codexClient = new();
     private readonly ClaudeUsageClient? _claudeClient;
     private readonly ClaudeAccountController? _claudeAccounts;
+    private readonly ClaudeShelfService? _claudeShelf;
+    private readonly ClaudeAppFollower? _claudeFollower;
+    private string? _lastAppKey;
+    private string? _claudeAppGate;
+    private DateTime? _claudeGateRun;
     private long _claudeGeneration;
     private readonly CodexDesktopStateReader _codexStateReader = new();
     private readonly System.Windows.Forms.Timer _pollTimer = new() { Interval = 60_000 };
@@ -108,11 +113,25 @@ internal sealed class UsageIndicatorForm : Form
         {
             _claudeAccounts = new ClaudeAccountController();
             _claudeAccounts.SelectionChanged += OnClaudeSelectionChanged;
+            var claudeAccounts = _claudeAccounts;
+            var shelf = new ClaudeShelfService(this, () => claudeAccounts.Store.ListProfiles());
+            _claudeShelf = shelf;
+            shelf.StatusChanged += OnClaudeShelfStatusChanged;
+            _claudeFollower = new ClaudeAppFollower(() => shelf.Status, () => claudeAccounts.SelectedProfile.Id,
+                async (profileId, stillWanted, token) =>
+                {
+                    var profile = claudeAccounts.Store.ListProfiles().SingleOrDefault(p => p.Id == profileId && p.IsVerified)
+                        ?? throw new InvalidOperationException("The app's account needs a usage sign-in.");
+                    await claudeAccounts.SelectAsync(profile, token, stillWanted);
+                }, () => DateTimeOffset.Now, _claudeLifetime.Token);
+            _claudeFollower.Changed += (_, _) => { if (!IsDisposed) UpdateAppMismatch(); };
             _claudeAccounts.UsageChanged += (_, observation) =>
             {
                 if (!IsDisposed && IsHandleCreated) BeginInvoke((Action)(() =>
                 {
-                    if (IsDisposed || observation.ProfileId != _claudeAccounts.SelectionKey) return;
+                    if (IsDisposed) return;
+                    _claudeFollower?.OnUsageObserved(observation.ProfileId, _claudeAccounts.LastFailure(observation.ProfileId) is null);
+                    if (observation.ProfileId != _claudeAccounts.SelectionKey) return;
                     _claudeUsage = _claudeAccounts.LastUsage(observation.ProfileId);
                     _claudeFailure = _claudeAccounts.LastFailure(observation.ProfileId);
                     _claudeError = _claudeFailure is not null ? FriendlyClaudeError(_claudeFailure)
@@ -146,7 +165,7 @@ internal sealed class UsageIndicatorForm : Form
         _toolTip.SetHoverText(UiText.T("Codex 및 Claude 사용량을 불러오는 중…"));
         _toolTip.TrackHover(this);
 
-        _pollTimer.Tick += async (_, _) => await RefreshUsageAsync();
+        _pollTimer.Tick += async (_, _) => { _claudeFollower?.Ensure(); await RefreshUsageAsync(); };
         _codexStateTimer.Tick += (_, _) =>
         {
             if (_openAccountsSignal.WaitOne(0)) ShowAccountManager();
@@ -170,6 +189,7 @@ internal sealed class UsageIndicatorForm : Form
             else if (_accountStore.HasPendingUsageQuery) ShowAccountManager();
             SyncCodexVisibility();
             _codexStateTimer.Start();
+            _claudeShelf?.Start();
             if (openAccounts) ShowAccountManager();
         };
 
@@ -195,6 +215,8 @@ internal sealed class UsageIndicatorForm : Form
             _codexClient.Dispose();
             _claudeClient?.Dispose();
             _claudeLifetime.Cancel();
+            _claudeFollower?.Dispose();
+            _claudeShelf?.Dispose();
             _claudeAccounts?.Dispose();
             _toolTip.Dispose();
             _contextMenu.Dispose();
@@ -274,11 +296,12 @@ internal sealed class UsageIndicatorForm : Form
         var copyItem = new ToolStripMenuItem(UiText.T("현재 상태 복사"));
         copyItem.Click += (_, _) =>
         {
+            var (claudeUsage, claudeError) = ClaudeDisplay();
             Clipboard.SetText(BuildClipboardText(
                 _codexSnapshot,
-                _claudeUsage,
+                claudeUsage,
                 _codexError,
-                _claudeError,
+                claudeError,
                 _showClaude, _claudeMetric));
         };
 
@@ -516,7 +539,8 @@ internal sealed class UsageIndicatorForm : Form
         }
         string? claudeLabel = null;
         try { claudeLabel = _claudeAccounts?.SelectedProfile.Label; } catch { }
-        _toolTip.SetHoverText(BuildTooltipText(_codexSnapshot, _claudeUsage, _codexError, _claudeError,
+        var (claudeUsage, claudeError) = ClaudeDisplay();
+        _toolTip.SetHoverText(BuildTooltipText(_codexSnapshot, claudeUsage, _codexError, claudeError,
             _showClaude, _combinedUsage, accounts.FirstOrDefault(a => a.IsActive)?.Label, _claudeMetric, claudeLabel));
     }
 
@@ -566,7 +590,8 @@ internal sealed class UsageIndicatorForm : Form
     }
 
     private AccountManagerForm CreateAccountManager(bool refreshAllOnOpen) => new(_accountStore, SuspendAccountsAsync, ResumeAccounts,
-        queryUsage: QueryAccountUsageAsync, combined: _combinedUsage, usageChanged: UpdateToolTip, refreshAllOnOpen: refreshAllOnOpen, claudeAccounts: _claudeAccounts);
+        queryUsage: QueryAccountUsageAsync, combined: _combinedUsage, usageChanged: UpdateToolTip, refreshAllOnOpen: refreshAllOnOpen, claudeAccounts: _claudeAccounts,
+        claudeShelf: _claudeShelf);
 
     private async Task QueryAccountUsageAsync(SavedCodexAccount account, CancellationToken token)
     {
@@ -636,6 +661,68 @@ internal sealed class UsageIndicatorForm : Form
         }
     }
 
+    // The widget's Claude number describes the account the running Desktop app uses. Whenever the app is known to be
+    // on another account, signed out, switching, or on an unregistered account, show no number and the reason rather
+    // than another account's. A lapse in observing the same run, or an uninspectable process, keeps what was shown;
+    // a closed app, or a new run not observed yet, shows the last selection.
+    private (ClaudeUsageResult? Usage, string? Error) ClaudeDisplay() =>
+        _claudeAppGate is null ? (_claudeUsage, _claudeError) : (null, _claudeAppGate);
+
+    private void OnClaudeShelfStatusChanged(object? sender, EventArgs e)
+    {
+        if (IsDisposed || _claudeAccounts is null || _claudeShelf is null) return;
+        var status = _claudeShelf.Status;
+        var appKey = status.AppConfirmed ? status.App.Key : null;
+        if (appKey != _lastAppKey)
+        {
+            _lastAppKey = appKey;
+            if (appKey is not null && status.PendingForApp is > 0 && _accountTray is { Visible: true } tray)
+            {
+                var label = _claudeAccounts.Store.ListProfiles().SingleOrDefault(p => p.Id == status.AppProfileId)?.Label ?? "";
+                tray.ShowBalloonTip(8000, UiText.T("Claude 세션 목록"),
+                    UiText.F($"{label} 계정 목록에 아직 없는 세션이 {status.PendingForApp}개 있습니다. Claude를 한 번 종료하면 채워집니다."),
+                    ToolTipIcon.Info);
+            }
+        }
+        _claudeFollower?.OnStatusChanged();
+        UpdateAppMismatch();
+    }
+
+    private void UpdateAppMismatch()
+    {
+        if (_claudeAccounts is null || _claudeShelf is null) return;
+        var status = _claudeShelf.Status;
+        var gate = AppGate(status, _claudeAccounts.SelectedProfile.Id, _claudeFollower?.Following is not null, _claudeAppGate,
+            _claudeGateRun);
+        // The displayed reason belongs to the observed run; an uninspectable process keeps it.
+        if (status.Desktop != ClaudeDesktopRunState.Unknown) _claudeGateRun = status.HostStartedAt;
+        if (gate == _claudeAppGate) return;
+        _claudeAppGate = gate;
+        UpdateToolTip(); Invalidate();
+    }
+
+    internal static string? AppGate(ClaudeShelfStatus status, string selectedProfileId, bool following, string? shown = null,
+        DateTime? shownRun = null)
+    {
+        if (status.Desktop == ClaudeDesktopRunState.Closed) return null;
+        // An app process that cannot be inspected is evidence of nothing: keep what was shown.
+        if (status.Desktop == ClaudeDesktopRunState.Unknown) return shown;
+        return status.App.Status switch
+        {
+            ClaudeDesktopAccountStatus.Unregistered => UiText.T("Claude 앱이 등록되지 않은 계정으로 로그인되어 있습니다."),
+            ClaudeDesktopAccountStatus.SignedOut => UiText.T("Claude 앱이 로그아웃 상태입니다."),
+            ClaudeDesktopAccountStatus.SignedIn when !status.App.Confirmed => UiText.T("Claude 앱 계정을 확인하는 중입니다."),
+            ClaudeDesktopAccountStatus.SignedIn when status.AppProfileId is null =>
+                UiText.T("Claude 앱이 등록되지 않은 계정으로 로그인되어 있습니다."),
+            ClaudeDesktopAccountStatus.SignedIn when status.AppProfileId != selectedProfileId => following
+                ? UiText.T("Claude 앱 계정을 확인하는 중입니다.") : UiText.T("Claude 앱 계정의 사용량을 확인하지 못했습니다."),
+            // A lapse in observing the same run keeps what was shown; a new run not observed yet shows the last selection.
+            ClaudeDesktopAccountStatus.Unknown or ClaudeDesktopAccountStatus.Closed =>
+                status.HostStartedAt is { } run && run == shownRun ? shown : null,
+            _ => null
+        };
+    }
+
     private async void OnClaudeSelectionChanged(object? sender, EventArgs e)
     {
         _claudeGeneration++;
@@ -661,8 +748,9 @@ internal sealed class UsageIndicatorForm : Form
         graphics.DrawPath(borderPen, borderPath);
 
         var codexUsed = _codexError is null ? (double?)_codexSnapshot?.UsedPercent : null;
-        var claudeUsed = _claudeError is null
-            ? _claudeMetric.SelectUsedPercent(_claudeUsage?.Snapshot, DateTimeOffset.UtcNow)
+        var (claudeUsage, claudeError) = ClaudeDisplay();
+        var claudeUsed = claudeError is null
+            ? _claudeMetric.SelectUsedPercent(claudeUsage?.Snapshot, DateTimeOffset.UtcNow)
             : null;
         var codexAccent = Color.FromArgb(124, 156, 255);
 

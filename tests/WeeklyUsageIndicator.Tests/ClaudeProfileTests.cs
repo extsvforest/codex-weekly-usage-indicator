@@ -101,13 +101,9 @@ internal static class ClaudeProfileTests
             runner.Status = Status(second, "second@example.test", "api_key");
             await MustThrowAsync<UnauthorizedAccessException>(() => runtime.VerifyAsync(verified, CancellationToken.None));
 
-            runner.Status = Status(second, "second@example.test");
-            var processId = await runtime.LaunchAsync(verified, original);
-            Check(processId == 77 && runner.LastLaunch is { CreateNoWindow: false, UseShellExecute: false },
-                "explicit launch opens only the official executable in a new user console");
-            Check(runner.LastLaunch!.WorkingDirectory == original
-                  && runner.LastLaunch.Environment["CLAUDE_CONFIG_DIR"] == second.ConfigDirectory,
-                "the verified launch and selected profile use the same home");
+            Check(typeof(ClaudeProfileRuntime).GetMethod("LaunchAsync") is null
+                  && typeof(IClaudeProfileCommandRunner).GetMethod("Launch") is null,
+                "the utility never starts an interactive Claude session with a profile");
             runner.InteractiveExit = 1;
             await MustThrowAsync<InvalidOperationException>(() => runtime.LoginAsync(second, CancellationToken.None));
             Check(store.SelectedProfileId == second.Id, "failed official login leaves selection unchanged");
@@ -207,12 +203,10 @@ internal static class ClaudeProfileTests
         public int InteractiveExit { get; set; }
         public ProcessStartInfo? LastStatus { get; private set; }
         public ProcessStartInfo? LastInteractive { get; private set; }
-        public ProcessStartInfo? LastLaunch { get; private set; }
         public Task<ClaudeProfileCommandResult> RunStatusAsync(ProcessStartInfo start, CancellationToken cancellationToken)
         { cancellationToken.ThrowIfCancellationRequested(); LastStatus = start; return Task.FromResult(Status); }
         public Task<int> RunInteractiveAsync(ProcessStartInfo start, CancellationToken cancellationToken)
         { cancellationToken.ThrowIfCancellationRequested(); LastInteractive = start; return Task.FromResult(InteractiveExit); }
         public Task<int> RunQuietAsync(ProcessStartInfo start, CancellationToken cancellationToken) => Task.FromResult(0);
-        public int Launch(ProcessStartInfo start) { LastLaunch = start; return 77; }
     }
 }

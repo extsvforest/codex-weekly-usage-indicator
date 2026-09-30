@@ -11,7 +11,7 @@ Blue is Codex; orange is Claude. Choose **all-model weekly** or **Fable weekly**
 ![A light account manager showing combined Codex usage, reset times and manual switch actions](docs/design/2026-09-28/100/manager.png)
 
 - **See what is left across your Codex accounts.** Check their remaining weekly percentages and the next reset without signing out of your current account.
-- **Choose the account you want to use.** Switch Codex manually, or open Claude Code with a selected profile and your existing local conversations and skills.
+- **Choose the account you want to use.** Switch Codex manually. For Claude, switch accounts in the Claude app; every account keeps this PC's Code sessions in its list.
 - **Keep Windows and WSL Codex in step.** Connect an installed WSL environment once, then include it when you switch accounts.
 
 Screenshots use synthetic accounts and usage. This is an unofficial community project.
@@ -58,18 +58,20 @@ Local file-based ChatGPT authentication is supported. Keyring and managed authen
 
 ## Claude Code accounts
 
-![Claude account tab with a selected profile, weekly usage and launch actions](docs/design/2026-09-28/100/claude.png)
-
 1. Open the **Claude** tab and choose **Connect existing account** to register the Claude Code account you already use.
-2. Choose **+ Add account** and sign in through the official Claude Code login window. Each additional account gets its own official login profile.
-3. Press **Select** on the account you want. The widget and new Claude launches from this panel now use that profile.
-4. Press **Open Claude…**, choose your project folder, and continue working in the new terminal.
+2. Choose **+ Add account** and sign in through the official Claude Code login window. Each additional account gets its own official login profile, used for its usage checks.
+3. Switch accounts in the Claude desktop app itself: sign out, then sign in with the other account. The row of the account the app is using shows **In use**, and the widget follows it. While the app is signed out, signed in to an account not registered here, or still confirming a switch, the widget shows `—` with the reason instead of another account's usage.
 
-**Use the panel to launch an additional profile.** Selecting one here does not change a plain `claude` command in an ordinary terminal or an already open IDE session. Existing sessions keep their current account; no running work is stopped or switched underneath you.
+### Keep your Code sessions in every account
 
-Your original Claude folder stays in place. Additional profiles share the existing local conversation, skill and other working directories through folder links. User instructions and settings are passed to the official CLI; local plugin installations are reused where supported. Account-specific configuration, cloud connections and authentication stay separate. Prompt recall history is shared where Windows file links are available; conversation files remain shared independently of that capability.
+The Claude desktop app lists Code sessions per account, so signing in with another account used to show an empty list even though the conversations were still on this PC. The widget fixes the list, not the login: whenever Claude is fully closed, it adds each registered account's missing Code sessions to the other accounts' lists. The next time you open Claude with either account, the same sessions are there, and opening one continues the same conversation.
 
-The summary shows the selected account's overall weekly balance and reset time. Use **Refresh** in the upper-right corner to check it, or choose **Check this account's usage** from another account's **···** menu. Manual and widget checks share a ten-minute interval for each account, so you can check another account immediately after the current one. Repeated checks reuse that account's current observation; temporary failures delay retries only for the affected account. Other Claude accounts are not polled in the background. **Open Claude…** is at the bottom right. The **···** menu also provides account details, rename, sign in again, sign out and removal from the list. **Remove from list** keeps that profile's login and conversation files; use **Sign out** first if you want the official CLI to end its login.
+- It only adds entries. It never moves, changes or deletes a list entry the app wrote, never touches conversations themselves, and never reads or copies sign-in data.
+- It writes only while Claude and its Code sessions are closed. If you switch accounts inside the app, the account tab says how many sessions are still missing; quit Claude once and they are added. **Reopen after quitting** reopens Claude after that fill (once, within 30 minutes).
+- Archived sessions, sessions still being written, folderless scratch sessions, remote/worktree/Cowork sessions and sessions whose folder or conversation file is gone are left out. A session you delete in one account's list is not added back to that account.
+- After a Claude update the widget checks that the app still behaves the way this relies on. If not, it pauses filling and says so on the account tab.
+
+The summary shows the in-use account's overall weekly balance and reset time. Use **Refresh** in the upper-right corner to check it, or choose **Check this account's usage** from another account's **···** menu. Manual and widget checks share a ten-minute interval for each account, so you can check another account immediately after the current one. Repeated checks reuse that account's current observation; temporary failures delay retries only for the affected account. Other Claude accounts are not polled in the background. The **···** menu also provides account details, rename, sign in again, sign out and removal from the list. **Remove from list** keeps that profile's login files; use **Sign out** first if you want the official CLI to end its login.
 
 Usage requires a working [Claude Code CLI sign-in](https://code.claude.com/docs/en/authentication). Being able to chat in the Claude desktop app does not verify the CLI's sign-in. If authentication is missing or another account is signed in, the account tab shows the reason and a **Sign in again** button. Sign in with the account originally connected to that row. The tool keeps the saved identity, and it does not display another account's usage under the old label. A malformed status response is reported as an error, not as an expired login.
 

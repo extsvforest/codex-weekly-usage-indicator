@@ -41,7 +41,9 @@ internal static class ClaudeAccountMenuSmoke
                             TimeProvider.System, ClaudeUsageNullCacheStore.Instance, key, accountKey: accountKey), clearRecoveryCache: () => { });
                 using var form = new Form { ClientSize = new(960, 650), Text = "Claude account interaction check" };
                 AccountUiTheme.SetForm(form);
-                using var panel = new ClaudeAccountPanel(controller) { Dock = DockStyle.Fill };
+                // Never started: no real Desktop observation or fill runs inside this fixture.
+                using var shelf = new ClaudeShelfService(form, () => store.ListProfiles());
+                using var panel = new ClaudeAccountPanel(controller, shelf) { Dock = DockStyle.Fill };
                 form.Controls.Add(panel); form.Show(); Application.DoEvents();
 
                 ContextMenuStrip OpenMenu(string id)
@@ -115,8 +117,25 @@ internal static class ClaudeAccountMenuSmoke
                 Check(Find<Label>(panel, "ClaudeWeeklyRemaining-" + second.Id).Text != "—", "the added account's row shows a percentage");
                 Check(store.SelectedProfileId == selectedBefore, "checking an inactive account does not switch the selected account");
                 if (!live) Check(sourceCalls.SequenceEqual(new[] { second.Id }), "only the requested profile is queried");
-                Check(Find<Button>(panel, "ClaudeSelect-" + main.Id).Text == UiText.T("사용 중")
-                    && Find<Button>(panel, "ClaudeSelect-" + second.Id).Text == UiText.T("전환"), "both providers use the same account-state vocabulary");
+                Check(!Find<Button>(panel, "ClaudeSelect-" + main.Id).Visible && !Find<Button>(panel, "ClaudeSelect-" + second.Id).Visible,
+                    "without a confirmed Desktop account no row claims to be in use, and there is no manual switch");
+                shelf.SetStatusForTest(ClaudeShelfStatus.Initial with
+                {
+                    Desktop = ClaudeDesktopRunState.Running, AppProfileId = second.Id, PendingForApp = 2, MappedAccounts = 2,
+                    App = new ClaudeDesktopAccountState(ClaudeDesktopAccountStatus.SignedIn,
+                        "46411433-0040-4598-a1bd-a5444a5eb7b4", "a8f42351-0c23-4928-87ef-ecb3e3bf2b10")
+                });
+                Application.DoEvents();
+                var badge = Find<Button>(panel, "ClaudeSelect-" + second.Id);
+                Check(badge.Visible && badge.Text == UiText.T("사용 중") && !badge.Enabled
+                    && !Find<Button>(panel, "ClaudeSelect-" + main.Id).Visible, "only the Desktop app's confirmed account shows In use");
+                var reopen = Find<Button>(panel, "ClaudeShelfRelaunchButton");
+                Check(reopen.Visible && reopen.Text == UiText.T("종료하면 다시 열기")
+                    && Find<Label>(panel, "ClaudeShelfStatusLabel").Text.Contains('2'), "a pending fill explains itself and offers a reopen");
+                reopen.PerformClick(); Application.DoEvents();
+                Check(shelf.Status.RelaunchArmed && reopen.Text == UiText.T("다시 열기 취소"), "reopening after quit can be armed");
+                reopen.PerformClick(); Application.DoEvents();
+                Check(!shelf.Status.RelaunchArmed && reopen.Text == UiText.T("종료하면 다시 열기"), "and cancelled");
                 Console.WriteLine(live ? "PASS: live Claude menu dismissal, same-label saves and inactive-profile weekly lookup; selection preserved"
                     : "PASS: Claude menu lifecycle, active/inactive rename, inactive usage and shared status labels");
                 var capture = Environment.GetEnvironmentVariable("GFS_CLAUDE_MENU_CAPTURE");
@@ -167,7 +186,6 @@ internal static class ClaudeAccountMenuSmoke
             Task.FromResult(Status(start.Environment["CLAUDE_CONFIG_DIR"]!));
         public Task<int> RunInteractiveAsync(ProcessStartInfo start, CancellationToken token) => throw new NotSupportedException();
         public Task<int> RunQuietAsync(ProcessStartInfo start, CancellationToken token) => throw new NotSupportedException();
-        public int Launch(ProcessStartInfo start) => throw new NotSupportedException();
     }
     private sealed class FixtureSource(Action called) : IClaudeUsageSource
     {

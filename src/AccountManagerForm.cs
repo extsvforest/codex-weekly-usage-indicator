@@ -38,6 +38,7 @@ internal sealed partial class AccountManagerForm : Form
     private readonly Button _claudeTab = AccountUiTheme.Button("ClaudeProviderTab", "Claude");
     private readonly Button _environments = AccountUiTheme.Button("CodexEnvironmentsButton", UiText.T("Windows · WSL 연결"));
     private readonly ClaudeAccountController? _claudeAccounts;
+    private readonly ClaudeShelfService? _claudeShelf;
     private readonly ClaudeAccountPanel? _claudePanel;
     private bool _showingClaude;
     private readonly TableLayoutPanel _notice = new() { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1, Margin = new Padding(0, 0, 0, 12), Padding = new Padding(12, 6, 8, 6), BackColor = AccountUiTheme.Raised };
@@ -57,7 +58,8 @@ internal sealed partial class AccountManagerForm : Form
     internal AccountManagerForm CreateLocalizedCopy()
     {
         var copy = new AccountManagerForm(_store, _suspend, _resume, _accountsChanged,
-            _queryUsage, refreshAllOnOpen: false, combined: _combined, usageChanged: _usageChanged, claudeAccounts: _claudeAccounts);
+            _queryUsage, refreshAllOnOpen: false, combined: _combined, usageChanged: _usageChanged, claudeAccounts: _claudeAccounts,
+            claudeShelf: _claudeShelf);
         copy.ShowProvider(_showingClaude);
         return copy;
     }
@@ -67,11 +69,11 @@ internal sealed partial class AccountManagerForm : Form
 
     public AccountManagerForm(CodexAccountStore store, Func<Task> suspend, Action resume, Action? accountsChanged = null,
         Func<SavedCodexAccount, CancellationToken, Task>? queryUsage = null, bool refreshAllOnOpen = true, CombinedUsageSnapshot? combined = null, Action? usageChanged = null,
-        ClaudeAccountController? claudeAccounts = null)
+        ClaudeAccountController? claudeAccounts = null, ClaudeShelfService? claudeShelf = null)
     {
         SuspendLayout(); _store = store; _suspend = suspend; _resume = resume; _accountsChanged = accountsChanged;
         _queryUsage = queryUsage ?? ((account, token) => CodexAccountUsageReader.ReadInactiveAsync(store, account.Id, token));
-        _combined = combined ?? new(); _usageChanged = usageChanged; _claudeAccounts = claudeAccounts;
+        _combined = combined ?? new(); _usageChanged = usageChanged; _claudeAccounts = claudeAccounts; _claudeShelf = claudeShelf;
         _refreshAllOnOpen = refreshAllOnOpen; Name = "AccountManagerForm";
         AccountUiTheme.SetForm(this); Text = UiText.T("계정 관리");
         ClientSize = new Size(920, 780); MinimumSize = new Size(780, 600); StartPosition = FormStartPosition.CenterScreen; KeyPreview = true;
@@ -118,7 +120,7 @@ internal sealed partial class AccountManagerForm : Form
         _pageHost.Controls.Add(_root);
         if (claudeAccounts is not null)
         {
-            _claudePanel = new ClaudeAccountPanel(claudeAccounts) { Dock = DockStyle.Fill, Visible = false };
+            _claudePanel = new ClaudeAccountPanel(claudeAccounts, claudeShelf) { Dock = DockStyle.Fill, Visible = false };
             _claudePanel.BusyChanged += (_, _) => { _codexTab.Enabled = _claudeTab.Enabled = !IsOperationInProgress; UpdateProviderHeader(); };
             _claudePanel.SummaryChanged += (_, _) => UpdateProviderHeader();
             _pageHost.Controls.Add(_claudePanel);

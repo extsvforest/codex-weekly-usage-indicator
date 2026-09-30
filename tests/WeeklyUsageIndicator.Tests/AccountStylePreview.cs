@@ -204,7 +204,6 @@ internal static class AccountStylePreview
         public Task<ClaudeProfileCommandResult> RunStatusAsync(System.Diagnostics.ProcessStartInfo start, CancellationToken token) => throw NoAccess();
         public Task<int> RunInteractiveAsync(System.Diagnostics.ProcessStartInfo start, CancellationToken token) => throw NoAccess();
         public Task<int> RunQuietAsync(System.Diagnostics.ProcessStartInfo start, CancellationToken token) => throw NoAccess();
-        public int Launch(System.Diagnostics.ProcessStartInfo start) => throw NoAccess();
     }
     private sealed class PreviewWslBridge : IWslCodexBridge
     {

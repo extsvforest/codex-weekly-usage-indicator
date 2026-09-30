@@ -67,5 +67,11 @@
   "Claude 표시": "Claude display",
   "Fable 주간 잔여량": "Fable · weekly remaining",
   "전체 주간 잔여량": "All models · weekly remaining",
-  "사용량 표시": "Show usage"
+  "사용량 표시": "Show usage",
+  "Claude 앱이 등록되지 않은 계정으로 로그인되어 있습니다.": "The Claude app is signed in to an account that is not registered.",
+  "Claude 앱 계정의 사용량을 확인하지 못했습니다.": "Could not check usage for the Claude app's account.",
+  "Claude 세션 목록": "Claude session lists",
+  "{0} 계정 목록에 아직 없는 세션이 {1}개 있습니다. Claude를 한 번 종료하면 채워집니다.": "{1} sessions are missing from {0}'s list. Quit Claude once to add them.",
+  "Claude 앱이 로그아웃 상태입니다.": "The Claude app is signed out.",
+  "Claude 앱 계정을 확인하는 중입니다.": "Checking the Claude app's account."
 }

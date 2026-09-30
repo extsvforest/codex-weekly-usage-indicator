@@ -24,7 +24,6 @@ internal sealed class ClaudeAccountController : IDisposable
     private volatile bool _disposed;
     internal event EventHandler? SelectionChanged;
     internal event EventHandler<ClaudeUsageObservedEventArgs>? UsageChanged;
-    internal string? LastWorkingDirectory { get; set; }
     internal ClaudeProfile SelectedProfile => Store.SelectedProfile ?? Store.DefaultProfile;
     internal string SelectionKey => SelectedProfile.Id;
 
@@ -120,7 +119,10 @@ internal sealed class ClaudeAccountController : IDisposable
         finally { _gate.Release(); }
     }
 
-    internal async Task SelectAsync(ClaudeProfile profile, CancellationToken token)
+    /// <summary>Selects the profile whose usage the widget shows. <paramref name="stillWanted"/> is checked right
+    /// before the selection is stored, so a verification that outlives its reason (the app changed accounts again)
+    /// never lands.</summary>
+    internal async Task SelectAsync(ClaudeProfile profile, CancellationToken token, Func<bool>? stillWanted = null)
     {
         using var operation = BeginOperation(token);
         await _gate.WaitAsync(operation.Token);
@@ -132,6 +134,8 @@ internal sealed class ClaudeAccountController : IDisposable
             var usageIdentity = await Runtime.VerifyAsync(profile, operation.Token, safeMode: true);
             if (identity.Key != usageIdentity.Key)
                 throw new InvalidOperationException("Claude 실행과 사용량 조회의 계정이 다릅니다. 로그인 설정을 확인해 주세요.");
+            operation.Token.ThrowIfCancellationRequested();
+            if (stillWanted?.Invoke() == false) throw new OperationCanceledException("The Desktop account changed again.");
             Store.Select(profile.Id, identity);
             ClearAuthenticationFailure(profile.Id);
         }

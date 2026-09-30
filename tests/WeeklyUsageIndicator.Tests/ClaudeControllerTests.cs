@@ -350,7 +350,6 @@ internal static class ClaudeControllerTests
         }
 
         public Task<int> RunQuietAsync(ProcessStartInfo start, CancellationToken token) => Task.FromResult(0);
-        public int Launch(ProcessStartInfo start) => 77;
 
         internal static ClaudeProfileCommandResult Status(string directory, string email) => new(0,
             JsonSerializer.Serialize(new { loggedIn = true, authMethod = "claude.ai", apiProvider = "firstParty",

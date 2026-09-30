@@ -61,5 +61,10 @@
   "파일 사용 중": "File in use",
   "파일 정리 오류": "File cleanup error",
   "조회 프로세스 종료를 확인하지 못했습니다. 조회 복구를 실행해 주세요.": "The usage-check process could not be confirmed stopped. Run usage-check recovery.",
-  "Codex CLI를 찾지 못했습니다. Codex 앱을 먼저 실행해 주세요.": "The Codex CLI could not be found. Open the Codex app first."
+  "Codex CLI를 찾지 못했습니다. Codex 앱을 먼저 실행해 주세요.": "The Codex CLI could not be found. Open the Codex app first.",
+  "Claude 앱이 실행 중이라 세션 목록을 채우지 않았습니다.": "Claude is running, so session lists were not filled.",
+  "Claude 앱이 켜져 세션 목록 채우기를 중간에 멈췄습니다.": "Claude started, so filling session lists stopped partway.",
+  "세션 목록이 준비 중에 바뀌어 아무것도 쓰지 않았습니다.": "A session list changed during preparation, so nothing was written.",
+  "세션 목록 채우기가 이미 진행 중입니다.": "Session lists are already being filled.",
+  "세션 목록 장부를 읽을 수 없습니다.": "The session-list ledger cannot be read."
 }

@@ -160,5 +160,19 @@
   "초기화 시점 지남 · 갱신 필요": "Reset time passed · Refresh needed",
   "확인 완료": "Checked",
   "주간 잔여 사용량": "Weekly remaining usage",
-  "조회 취소됨": "Canceled"
+  "조회 취소됨": "Canceled",
+  "종료하면 다시 열기": "Reopen after quitting",
+  "다시 열기 취소": "Cancel reopen",
+  "Claude를 종료하면 세션 목록을 채운 뒤 다시 엽니다. 30분 안에 한 번 적용됩니다.": "When Claude quits, session lists are filled and Claude reopens. Applies once within 30 minutes.",
+  "Claude 계정을 두 개 이상 연결하면 세션 목록을 서로 채웁니다.": "Connect two or more Claude accounts to fill their session lists from each other.",
+  "세션 목록 채우기 멈춤 · 이 Claude 버전은 아직 확인되지 않았습니다.": "Session-list filling paused · This Claude version has not been verified yet.",
+  "아직 없는 세션 {0}개 · Claude를 종료하면 채운 뒤 다시 엽니다.": "{0} sessions missing · When Claude quits, they are added and Claude reopens.",
+  "{0} 목록에 아직 없는 세션 {1}개 · Claude를 종료하면 채웁니다.": "{1} sessions missing from {0}'s list · They are added when Claude quits.",
+  "세션 목록 채우기 실패 · {0}": "Session-list filling failed · {0}",
+  "세션 목록 일부 보류 · 사용 중이거나 복구 중인 세션은 나중에 채웁니다.": "Some sessions held · Sessions in use or being recovered are added later.",
+  "세션 목록 · 모든 계정 채움 · {0}": "Session lists · All accounts filled · {0}",
+  "세션 목록 · Claude를 종료하면 모든 계정 목록을 서로 채웁니다.": "Session lists · When Claude quits, every account's list is filled from the others.",
+  "이 계정의 사용량 조회 로그인이 필요합니다.": "This account needs a usage sign-in.",
+  "Claude 앱이 지금 이 계정으로 로그인되어 있습니다.": "The Claude app is signed in to this account now.",
+  "다시 열기 예약됨 · Claude를 종료하면 세션 목록을 채운 뒤 다시 엽니다.": "Reopen scheduled · When Claude quits, session lists are filled and Claude reopens."
 }

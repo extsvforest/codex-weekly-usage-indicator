@@ -2,6 +2,18 @@
 
 The September 28 upgrade combines the approved compact account-table layout with the warm paper palette, adds a selectable Claude weekly metric, and connects manual Claude profiles and installed WSL Codex environments.
 
+## Preview 7: Claude session lists across accounts (2026-10-01)
+
+The desktop app lists Code sessions per account and organization (`claude-code-sessions\<account>\<org>`), while every account shares the same transcripts. Signing in with another account therefore showed an empty list. The earlier plan of swapping whole app-data folders per account is withdrawn: it split the lists further and held login state in utility folders. That work is kept only on the local branch `codex/desktop-profile-swap-wip`.
+
+Decision (reviewed with Codex before and during implementation): sign-in stays in the official app, and the widget adds missing list entries only while Desktop is closed. Invariants are in `AGENTS.md`. Manual Claude "switch" and **Open Claude…** are removed; **In use** now reflects the account the running app confirmed in its log.
+
+Two implementation review rounds tightened the first build: the plan is rebuilt immediately before publishing and Desktop is checked before every file; an uninspectable process never counts as closed; a gap in the app log drops the confirmed account, and the log file is recognized by its file identity because rotation keeps the old creation time; a malformed writer registration of a live process holds writes; a reopen request belongs to one closure; the widget shows no number while the app is signed out, switching or on an unregistered account; and the compatibility guard checks the data flow of the app's deletion protection, not only its strings.
+
+Live evidence on this PC (app 2.16120.0.0): a one-shot script outside the app waited for Desktop to quit, added 88 entries to the second account's list and reopened the app. The app then logged `Loaded 88 persisted sessions` for that account. One conversation was continued under the second account, then under the first account's original entry after signing back in; the second account's turns were present. Deleting a session in one account while another account still lists it was checked only in the app code, not live. The Windows implementation's own fixture tests do not replace a live round trip; the installed build still needs one.
+
+Known limits: the main row's usage profile is the default Claude home, so signing the terminal CLI into another account still shows "different account" until it is signed back in. Utility profiles created earlier keep their folder links; nothing launches sessions with them now.
+
 ## Implementation boundary
 
 - Codex and Claude remain separate provider pages. Percentages from different providers are never added together.

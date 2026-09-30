@@ -8,7 +8,7 @@ internal static class AccountUsageText
     internal static string PartiallyUpdated(DateTimeOffset at, DateTimeOffset now) => UiText.F($"일부 갱신 · {DateAndTime(at, now)}");
     internal static string PreviousValue(DateTimeOffset at, DateTimeOffset now) => UiText.F($"이전 값 · {DateAndTime(at, now)}");
 
-    private static string DateAndTime(DateTimeOffset at, DateTimeOffset now)
+    internal static string DateAndTime(DateTimeOffset at, DateTimeOffset now)
     {
         var local = at.ToLocalTime();
         var day = local.Date == now.ToLocalTime().Date ? UiText.T("오늘") : local.ToString("MM.dd");

@@ -21,12 +21,12 @@ internal interface IClaudeProfileCommandRunner
     Task<ClaudeProfileCommandResult> RunStatusAsync(ProcessStartInfo start, CancellationToken cancellationToken);
     Task<int> RunInteractiveAsync(ProcessStartInfo start, CancellationToken cancellationToken);
     Task<int> RunQuietAsync(ProcessStartInfo start, CancellationToken cancellationToken);
-    int Launch(ProcessStartInfo start);
 }
 
 /// <summary>
-/// Launches the unmodified official CLI. Authentication files and token refresh belong exclusively to Claude.
-/// Changing the selected profile affects new managed launches; an existing terminal remains untouched.
+/// Runs the unmodified official CLI for sign-in, identity checks and usage. Authentication files and token refresh
+/// belong exclusively to Claude. The utility never starts an interactive session with a profile: such a writer would
+/// be invisible to the Desktop app's own "in use" check.
 /// </summary>
 internal sealed class ClaudeProfileRuntime
 {
@@ -136,16 +136,6 @@ internal sealed class ClaudeProfileRuntime
         catch (JsonException) { throw new InvalidOperationException("Claude 로그아웃 상태를 확인하지 못했습니다."); }
     }
 
-    public async Task<int> LaunchAsync(ClaudeProfile profile, string workingDirectory,
-        CancellationToken cancellationToken = default)
-    {
-        if (!profile.IsVerified) throw new InvalidOperationException("Claude 로그인을 확인한 뒤 실행하세요.");
-        PrepareProfile(profile);
-        await VerifyAsync(profile, cancellationToken, workingDirectory).ConfigureAwait(false);
-        cancellationToken.ThrowIfCancellationRequested();
-        return _runner.Launch(CreateStartInfo(profile, workingDirectory, visible: true, safeMode: false));
-    }
-
     internal ProcessStartInfo CreateStartInfo(ClaudeProfile profile, string? workingDirectory,
         bool visible, bool safeMode)
     {
@@ -228,8 +218,7 @@ internal sealed class ClaudeProfileRuntime
                 || !address.Address.Equals(email, StringComparison.OrdinalIgnoreCase)) throw InvalidStatus();
             var organization = ReadSafeString(root, "orgId", 128) ?? string.Empty;
             if (organization.Length > 0 && !Guid.TryParse(organization, out _)) throw InvalidStatus();
-            var key = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(
-                email.Trim().ToLowerInvariant() + "\n" + organization.ToLowerInvariant())));
+            var key = IdentityKey(email, organization);
             var first = char.IsLetterOrDigit(email[0]) ? email[0].ToString() : "*";
             var subscription = ReadSafeString(root, "subscriptionType", 32);
             if (subscription is not null && subscription.Any(character => !char.IsLetterOrDigit(character)
@@ -238,6 +227,11 @@ internal sealed class ClaudeProfileRuntime
         }
         catch (JsonException) { throw InvalidStatus(); }
     }
+
+    /// <summary>The persisted identity digest. Shared with the session-shelf account mapping.</summary>
+    internal static string IdentityKey(string email, string organization) =>
+        Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(
+            email.Trim().ToLowerInvariant() + "\n" + organization.ToLowerInvariant())));
 
     private static string? ReadSafeString(JsonElement element, string property, int maxLength)
     {
@@ -552,12 +546,6 @@ internal sealed class ClaudeProfileProcessRunner : IClaudeProfileCommandRunner
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         { throw new TimeoutException("Claude 명령 실행 시간이 초과되었습니다."); }
         finally { TryKillOwned(process); }
-    }
-
-    public int Launch(ProcessStartInfo start)
-    {
-        using var process = Process.Start(start) ?? throw new IOException("Claude Code를 시작하지 못했습니다.");
-        return process.Id;
     }
 
     private static async Task<string> ReadBoundedAsync(StreamReader reader, bool capture,
