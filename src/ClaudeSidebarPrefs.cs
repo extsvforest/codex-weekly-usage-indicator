@@ -51,29 +51,29 @@ internal static class ClaudeSidebarPrefs
     /// copy that was just archived to the newer record that replaced it; its pin and group move there.
     /// </summary>
     internal static Outcome Sync(string configPath, string stateDirectory, IReadOnlyList<Link> links,
+        IReadOnlyDictionary<string, string> moved, Func<bool> desktopClosed) =>
+        Sync(new SettingsFileSource(configPath, stateDirectory), stateDirectory, links, moved, desktopClosed);
+
+    /// <summary>Where the sidebar values are read from and written back to.</summary>
+    internal interface ISource
+    {
+        /// <summary>The <c>epitaxyPrefs</c>-shaped values, or a skip reason.</summary>
+        (JsonObject? Prefs, string? Skipped) Load();
+        /// <summary>Writes the changed values; returns a skip reason when nothing was written.</summary>
+        string? Save(JsonObject prefs, Func<bool> desktopClosed);
+        /// <summary>Each source keeps its own last-synced state, so a change of source starts as a first sync.</summary>
+        string MirrorName { get; }
+    }
+
+    internal static Outcome Sync(ISource source, string stateDirectory, IReadOnlyList<Link> links,
         IReadOnlyDictionary<string, string> moved, Func<bool> desktopClosed)
     {
-        byte[] original;
-        JsonObject root;
-        try
-        {
-            // Read directly: File.Exists also says false when access fails, and only a confirmed absence is done.
-            original = File.ReadAllBytes(configPath);
-            root = JsonNode.Parse(original) as JsonObject ?? throw new JsonException();
-        }
-        catch (Exception exception) when (exception is FileNotFoundException or DirectoryNotFoundException)
-        { return Skip("no_config"); }
-        catch (Exception exception) when (exception is JsonException or IOException or UnauthorizedAccessException)
-        { return Skip("unreadable"); }
-        // Only a missing section means there is nothing to keep in step; a section of another shape waits.
-        if (root["preferences"] is null || root["preferences"] is JsonObject { } absent && absent["epitaxyPrefs"] is null)
-            return Skip("no_sidebar");
-        if (root["preferences"] is not JsonObject preferences || preferences["epitaxyPrefs"] is not JsonObject prefs)
-            return Skip("shape");
+        var (prefs, loadSkipped) = source.Load();
+        if (prefs is null) return Skip(loadSkipped ?? "unreadable");
         var pins = Pins.Read(prefs);
         var groups = Groups.Read(prefs);
         if (pins is null && groups is null) return Skip("shape");
-        var mirror = ReadMirror(stateDirectory);
+        var mirror = ReadMirror(stateDirectory, source.MirrorName);
         int pinned = 0, unpinned = 0, grouped = 0, ungrouped = 0, movedCount = 0;
 
         foreach (var (from, to) in moved)
@@ -115,22 +115,133 @@ internal static class ClaudeSidebarPrefs
         var skipped = pins is null ? "pins_shape" : groups is null ? "groups_shape" : null;
         if (pinned + unpinned + grouped + ungrouped + movedCount > 0)
         {
-            var bytes = Encoding.UTF8.GetBytes(root.ToJsonString(Output).Replace("\r\n", "\n"));
-            // The app may have started, or changed its settings, since they were read: then write nothing.
+            // The app may have started, or changed its values, since they were read: then write nothing.
             if (!desktopClosed()) return Skip("desktop_running");
-            try
-            {
-                if (!File.ReadAllBytes(configPath).AsSpan().SequenceEqual(original)) return Skip("changed");
-                Directory.CreateDirectory(stateDirectory);
-                File.WriteAllBytes(Path.Combine(stateDirectory, BackupFile), original);
-                if (!Replace(configPath, bytes, () => desktopClosed() && File.ReadAllBytes(configPath).AsSpan().SequenceEqual(original)))
-                    return Skip("changed");
-            }
-            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { return Skip("write_failed"); }
+            if (source.Save(prefs, desktopClosed) is { } notSaved) return Skip(notSaved);
         }
-        WriteMirror(stateDirectory, next);
+        WriteMirror(stateDirectory, source.MirrorName, next);
         return new Outcome(pinned, unpinned, grouped, ungrouped, movedCount, skipped);
     }
+
+    /// <summary>The settings-file mirror. Kept for reference and tests only: the app rewrites it from its own store.</summary>
+    internal sealed class SettingsFileSource(string configPath, string stateDirectory) : ISource
+    {
+        private byte[]? _original;
+        private JsonObject? _root;
+        public string MirrorName => MirrorFile;
+
+        public (JsonObject? Prefs, string? Skipped) Load()
+        {
+            try
+            {
+                // Read directly: File.Exists also says false when access fails, and only a confirmed absence is done.
+                _original = File.ReadAllBytes(configPath);
+                _root = JsonNode.Parse(_original) as JsonObject ?? throw new JsonException();
+            }
+            catch (Exception exception) when (exception is FileNotFoundException or DirectoryNotFoundException)
+            { return (null, "no_config"); }
+            catch (Exception exception) when (exception is JsonException or IOException or UnauthorizedAccessException)
+            { return (null, "unreadable"); }
+            // Only a missing section means there is nothing to keep in step; a section of another shape waits.
+            if (_root["preferences"] is null || _root["preferences"] is JsonObject { } absent && absent["epitaxyPrefs"] is null)
+                return (null, "no_sidebar");
+            return _root["preferences"] is JsonObject preferences && preferences["epitaxyPrefs"] is JsonObject prefs
+                ? (prefs, null) : (null, "shape");
+        }
+
+        public string? Save(JsonObject prefs, Func<bool> desktopClosed)
+        {
+            var bytes = Encoding.UTF8.GetBytes(_root!.ToJsonString(Output).Replace("\r\n", "\n"));
+            try
+            {
+                if (!File.ReadAllBytes(configPath).AsSpan().SequenceEqual(_original)) return "changed";
+                Directory.CreateDirectory(stateDirectory);
+                File.WriteAllBytes(Path.Combine(stateDirectory, BackupFile), _original!);
+                return Replace(configPath, bytes, () => desktopClosed() && File.ReadAllBytes(configPath).AsSpan().SequenceEqual(_original))
+                    ? null : "changed";
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { return "write_failed"; }
+        }
+    }
+
+    /// <summary>The web UI's own store: <c>LSS-persisted.&lt;name&gt;</c> entries of claude.ai's localStorage, each
+    /// <c>{"value": …, "tabId": "", "timestamp": ms}</c>. This is what the sidebar reads on start.</summary>
+    /// <summary>The web UI's own store. The sidebar's persisted zustand state lives in localStorage under
+    /// <c>dframe-store</c> (<c>{"state":{…,"pinnedOrder":[…],"customGroupsByScope":{…}},"version":1}</c>); on start the UI
+    /// keeps that state and rewrites its <c>LSS-persisted.*</c> mirrors and the settings file from it, so pins and groups
+    /// are changed there. The mirrors are written to match, so the UI finds nothing to reconcile.</summary>
+    internal sealed class LocalStorageSource(ClaudeLocalStorage store, string backupRoot, Func<DateTimeOffset> now) : ISource
+    {
+        internal const string StoreKey = "dframe-store";
+        internal static readonly string[] Names = ["dframe-local-slice", "starred-local-code-sessions", "dframe-group-scopes"];
+        private ClaudeLocalStorage.Snapshot? _snapshot;
+        private JsonObject? _storeRoot;
+        private readonly Dictionary<string, string> _before = new(StringComparer.Ordinal);
+        public string MirrorName => "sidebar-mirror.dframe-store.json";
+
+        private static string[] Keys => [StoreKey, .. Names.Select(name => "LSS-persisted." + name)];
+
+        public (JsonObject? Prefs, string? Skipped) Load()
+        {
+            // Any failure to read the whole database leaves the work pending: a missing part of it is not "no settings".
+            try { _snapshot = store.Read(Keys); }
+            catch (Exception exception) when (exception is InvalidDataException or IOException or UnauthorizedAccessException)
+            { return (null, "unreadable"); }
+            if (!_snapshot.Clean) return (null, "unreadable");
+            if (_snapshot.Version != ClaudeLocalStorage.SupportedVersion) return (null, "shape");
+            // The sidebar has never been used here: nothing to keep in step.
+            if (_snapshot.Values[StoreKey] is not { } storeText) return (null, "no_sidebar");
+            try { _storeRoot = JsonNode.Parse(storeText) as JsonObject; }
+            catch (JsonException) { return (null, "shape"); }
+            if (_storeRoot?["state"] is not JsonObject state || _storeRoot["version"] is not JsonValue version
+                || !version.TryGetValue<int>(out var number) || number != 1
+                || state["pinnedOrder"] is not JsonArray pinned
+                || state["customGroupsByScope"] is not (null or JsonObject)) return (null, "shape");
+            var prefs = new JsonObject
+            {
+                ["dframe-local-slice"] = new JsonObject
+                {
+                    ["pinnedOrder"] = pinned.DeepClone(),
+                    ["homeProjectsPinnedOrder"] = state["homeProjectsPinnedOrder"]?.DeepClone() ?? new JsonArray()
+                },
+                ["dframe-group-scopes"] = state["customGroupsByScope"]?.DeepClone() ?? new JsonObject()
+            };
+            if (_snapshot.Values["LSS-persisted.starred-local-code-sessions"] is { } starredText)
+            {
+                try
+                {
+                    if (JsonNode.Parse(starredText) is JsonObject wrapper && wrapper["value"] is JsonArray starred)
+                        prefs["starred-local-code-sessions"] = starred.DeepClone();
+                }
+                catch (JsonException) { return (null, "shape"); }
+            }
+            foreach (var name in Names) _before[name] = prefs[name]?.ToJsonString(Compact) ?? "null";
+            return (prefs, null);
+        }
+
+        public string? Save(JsonObject prefs, Func<bool> desktopClosed)
+        {
+            var timestamp = now().ToUnixTimeMilliseconds();
+            var values = new Dictionary<string, string>(StringComparer.Ordinal);
+            var changed = Names.Where(name => prefs[name] is { } value && (!_before.TryGetValue(name, out var before)
+                || before != value.ToJsonString(Compact))).ToHashSet(StringComparer.Ordinal);
+            if (changed.Count == 0) return null;
+            var state = (JsonObject)_storeRoot!["state"]!;
+            if (prefs["dframe-local-slice"] is JsonObject slice && slice["pinnedOrder"] is JsonArray order)
+                state["pinnedOrder"] = order.DeepClone();
+            if (prefs["dframe-group-scopes"] is JsonObject scopes) state["customGroupsByScope"] = scopes.DeepClone();
+            values[StoreKey] = _storeRoot.ToJsonString(Compact);
+            foreach (var name in changed)
+                values["LSS-persisted." + name] = new JsonObject { ["value"] = prefs[name]!.DeepClone(), ["tabId"] = "", ["timestamp"] = timestamp }
+                    .ToJsonString(Compact);
+            try { return store.Write(_snapshot!, values, backupRoot, desktopClosed) ? null : "changed"; }
+            catch (Exception exception) when (exception is InvalidDataException or IOException or UnauthorizedAccessException)
+            { return "write_failed"; }
+        }
+    }
+
+    private static readonly JsonSerializerOptions Compact = new()
+    { Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping, TypeInfoResolver = new System.Text.Json.Serialization.Metadata.DefaultJsonTypeInfoResolver() };
 
     private static T Resolve<T>(T a, T b, T last, bool hasLast, T merged)
     {
@@ -158,21 +269,21 @@ internal static class ClaudeSidebarPrefs
         finally { if (File.Exists(temporary)) File.Delete(temporary); }
     }
 
-    private static JsonObject ReadMirror(string directory)
+    private static JsonObject ReadMirror(string directory, string name)
     {
         try
         {
-            var path = Path.Combine(directory, MirrorFile);
+            var path = Path.Combine(directory, name);
             return File.Exists(path) && JsonNode.Parse(File.ReadAllBytes(path))?["links"] is JsonObject links
                 ? (JsonObject)links.DeepClone() : [];
         }
         catch (Exception exception) when (exception is JsonException or IOException or UnauthorizedAccessException) { return []; }
     }
 
-    private static void WriteMirror(string directory, JsonObject links)
+    private static void WriteMirror(string directory, string name, JsonObject links)
     {
         Directory.CreateDirectory(directory);
-        var path = Path.Combine(directory, MirrorFile);
+        var path = Path.Combine(directory, name);
         var temporary = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
         try
         {

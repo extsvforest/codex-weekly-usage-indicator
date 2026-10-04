@@ -30,8 +30,8 @@ internal sealed record ClaudeShelfPaths(string SessionsRoot, string ProjectsRoot
         return new(Path.Combine(roaming, "Claude", "claude-code-sessions"), Path.Combine(config, "projects"),
             Path.Combine(roaming, "Claude", "scratch-workspaces"), registries,
             Path.Combine(local, "CodexWeeklyUsageIndicator.SessionShelf"),
-            // Sidebar sync is off: live, the app rewrote the settings file from its own state on start, dropping the
-            // copies' pins and groups, and the next sync read that as the user unpinning the originals.
+            // Automatic sidebar writes stay off: holding the web UI store's lock while Desktop starts can make Chromium
+            // fail to open it and recreate it. Writes run only as a controlled step (see ClaudeLocalStorage).
             DesktopConfig: null);
     }
 }
@@ -52,6 +52,8 @@ internal sealed class ClaudeShelfPlan
     internal SortedDictionary<string, SortedDictionary<string, int>> Skipped { get; } = new(StringComparer.Ordinal);
     internal SortedDictionary<string, string> Held { get; } = new(StringComparer.Ordinal);
     internal SortedDictionary<string, SortedDictionary<string, string>> Fingerprints { get; } = new(StringComparer.Ordinal);
+    /// <summary>Transcript ids live CLIs were writing when the plan was made.</summary>
+    internal IReadOnlySet<string> LiveIds { get; set; } = new HashSet<string>();
     internal int PendingFor(string targetKey) => Actions.Count(action => action.Target == targetKey);
     internal bool HasTransientSkips => Skipped.Values.Any(reasons => TransientReasons.Any(reasons.ContainsKey));
     internal bool IsComplete => Held.Count == 0 && !HasTransientSkips;
@@ -69,7 +71,7 @@ internal sealed class ClaudeShelfPlan
 }
 
 internal sealed record ClaudeShelfResult(int Created, ClaudeShelfPlan Plan, int Retired = 0,
-    ClaudeSidebarPrefs.Outcome? Prefs = null);
+    ClaudeSidebarPrefs.Outcome? Prefs = null, int Retitled = 0);
 
 internal sealed class ClaudeDesktopRunningException(int created = 0)
     : InvalidOperationException(created == 0 ? "Claude 앱이 실행 중이라 세션 목록을 채우지 않았습니다."
@@ -127,6 +129,7 @@ internal sealed class ClaudeSessionShelf
         var live = _liveWriters();
         // An unreadable registration could name any session: hold everything rather than guess.
         if (live.Unknown) { foreach (var account in distinct) plan.Held[account.Key] = "writer_unknown"; return plan; }
+        plan.LiveIds = live.Ids;
         var transcripts = TranscriptIds();
         // Continuing a conversation gives it a new transcript id and lists the earlier ones. An id that another
         // record of the same list lists as earlier, and that does not list that record back, is an older state of a
@@ -260,11 +263,95 @@ internal sealed class ClaudeSessionShelf
         return decisions.Count > 0;
     }
 
+    /// <summary>
+    /// Keeps the title of each copy this utility made in step with its original, so a conversation has one name in
+    /// every account. A copy is left alone once it is that account's own conversation: continued under a new
+    /// transcript id, used there more recently than the original, or renamed there since its title was last set.
+    /// Only the title fields change; the copy stays as recognisable as before (its ledger hash follows when it was
+    /// still exactly as written).
+    /// </summary>
+    private int FollowTitles(ClaudeShelfLedger ledger, ClaudeShelfPlan plan, Func<bool> desktopClosed, int created)
+    {
+        var retitled = 0;
+        foreach (var entry in ledger.Created.Where(entry => !entry.Pending && !entry.Retired).ToArray())
+        {
+            // The same holds as for filling: only lists in this run, none held (unknown writers, recovery files,
+            // unreadable records), and no conversation a live CLI is writing.
+            if (!plan.Fingerprints.ContainsKey(entry.Target) || !plan.Fingerprints.ContainsKey(entry.Source)
+                || plan.Held.ContainsKey(entry.Target) || plan.LiveIds.Contains(entry.CliSessionId.ToLowerInvariant())
+                || entry.Source.Split('/') is not [var account, var org] || !Guid.TryParse(account, out _) || !Guid.TryParse(org, out _)
+                || !entry.SourceFile.StartsWith("local_", StringComparison.Ordinal) || entry.SourceFile.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0
+                || ClaudeShelfLedger.EntryPath(_paths.SessionsRoot, entry) is not { } path
+                || ReadRecord(Path.Combine(_paths.SessionsRoot, account, org, entry.SourceFile)) is not { } source) continue;
+            byte[] before;
+            try { before = File.ReadAllBytes(path); }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { continue; }
+            JsonObject? copy;
+            try { copy = JsonNode.Parse(before) as JsonObject; }
+            catch (JsonException) { continue; }
+            if (copy is null) continue;
+            var current = Text(copy, "title");
+            var untouched = Convert.ToHexString(SHA256.HashData(before)) == entry.Sha256;
+            if (Bool(copy, "isArchived")
+                || !string.Equals(Text(copy, "cliSessionId"), entry.CliSessionId, StringComparison.OrdinalIgnoreCase)
+                || Number(copy, "lastActivityAt") > Number(source, "lastActivityAt")) continue;
+            var title = Text(source, "title");
+            if (entry.Title is null)
+            {
+                // An older entry starts tracking once the copy shows the original's title. Until then only a copy still
+                // exactly as written proves its name was never changed there; the app's rename history cannot, as it
+                // records neither a first name nor a change of case or spacing.
+                if (current is not null && current == title) { ledger.Retitle(entry, current, entry.Sha256); continue; }
+                if (!untouched) continue;
+            }
+            else if (current != entry.Title) continue;
+            if (string.IsNullOrWhiteSpace(title) || title == current) continue;
+            copy["title"] = title;
+            if (source["titleSource"] is JsonValue titleSource) copy["titleSource"] = titleSource.DeepClone();
+            var after = JsonSerializer.SerializeToUtf8Bytes(copy, RecordJson);
+            if (!desktopClosed()) throw new ClaudeDesktopRunningException(created);
+            if (!Replace(path, before, after, desktopClosed))
+            {
+                // The old name is still showing: leave the run unfinished so it is retried, not reported as done.
+                plan.Held[entry.Target] = "retitle_failed";
+                continue;
+            }
+            // Only the bytes written here become this utility's; a copy the app had changed stays changed.
+            ledger.Retitle(entry, title, untouched ? Convert.ToHexString(SHA256.HashData(after)) : entry.Sha256);
+            retitled++;
+        }
+        return retitled;
+    }
+
+    /// <summary>Replaces a record with <paramref name="after"/> only if it still holds exactly <paramref name="before"/>
+    /// and Desktop is still closed at the last moment.</summary>
+    private static bool Replace(string path, byte[] before, byte[] after, Func<bool> desktopClosed)
+    {
+        var partial = Path.Combine(Path.GetDirectoryName(path)!, "." + Path.GetFileName(path) + PartialSuffix);
+        try
+        {
+            using (var stream = new FileStream(partial, FileMode.CreateNew, FileAccess.Write, FileShare.None, 4096,
+                       FileOptions.WriteThrough))
+            { stream.Write(after); stream.Flush(flushToDisk: true); }
+            if (!desktopClosed() || !File.ReadAllBytes(path).AsSpan().SequenceEqual(before)) return false;
+            File.Move(partial, path, overwrite: true);
+            return true;
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { return false; }
+        finally { if (File.Exists(partial)) File.Delete(partial); }
+    }
+
+    private static long Number(JsonObject record, string field) =>
+        record[field] is JsonValue value && value.TryGetValue<long>(out var number) ? number : 0;
+
     /// <summary>Archives a superseded copy in place, the way the app archives a session; nothing is deleted.</summary>
-    private static bool Archive(string path)
+    private static bool Archive(string path) => Rewrite(path, record => record["isArchived"] = true);
+
+    /// <summary>Rewrites one record in place through a temporary file, changing only what <paramref name="change"/> sets.</summary>
+    private static bool Rewrite(string path, Action<JsonObject> change)
     {
         if (ReadRecord(path) is not { } record) return false;
-        record["isArchived"] = true;
+        change(record);
         var partial = Path.Combine(Path.GetDirectoryName(path)!, "." + Path.GetFileName(path) + PartialSuffix);
         try
         {
@@ -301,7 +388,7 @@ internal sealed class ClaudeSessionShelf
                 var name = action.Record["sessionId"]!.GetValue<string>() + ".json";
                 return (Action: action, Name: name, Bytes: bytes, Entry: new ClaudeShelfLedger.Entry(action.Target, name,
                     Convert.ToHexString(SHA256.HashData(bytes)), action.CliSessionId, action.Source, action.SourceFile,
-                    _time.GetUtcNow(), appVersion, Pending: true));
+                    _time.GetUtcNow(), appVersion, Pending: true, Title: Text(action.Record, "title")));
             }).ToArray();
             // Record intent first: after a crash the next load keeps only files whose content matches.
             ledger.Created.AddRange(prepared.Select(item => item.Entry));
@@ -309,6 +396,7 @@ internal sealed class ClaudeSessionShelf
             var created = 0;
             List<ClaudeShelfRetirement> retired = [];
             ClaudeSidebarPrefs.Outcome? prefs = null;
+            var retitled = 0;
             try
             {
                 foreach (var item in prepared)
@@ -354,11 +442,15 @@ internal sealed class ClaudeSessionShelf
                     ledger.Retire(retirement.Target, retirement.File, _time.GetUtcNow());
                     retired.Add(retirement);
                 }
+                retitled = FollowTitles(ledger, plan, desktopClosed, created);
                 if (_paths.DesktopConfig is { } config)
                 {
                     if (!desktopClosed()) throw new ClaudeDesktopRunningException(created);
                     var moves = ledger.PendingMoves();
-                    prefs = ClaudeSidebarPrefs.Sync(config, _paths.LedgerDirectory, ClaudeSidebarPrefs.Links(ledger, _paths.SessionsRoot),
+                    ClaudeSidebarPrefs.ISource source = config.EndsWith(".json", StringComparison.OrdinalIgnoreCase)
+                        ? new ClaudeSidebarPrefs.SettingsFileSource(config, _paths.LedgerDirectory)
+                        : new ClaudeSidebarPrefs.LocalStorageSource(new ClaudeLocalStorage(config), _paths.LedgerDirectory, _time.GetUtcNow);
+                    prefs = ClaudeSidebarPrefs.Sync(source, _paths.LedgerDirectory, ClaudeSidebarPrefs.Links(ledger, _paths.SessionsRoot),
                         moves.ToDictionary(entry => ClaudeSidebarPrefs.ListId(entry.File), entry => ClaudeSidebarPrefs.ListId(entry.MovedTo!)),
                         desktopClosed);
                     if (prefs.Complete) foreach (var entry in moves) ledger.FinishMove(entry);
@@ -367,10 +459,10 @@ internal sealed class ClaudeSessionShelf
             finally
             {
                 ledger.SettlePending(_paths.SessionsRoot);
-                ledger.AddRun(_time.GetUtcNow(), "apply", appVersion, created, plan, retired.Count, prefs);
+                ledger.AddRun(_time.GetUtcNow(), "apply", appVersion, created, plan, retired.Count, prefs, retitled);
                 ledger.Save(_paths.LedgerDirectory);
             }
-            return new ClaudeShelfResult(created, plan, retired.Count, prefs);
+            return new ClaudeShelfResult(created, plan, retired.Count, prefs, retitled);
         }
         finally { RunGate.Release(); }
     }
@@ -525,7 +617,7 @@ internal sealed class ClaudeShelfLedger
     private const int MaxRuns = 50;
     internal sealed record Entry(string Target, string File, string Sha256, string CliSessionId, string Source,
         string SourceFile, DateTimeOffset CreatedAt, string? AppVersion, bool Pending = false,
-        DateTimeOffset? RetiredAt = null, string? MovedTo = null, bool MoveDone = false)
+        DateTimeOffset? RetiredAt = null, string? MovedTo = null, bool MoveDone = false, string? Title = null)
     {
         internal bool Retired => RetiredAt is not null;
     }
@@ -550,7 +642,8 @@ internal sealed class ClaudeShelfLedger
             var loaded = new Entry(target.ToLowerInvariant(), file, hash.ToUpperInvariant(), cli, Read("src") ?? "",
                 Read("srcFile") ?? "", created, Read("appVersion"),
                 RetiredAt: DateTimeOffset.TryParse(Read("retiredAt"), out var retiredAt) ? retiredAt : null,
-                MovedTo: Read("movedTo"), MoveDone: entry["moveDone"] is JsonValue done && done.TryGetValue<bool>(out var finished) && finished);
+                MovedTo: Read("movedTo"), MoveDone: entry["moveDone"] is JsonValue done && done.TryGetValue<bool>(out var finished) && finished,
+                Title: Read("title"));
             // An interrupted run: keep the intent only when the published file has exactly the intended content.
             if (pending && (EntryPath(sessionsRoot, loaded) is not { } published || !File.Exists(published)
                             || ClaudeSessionShelf.Hash(published) != loaded.Sha256)) continue;
@@ -593,6 +686,13 @@ internal sealed class ClaudeShelfLedger
     /// <summary>Archived copies whose pins and groups have not reached their successor yet.</summary>
     internal IReadOnlyList<Entry> PendingMoves() => Created.Where(entry => entry.Retired && entry.MovedTo is not null && !entry.MoveDone).ToArray();
 
+    /// <summary>Records the title last set on a copy, and its new hash when the copy was still exactly as written.</summary>
+    internal void Retitle(Entry entry, string title, string sha256)
+    {
+        var index = Created.IndexOf(entry);
+        if (index >= 0) Created[index] = entry with { Title = title, Sha256 = sha256 };
+    }
+
     internal void FinishMove(Entry entry)
     {
         var index = Created.IndexOf(entry);
@@ -619,10 +719,11 @@ internal sealed class ClaudeShelfLedger
     }
 
     internal void AddRun(DateTimeOffset at, string mode, string? appVersion, int count, ClaudeShelfPlan? plan,
-        int retired = 0, ClaudeSidebarPrefs.Outcome? prefs = null)
+        int retired = 0, ClaudeSidebarPrefs.Outcome? prefs = null, int retitled = 0)
     {
         var run = new JsonObject { ["at"] = at.ToString("O"), ["mode"] = mode, ["appVersion"] = appVersion, ["count"] = count };
         if (retired > 0) run["archived"] = retired;
+        if (retitled > 0) run["retitled"] = retitled;
         if (prefs is not null)
             run["sidebar"] = new JsonObject { ["pinned"] = prefs.Pinned, ["unpinned"] = prefs.Unpinned, ["grouped"] = prefs.Grouped,
                 ["ungrouped"] = prefs.Ungrouped, ["moved"] = prefs.Moved, ["skipped"] = prefs.Skipped };
@@ -650,7 +751,7 @@ internal sealed class ClaudeShelfLedger
                 ["cliSessionId"] = entry.CliSessionId, ["src"] = entry.Source, ["srcFile"] = entry.SourceFile,
                 ["createdAt"] = entry.CreatedAt.ToString("O"), ["appVersion"] = entry.AppVersion,
                 ["pending"] = entry.Pending ? true : null, ["retiredAt"] = entry.RetiredAt?.ToString("O"),
-                ["movedTo"] = entry.MovedTo, ["moveDone"] = entry.MoveDone ? true : null
+                ["movedTo"] = entry.MovedTo, ["moveDone"] = entry.MoveDone ? true : null, ["title"] = entry.Title
             }).ToArray()),
             ["runs"] = new JsonArray(_runs.Select(run => (JsonNode?)run.DeepClone()).ToArray())
         };

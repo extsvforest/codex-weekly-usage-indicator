@@ -27,6 +27,8 @@ internal static class ClaudeSessionShelfTests
         TestConversationLineage();
         TestSidebarPrefs();
         TestLineageEdges();
+        TestLocalStorage();
+        TestTitlesFollowOriginals();
     }
 
     private static void TestPlanningAndPublishing()
@@ -577,7 +579,7 @@ internal static class ClaudeSessionShelfTests
                 Console.WriteLine($"archive {retirement.Target[..8]} {retirement.File[..14]} -> successor {retirement.SuccessorFile[..14]}");
             // Sidebar dry run on a scratch copy of the settings file; the real file is not written.
             var paths = ClaudeShelfPaths.CreateDefault();
-            if (paths.DesktopConfig is { } config && File.Exists(config))
+            if (Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Claude", "claude_desktop_config.json") is var config && File.Exists(config))
             {
                 Directory.CreateDirectory(scratch);
                 var copy = Path.Combine(scratch, "claude_desktop_config.json");
@@ -587,7 +589,20 @@ internal static class ClaudeSessionShelfTests
                 var links = ClaudeSidebarPrefs.Links(ClaudeShelfLedger.Load(paths.LedgerDirectory, paths.SessionsRoot), paths.SessionsRoot);
                 var moved = plan.Retirements.ToDictionary(r => ClaudeSidebarPrefs.ListId(r.File), r => ClaudeSidebarPrefs.ListId(r.SuccessorFile));
                 var outcome = ClaudeSidebarPrefs.Sync(copy, scratch, links, moved, () => true);
-                Console.WriteLine($"sidebar dry run: links={links.Count} {outcome}");
+                Console.WriteLine($"sidebar dry run (settings mirror): links={links.Count} {outcome}");
+                // The real store, on a copy kept for an independent reader to check.
+                var real = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Claude", "Local Storage", "leveldb");
+                var trial = Path.Combine(Path.GetTempPath(), "gfs-agent", "260930_claude-acct-switch", "ls-trial");
+                if (Directory.Exists(trial)) Directory.Delete(trial, recursive: true);
+                Directory.CreateDirectory(trial);
+                foreach (var file in Directory.EnumerateFiles(real))
+                    if (!Path.GetFileName(file).Equals("LOCK", StringComparison.OrdinalIgnoreCase)) File.Copy(file, Path.Combine(trial, Path.GetFileName(file)));
+                File.WriteAllText(Path.Combine(trial, "LOCK"), "");
+                var trialState = trial + "-state";
+                if (Directory.Exists(trialState)) Directory.Delete(trialState, recursive: true);
+                var trialOutcome = ClaudeSidebarPrefs.Sync(new ClaudeSidebarPrefs.LocalStorageSource(new ClaudeLocalStorage(trial), trialState, () => DateTimeOffset.UtcNow),
+                    trialState, links, moved, () => true);
+                Console.WriteLine($"sidebar trial on a copy of the real store: {trialOutcome} at {trial}");
             }
         }
         finally { if (Directory.Exists(scratch)) Directory.Delete(scratch, recursive: true); }
@@ -910,6 +925,192 @@ internal static class ClaudeSessionShelfTests
         var scopes = JsonNode.Parse(File.ReadAllText(config))!["preferences"]!["epitaxyPrefs"]!["dframe-group-scopes"]!;
         Check(scopes[A.Key]!["assignments"]?[a] is null && scopes[B.Key]!["assignments"]?[b] is null,
             "when both sides changed, the original leaving its group wins");
+    }
+
+    private static void TestLocalStorage()
+    {
+        using var fixture = new Fixture();
+        var db = Directory.CreateDirectory(Path.Combine(fixture.Root, "leveldb")).FullName;
+        static byte[] Varint(ulong value) { var bytes = new List<byte>(); while (value >= 0x80) { bytes.Add((byte)(value | 0x80)); value >>= 7; } bytes.Add((byte)value); return bytes.ToArray(); }
+        // A manifest naming log 5 and last sequence 41, and a log whose filler pushes the next record across a block.
+        var edit = new List<byte>();
+        edit.AddRange(Varint(2)); edit.AddRange(Varint(5)); edit.AddRange(Varint(3)); edit.AddRange(Varint(7));
+        edit.AddRange(Varint(4)); edit.AddRange(Varint(41));
+        File.WriteAllBytes(Path.Combine(db, "MANIFEST-000003"), ClaudeLocalStorage.Frame(edit.ToArray(), 0));
+        File.WriteAllText(Path.Combine(db, "CURRENT"), "MANIFEST-000003\n");
+        File.WriteAllText(Path.Combine(db, "LOCK"), "");
+        byte[] Batch(ulong sequence, params (string Key, string Value)[] puts)
+        {
+            var bytes = new List<byte>(); bytes.AddRange(BitConverter.GetBytes(sequence)); bytes.AddRange(BitConverter.GetBytes(puts.Length));
+            foreach (var (key, value) in puts)
+            {
+                var k = Encoding.UTF8.GetBytes("_https://claude.ai").Concat(new byte[] { 0 }).Concat(ClaudeLocalStorage.EncodeValue(key)).ToArray();
+                var v = ClaudeLocalStorage.EncodeValue(value);
+                bytes.Add(1); bytes.AddRange(Varint((ulong)k.Length)); bytes.AddRange(k); bytes.AddRange(Varint((ulong)v.Length)); bytes.AddRange(v);
+            }
+            return bytes.ToArray();
+        }
+        var version = new List<byte>(); version.AddRange(BitConverter.GetBytes(41UL)); version.AddRange(BitConverter.GetBytes(1));
+        version.Add(1); version.AddRange(Varint(7)); version.AddRange(Encoding.ASCII.GetBytes("VERSION")); version.AddRange(Varint(1)); version.Add((byte)'1');
+        var filler = Batch(42, ("LSS-persisted.other", new string('x', 32700)));
+        var versionFrame = ClaudeLocalStorage.Frame(version.ToArray(), 0);
+        var log = versionFrame.Concat(ClaudeLocalStorage.Frame(filler, versionFrame.Length)).ToArray();
+        File.WriteAllBytes(Path.Combine(db, "000005.log"), log);
+        var store = new ClaudeLocalStorage(db);
+        var keys = new[] { "LSS-persisted.dframe-local-slice", "LSS-persisted.dframe-group-scopes" };
+        var snapshot = store.Read(keys);
+        Check(snapshot.LastSequence == 42 && snapshot.Values.All(pair => pair.Value is null), "the fixture database reads back");
+        var values = new Dictionary<string, string> { [keys[0]] = "{\"value\":{\"pinnedOrder\":[]}}", [keys[1]] = "{\"value\":{\"그룹\":1}}" };
+        var backups = Path.Combine(fixture.Root, "backups");
+        Check(store.Write(snapshot, values, backups, () => true), "a batch is appended");
+        var after = store.Read(keys);
+        Check(after.LastSequence == 44 && after.Values[keys[0]] == values[keys[0]] && after.Values[keys[1]] == values[keys[1]]
+              && ClaudeLocalStorage.ReadLog(File.ReadAllBytes(Path.Combine(db, "000005.log")), strict: true).Count() == 3,
+            "the appended batch spans a block boundary, passes its checksums and is the newest value");
+        Check(Directory.EnumerateDirectories(ClaudeLocalStorage.BackupsFolder(backups)).Count() == 1, "the directory was backed up first");
+        Check(!store.Write(snapshot, values, backups, () => true), "a stale snapshot writes nothing");
+        using (new FileStream(Path.Combine(db, "LOCK"), FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+            Check(!store.Write(after, values, backups, () => true), "a database in use writes nothing");
+        Check(!store.Write(after, values, backups, () => false), "nothing is written once the app runs");
+        // A failure after the append cuts the log back; no other file is touched.
+        var logPath = Path.Combine(db, "000005.log");
+        var bytesBefore = File.ReadAllBytes(logPath);
+        var manifestBefore = File.ReadAllBytes(Path.Combine(db, "MANIFEST-000003"));
+        store.AfterAppend = () => throw new IOException("injected");
+        MustThrow<IOException>(() => store.Write(after, values, backups, () => true));
+        store.AfterAppend = null;
+        Check(File.ReadAllBytes(logPath).SequenceEqual(bytesBefore) && File.ReadAllBytes(Path.Combine(db, "MANIFEST-000003")).SequenceEqual(manifestBefore),
+            "a failed write leaves the database exactly as it was");
+        // A log ending inside a record is not written to.
+        File.WriteAllBytes(logPath, bytesBefore.Concat(ClaudeLocalStorage.Frame(new byte[40000], bytesBefore.Length).Take(100)).ToArray());
+        Check(!store.Read(keys).Clean && !store.Write(store.Read(keys), values, backups, () => true), "a torn log is not written to");
+        File.WriteAllBytes(logPath, bytesBefore);
+        // Corruption and an incomplete manifest are refused, as LevelDB refuses them.
+        var corrupt = (byte[])bytesBefore.Clone(); corrupt[20] ^= 0xff;
+        File.WriteAllBytes(logPath, corrupt);
+        MustThrow<InvalidDataException>(() => store.Read(keys));
+        File.WriteAllBytes(logPath, bytesBefore);
+        var noNext = new List<byte>(); noNext.AddRange(Varint(2)); noNext.AddRange(Varint(5)); noNext.AddRange(Varint(4)); noNext.AddRange(Varint(41));
+        File.WriteAllBytes(Path.Combine(db, "MANIFEST-000003"), ClaudeLocalStorage.Frame(noNext.ToArray(), 0));
+        MustThrow<InvalidDataException>(() => store.Read(keys));
+        var badManifest = (byte[])manifestBefore.Clone(); badManifest[8] ^= 0xff;
+        File.WriteAllBytes(Path.Combine(db, "MANIFEST-000003"), badManifest);
+        MustThrow<InvalidDataException>(() => store.Read(keys));
+    }
+
+    private static void TestTitlesFollowOriginals()
+    {
+        using var fixture = new Fixture();
+        var cli = fixture.Transcript();
+        fixture.Record(A, "local_b1b1b1b1-0000-4000-8000-000000000001", cli);
+        var original = Path.Combine(fixture.ShelfPath(A), "local_b1b1b1b1-0000-4000-8000-000000000001.json");
+        var shelf = fixture.Shelf();
+        shelf.Apply([A, B], () => true);
+        var copy = fixture.Files(B).Single();
+        void Set(string path, Action<JsonObject> change)
+        {
+            var record = JsonNode.Parse(File.ReadAllText(path))!.AsObject(); change(record); File.WriteAllText(path, record.ToJsonString());
+        }
+        string Title(string path) => JsonNode.Parse(File.ReadAllText(path))!["title"]!.GetValue<string>();
+
+        Set(original, r => { r["title"] = "새 이름"; r["titleSource"] = "user"; });
+        Check(shelf.Apply([A, B], () => true).Retitled == 1 && Title(copy) == "새 이름", "a renamed original renames its copy");
+        Check(shelf.Undo(() => true).Removed == 1, "a retitled copy is still recognised as written by this utility");
+
+        // A copy renamed in its own account keeps that name.
+        shelf.Apply([A, B], () => true);
+        copy = fixture.Files(B).Single();
+        Set(copy, r => r["title"] = "서브에서 바꾼 이름");
+        Set(original, r => r["title"] = "또 바꾼 이름");
+        Check(shelf.Apply([A, B], () => true).Retitled == 0 && Title(copy) == "서브에서 바꾼 이름", "a rename in the copy's account is respected");
+
+        // A copy used in its own account more recently than the original, or continued under a new id, is left alone.
+        using var used = new Fixture();
+        var usedCli = used.Transcript();
+        used.Record(A, "local_b2b2b2b2-0000-4000-8000-000000000001", usedCli);
+        var usedOriginal = Path.Combine(used.ShelfPath(A), "local_b2b2b2b2-0000-4000-8000-000000000001.json");
+        var usedShelf = used.Shelf();
+        usedShelf.Apply([A, B], () => true);
+        var usedCopy = used.Files(B).Single();
+        Set(usedCopy, r => r["lastActivityAt"] = 999);
+        Set(usedOriginal, r => r["title"] = "원본 새 이름");
+        Check(usedShelf.Apply([A, B], () => true).Retitled == 0 && Title(usedCopy) != "원본 새 이름", "a copy used in its own account keeps its name");
+        Set(usedCopy, r => { r["lastActivityAt"] = 1; r["cliSessionId"] = used.Transcript(); });
+        Check(usedShelf.Apply([A, B], () => true).Retitled == 0, "a copy continued under a new id keeps its name");
+
+        // An older ledger entry has no recorded title: only a copy still exactly as written is renamed.
+        using var legacy = new Fixture();
+        var legacyCli = legacy.Transcript();
+        legacy.Record(A, "local_b3b3b3b3-0000-4000-8000-000000000001", legacyCli);
+        var legacyOriginal = Path.Combine(legacy.ShelfPath(A), "local_b3b3b3b3-0000-4000-8000-000000000001.json");
+        var legacyShelf = legacy.Shelf();
+        legacyShelf.Apply([A, B], () => true);
+        var legacyCopy = legacy.Files(B).Single();
+        var ledgerPath = Path.Combine(legacy.Ledger, "ledger.json");
+        void ForgetTitles() { var l = JsonNode.Parse(File.ReadAllText(ledgerPath))!.AsObject(); foreach (var e in l["created"]!.AsArray()) e!.AsObject().Remove("title"); File.WriteAllText(ledgerPath, l.ToJsonString()); }
+        ForgetTitles();
+        Set(legacyCopy, r => r["title"] = "서브에서 바꾼 옛 이름");
+        Set(legacyOriginal, r => r["title"] = "원본 이름");
+        Check(legacyShelf.Apply([A, B], () => true).Retitled == 0 && Title(legacyCopy) == "서브에서 바꾼 옛 이름",
+            "a changed copy without a recorded title keeps its name");
+
+        // A changed older copy starts tracking once it shows the original's title, then follows it.
+        using var track = new Fixture();
+        track.Record(A, "local_b5b5b5b5-0000-4000-8000-000000000001", track.Transcript(), extra: r => r["title"] = "처음 이름");
+        var trackOriginal = Path.Combine(track.ShelfPath(A), "local_b5b5b5b5-0000-4000-8000-000000000001.json");
+        var trackShelf = track.Shelf();
+        trackShelf.Apply([A, B], () => true);
+        var trackCopy = track.Files(B).Single();
+        var trackLedger = Path.Combine(track.Ledger, "ledger.json");
+        { var l = JsonNode.Parse(File.ReadAllText(trackLedger))!.AsObject(); foreach (var e in l["created"]!.AsArray()) e!.AsObject().Remove("title"); File.WriteAllText(trackLedger, l.ToJsonString()); }
+        Set(trackCopy, r => r["lastFocusedAt"] = 5);
+        Check(trackShelf.Apply([A, B], () => true).Retitled == 0
+            && JsonNode.Parse(File.ReadAllText(trackLedger))!["created"]![0]!["title"]!.GetValue<string>() == "처음 이름",
+            "a changed older copy showing the original's title starts tracking");
+        Set(trackOriginal, r => { r["title"] = "원본에서 바꾼 이름"; r["previousTitles"] = new JsonArray("처음 이름"); });
+        Check(trackShelf.Apply([A, B], () => true).Retitled == 1 && Title(trackCopy) == "원본에서 바꾼 이름", "a tracked older copy follows");
+        Check(trackShelf.Undo(() => true).Removed == 0 && File.Exists(trackCopy), "a copy the app changed is kept by undo");
+
+        // The app records no history for a first name or a change of case, so history cannot prove a changed copy kept its name.
+        using var unproven = new Fixture();
+        unproven.Record(A, "local_b6b6b6b6-0000-4000-8000-000000000001", unproven.Transcript(), extra: r => r.Remove("title"));
+        var unprovenOriginal = Path.Combine(unproven.ShelfPath(A), "local_b6b6b6b6-0000-4000-8000-000000000001.json");
+        var unprovenShelf = unproven.Shelf();
+        unprovenShelf.Apply([A, B], () => true);
+        var unprovenCopy = unproven.Files(B).Single();
+        var unprovenLedger = Path.Combine(unproven.Ledger, "ledger.json");
+        { var l = JsonNode.Parse(File.ReadAllText(unprovenLedger))!.AsObject(); foreach (var e in l["created"]!.AsArray()) e!.AsObject().Remove("title"); File.WriteAllText(unprovenLedger, l.ToJsonString()); }
+        Set(unprovenCopy, r => { r["title"] = "검산"; r["titleSource"] = "user"; });
+        Set(unprovenOriginal, r => { r["title"] = "검산 최종"; r["titleSource"] = "user"; r["previousTitles"] = new JsonArray("검산"); });
+        Check(unprovenShelf.Apply([A, B], () => true).Retitled == 0 && Title(unprovenCopy) == "검산",
+            "a name first given in the copy's account is kept even if the original once had it");
+
+        using var clean = new Fixture();
+        var cleanCli = clean.Transcript();
+        clean.Record(A, "local_b4b4b4b4-0000-4000-8000-000000000001", cleanCli);
+        var cleanOriginal = Path.Combine(clean.ShelfPath(A), "local_b4b4b4b4-0000-4000-8000-000000000001.json");
+        var cleanShelf = clean.Shelf();
+        cleanShelf.Apply([A, B], () => true);
+        var cleanCopy = clean.Files(B).Single();
+        var cleanLedger = Path.Combine(clean.Ledger, "ledger.json");
+        { var l = JsonNode.Parse(File.ReadAllText(cleanLedger))!.AsObject(); foreach (var e in l["created"]!.AsArray()) e!.AsObject().Remove("title"); File.WriteAllText(cleanLedger, l.ToJsonString()); }
+        Set(cleanOriginal, r => r["title"] = "원본 새 이름");
+        // Held lists and live writers are left alone.
+        File.WriteAllText(Path.Combine(clean.ShelfPath(B), "local_cccccccc-0000-4000-8000-000000000009.json.tmp"), "{}");
+        Check(cleanShelf.Apply([A, B], () => true).Retitled == 0, "a list the app is recovering is not retitled");
+        File.Delete(Path.Combine(clean.ShelfPath(B), "local_cccccccc-0000-4000-8000-000000000009.json.tmp"));
+        var unknownWriters = clean.Shelf(() => new ClaudeLiveSessionScan(new HashSet<string>(), true));
+        Check(unknownWriters.Apply([A, B], () => true).Retitled == 0, "unknown writers hold retitling");
+        var writing = clean.Shelf(() => new ClaudeLiveSessionScan(new HashSet<string> { cleanCli.ToLowerInvariant() }, false));
+        Check(writing.Apply([A, B], () => true).Retitled == 0, "a conversation being written is not retitled");
+        ClaudeShelfResult blocked;
+        using (new FileStream(cleanCopy, FileMode.Open, FileAccess.Read, FileShare.Read)) blocked = cleanShelf.Apply([A, B], () => true);
+        Check(blocked.Retitled == 0 && !blocked.Plan.IsComplete && blocked.Plan.Held[B.Key] == "retitle_failed" && Title(cleanCopy) != "원본 새 이름",
+            "a rename that cannot be written leaves the run unfinished");
+        Check(cleanShelf.Apply([A, B], () => true).Retitled == 1 && Title(cleanCopy) == "원본 새 이름", "an untouched copy without a recorded title is renamed");
+        // The ledger owns exactly the bytes written; a later change by the app keeps the copy out of undo.
+        Set(cleanCopy, r => r["completedTurns"] = 7);
+        Check(cleanShelf.Undo(() => true).Removed == 0 && File.Exists(cleanCopy), "a copy changed after retitling is kept by undo");
     }
 
     private sealed class Fixture : IDisposable
