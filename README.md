@@ -68,6 +68,8 @@ The Claude desktop app lists Code sessions per account, so signing in with anoth
 
 - It only adds entries. It never moves, changes or deletes a list entry the app wrote, never touches conversations themselves, and never reads or copies sign-in data.
 - It writes only while Claude and its Code sessions are closed. If you switch accounts inside the app, the account tab says how many sessions are still missing; quit Claude once and they are added. **Reopen after quitting** reopens Claude after that fill (once, within 30 minutes).
+- A conversation continued in another account is listed once, in its newest state. An older copy the widget made earlier is archived (find it in the app's archive), never deleted.
+- Pins and session groups follow the copies: pinning, unpinning or regrouping a session in one account is applied to its copies the next time Claude quits.
 - Archived sessions, sessions still being written, folderless scratch sessions, remote/worktree/Cowork sessions and sessions whose folder or conversation file is gone are left out. A session you delete in one account's list is not added back to that account.
 - After a Claude update the widget checks that the app still behaves the way this relies on. If not, it pauses filling and says so on the account tab.
 

@@ -223,11 +223,13 @@ internal sealed class ClaudeShelfService : IDisposable
         {
             var result = _shelf.Apply(_accounts, () => _environment.Observe().State == ClaudeDesktopRunState.Closed,
                 package.Version.ToString());
-            _lastFillAt = now; _lastCreated = result.Created; _lastComplete = result.Plan.IsComplete;
+            _lastFillAt = now; _lastCreated = result.Created;
+            // A sidebar sync that could not finish is retried like a held list.
+            _lastComplete = result.Plan.IsComplete && result.Prefs?.Complete != false;
             _problem = result.Plan.Held.Count > 0 ? ClaudeShelfProblem.Held : ClaudeShelfProblem.None;
             _problemDetail = result.Plan.Held.Values.FirstOrDefault();
             // Sessions held by a live writer or a pending app recovery clear up on their own.
-            if (!result.Plan.IsComplete) ScheduleRetry(now);
+            if (!_lastComplete) ScheduleRetry(now);
         }
         catch (ClaudeDesktopRunningException exception)
         {

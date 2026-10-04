@@ -24,6 +24,9 @@ internal static class ClaudeSessionShelfTests
         TestWidgetGate();
         await TestFollowingTheAppAccount();
         TestRelaunchReservation();
+        TestConversationLineage();
+        TestSidebarPrefs();
+        TestLineageEdges();
     }
 
     private static void TestPlanningAndPublishing()
@@ -570,8 +573,343 @@ internal static class ClaudeSessionShelfTests
             foreach (var (pair, reasons) in plan.Skipped)
                 Console.WriteLine($"skipped {pair}: " + string.Join(", ", reasons.Select(reason => reason.Key + "=" + reason.Value)));
             foreach (var (key, reason) in plan.Held) Console.WriteLine($"held {key}: {reason}");
+            foreach (var retirement in plan.Retirements)
+                Console.WriteLine($"archive {retirement.Target[..8]} {retirement.File[..14]} -> successor {retirement.SuccessorFile[..14]}");
+            // Sidebar dry run on a scratch copy of the settings file; the real file is not written.
+            var paths = ClaudeShelfPaths.CreateDefault();
+            if (paths.DesktopConfig is { } config && File.Exists(config))
+            {
+                Directory.CreateDirectory(scratch);
+                var copy = Path.Combine(scratch, "claude_desktop_config.json");
+                File.Copy(config, copy);
+                var mirror = Path.Combine(paths.LedgerDirectory, "sidebar-mirror.json");
+                if (File.Exists(mirror)) File.Copy(mirror, Path.Combine(scratch, "sidebar-mirror.json"));
+                var links = ClaudeSidebarPrefs.Links(ClaudeShelfLedger.Load(paths.LedgerDirectory, paths.SessionsRoot), paths.SessionsRoot);
+                var moved = plan.Retirements.ToDictionary(r => ClaudeSidebarPrefs.ListId(r.File), r => ClaudeSidebarPrefs.ListId(r.SuccessorFile));
+                var outcome = ClaudeSidebarPrefs.Sync(copy, scratch, links, moved, () => true);
+                Console.WriteLine($"sidebar dry run: links={links.Count} {outcome}");
+            }
         }
         finally { if (Directory.Exists(scratch)) Directory.Delete(scratch, recursive: true); }
+    }
+
+    private static void TestConversationLineage()
+    {
+        using var fixture = new Fixture();
+        // A conversation continued in A: its newer record lists the earlier transcript id.
+        var old = fixture.Transcript(); var newer = fixture.Transcript();
+        fixture.Record(A, "local_a1a1a1a1-0000-4000-8000-000000000001", old);
+        fixture.Record(A, "local_a1a1a1a1-0000-4000-8000-000000000002", newer, extra: r => r["priorCliSessionIds"] = new JsonArray(old));
+        var plan = fixture.Shelf().Plan([A, B]);
+        Check(plan.Actions.Count == 1 && plan.Actions[0].CliSessionId == newer && plan.Skipped.Values.Single()["superseded"] == 1,
+            "an older state of a conversation is never copied when a newer one is in the same list");
+
+        // B already has the newer state: an older id is present through its lineage.
+        fixture.Record(B, "local_b2b2b2b2-0000-4000-8000-000000000001", newer, extra: r => r["priorCliSessionIds"] = new JsonArray(old));
+        Check(fixture.Shelf().Plan([A, B]).Actions.Count == 0, "a conversation already listed in a newer state is present");
+
+        // A copy made before the conversation moved on is archived, not deleted, once the newer state is copied.
+        using var moved = new Fixture();
+        var first = moved.Transcript(); var second = moved.Transcript();
+        moved.Record(A, "local_c3c3c3c3-0000-4000-8000-000000000001", first);
+        var shelf = moved.Shelf();
+        Check(shelf.Apply([A, B], () => true).Created == 1, "the first state is copied to B");
+        var stale = moved.Files(B).Single();
+        File.Delete(moved.Files(A).Single());
+        moved.Record(A, "local_c3c3c3c3-0000-4000-8000-000000000002", second, extra: r => r["priorCliSessionIds"] = new JsonArray(first));
+        var result = shelf.Apply([A, B], () => true);
+        var archived = JsonNode.Parse(File.ReadAllText(stale))!.AsObject();
+        Check(result.Created == 1 && result.Retired == 1 && File.Exists(stale) && archived["isArchived"]!.GetValue<bool>()
+              && archived["cliSessionId"]!.GetValue<string>() == first,
+            "the superseded copy stays on disk, archived, with its transcript reference intact");
+        Check(shelf.Apply([A, B], () => true) is { Created: 0, Retired: 0 }, "a retired copy is neither recreated nor archived twice");
+        var ledger = JsonNode.Parse(File.ReadAllText(Path.Combine(moved.Ledger, "ledger.json")))!;
+        Check(ledger["created"]!.AsArray().Count(entry => entry!["retiredAt"] is not null) == 1, "the ledger records the retirement");
+
+        // Records the app wrote, and copies the app continued, are left alone.
+        using var native = new Fixture();
+        var older = native.Transcript(); var newest = native.Transcript(); var continued = native.Transcript();
+        native.Record(B, "local_d4d4d4d4-0000-4000-8000-000000000001", older);
+        native.Record(A, "local_d4d4d4d4-0000-4000-8000-000000000002", newest, extra: r => r["priorCliSessionIds"] = new JsonArray(older));
+        var nativeResult = native.Shelf().Apply([A, B], () => true);
+        Check(nativeResult.Retired == 0 && JsonNode.Parse(File.ReadAllText(Path.Combine(native.ShelfPath(B), "local_d4d4d4d4-0000-4000-8000-000000000001.json")))!["isArchived"]!.GetValue<bool>() == false,
+            "an older record the app wrote is never archived");
+        // B received a copy of the newest state; the app then continued that copy under B.
+        var copy = native.Files(B).Single(path => !path.EndsWith("0001.json", StringComparison.Ordinal));
+        var record = JsonNode.Parse(File.ReadAllText(copy))!.AsObject();
+        record["cliSessionId"] = continued; record["priorCliSessionIds"] = new JsonArray(older, newest);
+        File.WriteAllText(copy, record.ToJsonString());
+        Check(native.Shelf().Apply([A, B], () => true).Retired == 0 && !JsonNode.Parse(File.ReadAllText(copy))!["isArchived"]!.GetValue<bool>(),
+            "a copy the app continued is the user's conversation now and is not archived");
+    }
+
+    private static void TestSidebarPrefs()
+    {
+        using var fixture = new Fixture();
+        var config = Path.Combine(fixture.Root, "claude_desktop_config.json");
+        var state = Path.Combine(fixture.Root, "state");
+        const string idA = "code:local_aaaaaaaa-1111-4000-8000-000000000001", idB = "code:local_bbbbbbbb-1111-4000-8000-000000000001";
+        const string otherA = "code:local_aaaaaaaa-1111-4000-8000-000000000009";
+        var link = new ClaudeSidebarPrefs.Link(A.Key, idA, B.Key, idB, B.Key + "/local_bbbbbbbb-1111-4000-8000-000000000001.json");
+        void Write(JsonObject prefs) => File.WriteAllText(config, new JsonObject
+        { ["globalShortcut"] = "", ["preferences"] = new JsonObject { ["sidebarMode"] = "epitaxy", ["epitaxyPrefs"] = prefs.DeepClone() } }.ToJsonString());
+        JsonObject Prefs() => JsonNode.Parse(File.ReadAllText(config))!["preferences"]!["epitaxyPrefs"]!.AsObject();
+        ClaudeSidebarPrefs.Outcome Sync(IReadOnlyDictionary<string, string>? moved = null, Func<bool>? closed = null) =>
+            ClaudeSidebarPrefs.Sync(config, state, [link], moved ?? new Dictionary<string, string>(), closed ?? (() => true));
+        List<string> Pinned() => Prefs()["dframe-local-slice"]!["pinnedOrder"]!.AsArray().Select(item => item!.GetValue<string>()).ToList();
+        string? GroupOf(string account, string id)
+        {
+            var scope = Prefs()["dframe-group-scopes"]?[account];
+            var groupId = scope?["assignments"]?[id]?.GetValue<string>();
+            return scope?["groups"]!.AsArray().FirstOrDefault(group => group!["id"]!.GetValue<string>() == groupId)?["name"]?.GetValue<string>();
+        }
+
+        Write(new JsonObject
+        {
+            ["dframe-local-slice"] = new JsonObject { ["pinnedOrder"] = new JsonArray(otherA, idA), ["homeProjectsPinnedOrder"] = new JsonArray() },
+            ["starred-local-code-sessions"] = new JsonArray(idA["code:".Length..]),
+            ["dframe-group-scopes"] = new JsonObject
+            {
+                [A.Key] = new JsonObject
+                {
+                    ["groups"] = new JsonArray(new JsonObject { ["id"] = "cg-1", ["name"] = "대기" }),
+                    ["assignments"] = new JsonObject { [idA] = "cg-1" }, ["order"] = new JsonObject { ["cg-1"] = new JsonArray(idA) }
+                }
+            },
+            ["fastMode"] = true
+        });
+        var first = Sync();
+        Check(first.Pinned == 1 && Pinned().SequenceEqual([otherA, idA, idB]) && GroupOf(B.Key, idB) == "대기" && first.Grouped == 1,
+            "a copy is pinned next to its original and put in a group of the same name in its account");
+        Check(Prefs()["fastMode"]!.GetValue<bool>() && Prefs()["starred-local-code-sessions"]!.AsArray().Count == 2
+              && !File.ReadAllText(config).Contains('\r') && File.ReadAllText(config).Contains("\"대기\""),
+            "other settings, the starred mirror, line endings and Korean text are preserved");
+        Check(Sync() is { Pinned: 0, Unpinned: 0, Grouped: 0 }, "an aligned pair changes nothing");
+
+        // The user unpins the copy and moves it out of the group while signed in to B: that change wins.
+        var prefs = Prefs();
+        prefs["dframe-local-slice"]!["pinnedOrder"]!.AsArray().RemoveAt(2);
+        prefs["dframe-group-scopes"]![B.Key]!["assignments"]!.AsObject().Remove(idB);
+        Write(prefs);
+        var second = Sync();
+        Check(second.Unpinned == 1 && second.Ungrouped == 1 && !Pinned().Contains(idA) && GroupOf(A.Key, idA) is null,
+            "an unpin or ungroup made on either side reaches the other side");
+
+        // A copy that was archived hands its pin and group to the newer record that replaced it.
+        const string newer = "code:local_bbbbbbbb-1111-4000-8000-000000000002";
+        prefs = Prefs();
+        prefs["dframe-local-slice"]!["pinnedOrder"]!.AsArray().Add(idB);
+        Write(prefs);
+        var moved = ClaudeSidebarPrefs.Sync(config, state, [], new Dictionary<string, string> { [idB] = newer }, () => true);
+        Check(moved.Moved == 1 && Pinned().Contains(newer) && !Pinned().Contains(idB), "a retired copy's pin moves to its successor");
+
+        // Unexpected shapes and concurrent changes write nothing.
+        File.WriteAllText(config, "{\"preferences\":{\"epitaxyPrefs\":{\"dframe-local-slice\":{\"pinnedOrder\":\"oops\"},\"dframe-group-scopes\":[]}}}");
+        var before = File.ReadAllBytes(config);
+        Check(Sync().Skipped == "shape" && File.ReadAllBytes(config).SequenceEqual(before), "an unfamiliar settings shape is left untouched");
+        Write(new JsonObject { ["dframe-local-slice"] = new JsonObject { ["pinnedOrder"] = new JsonArray(idA) } });
+        File.Delete(Path.Combine(state, "sidebar-mirror.json"));
+        before = File.ReadAllBytes(config);
+        Check(Sync(closed: () => false).Skipped == "desktop_running" && File.ReadAllBytes(config).SequenceEqual(before),
+            "nothing is written once the app is running again");
+    }
+
+    private static void TestLineageEdges()
+    {
+        // A conversation restored after a clear lists its own current id as earlier; it is still copied.
+        using var restored = new Fixture();
+        var current = restored.Transcript(); var cleared = restored.Transcript();
+        restored.Record(A, "local_e5e5e5e5-0000-4000-8000-000000000001", current,
+            extra: r => r["priorCliSessionIds"] = new JsonArray(current, cleared));
+        Check(restored.Shelf().Plan([A, B]).Actions.Count == 1, "a record's own earlier-id list never hides it");
+        // Two records that list each other are ambiguous: neither is treated as an older state.
+        restored.Record(A, "local_e5e5e5e5-0000-4000-8000-000000000002", cleared, extra: r => r["priorCliSessionIds"] = new JsonArray(current));
+        Check(restored.Shelf().Plan([A, B]).Actions.Count == 2, "mutually listed records are both kept");
+
+        // A copy the app changed under the same id may be a branch the user is working in: never archived.
+        using var edited = new Fixture();
+        var first = edited.Transcript(); var second = edited.Transcript();
+        edited.Record(A, "local_f6f6f6f6-0000-4000-8000-000000000001", first);
+        var shelf = edited.Shelf();
+        shelf.Apply([A, B], () => true);
+        var copy = edited.Files(B).Single();
+        var record = JsonNode.Parse(File.ReadAllText(copy))!.AsObject();
+        record["completedTurns"] = 9; record["lastActivityAt"] = 99;
+        File.WriteAllText(copy, record.ToJsonString());
+        edited.Record(A, "local_f6f6f6f6-0000-4000-8000-000000000002", second, extra: r => r["priorCliSessionIds"] = new JsonArray(first));
+        var result = shelf.Apply([A, B], () => true);
+        Check(result.Retired == 0 && !JsonNode.Parse(File.ReadAllText(copy))!["isArchived"]!.GetValue<bool>(),
+            "a copy resumed under the same id is left for the user");
+
+        // Two newer branches of the same conversation: which one replaces the copy is unclear, so nothing is archived.
+        using var branches = new Fixture();
+        var root = branches.Transcript(); var left = branches.Transcript(); var right = branches.Transcript();
+        branches.Record(A, "local_a7a7a7a7-0000-4000-8000-000000000001", root);
+        var forked = branches.Shelf();
+        forked.Apply([A, B], () => true);
+        File.Delete(branches.Files(A).Single());
+        branches.Record(A, "local_a7a7a7a7-0000-4000-8000-000000000002", left, extra: r => r["priorCliSessionIds"] = new JsonArray(root));
+        branches.Record(A, "local_a7a7a7a7-0000-4000-8000-000000000003", right, extra: r => r["priorCliSessionIds"] = new JsonArray(root));
+        Check(forked.Apply([A, B], () => true).Retired == 0, "a copy with two newer branches stays");
+
+        // The pin of an archived copy reaches its successor even when the first sidebar sync could not run.
+        using var moving = new Fixture();
+        moving.Config = Path.Combine(moving.Root, "claude_desktop_config.json");
+        var one = moving.Transcript(); var two = moving.Transcript();
+        moving.Record(A, "local_b8b8b8b8-0000-4000-8000-000000000001", one);
+        var pinning = moving.Shelf();
+        pinning.Apply([A, B], () => true);
+        var stale = Path.GetFileNameWithoutExtension(moving.Files(B).Single());
+        File.WriteAllText(moving.Config, new JsonObject { ["preferences"] = new JsonObject { ["epitaxyPrefs"] = new JsonObject
+            { ["dframe-local-slice"] = new JsonObject { ["pinnedOrder"] = new JsonArray("code:" + stale) } } } }.ToJsonString());
+        File.Delete(moving.Files(A).Single());
+        moving.Record(A, "local_b8b8b8b8-0000-4000-8000-000000000002", two, extra: r => r["priorCliSessionIds"] = new JsonArray(one));
+        // The app reopens after the copy is archived and before the settings are written.
+        var checks = 0;
+        MustThrow<ClaudeDesktopRunningException>(() => pinning.Apply([A, B], () => ++checks <= 4));
+        Check(moving.Files(B).Any(path => path.Contains(stale)) && JsonNode.Parse(File.ReadAllText(moving.Files(B).First(path => path.Contains(stale))))!["isArchived"]!.GetValue<bool>(),
+            "the copy was archived before the interruption");
+        pinning.Apply([A, B], () => true);
+        var pinned = JsonNode.Parse(File.ReadAllText(moving.Config))!["preferences"]!["epitaxyPrefs"]!["dframe-local-slice"]!["pinnedOrder"]!.AsArray()
+            .Select(item => item!.GetValue<string>()).ToArray();
+        var successor = Path.GetFileNameWithoutExtension(moving.Files(B).Single(path => !path.Contains(stale)));
+        Check(pinned.Contains("code:" + successor) && !pinned.Contains("code:" + stale), "the pending move is finished on the next run");
+
+        // An archive that did not happen is not counted as one: the intent is settled from the file on the next run.
+        using var halted = new Fixture();
+        halted.Config = Path.Combine(halted.Root, "claude_desktop_config.json");
+        var h1 = halted.Transcript(); var h2 = halted.Transcript();
+        halted.Record(A, "local_d0d0d0d0-0000-4000-8000-000000000001", h1);
+        var haltedShelf = halted.Shelf();
+        haltedShelf.Apply([A, B], () => true);
+        var haltedCopy = halted.Files(B).Single();
+        var haltedId = Path.GetFileNameWithoutExtension(haltedCopy);
+        File.WriteAllText(halted.Config, new JsonObject { ["preferences"] = new JsonObject { ["epitaxyPrefs"] = new JsonObject
+            { ["dframe-local-slice"] = new JsonObject { ["pinnedOrder"] = new JsonArray("code:" + haltedId) } } } }.ToJsonString());
+        File.Delete(halted.Files(A).Single());
+        halted.Record(A, "local_d0d0d0d0-0000-4000-8000-000000000002", h2, extra: r => r["priorCliSessionIds"] = new JsonArray(h1));
+        // A run stopped after recording its intent and before archiving: simulate with the ledger alone.
+        var ledgerPath = Path.Combine(halted.Ledger, "ledger.json");
+        var haltedLedger = JsonNode.Parse(File.ReadAllText(ledgerPath))!.AsObject();
+        haltedLedger["created"]![0]!["movedTo"] = "local_d0d0d0d0-0000-4000-8000-0000000000ff.json";
+        File.WriteAllText(ledgerPath, haltedLedger.ToJsonString());
+        var resumed = haltedShelf.Apply([A, B], () => true);
+        var pinnedNow = JsonNode.Parse(File.ReadAllText(halted.Config))!["preferences"]!["epitaxyPrefs"]!["dframe-local-slice"]!["pinnedOrder"]!.AsArray()
+            .Select(item => item!.GetValue<string>()).ToArray();
+        var haltedSuccessor = Path.GetFileNameWithoutExtension(halted.Files(B).Single(path => path != haltedCopy));
+        Check(resumed.Retired == 1 && JsonNode.Parse(File.ReadAllText(haltedCopy))!["isArchived"]!.GetValue<bool>()
+              && pinnedNow.Contains("code:" + haltedSuccessor) && !pinnedNow.Contains("code:" + haltedId),
+            "an unarchived copy with a stale intent is archived again and its pin then moves");
+
+        // A sidebar section of an unfamiliar shape leaves the move pending until it can be read.
+        using var odd = new Fixture();
+        odd.Config = Path.Combine(odd.Root, "claude_desktop_config.json");
+        var o1 = odd.Transcript(); var o2 = odd.Transcript();
+        odd.Record(A, "local_e1e1e1e1-0000-4000-8000-000000000001", o1);
+        var oddShelf = odd.Shelf();
+        oddShelf.Apply([A, B], () => true);
+        var oddCopy = Path.GetFileNameWithoutExtension(odd.Files(B).Single());
+        File.Delete(odd.Files(A).Single());
+        odd.Record(A, "local_e1e1e1e1-0000-4000-8000-000000000002", o2, extra: r => r["priorCliSessionIds"] = new JsonArray(o1));
+        File.WriteAllText(odd.Config, "{\"preferences\":{\"epitaxyPrefs\":[]}}");
+        var oddResult = oddShelf.Apply([A, B], () => true);
+        Check(oddResult.Retired == 1 && oddResult.Prefs is { Complete: false }, "an unfamiliar sidebar section is not reported as done");
+        File.WriteAllText(odd.Config, new JsonObject { ["preferences"] = new JsonObject { ["epitaxyPrefs"] = new JsonObject
+            { ["dframe-local-slice"] = new JsonObject { ["pinnedOrder"] = new JsonArray("code:" + oddCopy) } } } }.ToJsonString());
+        oddShelf.Apply([A, B], () => true);
+        var oddPinned = JsonNode.Parse(File.ReadAllText(odd.Config))!["preferences"]!["epitaxyPrefs"]!["dframe-local-slice"]!["pinnedOrder"]!.AsArray()
+            .Select(item => item!.GetValue<string>()).ToArray();
+        var oddSuccessor = Path.GetFileNameWithoutExtension(odd.Files(B).Single(path => !path.Contains(oddCopy)));
+        Check(!oddPinned.Contains("code:" + oddCopy) && oddPinned.Contains("code:" + oddSuccessor), "the pending move completes once the section is readable");
+
+        // An archive that cannot be written is reported as unfinished and retried; it is never counted as done.
+        using var stuck = new Fixture();
+        var s1 = stuck.Transcript(); var s2 = stuck.Transcript();
+        stuck.Record(A, "local_f2f2f2f2-0000-4000-8000-000000000001", s1);
+        var stuckShelf = stuck.Shelf();
+        stuckShelf.Apply([A, B], () => true);
+        var stuckCopy = stuck.Files(B).Single();
+        File.Delete(stuck.Files(A).Single());
+        stuck.Record(A, "local_f2f2f2f2-0000-4000-8000-000000000002", s2, extra: r => r["priorCliSessionIds"] = new JsonArray(s1));
+        File.SetAttributes(stuckCopy, FileAttributes.ReadOnly);
+        var failed = stuckShelf.Apply([A, B], () => true);
+        File.SetAttributes(stuckCopy, FileAttributes.Normal);
+        Check(failed.Retired == 0 && !failed.Plan.IsComplete && failed.Plan.Held[B.Key] == "archive_failed"
+              && !JsonNode.Parse(File.ReadAllText(stuckCopy))!["isArchived"]!.GetValue<bool>(), "a failed archive leaves the run unfinished");
+        Check(stuckShelf.Apply([A, B], () => true).Retired == 1, "the archive succeeds on the retry");
+
+        // Archived, but the run stopped before the ledger said so; the next run cannot read the copy at first.
+        using var locked = new Fixture();
+        locked.Config = Path.Combine(locked.Root, "claude_desktop_config.json");
+        var l1 = locked.Transcript(); var l2 = locked.Transcript();
+        locked.Record(A, "local_f3f3f3f3-0000-4000-8000-000000000001", l1);
+        var lockedShelf = locked.Shelf();
+        lockedShelf.Apply([A, B], () => true);
+        var lockedCopy = locked.Files(B).Single();
+        var lockedId = Path.GetFileNameWithoutExtension(lockedCopy);
+        File.Delete(locked.Files(A).Single());
+        locked.Record(A, "local_f3f3f3f3-0000-4000-8000-000000000002", l2, extra: r => r["priorCliSessionIds"] = new JsonArray(l1));
+        lockedShelf.Apply([A, B], () => true); // copies the newer state to B (no sidebar file yet: nothing to move)
+        var lockedSuccessor = Path.GetFileNameWithoutExtension(locked.Files(B).Single(path => path != lockedCopy));
+        // Rewind the ledger to "intent recorded, archive written, not yet confirmed" with a pin still on the copy.
+        var lockedLedgerPath = Path.Combine(locked.Ledger, "ledger.json");
+        var lockedLedger = JsonNode.Parse(File.ReadAllText(lockedLedgerPath))!.AsObject();
+        var lockedEntry = lockedLedger["created"]!.AsArray().First(entry => entry!["file"]!.GetValue<string>() == lockedId + ".json")!.AsObject();
+        lockedEntry["retiredAt"] = null; lockedEntry["moveDone"] = null; lockedEntry["movedTo"] = lockedSuccessor + ".json";
+        File.WriteAllText(lockedLedgerPath, lockedLedger.ToJsonString());
+        File.WriteAllText(locked.Config, new JsonObject { ["preferences"] = new JsonObject { ["epitaxyPrefs"] = new JsonObject
+            { ["dframe-local-slice"] = new JsonObject { ["pinnedOrder"] = new JsonArray("code:" + lockedId) } } } }.ToJsonString());
+        using (new FileStream(lockedCopy, FileMode.Open, FileAccess.Read, FileShare.None))
+            MustThrow<IOException>(() => lockedShelf.Apply([A, B], () => true));
+        Check(JsonNode.Parse(File.ReadAllText(lockedLedgerPath))!["created"]!.AsArray()
+                .Any(entry => entry!["file"]!.GetValue<string>() == lockedId + ".json" && entry["movedTo"] is not null),
+            "an unreadable copy keeps its pending move");
+        lockedShelf.Apply([A, B], () => true);
+        var lockedPins = JsonNode.Parse(File.ReadAllText(locked.Config))!["preferences"]!["epitaxyPrefs"]!["dframe-local-slice"]!["pinnedOrder"]!.AsArray()
+            .Select(item => item!.GetValue<string>()).ToArray();
+        Check(lockedPins.Contains("code:" + lockedSuccessor) && !lockedPins.Contains("code:" + lockedId),
+            "once readable, the archive is confirmed and the pin moves");
+
+        // A settings file that exists but cannot be opened is not "no settings": the move stays pending.
+        using var busy = new Fixture();
+        busy.Config = Path.Combine(busy.Root, "claude_desktop_config.json");
+        var b1 = busy.Transcript(); var b2 = busy.Transcript();
+        busy.Record(A, "local_f4f4f4f4-0000-4000-8000-000000000001", b1);
+        var busyShelf = busy.Shelf();
+        busyShelf.Apply([A, B], () => true);
+        var busyCopy = Path.GetFileNameWithoutExtension(busy.Files(B).Single());
+        File.WriteAllText(busy.Config, new JsonObject { ["preferences"] = new JsonObject { ["epitaxyPrefs"] = new JsonObject
+            { ["dframe-local-slice"] = new JsonObject { ["pinnedOrder"] = new JsonArray("code:" + busyCopy) } } } }.ToJsonString());
+        File.Delete(busy.Files(A).Single());
+        busy.Record(A, "local_f4f4f4f4-0000-4000-8000-000000000002", b2, extra: r => r["priorCliSessionIds"] = new JsonArray(b1));
+        ClaudeShelfResult busyResult;
+        using (new FileStream(busy.Config, FileMode.Open, FileAccess.Read, FileShare.None)) busyResult = busyShelf.Apply([A, B], () => true);
+        Check(busyResult.Retired == 1 && busyResult.Prefs is { Complete: false, Skipped: "unreadable" }, "an unopenable settings file leaves the move pending");
+        busyShelf.Apply([A, B], () => true);
+        var busySuccessor = Path.GetFileNameWithoutExtension(busy.Files(B).Single(path => !path.Contains(busyCopy)));
+        var busyPins = JsonNode.Parse(File.ReadAllText(busy.Config))!["preferences"]!["epitaxyPrefs"]!["dframe-local-slice"]!["pinnedOrder"]!.AsArray()
+            .Select(item => item!.GetValue<string>()).ToArray();
+        Check(busyPins.Contains("code:" + busySuccessor) && !busyPins.Contains("code:" + busyCopy), "the move completes once the file opens");
+        Check(ClaudeSidebarPrefs.Sync(Path.Combine(busy.Root, "missing", "c.json"), busy.Root, [], new Dictionary<string, string>(), () => true)
+            is { Skipped: "no_config", Complete: true }, "only a confirmed missing file counts as no settings");
+
+        // Both sides changed a group: the original's choice wins, including leaving the group.
+        using var conflict = new Fixture();
+        var config = Path.Combine(conflict.Root, "c.json"); var state = Path.Combine(conflict.Root, "s");
+        const string a = "code:local_c9c9c9c9-0000-4000-8000-000000000001", b = "code:local_c9c9c9c9-0000-4000-8000-000000000002";
+        var link = new ClaudeSidebarPrefs.Link(A.Key, a, B.Key, b, "k");
+        JsonObject Scope(string id, string? group) => group is null ? new JsonObject()
+            : new JsonObject { ["groups"] = new JsonArray(new JsonObject { ["id"] = "g-" + group, ["name"] = group }),
+                ["assignments"] = new JsonObject { [id] = "g-" + group }, ["order"] = new JsonObject { ["g-" + group] = new JsonArray(id) } };
+        void Write(string? groupA, string? groupB) => File.WriteAllText(config, new JsonObject { ["preferences"] = new JsonObject { ["epitaxyPrefs"] =
+            new JsonObject { ["dframe-group-scopes"] = new JsonObject { [A.Key] = Scope(a, groupA), [B.Key] = Scope(b, groupB) } } } }.ToJsonString());
+        Write("G0", "G0");
+        ClaudeSidebarPrefs.Sync(config, state, [link], new Dictionary<string, string>(), () => true);
+        Write(null, "G1");
+        ClaudeSidebarPrefs.Sync(config, state, [link], new Dictionary<string, string>(), () => true);
+        var scopes = JsonNode.Parse(File.ReadAllText(config))!["preferences"]!["epitaxyPrefs"]!["dframe-group-scopes"]!;
+        Check(scopes[A.Key]!["assignments"]?[a] is null && scopes[B.Key]!["assignments"]?[b] is null,
+            "when both sides changed, the original leaving its group wins");
     }
 
     private sealed class Fixture : IDisposable
@@ -592,8 +930,10 @@ internal static class ClaudeSessionShelfTests
             _work = Directory.CreateDirectory(Path.Combine(Root, "work")).FullName;
         }
 
+        internal string? Config { get; set; }
+
         internal ClaudeSessionShelf Shelf(Func<ClaudeLiveSessionScan>? writers = null) => new(
-            new ClaudeShelfPaths(Sessions, Projects, Scratch, [], Ledger),
+            new ClaudeShelfPaths(Sessions, Projects, Scratch, [], Ledger, Config),
             writers ?? (() => new ClaudeLiveSessionScan(new HashSet<string>(), false)), () => new MemoryStream());
 
         internal string ShelfPath(ClaudeShelfAccount account) => Path.Combine(Sessions, account.AccountUuid, account.OrgUuid);
