@@ -30,7 +30,9 @@ internal sealed record ClaudeShelfPaths(string SessionsRoot, string ProjectsRoot
         return new(Path.Combine(roaming, "Claude", "claude-code-sessions"), Path.Combine(config, "projects"),
             Path.Combine(roaming, "Claude", "scratch-workspaces"), registries,
             Path.Combine(local, "CodexWeeklyUsageIndicator.SessionShelf"),
-            Path.Combine(roaming, "Claude", "claude_desktop_config.json"));
+            // Sidebar sync is off: live, the app rewrote the settings file from its own state on start, dropping the
+            // copies' pins and groups, and the next sync read that as the user unpinning the originals.
+            DesktopConfig: null);
     }
 }
 
