@@ -5,6 +5,7 @@ if (args.Contains("--english")) UiText.SetLanguage("en");
 if (args.Contains("--live-environment-smoke")) { await LiveEnvironmentSmoke.RunAsync(); return; }
 if (args.Contains("--claude-shelf-live-probe")) { ClaudeSessionShelfTests.LiveProbe(); return; }
 if (args.Contains("--claude-shelf-tests")) { await ClaudeSessionShelfTests.RunAsync(); Console.WriteLine("PASS: Claude session shelf"); return; }
+if (args.Contains("--claude-sync-tests")) { await ClaudeSessionSyncTests.RunAsync(); Console.WriteLine("PASS: Claude session sync"); return; }
 if (args.Contains("--claude-menu-smoke")) { await ClaudeAccountMenuSmoke.RunAsync(); return; }
 if (args.Contains("--live-claude-menu-smoke")) { await ClaudeAccountMenuSmoke.RunAsync(live: true); return; }
 if (args.Contains("--language-ui-smoke")) { await LanguageUiSmoke.RunAsync(); return; }
@@ -38,6 +39,7 @@ var tests = new (string Name, Func<Task> Run)[]
     ("Claude weekly metric, independent expiry and profile cache", ClaudeMetricTests.RunAll),
     ("Claude official profile identity and shared local work", ClaudeProfileTests.RunAsync),
     ("Claude session shelf: add-only fill, closed-app writes, account mapping and log observation", ClaudeSessionShelfTests.RunAsync),
+    ("Claude combined weekly total and session-layout plan", ClaudeSessionSyncTests.RunAsync),
     ("Claude login waits, transient observation and identity invalidation", ClaudeControllerTests.RunAsync),
     ("Claude account menu actions and inactive-profile usage", () => ClaudeAccountMenuSmoke.RunAsync()),
     ("account operation lease blocks lifecycle replacement across awaits", AccountOperationLeaseTests.RunAsync),

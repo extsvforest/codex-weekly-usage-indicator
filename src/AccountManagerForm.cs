@@ -52,6 +52,7 @@ internal sealed partial class AccountManagerForm : Form
     private string? _desktopPath, _operationMessage;
     private bool _operationError, _operationSuccess;
     private readonly bool _refreshAllOnOpen;
+    private bool _claudeReadPending, _closeAfterClaude;
     private UsageQueryStatus _usageQueryStatus = new(UsageQueryState.None);
     internal CombinedUsageSnapshot CombinedUsage => _combined;
     internal bool IsOperationInProgress => _busy || _claudePanel?.IsBusy == true;
@@ -74,7 +75,7 @@ internal sealed partial class AccountManagerForm : Form
         SuspendLayout(); _store = store; _suspend = suspend; _resume = resume; _accountsChanged = accountsChanged;
         _queryUsage = queryUsage ?? ((account, token) => CodexAccountUsageReader.ReadInactiveAsync(store, account.Id, token));
         _combined = combined ?? new(); _usageChanged = usageChanged; _claudeAccounts = claudeAccounts; _claudeShelf = claudeShelf;
-        _refreshAllOnOpen = refreshAllOnOpen; Name = "AccountManagerForm";
+        _refreshAllOnOpen = _claudeReadPending = refreshAllOnOpen; Name = "AccountManagerForm";
         AccountUiTheme.SetForm(this); Text = UiText.T("계정 관리");
         ClientSize = new Size(920, 780); MinimumSize = new Size(780, 600); StartPosition = FormStartPosition.CenterScreen; KeyPreview = true;
         _shell.Padding = new Padding(30, 24, 30, 20);
@@ -137,7 +138,7 @@ internal sealed partial class AccountManagerForm : Form
         _refresh.Click += (_, _) => { if (!_busy && Reload()) SetStatus(UiText.T("저장된 계정 목록을 다시 읽었습니다.")); };
         _refreshAll.Click += async (_, _) =>
         {
-            if (_showingClaude && _claudePanel is not null) await _claudePanel.RefreshSelectedUsageAsync();
+            if (_showingClaude && _claudePanel is not null) await _claudePanel.RefreshAllUsageAsync();
             else await ReadAllUsageAsync();
         };
         _readUsage.Click += async (_, _) => await ReadSelectedUsageAsync(); _rename.Click += (_, _) => RenameSelected();
@@ -166,7 +167,24 @@ internal sealed partial class AccountManagerForm : Form
         };
         FormClosing += (_, e) =>
         {
-            if (_claudePanel?.IsBusy == true) { e.Cancel = true; return; }
+            if (_claudePanel?.IsBusy == true)
+            {
+                e.Cancel = true;
+                // Reading every account only reads usage: cancel it and close once it has unwound.
+                if (_claudePanel.IsRefreshingAll && !_closeAfterClaude)
+                {
+                    _closeAfterClaude = true;
+                    void CloseWhenIdle(object? sender, EventArgs args)
+                    {
+                        if (_claudePanel.IsBusy) return;
+                        _claudePanel.BusyChanged -= CloseWhenIdle;
+                        BeginInvoke(new Action(Close));
+                    }
+                    _claudePanel.BusyChanged += CloseWhenIdle;
+                    _claudePanel.CancelOperation();
+                }
+                return;
+            }
             if (!_busy) return; e.Cancel = true;
             if (_batchQuerying) { _closeAfterBatch = true; _loginCancellation?.Cancel(); SetStatus(UiText.T("전체 조회를 취소하고 안전하게 정리한 뒤 닫습니다…")); }
             else SetStatus(UiText.T("진행 중인 작업이 있습니다. 취소 버튼으로 요청을 마친 뒤 닫아주세요."));

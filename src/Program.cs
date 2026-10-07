@@ -12,6 +12,9 @@ internal static class Program
     [STAThread]
     private static int Main(string[] args)
     {
+        // A read-only planning command for the claude-session-sync skill: no window, no single-instance claim.
+        if (args.Length > 0 && args[0].Equals(ClaudeSessionSync.CommandFlag, StringComparison.OrdinalIgnoreCase))
+            return ClaudeSessionSync.RunCommand(args[1..]);
         var openAccounts = args.Any(argument => argument.Equals("--accounts", StringComparison.OrdinalIgnoreCase));
         if (args.Any(argument => argument.Equals("--supervise", StringComparison.OrdinalIgnoreCase)))
             return WidgetSupervisor.Run();

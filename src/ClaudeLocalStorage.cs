@@ -28,8 +28,11 @@ internal sealed class ClaudeLocalStorage(string directory, string origin = "http
     internal Action? AfterAppend { get; set; }
 
     /// <summary>The newest value of each key (null when absent or deleted) and the database's last sequence number.</summary>
-    internal Snapshot Read(IReadOnlyCollection<string> keys)
+    /// <param name="whileOpen">Read alongside a running app: open files with full sharing. Only for read-only callers;
+    /// a torn tail or a table replaced underneath throws, and the caller retries.</param>
+    internal Snapshot Read(IReadOnlyCollection<string> keys, bool whileOpen = false)
     {
+        byte[] ReadAll(string path) => whileOpen ? ReadShared(path) : File.ReadAllBytes(path);
         var wanted = keys.ToDictionary(key => Key(key), key => key, new BytesComparer());
         wanted[Encoding.ASCII.GetBytes("VERSION")] = "\0VERSION";
         var latest = new Dictionary<string, (ulong Sequence, byte[]? Value)>(StringComparer.Ordinal);
@@ -40,17 +43,17 @@ internal sealed class ClaudeLocalStorage(string directory, string origin = "http
         }
 
         // CURRENT names the manifest and must end with a newline, as LevelDB requires.
-        var currentText = File.ReadAllText(Path.Combine(Directory, "CURRENT"));
+        var currentText = Encoding.UTF8.GetString(ReadAll(Path.Combine(Directory, "CURRENT")));
         if (!currentText.EndsWith('\n')) throw new InvalidDataException("CURRENT does not end with a newline.");
         var current = currentText[..^1];
         if (!current.StartsWith("MANIFEST-", StringComparison.Ordinal) || current.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
             throw new InvalidDataException("Unexpected CURRENT file.");
-        var (lastSequence, logNumber, liveTables) = ReadManifest(Path.Combine(Directory, current));
+        var (lastSequence, logNumber, liveTables) = ReadManifest(ReadAll(Path.Combine(Directory, current)));
         foreach (var number in liveTables)
         {
             var path = Path.Combine(Directory, number.ToString("D6") + ".ldb");
             if (!File.Exists(path)) path = Path.Combine(Directory, number.ToString("D6") + ".sst");
-            foreach (var (internalKey, value) in ReadTable(File.ReadAllBytes(path)))
+            foreach (var (internalKey, value) in ReadTable(ReadAll(path)))
             {
                 if (internalKey.Length < 8) throw new InvalidDataException("Short internal key.");
                 var tag = BinaryPrimitives.ReadUInt64LittleEndian(internalKey.AsSpan(internalKey.Length - 8));
@@ -66,7 +69,7 @@ internal sealed class ClaudeLocalStorage(string directory, string origin = "http
         var clean = true;
         foreach (var (path, _) in logs)
         {
-            var (batches, complete) = ParseLog(File.ReadAllBytes(path));
+            var (batches, complete) = ParseLog(ReadAll(path));
             clean &= complete;
             foreach (var batch in batches) lastSequence = Math.Max(lastSequence, ReadBatch(batch, Offer));
         }
@@ -188,12 +191,20 @@ internal sealed class ClaudeLocalStorage(string directory, string origin = "http
 
     // ---- LevelDB formats -------------------------------------------------------------------------------------------
 
-    private static (ulong LastSequence, ulong LogNumber, IReadOnlyList<ulong> Tables) ReadManifest(string path)
+    private static byte[] ReadShared(string path)
+    {
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        var bytes = new byte[stream.Length];
+        stream.ReadExactly(bytes);
+        return bytes;
+    }
+
+    private static (ulong LastSequence, ulong LogNumber, IReadOnlyList<ulong> Tables) ReadManifest(byte[] manifest)
     {
         ulong lastSequence = 0, logNumber = 0;
         bool hasLog = false, hasNext = false, hasSequence = false;
         var tables = new HashSet<ulong>();
-        var (edits, complete) = ParseLog(File.ReadAllBytes(path));
+        var (edits, complete) = ParseLog(manifest);
         if (!complete) throw new InvalidDataException("The manifest ends mid-record.");
         foreach (var edit in edits)
         {

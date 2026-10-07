@@ -73,6 +73,9 @@ internal sealed class ClaudeShelfService : IDisposable
     private (Guid Id, DateTimeOffset Until)? _reservation;
     private string? _launchFailure;
     internal ClaudeShelfStatus Status { get; private set; } = ClaudeShelfStatus.Initial;
+    /// <summary>The Desktop account/organization of each registered profile, as last resolved by the worker.</summary>
+    internal IReadOnlyList<ClaudeShelfAccount> Accounts => Volatile.Read(ref _accounts);
+    internal string LedgerDirectory => _shelf.Paths.LedgerDirectory;
     internal event EventHandler? StatusChanged;
 
     internal ClaudeShelfService(Control owner, Func<IReadOnlyList<ClaudeProfile>> profiles, ClaudeSessionShelf? shelf = null,
@@ -146,6 +149,7 @@ internal sealed class ClaudeShelfService : IDisposable
     }
 
     internal void SetStatusForTest(ClaudeShelfStatus status) => Publish(status);
+    internal void SetAccountsForTest(IReadOnlyList<ClaudeShelfAccount> accounts) => Volatile.Write(ref _accounts, accounts);
 
     private void Publish(ClaudeShelfStatus status)
     {
@@ -204,8 +208,8 @@ internal sealed class ClaudeShelfService : IDisposable
     {
         var key = string.Join("|", profiles.Select(profile => profile.Id + ":" + profile.Identity?.Key + ":" + profile.IsVerified));
         if (key == _accountsKey && now - _accountsAt < AccountsInterval) return;
-        try { _accounts = ClaudeShelfAccounts.Resolve(profiles, _shelf.Paths.LedgerDirectory); }
-        catch (Exception) { _accounts = []; }
+        try { Volatile.Write(ref _accounts, ClaudeShelfAccounts.Resolve(profiles, _shelf.Paths.LedgerDirectory)); }
+        catch (Exception) { Volatile.Write(ref _accounts, []); }
         _accountsKey = key; _accountsAt = now;
     }
 

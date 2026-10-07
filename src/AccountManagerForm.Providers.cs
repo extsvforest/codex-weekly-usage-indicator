@@ -13,6 +13,14 @@ internal sealed partial class AccountManagerForm
             UpdateProviderHeader();
             StyleTab(_codexTab, !claude); StyleTab(_claudeTab, claude);
         });
+        // Like the Codex tab when the window opens: the first visit checks every Claude account once.
+        if (claude && _claudeReadPending && _claudePanel is { CanRefreshAll: true } panel)
+            BeginInvoke(new Action(async () =>
+            {
+                if (IsDisposed || !_showingClaude || !_claudeReadPending || !panel.CanRefreshAll) return;
+                _claudeReadPending = false;
+                await panel.RefreshAllUsageAsync();
+            }));
     }
 
     // Both providers use the same header controls. Only the scope of the read differs.
@@ -20,11 +28,12 @@ internal sealed partial class AccountManagerForm
     {
         _refreshAll.Visible = _checkedAt.Visible = true;
         _refreshAll.Text = UiText.T("갱신");
-        _refreshAll.AccessibleName = _showingClaude ? UiText.T("사용 중인 계정 사용량 갱신") : UiText.T("모든 계정 사용량 갱신");
-        var details = _refreshAll.AccessibleName + (_showingClaude ? "" : "\n" + UiText.T("창을 열 때 한 번 갱신합니다."));
+        _refreshAll.AccessibleName = UiText.T("모든 계정 사용량 갱신");
+        var details = _refreshAll.AccessibleName + "\n" + (_showingClaude
+            ? UiText.T("Claude 탭을 처음 열 때 한 번 갱신합니다. 계정마다 10분에 한 번만 새로 확인합니다.") : UiText.T("창을 열 때 한 번 갱신합니다."));
         _headerDetails.SetToolTip(_refreshAll, details); _refreshAll.AccessibleDescription = details;
         _checkedAt.Text = _showingClaude ? _claudePanel?.CheckedAtText ?? "" : _overview.CheckedAtText;
-        _refreshAll.Enabled = _showingClaude ? !_busy && _claudePanel?.CanRefreshSelected == true
+        _refreshAll.Enabled = _showingClaude ? !_busy && _claudePanel?.CanRefreshAll == true
             : !_busy && !_store.HasPendingRecovery && !HasLinkedRecovery && _usageQueryStatus.State != UsageQueryState.RecoveryRequired && _items.Count > 0;
     }
 

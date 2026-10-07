@@ -30,8 +30,13 @@ internal sealed class ClaudeAccountPanel : UserControl
     private bool _operationError, _operationSuccess;
     private string? _usageFailureProfileId, _usageFailureMessage;
     private DateTimeOffset? _usageFailureObservedAt;
+    private (int Done, int Total)? _batchProgress;
     internal bool IsBusy => _cancellation is not null;
     internal bool CanRefreshSelected => !IsBusy && RegisteredSelection is not null;
+    internal bool CanRefreshAll => !IsBusy && _controller.Store.ListProfiles().Any(profile => profile.IsVerified);
+    /// <summary>A refresh of every account is running; it only reads usage and can be cancelled at any point.</summary>
+    internal bool IsRefreshingAll => _batchProgress is not null;
+    internal void CancelOperation() { _cancellation?.Cancel(); _cancel.Enabled = false; }
     internal string CheckedAtText => _summary.CheckedAtText;
     internal event EventHandler? BusyChanged;
     internal event EventHandler? SummaryChanged;
@@ -130,6 +135,7 @@ internal sealed class ClaudeAccountPanel : UserControl
     {
         using var layout = AccountUiTheme.DeferLayout(_layout);
         var profiles = _controller.Store.ListProfiles(); var selectedId = _controller.SelectedProfile.Id;
+        var reference = KeepReferenceLabels(profiles);
         _count.Text = UiText.F($"내 계정  {profiles.Count}");
         _register.Visible = !profiles.Any(p => p.IsDefault);
         var ids = profiles.Select(profile => profile.Id).ToHashSet(StringComparer.Ordinal);
@@ -152,11 +158,56 @@ internal sealed class ClaudeAccountPanel : UserControl
                 row.TabIndex = index; _rows.SetCellPosition(row, new TableLayoutPanelCellPosition(0, index));
                 _rows.RowStyles.Add(new RowStyle(SizeType.Absolute, 66));
                 row.DisplayProfile(profile, AppProfileId is { } app ? profile.Id == app : profile.Id == selectedId,
-                    profile.Id == AppProfileId, IsBusy);
+                    profile.Id == AppProfileId, IsBusy, reference is not null && AccountOf(profile.Id)?.Key == reference.Account);
                 row.DisplayUsage(_controller.LastUsage(profile.Id), _controller.LastFailure(profile.Id));
             }
         }
         ClearResolvedUsageFailure(); DisplaySummary(); RenderNotice(); UpdateActions(); UpdateShelfFooter(); ApplyGeometry();
+    }
+
+    private ClaudeShelfAccount? AccountOf(string profileId) => _shelf?.Accounts.FirstOrDefault(account => account.ProfileId == profileId);
+
+    /// <summary>Reads the session reference and keeps its account labels in step with renames on this page.</summary>
+    private ClaudeSessionReference? KeepReferenceLabels(IReadOnlyList<ClaudeProfile> profiles)
+    {
+        if (_shelf is null || ClaudeSessionReference.Load(_shelf.LedgerDirectory) is not { } reference) return null;
+        // Only add or update labels: an account not resolved yet keeps the label it had.
+        var labels = new Dictionary<string, string>(reference.Labels, StringComparer.Ordinal);
+        foreach (var (key, value) in ReferenceLabels(profiles)) labels[key] = value;
+        var label = labels.GetValueOrDefault(reference.Account, reference.Label);
+        if (labels.Count == reference.Labels.Count && !labels.Except(reference.Labels).Any() && label == reference.Label)
+            return reference;
+        try { (reference = reference with { Label = label, Labels = labels }).Save(_shelf.LedgerDirectory); }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { }
+        return reference;
+    }
+
+    private Dictionary<string, string> ReferenceLabels(IReadOnlyList<ClaudeProfile> profiles) =>
+        (_shelf?.Accounts ?? []).Where(account => profiles.Any(profile => profile.Id == account.ProfileId))
+            .DistinctBy(account => account.Key).ToDictionary(account => account.Key,
+                account => profiles.First(profile => profile.Id == account.ProfileId).Label, StringComparer.Ordinal);
+
+    /// <summary>Marks (or clears) the account whose session titles, pins and groups the other accounts copy when the
+    /// user asks Claude to align them. The page only records the choice; it never changes a sidebar.</summary>
+    private void ToggleReference(ClaudeProfile profile, bool isReference)
+    {
+        if (_shelf is null) return;
+        try
+        {
+            if (isReference)
+            {
+                ClaudeSessionReference.Clear(_shelf.LedgerDirectory);
+                Reload(); SetStatus(UiText.T("세션 정리 기준을 해제했습니다."), success: true);
+                return;
+            }
+            if (AccountOf(profile.Id) is not { } account) return;
+            new ClaudeSessionReference(account.Key, profile.Label, profile.Id, DateTimeOffset.UtcNow,
+                ReferenceLabels(_controller.Store.ListProfiles())).Save(_shelf.LedgerDirectory);
+            Reload();
+            SetStatus(UiText.F($"세션 정리 기준: {profile.Label} · 다른 계정에서 Claude에게 \"세션 맞춰줘\"라고 하면 이 계정에 맞춥니다."), success: true);
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        { SetStatus(UsageIndicatorForm.FriendlyClaudeError(exception), true); }
     }
 
     private void UpdateShelfFooter()
@@ -194,13 +245,42 @@ internal sealed class ClaudeAccountPanel : UserControl
         return (UiText.T("세션 목록 · Claude를 종료하면 모든 계정 목록을 서로 채웁니다."), false, null);
     }
 
-    private void DisplaySummary()
-    {
-        var selected = RegisteredSelection;
-        _summary.Display(selected, selected is null ? null : _controller.LastUsage(selected.Id), selected is null ? null : _controller.LastFailure(selected.Id));
-    }
+    private void DisplaySummary() => _summary.Display(_controller.Store.ListProfiles().Select(profile =>
+        new ClaudeSummaryRow(profile, _controller.LastUsage(profile.Id), _controller.LastFailure(profile.Id))).ToArray(), _batchProgress);
 
     internal Task RefreshSelectedUsageAsync() => RegisteredSelection is { } selected ? ReadUsageAsync(selected.Id) : Task.CompletedTask;
+
+    /// <summary>
+    /// Checks every signed-in account once, the in-use one first, as the Codex tab does when it opens. Each account
+    /// keeps its own ten-minute interval, so one checked recently reuses its observation instead of a new command.
+    /// A failure stays on its row and the remaining accounts continue. Accounts that need a sign-in are skipped.
+    /// </summary>
+    internal Task RefreshAllUsageAsync() => RunAsync(UiText.T("전체 계정의 주간 사용량을 확인하고 있습니다…"), async token =>
+    {
+        var selectedId = _controller.SelectedProfile.Id;
+        var targets = _controller.Store.ListProfiles()
+            .Where(profile => profile.IsVerified
+                && _controller.LastFailure(profile.Id) is not (ClaudeLoginRequiredException or ClaudeIdentityChangedException))
+            .OrderByDescending(profile => profile.Id == selectedId)
+            .DistinctBy(profile => profile.Identity!.Key, StringComparer.Ordinal).ToArray();
+        if (targets.Length == 0) throw new InvalidOperationException("확인할 수 있는 Claude 계정이 없습니다. 로그인이 필요한 계정은 다시 로그인하세요.");
+        var failed = 0;
+        _batchProgress = (0, targets.Length); DisplaySummary();
+        try
+        {
+            foreach (var profile in targets)
+            {
+                token.ThrowIfCancellationRequested();
+                try { await _controller.ReadUsageAsync(profile.Id, token); }
+                catch (OperationCanceledException) when (token.IsCancellationRequested) { throw; }
+                catch (Exception) { failed++; }
+                _batchProgress = (_batchProgress!.Value.Done + 1, targets.Length); DisplaySummary();
+            }
+        }
+        finally { _batchProgress = null; }
+        if (failed > 0) throw new InvalidOperationException("일부 계정의 확인이 필요합니다. 계정별 상태를 확인하고 다시 갱신하세요.");
+        return UiText.F($"{targets.Length}개 계정의 주간 잔여량을 확인했습니다.");
+    });
     private Task ReadUsageAsync(string profileId) => RunAsync(UiText.T("Claude 사용량을 확인하고 있습니다…"), async token =>
     {
         var result = await _controller.ReadUsageAsync(profileId, token);
@@ -310,7 +390,7 @@ internal sealed class ClaudeAccountPanel : UserControl
         private readonly Label _resetRelative = AccountUiTheme.Label("", 10.5f, true);
         private readonly Label _resetDate = AccountUiTheme.Label("", 9, color: AccountUiTheme.Muted);
         private readonly ToolTip _details = new() { InitialDelay = 500, ReshowDelay = 100, AutoPopDelay = 10000, ShowAlways = true };
-        private bool _busy;
+        private bool _busy, _reference;
         internal ClaudeProfile Profile { get; private set; }
         internal bool IsSelected { get; private set; }
         internal bool IsAppAccount { get; private set; }
@@ -352,9 +432,9 @@ internal sealed class ClaudeAccountPanel : UserControl
             return panel;
         }
 
-        internal void DisplayProfile(ClaudeProfile profile, bool selected, bool appAccount, bool busy)
+        internal void DisplayProfile(ClaudeProfile profile, bool selected, bool appAccount, bool busy, bool reference = false)
         {
-            Profile = profile; IsSelected = selected; IsAppAccount = appAccount; _busy = busy; _name.Text = profile.Label;
+            Profile = profile; IsSelected = selected; IsAppAccount = appAccount; _busy = busy; _reference = reference; _name.Text = profile.Label;
             _layout.Active = selected; _layout.Invalidate();
             MoreButton.Enabled = !busy; MoreButton.AccessibleName = UiText.F($"{profile.Label} 계정 관리 메뉴");
         }
@@ -386,8 +466,10 @@ internal sealed class ClaudeAccountPanel : UserControl
             _state.Text = failure is ClaudeLoginRequiredException ? UiText.T("CLI 로그인 필요") : failure is not null ? UsageIndicatorForm.FriendlyClaudeError(failure)
                 : Profile.Identity is null ? UiText.T("로그인 필요") : usage is null ? UiText.T("사용량 미확인")
                 : usage.IsStale || window?.ResetsAt <= now ? UiText.T("갱신 필요") : "";
+            var problem = _state.Text.Length > 0;
+            if (_reference) _state.Text = problem ? _state.Text + " · " + UiText.T("세션 기준") : UiText.T("세션 정리 기준");
             var showState = _state.Text.Length > 0;
-            _state.Visible = showState; _state.ForeColor = stale ? AccountUiTheme.Warning : AccountUiTheme.Muted;
+            _state.Visible = showState; _state.ForeColor = stale && problem ? AccountUiTheme.Warning : AccountUiTheme.Muted;
             _identity.RowStyles[0].SizeType = SizeType.Percent; _identity.RowStyles[0].Height = 100;
             _identity.RowStyles[1].SizeType = SizeType.Absolute; _identity.RowStyles[1].Height = showState ? 18 * DeviceDpi / 96f : 0;
             _resetRelative.Text = window?.ResetsAt is { } reset ? CombinedUsagePanel.TimeUntil(reset, now) : UiText.T("초기화 미확인");
@@ -431,6 +513,17 @@ internal sealed class ClaudeAccountPanel : UserControl
             catch (Exception ex) { SetStatus(ex.Message, true); }
         });
         menu.Items.Add(UiText.T("상세 정보"), null, (_, _) => ShowAccountInfo(profile));
+        if (_shelf is not null)
+        {
+            var account = AccountOf(profile.Id);
+            var isReference = account is not null && ClaudeSessionReference.Load(_shelf.LedgerDirectory)?.Account == account.Key;
+            var reference = menu.Items.Add(isReference ? UiText.T("세션 정리 기준 해제") : UiText.T("세션 정리 기준으로 삼기"), null,
+                (_, _) => ToggleReference(profile, isReference));
+            reference.Name = "ClaudeSessionReference-" + profile.Id;
+            reference.Enabled = isReference || account is not null;
+            reference.ToolTipText = account is null ? UiText.T("Claude 앱에서 한 번 로그인한 계정만 기준으로 삼을 수 있습니다.")
+                : UiText.T("다른 계정에서 Claude에게 \"세션 맞춰줘\"라고 하면 세션 이름·고정·그룹을 이 계정에 맞춥니다.");
+        }
         menu.Items.Add(UiText.T("다시 로그인"), null, async (_, _) => await SignInAgainAsync(profile));
         menu.Items.Add(UiText.T("로그아웃"), null, async (_, _) =>
         {
