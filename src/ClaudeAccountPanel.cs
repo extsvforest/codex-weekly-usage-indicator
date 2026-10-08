@@ -226,13 +226,15 @@ internal sealed class ClaudeAccountPanel : UserControl
         DateTimeOffset now)
     {
         if (status is null) return ("", false, null);
+        // A paused fill comes first: a reopen still happens, but nothing is filled before it.
+        if (status.Problem == ClaudeShelfProblem.Incompatible && status.MappedAccounts >= 2)
+            return (UiText.T("세션 목록 채우기 멈춤 · 이 Claude 버전은 아직 확인되지 않았습니다."), true,
+                status.RelaunchArmed ? UiText.T("다시 열기 취소") : null);
         if (status.RelaunchArmed)
             return (status.AppConfirmed && status.PendingForApp is > 0 and var waiting
                 ? UiText.F($"아직 없는 세션 {waiting}개 · Claude를 종료하면 채운 뒤 다시 엽니다.")
                 : UiText.T("다시 열기 예약됨 · Claude를 종료하면 세션 목록을 채운 뒤 다시 엽니다."), false, UiText.T("다시 열기 취소"));
         if (status.MappedAccounts < 2) return (UiText.T("Claude 계정을 두 개 이상 연결하면 세션 목록을 서로 채웁니다."), false, null);
-        if (status.Problem == ClaudeShelfProblem.Incompatible)
-            return (UiText.T("세션 목록 채우기 멈춤 · 이 Claude 버전은 아직 확인되지 않았습니다."), true, null);
         if (status.AppConfirmed && status.PendingForApp is > 0 and var pending)
             return (UiText.F($"{appLabel ?? ""} 목록에 아직 없는 세션 {pending}개 · Claude를 종료하면 채웁니다."), false,
                 UiText.T("종료하면 다시 열기"));

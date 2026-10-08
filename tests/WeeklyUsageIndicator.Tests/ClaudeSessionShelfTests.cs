@@ -284,6 +284,9 @@ internal static class ClaudeSessionShelfTests
     // Shapes of the reviewed 2.16120.0.0 bundle. Minified names change between builds; the flows must not.
     private const string CollectIds =
         "for(let n of[i.cliSessionId,i.unarchivedCliSessionId])typeof n==\"string\"&&(!a?.localOnly||t.WQ(n))&&e.add(n);for(let t of n.En(i.priorCliSessionIds)??[])e.add(t)}catch(n){}";
+    // 2.26454.0.0: earlier ids are spread into one array with, for mirrors, remote earlier ids.
+    private const string CollectIds26454 =
+        "for(let n of[i.cliSessionId,i.unarchivedCliSessionId])typeof n==\"string\"&&(!a?.localOnly||t.m4(n))&&e.add(n);for(let t of[...n.hn(i.priorCliSessionIds)??[],...a?.mirrors&&n.hn(i.priorRemoteCliSessionIds)||[]])e.add(t)}catch(n){}";
     private const string Reap =
         "async mayReapTranscript(e,n,r,i,a){let o=r!==void 0,s=(t,n)=>pF(e,t,n,o);let c=1;let l=await this.cliSessionIdsClaimedOnDisk();return l===null?s(\"records_unreadable\",\"could not be checked against the session records on disk\"):l.has(e)?s(\"claimed_elsewhere\",\"is claimed by a session of another account or profile on this computer\"):!0}";
     private const string Claims =
@@ -307,6 +310,13 @@ internal static class ClaudeSessionShelfTests
             "claiming something other than the record's current transcript id pauses writes");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(collect: CollectIds.Replace("e.add(t)}", "void t}"))),
             "no longer claiming earlier transcript ids pauses writes");
+        Check(ClaudeDesktopProbe.IsCompatible(Bundle(collect: CollectIds26454)), "the reviewed 2.26454 shape is compatible");
+        Check(!ClaudeDesktopProbe.IsCompatible(Bundle(collect: CollectIds26454.Replace("])e.add(t)}", "])void t}"))),
+            "the 2.26454 shape that stops claiming earlier ids pauses writes");
+        Check(!ClaudeDesktopProbe.IsCompatible(Bundle(collect: CollectIds26454.Replace("n.hn(i.priorCliSessionIds)??[],", ""))),
+            "claiming only remote earlier ids pauses writes");
+        Check(!ClaudeDesktopProbe.IsCompatible(Bundle(collect: CollectIds26454.Replace("])e.add(t)}", "])o.add(t)}"))),
+            "earlier ids added to another set pause writes");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(reap: Reap.Replace("l.has(e)?", "l.has(n)?"))),
             "a reap check that no longer tests the transcript being deleted pauses writes");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(reap: Reap.Replace("\"records_unreadable\"", "\"records_ignored\""))),
@@ -536,6 +546,27 @@ internal static class ClaudeSessionShelfTests
             "a pass that accepted a cancelled request neither reopens nor consumes the new one");
         service.ArmRelaunch(false);
         Check(!service.Status.RelaunchArmed, "a request can be cancelled");
+
+        // An unreviewed version is reported while the app runs, and the report clears once it is reviewed.
+        var compatible = false;
+        var guarded = new ClaudeShelfService(owner, () => [], fixture.Shelf(),
+            environment with { Observe = () => new ClaudeDesktopRuntime(ClaudeDesktopRunState.Running, null), IsCompatible = _ => compatible },
+            new ClaudeDesktopLogWatcher(Path.Combine(fixture.Root, "no-logs")));
+        guarded.Accept(guarded.Work([], null));
+        Check(guarded.Status.Problem == ClaudeShelfProblem.Incompatible && guarded.Status.ProblemDetail == "9.9.9.9",
+            "a running app of an unreviewed version is reported before it quits");
+        compatible = true;
+        guarded.Accept(guarded.Work([], null));
+        Check(guarded.Status.Problem == ClaudeShelfProblem.None, "a reviewed version clears the report");
+        guarded.Dispose();
+        var paused = ClaudeShelfStatus.Initial with
+        {
+            Desktop = ClaudeDesktopRunState.Running, MappedAccounts = 2, PendingForApp = 1, AppProfileId = "p",
+            Problem = ClaudeShelfProblem.Incompatible, RelaunchArmedUntil = DateTimeOffset.Now.AddMinutes(10)
+        };
+        var footer = ClaudeAccountPanel.ShelfFooter(paused, "메인", DateTimeOffset.Now);
+        Check(footer.Warning && footer.Text == UiText.T("세션 목록 채우기 멈춤 · 이 Claude 버전은 아직 확인되지 않았습니다.")
+              && footer.Action == UiText.T("다시 열기 취소"), "a paused fill is said first and never promised, with the reopen still cancellable");
 
         service.ArmRelaunch(true); Quit();
         var pass = Observe();

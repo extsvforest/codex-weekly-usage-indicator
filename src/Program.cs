@@ -682,9 +682,10 @@ internal sealed class UsageIndicatorForm : Form
             if (appKey is not null && status.PendingForApp is > 0 && _accountTray is { Visible: true } tray)
             {
                 var label = _claudeAccounts.Store.ListProfiles().SingleOrDefault(p => p.Id == status.AppProfileId)?.Label ?? "";
-                tray.ShowBalloonTip(8000, UiText.T("Claude 세션 목록"),
-                    UiText.F($"{label} 계정 목록에 아직 없는 세션이 {status.PendingForApp}개 있습니다. Claude를 한 번 종료하면 채워집니다."),
-                    ToolTipIcon.Info);
+                tray.ShowBalloonTip(8000, UiText.T("Claude 세션 목록"), status.Problem == ClaudeShelfProblem.Incompatible
+                    ? UiText.F($"{label} 계정 목록에 아직 없는 세션이 {status.PendingForApp}개 있지만, 이 Claude 버전은 아직 확인되지 않아 세션 채우기를 멈췄습니다.")
+                    : UiText.F($"{label} 계정 목록에 아직 없는 세션이 {status.PendingForApp}개 있습니다. Claude를 한 번 종료하면 채워집니다."),
+                    status.Problem == ClaudeShelfProblem.Incompatible ? ToolTipIcon.Warning : ToolTipIcon.Info);
             }
         }
         _claudeFollower?.OnStatusChanged();

@@ -171,6 +171,11 @@ internal sealed class ClaudeShelfService : IDisposable
         {
             case ClaudeDesktopRunState.Running:
                 _closedSince = null; _closureDone = false; _retryAt = null; _closureStarted = null;
+                // Report an unreviewed version while the app runs, so nothing promises a fill that will not run.
+                package = _environment.FindPackage();
+                if (package is null || !_environment.IsCompatible(package.AsarPath))
+                { _problem = ClaudeShelfProblem.Incompatible; _problemDetail = package?.Version.ToString(); }
+                else if (_problem == ClaudeShelfProblem.Incompatible) { _problem = ClaudeShelfProblem.None; _problemDetail = null; }
                 app = _log.Update(runtime.HostStartedAt, _accounts);
                 if (app.Key is { } key && (key != _pendingFor || now - _pendingAt >= PendingInterval))
                 {

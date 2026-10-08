@@ -60,7 +60,7 @@ internal static class ClaudeDesktopProbe
         ("async mayReapTranscript(", 1600, ["cliSessionIdsClaimedOnDisk()", "\"records_unreadable\"",
             "\"claimed_elsewhere\",\"is claimed by a session of another account or profile on this computer\""]),
         ("cliSessionIdsClaimedOnDisk(){", 900, ["failClosed:!0,localOnly:!0,recordsOnly:!0", "this.getAccountIds()"]),
-        ("unarchivedCliSessionId])typeof", 300, ["priorCliSessionIds)??[])"])
+        ("unarchivedCliSessionId])typeof", 300, ["priorCliSessionIds)??[]"])
     ];
     // Data flow the deletion protection depends on, checked with back-references so renamed variables still match
     // but a changed flow does not: (1) every record's current and earlier transcript ids go into the claims set,
@@ -71,8 +71,10 @@ internal static class ClaudeDesktopProbe
     // keep call returns is not checked; this is a drift guard, not a proof.
     internal static readonly (string Anchor, int Before, int After, Regex Flow)[] ContractFlows =
     [
+        // (1) Earlier ids are iterated directly (2.16120–2.19675) or spread first into an array that may add more ids,
+        // such as remote earlier ids (2.26454); either way each one enters the same set.
         ("unarchivedCliSessionId])typeof", 120, 320, new Regex(
-            @"for\(let (?<v>[\w$]+) of\[(?<r>[\w$]+)\.cliSessionId,\k<r>\.unarchivedCliSessionId\]\)typeof \k<v>==""string""&&[^;]{0,80}?(?<set>[\w$]+)\.add\(\k<v>\);for\(let (?<p>[\w$]+) of [\w$.]+\(\k<r>\.priorCliSessionIds\)\?\?\[\]\)\k<set>\.add\(\k<p>\)",
+            @"for\(let (?<v>[\w$]+) of\[(?<r>[\w$]+)\.cliSessionId,\k<r>\.unarchivedCliSessionId\]\)typeof \k<v>==""string""&&[^;]{0,80}?(?<set>[\w$]+)\.add\(\k<v>\);for\(let (?<p>[\w$]+) of(?: [\w$.]+\(\k<r>\.priorCliSessionIds\)\?\?\[\]|\[\.\.\.[\w$.]+\(\k<r>\.priorCliSessionIds\)\?\?\[\](?:,\.\.\.[^;{}]{0,160}?)?\])\)\k<set>\.add\(\k<p>\)",
             RegexOptions.CultureInvariant)),
         ("async mayReapTranscript(", 0, 1600, new Regex(
             @"^async mayReapTranscript\((?<id>[\w$]+),.{0,1200}?let (?<l>[\w$]+)=await this\.cliSessionIdsClaimedOnDisk\(\);return \k<l>===null\?[\w$]+\(""records_unreadable""[^)]*\):\k<l>\.has\(\k<id>\)\?[\w$]+\(""claimed_elsewhere",
