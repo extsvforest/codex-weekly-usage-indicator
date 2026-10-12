@@ -78,9 +78,11 @@ The Claude desktop app lists Code sessions per account, so signing in with anoth
 
 Choose one account as the reference: on the Claude tab, open its **···** menu and choose **Use as session layout reference**. After the Claude app switches to another account, ask Claude in any Code session to "sync my sessions" (세션 맞춰줘). The `claude-session-sync` skill asks the widget for a plan and applies it with the Claude app's own session tools, so the app keeps the result.
 
-- The plan only reads: titles and pins from each account's session records, groups from the app's own storage. It covers conversations both accounts have.
-- Missing groups are created, then sessions are moved, pinned and renamed to match the reference. Nothing is deleted; sessions and groups only one account has stay as they are.
-- Group order and pin order are left alone. Run it once in each account other than the reference.
+- The plan only reads: titles from each account's session records, pins from the list the app's sidebar shows, groups from the app's own storage. It covers conversations both accounts have.
+- Missing groups are created, then sessions are moved, pinned and renamed to match the reference.
+- A conversation continued in another account also leaves its older state in the account where it started, so it shows twice. Claude offers to archive the older state (you can bring it back from the app's archive) and keeps the newest, which takes over its pin and group. Nothing is deleted; other sessions and groups only one account has stay as they are.
+- When it is done, Claude shows both accounts' pins and groups side by side and says why anything still differs.
+- Group order and pin order are left alone. Run it once in each account other than the reference; in the reference account it only tidies older states.
 
 The summary adds up the overall weekly balance of every Claude account at 100% per account, like the Codex total, with the soonest and the latest reset. Opening the Claude tab checks every signed-in account once, the in-use one first; **Refresh** in the upper-right corner does it again, and **Check this account's usage** in an account's **···** menu checks just that one. Manual and widget checks share a ten-minute interval for each account: an account checked within the last ten minutes reuses that observation instead of a new check, and temporary failures delay retries only for the affected account. An account that failed, needs a sign-in or shows a previous value withholds the total, which then reads as a partial balance. Accounts are not polled in the background. The **···** menu also provides account details, rename, sign in again, sign out and removal from the list. **Remove from list** keeps that profile's login files; use **Sign out** first if you want the official CLI to end its login.
 

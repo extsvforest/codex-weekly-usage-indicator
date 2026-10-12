@@ -5,8 +5,9 @@ namespace WeeklyUsageIndicator;
 
 /// <summary>
 /// Reads and appends to the Chromium localStorage LevelDB that Claude Desktop's web UI uses
-/// (<c>%APPDATA%\Claude\Local Storage\leveldb</c>). The sidebar keeps pins and groups there; the settings file is only
-/// a mirror the UI rewrites on start. Writes happen only while Desktop is closed and the database is not locked: the
+/// (<c>%APPDATA%\Claude\Local Storage\leveldb</c>). The sidebar keeps its groups there (pins are in IndexedDB, read
+/// through <see cref="ReadMatching"/>; see <see cref="ClaudeSidebarPins"/>); the settings file is only a mirror the UI
+/// rewrites on start. Writes happen only while Desktop is closed and the database is not locked: the
 /// whole directory is backed up, one write batch is appended to the live log, and the result is read back. Anything
 /// unexpected stops before writing; a failed read-back restores the backup.
 /// </summary>
@@ -32,14 +33,42 @@ internal sealed class ClaudeLocalStorage(string directory, string origin = "http
     /// a torn tail or a table replaced underneath throws, and the caller retries.</param>
     internal Snapshot Read(IReadOnlyCollection<string> keys, bool whileOpen = false)
     {
-        byte[] ReadAll(string path) => whileOpen ? ReadShared(path) : File.ReadAllBytes(path);
         var wanted = keys.ToDictionary(key => Key(key), key => key, new BytesComparer());
         wanted[Encoding.ASCII.GetBytes("VERSION")] = "\0VERSION";
+        var (latest, lastSequence, logPath, clean) = Scan(key => wanted.GetValueOrDefault(key), whileOpen);
+        var values = keys.ToDictionary(key => key, key => latest.TryGetValue(key, out var found) && found.Value is { } bytes
+            ? DecodeValue(bytes) : null, StringComparer.Ordinal);
+        var version = latest.TryGetValue("\0VERSION", out var raw) && raw.Value is { } versionBytes ? Encoding.ASCII.GetString(versionBytes) : null;
+        return new Snapshot(values, lastSequence, logPath, clean, version);
+    }
+
+    /// <summary>The newest value of every key <paramref name="match"/> accepts, deleted keys left out. For the app's
+    /// other LevelDB stores (IndexedDB), whose keys are not localStorage keys. <c>Clean</c> is as in <see cref="Read"/>.</summary>
+    internal (IReadOnlyList<(byte[] Key, byte[] Value)> Entries, bool Clean) ReadMatching(Func<byte[], bool> match,
+        bool whileOpen = false)
+    {
+        var keys = new Dictionary<string, byte[]>(StringComparer.Ordinal);
+        var (latest, _, _, clean) = Scan(key =>
+        {
+            if (!match(key)) return null;
+            var name = Convert.ToHexString(key);
+            keys.TryAdd(name, key);
+            return name;
+        }, whileOpen);
+        return (latest.Where(pair => pair.Value.Value is not null).Select(pair => (keys[pair.Key], pair.Value.Value!)).ToArray(), clean);
+    }
+
+    /// <summary>The newest record of each key <paramref name="name"/> names (null skips the key), the last sequence
+    /// number, the live log and whether every live log ends on a complete record.</summary>
+    private (Dictionary<string, (ulong Sequence, byte[]? Value)> Latest, ulong LastSequence, string LogPath, bool Clean) Scan(
+        Func<byte[], string?> name, bool whileOpen)
+    {
+        byte[] ReadAll(string path) => whileOpen ? ReadShared(path) : File.ReadAllBytes(path);
         var latest = new Dictionary<string, (ulong Sequence, byte[]? Value)>(StringComparer.Ordinal);
         void Offer(byte[] userKey, ulong sequence, byte[]? value)
         {
-            if (!wanted.TryGetValue(userKey, out var name)) return;
-            if (!latest.TryGetValue(name, out var current) || current.Sequence < sequence) latest[name] = (sequence, value);
+            if (name(userKey) is not { } wanted) return;
+            if (!latest.TryGetValue(wanted, out var current) || current.Sequence < sequence) latest[wanted] = (sequence, value);
         }
 
         // CURRENT names the manifest and must end with a newline, as LevelDB requires.
@@ -73,10 +102,7 @@ internal sealed class ClaudeLocalStorage(string directory, string origin = "http
             clean &= complete;
             foreach (var batch in batches) lastSequence = Math.Max(lastSequence, ReadBatch(batch, Offer));
         }
-        var values = keys.ToDictionary(key => key, key => latest.TryGetValue(key, out var found) && found.Value is { } bytes
-            ? DecodeValue(bytes) : null, StringComparer.Ordinal);
-        var version = latest.TryGetValue("\0VERSION", out var raw) && raw.Value is { } versionBytes ? Encoding.ASCII.GetString(versionBytes) : null;
-        return new Snapshot(values, lastSequence, logs[^1].Path, clean, version);
+        return (latest, lastSequence, logs[^1].Path, clean);
     }
 
     /// <summary>Appends one batch putting <paramref name="values"/>. Returns false, writing nothing, when the database
