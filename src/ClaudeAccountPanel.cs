@@ -204,7 +204,7 @@ internal sealed class ClaudeAccountPanel : UserControl
             new ClaudeSessionReference(account.Key, profile.Label, profile.Id, DateTimeOffset.UtcNow,
                 ReferenceLabels(_controller.Store.ListProfiles())).Save(_shelf.LedgerDirectory);
             Reload();
-            SetStatus(UiText.F($"세션 정리 기준: {profile.Label} · 다른 계정에서 Claude에게 \"세션 맞춰줘\"라고 하면 이 계정에 맞춥니다."), success: true);
+            SetStatus(UiText.F($"세션 정리 기준: {profile.Label} · 다른 계정에서 /claude-session-sync를 부르면 이 계정에 맞춥니다."), success: true);
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
         { SetStatus(UsageIndicatorForm.FriendlyClaudeError(exception), true); }
@@ -524,7 +524,7 @@ internal sealed class ClaudeAccountPanel : UserControl
             reference.Name = "ClaudeSessionReference-" + profile.Id;
             reference.Enabled = isReference || account is not null;
             reference.ToolTipText = account is null ? UiText.T("Claude 앱에서 한 번 로그인한 계정만 기준으로 삼을 수 있습니다.")
-                : UiText.T("다른 계정에서 Claude에게 \"세션 맞춰줘\"라고 하면 세션 이름·고정·그룹을 이 계정에 맞춥니다.");
+                : UiText.T("다른 계정에서 /claude-session-sync를 부르면 세션 이름·고정·그룹을 이 계정에 맞춥니다. 계정을 바꾸면 맞추기를 마친 계정이 저절로 기준이 됩니다.");
         }
         menu.Items.Add(UiText.T("다시 로그인"), null, async (_, _) => await SignInAgainAsync(profile));
         menu.Items.Add(UiText.T("로그아웃"), null, async (_, _) =>

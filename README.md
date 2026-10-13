@@ -67,7 +67,7 @@ Local file-based ChatGPT authentication is supported. Keyring and managed authen
 The Claude desktop app lists Code sessions per account, so signing in with another account used to show an empty list even though the conversations were still on this PC. The widget fixes the list, not the login: whenever Claude is fully closed, it adds each registered account's missing Code sessions to the other accounts' lists. The next time you open Claude with either account, the same sessions are there, and opening one continues the same conversation.
 
 - It only adds entries. It never moves, changes or deletes a list entry the app wrote, never touches conversations themselves, and never reads or copies sign-in data.
-- It writes only while Claude and its Code sessions are closed. If you switch accounts inside the app, the account tab says how many sessions are still missing; quit Claude once and they are added. **Reopen after quitting** reopens Claude after that fill (once, within 30 minutes).
+- It writes only while Claude and its Code sessions are closed. If you switch accounts inside the app and the new account lacks sessions, the widget says how many and arms **Reopen after quitting** for you: quit Claude once, the sessions are added and Claude reopens (once, within 30 minutes). Cancel it on the account tab if you meant to stop.
 - A conversation continued in another account is listed once, in its newest state. An older copy the widget made earlier is archived (find it in the app's archive), never deleted.
 - A copy keeps its original's name. Rename a session in one account and its copies in the other accounts take the new name at the next fill, unless you renamed, continued or used that copy in its own account.
 - The widget itself never changes pins or groups. Ask Claude to align them instead (below).
@@ -76,10 +76,12 @@ The Claude desktop app lists Code sessions per account, so signing in with anoth
 
 ### Keep session names, pins and groups in step
 
-Choose one account as the reference: on the Claude tab, open its **···** menu and choose **Use as session layout reference**. After the Claude app switches to another account, ask Claude in any Code session to "sync my sessions" (세션 맞춰줘). The `claude-session-sync` skill asks the widget for a plan and applies it with the Claude app's own session tools, so the app keeps the result.
+After the Claude app switches to another account, run `/claude-session-sync` in any Code session. The skill asks the widget for a plan and applies it with the Claude app's own session tools, so the app keeps the result. It runs only when you call it.
+
+The reference follows your switches. When the app leaves an account whose sessions were aligned during that stay, that account becomes the reference, since it holds the newest layout. An account you only passed through, without aligning it, leaves the reference where it was, so its older layout never overwrites a newer one. An account the app left and came back to after its alignment, even across a restart, must be aligned again: another account may have changed the layout meanwhile. To choose the reference yourself, open an account's **···** menu on the Claude tab and choose **Use as session layout reference**.
 
 - The plan only reads: titles from each account's session records, pins from the list the app's sidebar shows, groups from the app's own storage. It covers conversations both accounts have.
-- Missing groups are created, then sessions are moved, pinned and renamed to match the reference.
+- Missing groups are created, then sessions are moved, pinned and renamed to match the reference. A session the widget copied into the reference account does not undo your pins, groups or names unless you changed them there.
 - A conversation continued in another account also leaves its older state in the account where it started, so it shows twice. Claude offers to archive the older state (you can bring it back from the app's archive) and keeps the newest, which takes over its pin and group. Nothing is deleted; other sessions and groups only one account has stay as they are.
 - When it is done, Claude shows both accounts' pins and groups side by side and says why anything still differs.
 - Group order and pin order are left alone. Run it once in each account other than the reference; in the reference account it only tidies older states.

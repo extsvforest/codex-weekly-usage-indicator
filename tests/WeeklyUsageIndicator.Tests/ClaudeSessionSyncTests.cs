@@ -15,6 +15,8 @@ internal static class ClaudeSessionSyncTests
         TestCombinedUsage();
         TestPlan();
         TestOlderStates();
+        TestAligned();
+        TestCopiesOfTheReference();
         TestPinList();
         TestTranscript();
         TestBuildFromDisk();
@@ -233,6 +235,70 @@ internal static class ClaudeSessionSyncTests
             "sidebars list pins and groups by title, a pinned session only under Pinned");
     }
 
+    private static void TestCopiesOfTheReference()
+    {
+        ClaudeSessionSync.Record R(string id, string title, bool pinned, string cli, bool renamed = false) =>
+            new(id, title, pinned, cli, [], 0, Renamed: renamed);
+        var groups = new ClaudeSessionSync.Layout([new("g", "G")], new Dictionary<string, string>());
+        var copies = new HashSet<string> { "local_copy" };
+        // This account pinned and renamed its own conversation; the reference only holds the widget's copy of it.
+        var mine = new[] { R("local_mine", "내 이름", true, "a") };
+        var plan = ClaudeSessionSync.Compute(CurrentKey, null, ReferenceKey, null, mine,
+            [R("local_copy", "옛 이름", false, "a"), R("local_other", "다른 것", true, "z")], groups, groups,
+            referenceCopies: copies);
+        Check(plan.Pins!.Count == 0 && plan.Renames!.Count == 0 && plan.Moves!.Count == 0 && ClaudeSessionSync.IsAligned(plan),
+            "a copy the widget made in the reference, untouched there, unpins and renames nothing");
+        var renamed = ClaudeSessionSync.Compute(CurrentKey, null, ReferenceKey, null, mine,
+            [R("local_copy", "거기서 바꾼 이름", false, "a", renamed: true), R("local_other", "다른 것", true, "z")], groups, groups,
+            referenceCopies: copies);
+        Check(renamed.Renames!.Single() is { Title: "거기서 바꾼 이름" } && renamed.Pins!.Count == 0,
+            "a copy renamed in the reference gives its title, still no pin");
+        var filed = ClaudeSessionSync.Compute(CurrentKey, null, ReferenceKey, null, [R("local_mine", "내 이름", false, "a")],
+            [R("local_copy", "내 이름", false, "a"), R("local_other", "다른 것", true, "z")], groups,
+            groups with { Assignments = new Dictionary<string, string> { ["local_copy"] = "g" } }, referenceCopies: copies);
+        Check(filed.Moves!.Single() is { Group: "G" }, "a copy filed under a group in the reference gives that group");
+        var original = ClaudeSessionSync.Compute(CurrentKey, null, ReferenceKey, null, mine,
+            [R("local_copy", "옛 이름", false, "a"), R("local_other", "다른 것", true, "z")], groups, groups);
+        Check(original.Pins!.Single() is { Pinned: false } && original.Renames!.Single().Title == "옛 이름",
+            "a record the app wrote in the reference gives its pin and title as they are");
+        // Each part a copy has stands alone: a pinned copy without a group leaves the group here, and a filed copy
+        // without a pin leaves the pin here.
+        var filedHere = groups with { Groups = [new("g", "G"), new("h", "H")], Assignments = new Dictionary<string, string> { ["local_mine"] = "h" } };
+        var pinnedCopy = ClaudeSessionSync.Compute(CurrentKey, null, ReferenceKey, null, mine,
+            [R("local_copy", "내 이름", true, "a")], filedHere, groups with { Groups = [new("g", "G"), new("h", "H")] }, referenceCopies: copies);
+        Check(pinnedCopy.Moves!.Count == 0 && pinnedCopy.Pins!.Count == 0, "a pinned copy without a group keeps this account's group");
+        var filedCopy = ClaudeSessionSync.Compute(CurrentKey, null, ReferenceKey, null, [R("local_mine", "내 이름", true, "a")],
+            [R("local_copy", "내 이름", false, "a"), R("local_other", "다른 것", true, "z")], groups,
+            groups with { Assignments = new Dictionary<string, string> { ["local_copy"] = "g" } }, referenceCopies: copies);
+        Check(filedCopy.Moves!.Single() is { Group: "G" } && filedCopy.Pins!.Single() is { Session: "local_mine", Pinned: true },
+            "a filed copy without a pin moves the session and pins it again, keeping this account's pin");
+        var dangling = ClaudeSessionSync.Compute(CurrentKey, null, ReferenceKey, null, [R("local_mine", "같음", true, "a")],
+            [R("local_ref", "같음", true, "a")], groups,
+            groups with { Assignments = new Dictionary<string, string> { ["local_ref"] = "gone" } });
+        Check(dangling.Moves!.Count == 0 && dangling.Warnings!.SequenceEqual(["groups_unresolved"]) && !ClaudeSessionSync.IsAligned(dangling),
+            "a group the scope does not list is reported, and the account is not taken as aligned");
+    }
+
+    private static void TestAligned()
+    {
+        var aligned = new ClaudeSessionSync.Plan("ok", CreateGroups: [], Moves: [], Pins: [], Renames: []);
+        Check(ClaudeSessionSync.IsAligned(aligned) && ClaudeSessionSync.IsAligned(aligned with { Status = "is_reference" }),
+            "nothing left to change is aligned");
+        Check(!ClaudeSessionSync.IsAligned(aligned with { Pins = [new("local_x", true, null)] })
+              && !ClaudeSessionSync.IsAligned(aligned with { Warnings = ["groups_unreadable"] })
+              && !ClaudeSessionSync.IsAligned(aligned with { Warnings = ["reference_pins_empty"] })
+              && !ClaudeSessionSync.IsAligned(aligned with { Warnings = ["groups_unresolved"] })
+              && !ClaudeSessionSync.IsAligned(new ClaudeSessionSync.Plan("no_reference")),
+            "a change left, an unread part or no plan is not aligned");
+        var setAt = new DateTimeOffset(2026, 10, 13, 1, 2, 3, TimeSpan.FromHours(9));
+        Check(ClaudeSessionSync.AlignedEventName(CurrentKey.ToUpperInvariant(), ReferenceKey, setAt)
+              == @"Local\CodexWeeklyUsageIndicator.SessionsAligned." + CurrentAccount + "_" + CurrentOrg + "." + ReferenceAccount + "_"
+              + ReferenceOrg + "." + setAt.UtcTicks
+              && ClaudeSessionSync.AlignedEventName(CurrentKey, ReferenceKey, setAt.AddSeconds(1)) != ClaudeSessionSync.AlignedEventName(CurrentKey, ReferenceKey, setAt),
+            "the event names the account and the reference as it was set");
+        Check(!ClaudeSessionSync.IsAligned(aligned with { Warnings = ["ledger_unreadable"] }), "unknown copies are not aligned");
+    }
+
     private static void TestPinList()
     {
         var key = PinKey(5);
@@ -382,6 +448,23 @@ internal static class ClaudeSessionSyncTests
                   && plan.Pins!.Single() is { Session: "local_self", Pinned: true } && plan.Moves!.Count == 0
                   && plan.Warnings!.SequenceEqual(["groups_unreadable"]),
                 "records are read case-insensitively, archived ones skipped, pins come from the app's pin list, and without local storage groups are reported unconfirmed");
+            File.WriteAllText(Path.Combine(ledger, "ledger.json"), "{\"created\":[]}");
+            using (new FileStream(Path.Combine(ledger, "ledger.json"), FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+            {
+                var locked = ClaudeSessionSync.Build(sources, "local_self");
+                Check(locked.Pins!.Count == 0 && locked.Renames!.Count == 0 && locked.Warnings!.Contains("ledger_unreadable"),
+                    "a ledger that is there but cannot be opened is unknown, not empty");
+            }
+            File.WriteAllText(Path.Combine(ledger, "ledger.json"), "{\"created\":[{\"dst\":");
+            var unknownCopies = ClaudeSessionSync.Build(sources, "local_self");
+            Check(unknownCopies.Pins!.Count == 0 && unknownCopies.Renames!.Count == 0
+                  && unknownCopies.Warnings!.Contains("ledger_unreadable") && !ClaudeSessionSync.IsAligned(unknownCopies),
+                "a ledger that cannot be read leaves pins and names alone, rather than take copies for choices");
+            File.WriteAllText(Path.Combine(ledger, "ledger.json"), "{\"created\":[{\"dst\":\"" + ReferenceKey + "\",\"file\":\"local_ref.json\"}]}");
+            Check(ClaudeSessionSync.Build(sources, "local_self") is { Renames.Count: 0 } copied
+                  && copied.Pins!.Single() is { Session: "local_self", Pinned: true },
+                "the reference's record the widget copied there gives the pin it has there, not its title");
+            File.Delete(Path.Combine(ledger, "ledger.json"));
             var unpinned = ClaudeSessionSync.Build(sources with { IndexedDb = Path.Combine(root, "no-idb") }, "local_self");
             Check(unpinned.Pins!.Count == 0 && unpinned.Renames!.Count == 1 && unpinned.Warnings!.SequenceEqual(["groups_unreadable", "pins_unreadable"]),
                 "without the pin list no pin is planned, never one taken from records");

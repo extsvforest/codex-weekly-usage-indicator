@@ -73,5 +73,6 @@
   "Claude 세션 목록": "Claude session lists",
   "{0} 계정 목록에 아직 없는 세션이 {1}개 있습니다. Claude를 한 번 종료하면 채워집니다.": "{1} sessions are missing from {0}'s list. Quit Claude once to add them.",
   "Claude 앱이 로그아웃 상태입니다.": "The Claude app is signed out.",
-  "Claude 앱 계정을 확인하는 중입니다.": "Checking the Claude app's account."
+  "Claude 앱 계정을 확인하는 중입니다.": "Checking the Claude app's account.",
+  "{0} 계정 목록에 아직 없는 세션이 {1}개 있습니다. Claude를 한 번 종료하면 채운 뒤 다시 엽니다.": "The {0} list is missing {1} sessions. Quit Claude once to add them; Claude reopens on its own."
 }

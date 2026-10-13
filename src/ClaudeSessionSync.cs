@@ -196,8 +196,9 @@ internal static class ClaudeSessionSync
     };
 
     /// <param name="Branch">A fork or a session spawned from another: a conversation of its own, never a newer state.</param>
+    /// <param name="Renamed">The app recorded an earlier title (<c>previousTitles</c>): someone renamed it in this list.</param>
     internal sealed record Record(string SessionId, string? Title, bool Pinned, string? Cli, IReadOnlyList<string> Prior,
-        long LastActivityAt, bool Branch = false);
+        long LastActivityAt, bool Branch = false, bool Renamed = false);
     internal sealed record Group(string Id, string Name);
     internal sealed record Layout(IReadOnlyList<Group> Groups, IReadOnlyDictionary<string, string> Assignments);
     internal sealed record Move(string? Group, IReadOnlyList<string> Sessions);
@@ -245,7 +246,8 @@ internal static class ClaudeSessionSync
         string? ReferenceLabel = null, IReadOnlyList<Retire>? Archive = null, IReadOnlyList<string>? CreateGroups = null,
         IReadOnlyList<Move>? Moves = null, IReadOnlyList<Pin>? Pins = null, IReadOnlyList<Rename>? Renames = null,
         int? Matched = null, int? Unmatched = null, IReadOnlyList<string>? OnlyHere = null, IReadOnlyList<string>? OnlyThere = null,
-        IReadOnlyList<Sidebar>? Sidebars = null, IReadOnlyList<string>? Warnings = null);
+        IReadOnlyList<Sidebar>? Sidebars = null, IReadOnlyList<string>? Warnings = null,
+        [property: JsonIgnore] DateTimeOffset? ReferenceSetAt = null);
 
     internal static bool IsAccountKey(string? key) =>
         key?.Split('/') is [var account, var org] && Guid.TryParse(account, out _) && Guid.TryParse(org, out _);
@@ -271,7 +273,38 @@ internal static class ClaudeSessionSync
         // Pins reach the disk within a second of a change; groups within seconds, up to about a minute when the app
         // writes its local storage often.
         if (settle > 0) Thread.Sleep(TimeSpan.FromSeconds(settle));
-        return Print(Build(Sources.Default(), session, reference), 0);
+        var plan = Build(Sources.Default(), session, reference);
+        // Only a plan against the stored reference speaks for alignment; a diagnostic override does not.
+        if (reference is null && plan is { Current: { } current, Reference: { } compared, ReferenceSetAt: { } setAt } && IsAligned(plan))
+            SignalAligned(current, compared, setAt);
+        return Print(plan, 0);
+    }
+
+    /// <summary>Nothing is left to change in this account's sidebar, as far as the plan could read it.</summary>
+    internal static bool IsAligned(Plan plan) =>
+        plan.Status is "ok" or "is_reference" && plan is { CreateGroups.Count: 0, Moves.Count: 0, Pins.Count: 0, Renames.Count: 0 }
+        && !(plan.Warnings ?? []).Any(warning => warning is "pins_unreadable" or "groups_unreadable" or "reference_pins_empty"
+            or "groups_unresolved" or "ledger_unreadable");
+
+    /// <summary>The widget's event for an account whose sidebar was found to match a reference, named after that
+    /// reference as it was set (account and time). The widget listens only for the reference in place, so a plan measured
+    /// against an earlier one is never heard. It makes such an account the reference when the app switches away.</summary>
+    internal static string AlignedEventName(string accountKey, string referenceKey, DateTimeOffset referenceSetAt)
+    {
+        static string Part(string key) => key.ToLowerInvariant().Replace('/', '_');
+        return @"Local\CodexWeeklyUsageIndicator.SessionsAligned." + Part(accountKey) + "." + Part(referenceKey) + "."
+               + referenceSetAt.UtcTicks.ToString(CultureInfo.InvariantCulture);
+    }
+
+    /// <summary>Tells a running widget; without one listening for that reference there is nobody to tell.</summary>
+    private static void SignalAligned(string accountKey, string referenceKey, DateTimeOffset referenceSetAt)
+    {
+        try
+        {
+            if (!EventWaitHandle.TryOpenExisting(AlignedEventName(accountKey, referenceKey, referenceSetAt), out var aligned)) return;
+            using (aligned) aligned.Set();
+        }
+        catch (Exception exception) when (exception is UnauthorizedAccessException or IOException) { }
     }
 
     internal static Plan Build(Sources sources, string sessionId, string? referenceOverride = null)
@@ -305,9 +338,39 @@ internal static class ClaudeSessionSync
         var lineage = new Lineage(sessionId, cli => Transcript(sources.ProjectsRoot, cli),
             (older, next) => HandOver(sources.ProjectsRoot, older, next));
         var currentRecords = ReadRecords(current.Value.Directory, pinned);
-        return Compute(current.Value.Key, Label(current.Value.Key), reference, Label(reference), currentRecords,
+        // Without knowing which reference records are the widget's copies, a copy would be taken for a choice.
+        var copies = isReference ? new HashSet<string>(StringComparer.Ordinal) : Copies(sources.Ledger, reference);
+        if (copies is null) warnings.Add("ledger_unreadable");
+        var plan = Compute(current.Value.Key, Label(current.Value.Key), reference, Label(reference), currentRecords,
             isReference ? currentRecords : ReadRecords(referenceDirectory, pinned), currentLayout, referenceLayout,
-            pinned is not null, lineage, warnings);
+            pinned is not null, lineage, warnings, copies, copiesKnown: copies is not null);
+        return plan with { ReferenceSetAt = referenceOverride is null ? marker?.SetAt : null };
+    }
+
+    /// <summary>Records the widget copied into an account's list, by session id, from its ledger. No ledger means no
+    /// copies; one that cannot be read whole is null.</summary>
+    internal static IReadOnlySet<string>? Copies(string ledgerDirectory, string account)
+    {
+        var path = Path.Combine(ledgerDirectory, "ledger.json");
+        try
+        {
+            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            if (JsonNode.Parse(stream) is not JsonObject { } root || root["created"] is not JsonArray created) return null;
+            var copies = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var item in created)
+            {
+                if (item is not JsonObject entry || Text(entry, "dst") is not { } target || Text(entry, "file") is not { } file
+                    || !file.StartsWith("local_", StringComparison.Ordinal) || !file.EndsWith(".json", StringComparison.Ordinal))
+                    return null;
+                if (string.Equals(target, account, StringComparison.OrdinalIgnoreCase) && entry["retiredAt"] is null)
+                    copies.Add(file[..^".json".Length]);
+            }
+            return copies;
+        }
+        catch (Exception exception) when (exception is FileNotFoundException or DirectoryNotFoundException)
+        { return new HashSet<string>(StringComparer.Ordinal); }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or JsonException)
+        { return null; }
     }
 
     /// <summary>
@@ -320,9 +383,14 @@ internal static class ClaudeSessionSync
     /// what it keeps, so stopping part way never loses a pin or a group. In the reference account itself only its older
     /// states are cleared.
     /// </summary>
+    /// <param name="referenceCopies">Session ids of records the widget copied into the reference's list. Such a copy
+    /// shows the conversation as it was when copied, not a choice made there: it gives a pin only when pinned there, a
+    /// group only when filed there, and a title only once renamed there.</param>
+    /// <param name="copiesKnown">False when the copies could not be told: then nothing is changed but older states.</param>
     internal static Plan Compute(string current, string? currentLabel, string reference, string? referenceLabel,
         IReadOnlyList<Record> currentRecords, IReadOnlyList<Record> referenceRecords, Layout? currentLayout,
-        Layout? referenceLayout, bool pinsKnown = true, Lineage? lineage = null, IReadOnlyList<string>? warnings = null)
+        Layout? referenceLayout, bool pinsKnown = true, Lineage? lineage = null, IReadOnlyList<string>? warnings = null,
+        IReadOnlySet<string>? referenceCopies = null, bool copiesKnown = true)
     {
         var notes = warnings?.ToList() ?? [];
         var self = reference == current;
@@ -359,10 +427,10 @@ internal static class ClaudeSessionSync
             : layout.Groups.FirstOrDefault(group => group.Id == id) is { } group ? (true, group.Name) : (false, null);
 
         // A reference without a single pin while this account has some looks like a wiped pin list: keep the pins.
-        var pinPlan = pinsKnown && (sources.Any(record => record.Pinned) || !candidates.Any(record => record.Pinned));
-        if (pinsKnown && !pinPlan) notes.Add("reference_pins_empty");
+        var pinPlan = pinsKnown && copiesKnown && (sources.Any(record => record.Pinned) || !candidates.Any(record => record.Pinned));
+        if (pinsKnown && copiesKnown && !pinPlan) notes.Add("reference_pins_empty");
         // Moves can unpin, so groups wait for readable pins too.
-        var groups = pinsKnown && currentLayout is not null && sourceLayout is not null;
+        var groups = pinsKnown && copiesKnown && currentLayout is not null && sourceLayout is not null;
         var existing = currentLayout?.Groups.Select(group => group.Name).ToHashSet(StringComparer.Ordinal) ?? [];
         var create = groups ? sourceLayout!.Groups.Select(group => group.Name)
             .Where(name => !existing.Contains(name)).Distinct(StringComparer.Ordinal).ToList() : [];
@@ -370,24 +438,35 @@ internal static class ClaudeSessionSync
         var ungroup = new List<string>();
         var pins = new List<Pin>();
         var renames = new List<Rename>();
-        var targets = new Dictionary<string, (Record Source, Layout? Layout)>(StringComparer.Ordinal);
+        // What each session here should end with: its pin, and its group (Known false when it cannot be resolved).
+        var targets = new Dictionary<string, (bool Pinned, (bool Known, string? Name) Group)>(StringComparer.Ordinal);
         int matched = 0, unmatched = 0;
+        var unresolved = false;
         foreach (var record in newest)
         {
-            Record source;
-            Layout? layout;
             var isMatch = matches.TryGetValue(record.SessionId, out var match);
-            if (isMatch) { matched++; (source, layout) = (match!, sourceLayout); }
-            else
+            if (isMatch) matched++; else unmatched++;
+            // A conversation the reference does not list keeps what it has, an older state's pin and group included.
+            if (!isMatch && !heads.Contains(record.SessionId)) continue;
+            // A copy the widget made in the reference shows the conversation as it was copied, not a choice made there:
+            // it gives a pin only when pinned there, a group only when filed there, a title only once renamed there.
+            // What it does not give, the conversation keeps from here.
+            var copy = isMatch && referenceCopies?.Contains(match!.SessionId) == true;
+            var mine = ownById[record.SessionId];
+            if (copiesKnown && isMatch && (!copy || match!.Renamed) && !string.IsNullOrWhiteSpace(match!.Title)
+                && match.Title != record.Title)
+                renames.Add(new(record.SessionId, match.Title, record.Title));
+            var pinTarget = isMatch && (!copy || match!.Pinned) ? match!.Pinned : mine.Pinned;
+            (bool Known, string? Name) groupTarget = (true, null);
+            if (groups)
             {
-                unmatched++;
-                // A conversation the reference does not list keeps what its older states here had.
-                if (!heads.Contains(record.SessionId)) continue;
-                (source, layout) = (ownById[record.SessionId], ownLayout);
+                var given = isMatch ? GroupOf(sourceLayout!, match!.SessionId) : (true, null);
+                groupTarget = isMatch && (!copy || !given.Known || given.Name is not null) ? given : GroupOf(ownLayout!, mine.SessionId);
+                if (!groupTarget.Known || !GroupOf(currentLayout!, record.SessionId).Known) unresolved = true;
             }
-            targets[record.SessionId] = (source, layout);
+            targets[record.SessionId] = (pinTarget, groupTarget);
             var pinned = record.Pinned;
-            if (groups && GroupOf(layout!, source.SessionId) is { Known: true, Name: var target }
+            if (groups && groupTarget is { Known: true, Name: var target }
                 && GroupOf(currentLayout!, record.SessionId) is { Known: true, Name: var now } && target != now
                 // Without a pin plan to restore it, a pinned session is not moved into a group.
                 && (target is null || !record.Pinned || pinPlan))
@@ -400,20 +479,20 @@ internal static class ClaudeSessionSync
                     pinned = false;
                 }
             }
-            if (pinPlan && source.Pinned != pinned) pins.Add(new(record.SessionId, source.Pinned, source.Title ?? record.Title));
-            if (isMatch && !string.IsNullOrWhiteSpace(source.Title) && source.Title != record.Title)
-                renames.Add(new(record.SessionId, source.Title, record.Title));
+            if (pinPlan && pinTarget != pinned) pins.Add(new(record.SessionId, pinTarget, (isMatch ? match!.Title : null) ?? record.Title));
         }
+        // A group the scope does not list leaves that session where it is, and nothing about it is settled.
+        if (unresolved) notes.Add("groups_unresolved");
         var moves = into.Select(pair => new Move(pair.Key, pair.Value)).ToList();
         if (ungroup.Count > 0) moves.Add(new Move(null, ungroup));
         // An older state goes only once what it leaves is known and already in place on its newest state: its own group,
         // the group and pin the newest state should have, and the newest state's own, all read and matching.
         bool Ready(Record old, Record head) =>
-            pinPlan && groups && targets.TryGetValue(head.SessionId, out var target) && target.Layout is { } layout
+            pinPlan && groups && targets.TryGetValue(head.SessionId, out var target)
             && GroupOf(currentLayout!, old.SessionId).Known
-            && GroupOf(layout, target.Source.SessionId) is { Known: true, Name: var want }
+            && target.Group is { Known: true, Name: var want }
             && GroupOf(currentLayout!, head.SessionId) is { Known: true, Name: var have } && want == have
-            && target.Source.Pinned == head.Pinned;
+            && target.Pinned == head.Pinned;
         var byId = currentRecords.ToDictionary(record => record.SessionId, StringComparer.Ordinal);
         var archive = currentRecords.Where(record => retiring.ContainsKey(record.SessionId)).Select(record =>
             {
@@ -711,7 +790,8 @@ internal static class ClaudeSessionSync
             records.Add(new(sessionId, Text(record, "title"), pinned?.Contains(sessionId) == true,
                 Text(record, "cliSessionId")?.ToLowerInvariant(), prior,
                 record["lastActivityAt"] is JsonValue at && at.TryGetValue<long>(out var activity) ? activity : 0,
-                Branch: !string.IsNullOrEmpty(Text(record, "forkedFromSessionId")) || record["spawnedFrom"] is JsonObject));
+                Branch: !string.IsNullOrEmpty(Text(record, "forkedFromSessionId")) || record["spawnedFrom"] is JsonObject,
+                Renamed: record["previousTitles"] is JsonArray { Count: > 0 }));
         }
         return records;
     }

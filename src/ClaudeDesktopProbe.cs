@@ -233,7 +233,8 @@ internal static class ClaudeDesktopProbe
 }
 
 /// <summary>Follows the app's main log in order, from the start of the current app process only. A new run, a
-/// sign-out or an unregistered account invalidates the previous observation.</summary>
+/// sign-out or an unregistered account invalidates the previous observation. Sign-ins are counted over every line from
+/// the first read on, across runs.</summary>
 internal sealed class ClaudeDesktopLogWatcher(string? directory = null)
 {
     private const long MaxRead = 16 * 1024 * 1024;
@@ -255,15 +256,23 @@ internal sealed class ClaudeDesktopLogWatcher(string? directory = null)
     private string? _file;
     private ClaudeDesktopAccountState _state = ClaudeDesktopAccountState.Closed;
     internal ClaudeDesktopAccountState State => _state;
+    /// <summary>The last update found lines lost (a gap): anything could have happened in them, a switch included.</summary>
+    internal bool LostLines { get; private set; }
+    /// <summary>The sign-ins in the lines read so far, across app runs; a switch is one. Two counts compare only when
+    /// no update between them lost lines.</summary>
+    internal int SignIns { get; private set; }
 
     internal ClaudeDesktopAccountState Update(DateTime? hostStartedAt, IReadOnlyCollection<ClaudeShelfAccount> registered)
     {
+        LostLines = false;
         if (hostStartedAt is null) { _generation = null; return _state = ClaudeDesktopAccountState.Closed; }
         var main = Path.Combine(_directory, "main.log");
         var previous = Path.Combine(_directory, "main1.log");
         List<string> lines = [];
         LogRead result;
         long end = 0; string? file = null;
+        // The lines no update read before: an increment, or after a replay only those written since the last read.
+        var unread = lines;
         if (_generation != hostStartedAt)
         {
             // A new app run, or a replay after a gap: forget the previous observation and replay this run from both
@@ -273,6 +282,13 @@ internal sealed class ClaudeDesktopLogWatcher(string? directory = null)
             result = File.Exists(previous) ? ReadFrom(previous, 0, null, true, lines, out _, out _) : LogRead.Ok;
             if (result == LogRead.Unfinished) result = LogRead.Ok;
             if (result == LogRead.Ok) result = ReadFrom(main, 0, null, false, lines, out end, out file);
+            // The lines written since the last read, by the run followed then or any run after it, may hold sign-ins no
+            // update counted: count them up to where this replay stopped. Lines that cannot be found are lost.
+            if (result == LogRead.Ok)
+            {
+                unread = [];
+                if (_file is not null && !ReadUnread(main, previous, end, file!, unread)) LostLines = true;
+            }
         }
         else if ((result = ReadFrom(main, _offset, _file, false, lines, out end, out file)) == LogRead.OtherFile)
         {
@@ -284,12 +300,23 @@ internal sealed class ClaudeDesktopLogWatcher(string? directory = null)
         if (result != LogRead.Ok)
         {
             // A gap in the log could hide a sign-out or switch: never keep a confirmation across it.
-            _generation = null;
+            _generation = null; LostLines = true;
             return _state = ClaudeDesktopAccountState.Unknown;
         }
         _generation = hostStartedAt; _offset = end; _file = file;
+        SignIns += unread.Count(line => Transition.Match(line) is { Success: true } transition
+            && transition.Groups["to"].Value != "<none>");
         return _state = Apply(_state, lines, hostStartedAt.Value, registered);
     }
+
+    /// <summary>Appends the lines after the last read position, up to <paramref name="end"/> of main.log (the file
+    /// <paramref name="file"/>): the rest of main.log if it is still the file read last, else the rest of that file,
+    /// rotated to main1.log, and main.log up to the end.</summary>
+    private bool ReadUnread(string main, string previous, long end, string file, List<string> unread) =>
+        _file == file
+            ? ReadFrom(main, _offset, file, false, unread, out _, out _, end) == LogRead.Ok
+            : ReadFrom(previous, _offset, _file, true, unread, out _, out _) == LogRead.Ok
+              && ReadFrom(main, 0, file, false, unread, out _, out _, end) == LogRead.Ok;
 
     internal static ClaudeDesktopAccountState Apply(ClaudeDesktopAccountState state, IEnumerable<string> lines,
         DateTime since, IReadOnlyCollection<ClaudeShelfAccount> registered)
@@ -329,12 +356,13 @@ internal sealed class ClaudeDesktopLogWatcher(string? directory = null)
 
     private enum LogRead { Ok, OtherFile, Unfinished, Failed }
 
-    /// <summary>Appends the complete lines after <paramref name="offset"/> and identifies the file, both through one
-    /// handle. With <paramref name="expectedFile"/>, another file now carrying the name reads nothing and returns
-    /// OtherFile. A <paramref name="final"/> read (a rotated file) that ends mid-line reads nothing and returns
-    /// Unfinished. An empty increment is a success; an unreadable file or a lost range is a failure.</summary>
+    /// <summary>Appends the complete lines after <paramref name="offset"/>, and before <paramref name="until"/>, and
+    /// identifies the file, both through one handle. With <paramref name="expectedFile"/>, another file now carrying the
+    /// name reads nothing and returns OtherFile. A <paramref name="final"/> read (a rotated file) that ends mid-line
+    /// reads nothing and returns Unfinished. An empty increment is a success; an unreadable file or a lost range is a
+    /// failure.</summary>
     private static LogRead ReadFrom(string path, long offset, string? expectedFile, bool final, List<string> lines,
-        out long end, out string? file)
+        out long end, out string? file, long until = long.MaxValue)
     {
         end = offset; file = null;
         try
@@ -343,7 +371,7 @@ internal sealed class ClaudeDesktopLogWatcher(string? directory = null)
             if (!GetFileInformationByHandle(stream.SafeFileHandle, out var information)) return LogRead.Failed;
             var identity = $"{information.VolumeSerialNumber:x8}-{information.FileIndexHigh:x8}{information.FileIndexLow:x8}";
             if (expectedFile is not null && identity != expectedFile) return LogRead.OtherFile;
-            var length = stream.Length;
+            var length = Math.Min(stream.Length, until);
             // Shrunk in place, or too far behind: replay the run instead.
             if (offset > length || length - offset > MaxRead) return LogRead.Failed;
             stream.Seek(offset, SeekOrigin.Begin);
