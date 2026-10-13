@@ -135,7 +135,6 @@ internal sealed class ClaudeAccountPanel : UserControl
     {
         using var layout = AccountUiTheme.DeferLayout(_layout);
         var profiles = _controller.Store.ListProfiles(); var selectedId = _controller.SelectedProfile.Id;
-        var reference = KeepReferenceLabels(profiles);
         _count.Text = UiText.F($"내 계정  {profiles.Count}");
         _register.Visible = !profiles.Any(p => p.IsDefault);
         var ids = profiles.Select(profile => profile.Id).ToHashSet(StringComparer.Ordinal);
@@ -158,57 +157,13 @@ internal sealed class ClaudeAccountPanel : UserControl
                 row.TabIndex = index; _rows.SetCellPosition(row, new TableLayoutPanelCellPosition(0, index));
                 _rows.RowStyles.Add(new RowStyle(SizeType.Absolute, 66));
                 row.DisplayProfile(profile, AppProfileId is { } app ? profile.Id == app : profile.Id == selectedId,
-                    profile.Id == AppProfileId, IsBusy, reference is not null && AccountOf(profile.Id)?.Key == reference.Account);
+                    profile.Id == AppProfileId, IsBusy);
                 row.DisplayUsage(_controller.LastUsage(profile.Id), _controller.LastFailure(profile.Id));
             }
         }
         ClearResolvedUsageFailure(); DisplaySummary(); RenderNotice(); UpdateActions(); UpdateShelfFooter(); ApplyGeometry();
     }
 
-    private ClaudeShelfAccount? AccountOf(string profileId) => _shelf?.Accounts.FirstOrDefault(account => account.ProfileId == profileId);
-
-    /// <summary>Reads the session reference and keeps its account labels in step with renames on this page.</summary>
-    private ClaudeSessionReference? KeepReferenceLabels(IReadOnlyList<ClaudeProfile> profiles)
-    {
-        if (_shelf is null || ClaudeSessionReference.Load(_shelf.LedgerDirectory) is not { } reference) return null;
-        // Only add or update labels: an account not resolved yet keeps the label it had.
-        var labels = new Dictionary<string, string>(reference.Labels, StringComparer.Ordinal);
-        foreach (var (key, value) in ReferenceLabels(profiles)) labels[key] = value;
-        var label = labels.GetValueOrDefault(reference.Account, reference.Label);
-        if (labels.Count == reference.Labels.Count && !labels.Except(reference.Labels).Any() && label == reference.Label)
-            return reference;
-        try { (reference = reference with { Label = label, Labels = labels }).Save(_shelf.LedgerDirectory); }
-        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { }
-        return reference;
-    }
-
-    private Dictionary<string, string> ReferenceLabels(IReadOnlyList<ClaudeProfile> profiles) =>
-        (_shelf?.Accounts ?? []).Where(account => profiles.Any(profile => profile.Id == account.ProfileId))
-            .DistinctBy(account => account.Key).ToDictionary(account => account.Key,
-                account => profiles.First(profile => profile.Id == account.ProfileId).Label, StringComparer.Ordinal);
-
-    /// <summary>Marks (or clears) the account whose session titles, pins and groups the other accounts copy when the
-    /// user asks Claude to align them. The page only records the choice; it never changes a sidebar.</summary>
-    private void ToggleReference(ClaudeProfile profile, bool isReference)
-    {
-        if (_shelf is null) return;
-        try
-        {
-            if (isReference)
-            {
-                ClaudeSessionReference.Clear(_shelf.LedgerDirectory);
-                Reload(); SetStatus(UiText.T("세션 정리 기준을 해제했습니다."), success: true);
-                return;
-            }
-            if (AccountOf(profile.Id) is not { } account) return;
-            new ClaudeSessionReference(account.Key, profile.Label, profile.Id, DateTimeOffset.UtcNow,
-                ReferenceLabels(_controller.Store.ListProfiles())).Save(_shelf.LedgerDirectory);
-            Reload();
-            SetStatus(UiText.F($"세션 정리 기준: {profile.Label} · 다른 계정에서 /claude-session-sync를 부르면 이 계정에 맞춥니다."), success: true);
-        }
-        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
-        { SetStatus(UsageIndicatorForm.FriendlyClaudeError(exception), true); }
-    }
 
     private void UpdateShelfFooter()
     {
@@ -392,7 +347,7 @@ internal sealed class ClaudeAccountPanel : UserControl
         private readonly Label _resetRelative = AccountUiTheme.Label("", 10.5f, true);
         private readonly Label _resetDate = AccountUiTheme.Label("", 9, color: AccountUiTheme.Muted);
         private readonly ToolTip _details = new() { InitialDelay = 500, ReshowDelay = 100, AutoPopDelay = 10000, ShowAlways = true };
-        private bool _busy, _reference;
+        private bool _busy;
         internal ClaudeProfile Profile { get; private set; }
         internal bool IsSelected { get; private set; }
         internal bool IsAppAccount { get; private set; }
@@ -434,9 +389,9 @@ internal sealed class ClaudeAccountPanel : UserControl
             return panel;
         }
 
-        internal void DisplayProfile(ClaudeProfile profile, bool selected, bool appAccount, bool busy, bool reference = false)
+        internal void DisplayProfile(ClaudeProfile profile, bool selected, bool appAccount, bool busy)
         {
-            Profile = profile; IsSelected = selected; IsAppAccount = appAccount; _busy = busy; _reference = reference; _name.Text = profile.Label;
+            Profile = profile; IsSelected = selected; IsAppAccount = appAccount; _busy = busy; _name.Text = profile.Label;
             _layout.Active = selected; _layout.Invalidate();
             MoreButton.Enabled = !busy; MoreButton.AccessibleName = UiText.F($"{profile.Label} 계정 관리 메뉴");
         }
@@ -469,8 +424,7 @@ internal sealed class ClaudeAccountPanel : UserControl
                 : Profile.Identity is null ? UiText.T("로그인 필요") : usage is null ? UiText.T("사용량 미확인")
                 : usage.IsStale || window?.ResetsAt <= now ? UiText.T("갱신 필요") : "";
             var problem = _state.Text.Length > 0;
-            if (_reference) _state.Text = problem ? _state.Text + " · " + UiText.T("세션 기준") : UiText.T("세션 정리 기준");
-            var showState = _state.Text.Length > 0;
+            var showState = problem;
             _state.Visible = showState; _state.ForeColor = stale && problem ? AccountUiTheme.Warning : AccountUiTheme.Muted;
             _identity.RowStyles[0].SizeType = SizeType.Percent; _identity.RowStyles[0].Height = 100;
             _identity.RowStyles[1].SizeType = SizeType.Absolute; _identity.RowStyles[1].Height = showState ? 18 * DeviceDpi / 96f : 0;
@@ -515,17 +469,6 @@ internal sealed class ClaudeAccountPanel : UserControl
             catch (Exception ex) { SetStatus(ex.Message, true); }
         });
         menu.Items.Add(UiText.T("상세 정보"), null, (_, _) => ShowAccountInfo(profile));
-        if (_shelf is not null)
-        {
-            var account = AccountOf(profile.Id);
-            var isReference = account is not null && ClaudeSessionReference.Load(_shelf.LedgerDirectory)?.Account == account.Key;
-            var reference = menu.Items.Add(isReference ? UiText.T("세션 정리 기준 해제") : UiText.T("세션 정리 기준으로 삼기"), null,
-                (_, _) => ToggleReference(profile, isReference));
-            reference.Name = "ClaudeSessionReference-" + profile.Id;
-            reference.Enabled = isReference || account is not null;
-            reference.ToolTipText = account is null ? UiText.T("Claude 앱에서 한 번 로그인한 계정만 기준으로 삼을 수 있습니다.")
-                : UiText.T("다른 계정에서 /claude-session-sync를 부르면 세션 이름·고정·그룹을 이 계정에 맞춥니다. 계정을 바꾸면 맞추기를 마친 계정이 저절로 기준이 됩니다.");
-        }
         menu.Items.Add(UiText.T("다시 로그인"), null, async (_, _) => await SignInAgainAsync(profile));
         menu.Items.Add(UiText.T("로그아웃"), null, async (_, _) =>
         {

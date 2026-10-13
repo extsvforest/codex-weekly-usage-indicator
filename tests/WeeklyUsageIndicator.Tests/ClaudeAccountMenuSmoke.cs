@@ -137,7 +137,7 @@ internal static class ClaudeAccountMenuSmoke
                     var oldest = new[] { main, second }.Min(profile => controller.LastUsage(profile.Id)!.LastUpdatedAt);
                     Check(panel.CheckedAtText == AccountUsageText.LastUpdated(oldest, DateTimeOffset.Now),
                         "a complete total shows when its oldest observation was made");
-                    TestReference(root, store, controller, main, second);
+                    TestNoReference(root, store, controller, second);
                 }
                 shelf.SetStatusForTest(ClaudeShelfStatus.Initial with
                 {
@@ -178,45 +178,27 @@ internal static class ClaudeAccountMenuSmoke
         thread.SetApartmentState(ApartmentState.STA); thread.Start(); return done.Task;
     }
 
-    /// <summary>The session reference is chosen from the row menu and recorded only in the shelf's ledger folder.</summary>
-    private static void TestReference(string root, ClaudeProfileStore store, ClaudeAccountController controller,
-        ClaudeProfile main, ClaudeProfile second)
+    /// <summary>The row menu offers no session layout reference: the widget keeps what the accounts agreed on itself, and
+    /// the page writes nothing to the shelf's ledger folder.</summary>
+    private static void TestNoReference(string root, ClaudeProfileStore store, ClaudeAccountController controller, ClaudeProfile second)
     {
         var ledger = Directory.CreateDirectory(Path.Combine(root, "shelf-ledger")).FullName;
         var paths = new ClaudeShelfPaths(Path.Combine(root, "sessions"), Path.Combine(root, "projects"), Path.Combine(root, "scratch"),
             [], ledger);
-        using var form = new Form { ClientSize = new(960, 650), Text = "Claude session reference check" };
+        using var form = new Form { ClientSize = new(960, 650), Text = "Claude session layout check" };
         AccountUiTheme.SetForm(form);
         using var shelf = new ClaudeShelfService(form, () => store.ListProfiles(), new ClaudeSessionShelf(paths));
         const string account = "46411433-0040-4598-a1bd-a5444a5eb7b4", org = "a8f42351-0c23-4928-87ef-ecb3e3bf2b10";
         shelf.SetAccountsForTest([new ClaudeShelfAccount(account, org, second.Label, second.Id)]);
         using var panel = new ClaudeAccountPanel(controller, shelf) { Dock = DockStyle.Fill };
         form.Controls.Add(panel); form.Show(); Application.DoEvents();
-        ToolStripItem Item(string id)
-        {
-            Find<Button>(panel, "ClaudeMore-" + id).PerformClick();
-            var menu = (ContextMenuStrip)typeof(ClaudeAccountPanel)
-                .GetField("_profileMenu", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(panel)!;
-            var item = menu.Items.Cast<ToolStripItem>().Single(entry => entry.Name == "ClaudeSessionReference-" + id);
-            menu.Close(ToolStripDropDownCloseReason.ItemClicked); Application.DoEvents();
-            return item;
-        }
-        var file = Path.Combine(ledger, ClaudeSessionReference.FileName);
-        Check(!Item(main.Id).Enabled, "an account the app has not listed yet cannot be the reference");
-        var set = Item(second.Id);
-        Check(set.Enabled && set.Text == UiText.T("세션 정리 기준으로 삼기"), "a listed account can be the reference");
-        set.PerformClick(); Application.DoEvents();
-        var reference = ClaudeSessionReference.Load(ledger);
-        var named = store.ListProfiles().Single(profile => profile.Id == second.Id).Label;
-        Check(reference is { Label: var label, ProfileId: var id } && reference.Account == account + "/" + org && label == named
-              && id == second.Id && reference.Labels[reference.Account] == named, "choosing it records the account and its current label");
-        var state = Find<Label>(panel, "ClaudeProfileState-" + second.Id);
-        Check(state.Visible && state.Text.EndsWith(UiText.T("세션 정리 기준"), StringComparison.Ordinal), "the row shows the reference");
-        var clear = Item(second.Id);
-        Check(clear.Text == UiText.T("세션 정리 기준 해제"), "the reference can be cleared from the same menu");
-        clear.PerformClick(); Application.DoEvents();
-        Check(!File.Exists(file) && !Find<Label>(panel, "ClaudeProfileState-" + second.Id).Text.Contains(UiText.T("세션 정리 기준"), StringComparison.Ordinal),
-            "clearing removes the record and the row mark");
+        Find<Button>(panel, "ClaudeMore-" + second.Id).PerformClick();
+        var menu = (ContextMenuStrip)typeof(ClaudeAccountPanel)
+            .GetField("_profileMenu", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(panel)!;
+        Check(menu.Items.Count > 0 && menu.Items.Cast<ToolStripItem>().All(entry => entry.Name?.StartsWith("ClaudeSessionReference-", StringComparison.Ordinal) != true),
+            "the row menu has no reference to choose");
+        menu.Close(ToolStripDropDownCloseReason.ItemClicked); Application.DoEvents();
+        Check(Directory.GetFiles(ledger).Length == 0, "the page writes nothing to the shelf's ledger folder");
         form.Close();
     }
 

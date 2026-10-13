@@ -89,14 +89,6 @@
   "갱신": "Refresh",
   "이전 확인 {0:MM.dd HH:mm}": "Last checked {0:MM.dd HH:mm}",
   "Claude 탭을 처음 열 때 한 번 갱신합니다. 계정마다 10분에 한 번만 새로 확인합니다.": "Refreshes once when the Claude tab first opens. Each account is checked at most once every ten minutes.",
-  "세션 정리 기준을 해제했습니다.": "Session layout reference cleared.",
-  "세션 정리 기준: {0} · 다른 계정에서 /claude-session-sync를 부르면 이 계정에 맞춥니다.": "Session layout reference: {0} · Run /claude-session-sync in another account to match this one.",
-  "세션 기준": "Session reference",
-  "세션 정리 기준": "Session layout reference",
-  "세션 정리 기준 해제": "Clear session layout reference",
-  "세션 정리 기준으로 삼기": "Use as session layout reference",
-  "Claude 앱에서 한 번 로그인한 계정만 기준으로 삼을 수 있습니다.": "Only an account that has signed in to the Claude app once can be the reference.",
-  "다른 계정에서 /claude-session-sync를 부르면 세션 이름·고정·그룹을 이 계정에 맞춥니다. 계정을 바꾸면 맞추기를 마친 계정이 저절로 기준이 됩니다.": "Run /claude-session-sync in another account to match names, pins and groups to this one. After a switch, an aligned account becomes the reference.",
   "확인할 수 있는 Claude 계정이 없습니다. 로그인이 필요한 계정은 다시 로그인하세요.": "No Claude account can be checked. Sign in again to the accounts that need it.",
   "{0} 계정 목록에 아직 없는 세션이 {1}개 있지만, 이 Claude 버전은 아직 확인되지 않아 세션 채우기를 멈췄습니다.": "The {0} account is missing {1} sessions, but filling is paused because this Claude version has not been verified yet."
 }

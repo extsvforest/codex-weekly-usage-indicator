@@ -43,9 +43,9 @@ internal sealed record ClaudeShelfPass(ClaudeShelfStatus Status, Guid? Reservati
 /// been fully closed for a moment it fills every registered account's session list, add-only. It relaunches Desktop
 /// when the user asked for that, or after a switch to an account that lacked sessions; otherwise a closed app stays
 /// closed.
-/// <para>When the app switches accounts, the account it left becomes the session layout reference if its sidebar was
-/// found aligned (the plan command's signal) during that stay: it then holds the newest layout. An account left
-/// without being aligned may hold a stale one, so the reference stays where it was.</para>
+/// <para>It also keeps what the accounts' sidebars last agreed on (<see cref="ClaudeSessionLayout"/>), which the
+/// <c>claude-session-sync</c> plan reads: the mapped accounts and their labels, when the app last left each one, and,
+/// after a plan ran in an account, what that account now shows alike with each other one.</para>
 /// </summary>
 internal sealed class ClaudeShelfService : IDisposable
 {
@@ -75,15 +75,13 @@ internal sealed class ClaudeShelfService : IDisposable
     private ClaudeShelfProblem _problem;
     private string? _problemDetail;
     private string? _confirmedKey;
-    private DateTimeOffset _arrivedAt;
-    // When an account was found aligned, and against which reference (account and when it was set).
-    private readonly Dictionary<string, (DateTimeOffset At, string? Reference, DateTimeOffset? SetAt)> _alignedAt =
-        new(StringComparer.Ordinal);
     // Counts the user's reopen choices, so a pass that started before one never overrides it.
     private int _relaunchChoice;
-    // The log watcher's sign-in count when the account was last confirmed.
-    private int _confirmSignIns;
-    private readonly Dictionary<string, EventWaitHandle> _alignedEvents = new(StringComparer.Ordinal);
+    // What the accounts' sidebars agreed on, kept by this widget alone; null until read or started.
+    private readonly ClaudeSessionSync.Sources _layoutSources;
+    private ClaudeSessionLayout? _layout;
+    private bool _layoutChanged;
+    private readonly Dictionary<string, EventWaitHandle> _plannedEvents = new(StringComparer.Ordinal);
     // UI-thread state.
     private bool _busy, _disposed;
     private (Guid Id, DateTimeOffset Until)? _reservation;
@@ -95,10 +93,12 @@ internal sealed class ClaudeShelfService : IDisposable
     internal event EventHandler? StatusChanged;
 
     internal ClaudeShelfService(Control owner, Func<IReadOnlyList<ClaudeProfile>> profiles, ClaudeSessionShelf? shelf = null,
-        ClaudeShelfEnvironment? environment = null, ClaudeDesktopLogWatcher? log = null)
+        ClaudeShelfEnvironment? environment = null, ClaudeDesktopLogWatcher? log = null,
+        ClaudeSessionSync.Sources? layoutSources = null)
     {
         _owner = owner; _profiles = profiles; _shelf = shelf ?? new ClaudeSessionShelf();
         _environment = environment ?? ClaudeShelfEnvironment.Real; _log = log ?? new ClaudeDesktopLogWatcher();
+        _layoutSources = layoutSources ?? ClaudeSessionSync.Sources.For(_shelf.Paths);
         _timer.Tick += (_, _) => Tick();
     }
 
@@ -192,7 +192,7 @@ internal sealed class ClaudeShelfService : IDisposable
         var now = _environment.Now();
         var choice = Volatile.Read(ref _relaunchChoice);
         RefreshAccounts(profiles, now);
-        TakeAlignedSignals(now);
+        KeepLayout();
         var runtime = _environment.Observe();
         string? switchedFrom = null;
         Guid? accepted = null;
@@ -208,20 +208,12 @@ internal sealed class ClaudeShelfService : IDisposable
                 { _problem = ClaudeShelfProblem.Incompatible; _problemDetail = package?.Version.ToString(); }
                 else if (_problem == ClaudeShelfProblem.Incompatible) { _problem = ClaudeShelfProblem.None; _problemDetail = null; }
                 app = _log.Update(runtime.HostStartedAt, _accounts);
-                // Lost log lines hide anything: start over rather than trust what was learned before them.
-                if (_log.LostLines) { _confirmedKey = null; _alignedAt.Clear(); }
-                if (app.Key is { } confirmed && _accounts.Any(account => account.Key == confirmed))
+                // Lost log lines could hide a switch: the next account seen is no switch.
+                if (_log.LostLines) _confirmedKey = null;
+                if (app.Key is { } confirmed && _accounts.Any(account => account.Key == confirmed) && confirmed != _confirmedKey)
                 {
-                    // More than one sign-in since the account was last confirmed, over passes and app runs, means the app
-                    // may have left an account and come back in stays no pass confirmed: start over the same way.
-                    if (_confirmedKey is not null && _log.SignIns - _confirmSignIns > 1)
-                    { _confirmedKey = null; _alignedAt.Clear(); }
-                    if (confirmed != _confirmedKey)
-                    {
-                        if (_confirmedKey is { } left) { switchedFrom = left; FollowReference(left, now); }
-                        _confirmedKey = confirmed; _arrivedAt = now;
-                    }
-                    _confirmSignIns = _log.SignIns;
+                    if (_confirmedKey is { } left) { switchedFrom = left; NoteLeft(left, now); }
+                    _confirmedKey = confirmed;
                 }
                 if (app.Key is { } key && (key != _pendingFor || now - _pendingAt >= PendingInterval))
                 {
@@ -255,42 +247,95 @@ internal sealed class ClaudeShelfService : IDisposable
             package ?? _environment.FindPackage(), switchedFrom, choice);
     }
 
-    /// <summary>Notes accounts the plan command found aligned with the reference in place since the last pass. A
-    /// signal names the reference it was measured against; listening only for the current one drops the others unheard.</summary>
-    private void TakeAlignedSignals(DateTimeOffset now)
+    /// <summary>Keeps <see cref="ClaudeSessionLayout"/>: starts it the first time, keeps the mapped accounts and their
+    /// labels, and after a plan ran in an account records what that account now shows alike with each other one.</summary>
+    private void KeepLayout()
     {
-        var reference = ClaudeSessionReference.Load(_shelf.Paths.LedgerDirectory);
-        var wanted = reference is null ? new Dictionary<string, string>(StringComparer.Ordinal)
-            : _accounts.DistinctBy(account => account.Key).ToDictionary(
-                account => ClaudeSessionSync.AlignedEventName(account.Key, reference.Account, reference.SetAt),
-                account => account.Key, StringComparer.Ordinal);
-        foreach (var name in _alignedEvents.Keys.Where(name => !wanted.ContainsKey(name)).ToArray())
-        { _alignedEvents[name].Dispose(); _alignedEvents.Remove(name); }
+        if (_layout is null)
+        {
+            var (kept, exists) = ClaudeSessionLayout.Load(_layoutSources.Ledger);
+            // One that is there but cannot be read is never replaced with a guess.
+            if (exists && kept is null) return;
+            if (kept is null)
+            {
+                // The old reference is matched against the mapped accounts, so those come first.
+                if (_accounts.Count == 0 || StartLayout() is not { } started) return;
+                kept = started; _layoutChanged = true;
+            }
+            _layout = kept;
+        }
+        if (_accounts.Count > 0)
+        {
+            var mapped = _accounts.DistinctBy(account => account.Key)
+                .ToDictionary(account => account.Key, account => account.Label, StringComparer.Ordinal);
+            foreach (var key in _layout.Accounts.Keys.Where(key => !mapped.ContainsKey(key)).ToArray())
+            { _layout.Accounts.Remove(key); _layoutChanged = true; }
+            foreach (var (key, label) in mapped)
+                if (!_layout.Accounts.TryGetValue(key, out var known) || known.Label != label)
+                { _layout.Accounts[key] = new(label, known?.LeftAt); _layoutChanged = true; }
+        }
+        var wanted = _layout.Accounts.Keys.ToDictionary(ClaudeSessionSync.PlannedEventName, key => key, StringComparer.Ordinal);
+        foreach (var name in _plannedEvents.Keys.Where(name => !wanted.ContainsKey(name)).ToArray())
+        { _plannedEvents[name].Dispose(); _plannedEvents.Remove(name); }
         foreach (var (name, key) in wanted)
         {
-            if (!_alignedEvents.TryGetValue(name, out var signal))
+            if (!_plannedEvents.TryGetValue(name, out var signal))
             {
-                try { _alignedEvents[name] = signal = new EventWaitHandle(false, EventResetMode.AutoReset, name); }
+                try { _plannedEvents[name] = signal = new EventWaitHandle(false, EventResetMode.AutoReset, name); }
                 catch (Exception exception) when (exception is UnauthorizedAccessException or IOException
                                                       or WaitHandleCannotBeOpenedException) { continue; }
             }
-            if (signal.WaitOne(0)) _alignedAt[key] = (now, reference!.Account, reference.SetAt);
+            if (!signal.WaitOne(0)) continue;
+            // Unreadable pins or groups teach nothing this time; the next plan signals again.
+            var others = _layout.Accounts.Keys.Where(other => other != key).ToArray();
+            try
+            {
+                foreach (var agreement in ClaudeSessionSync.Agreements(_layoutSources, key, others) ?? [])
+                { _layout.Record(agreement); _layoutChanged = true; }
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { }
         }
+        SaveLayout();
     }
 
-    /// <summary>The app left <paramref name="left"/>. It becomes the reference if it already is one, if there is none,
-    /// or if it was found aligned with the current reference after the app arrived there; otherwise the reference stays.</summary>
-    private void FollowReference(string left, DateTimeOffset now)
+    /// <summary>The first layout: the mapped accounts, each matched against the old reference if there is one, taking
+    /// its values as what they last agreed on. Null when that cannot be read now; a later pass tries again.</summary>
+    private ClaudeSessionLayout? StartLayout()
     {
-        var ledger = _shelf.Paths.LedgerDirectory;
-        var current = ClaudeSessionReference.Load(ledger);
-        if (current?.Account == left
-            || current is not null && !(_alignedAt.TryGetValue(left, out var aligned) && aligned.At >= _arrivedAt
-                                        && aligned.Reference == current.Account && aligned.SetAt == current.SetAt)) return;
-        if (_accounts.FirstOrDefault(account => account.Key == left) is not { } account) return;
-        var labels = new Dictionary<string, string>(current?.Labels ?? new Dictionary<string, string>(), StringComparer.Ordinal);
-        foreach (var known in _accounts) labels[known.Key] = known.Label;
-        try { new ClaudeSessionReference(left, account.Label, account.ProfileId, now, labels).Save(ledger); }
+        var layout = new ClaudeSessionLayout();
+        var keys = _accounts.Select(account => account.Key).Distinct(StringComparer.Ordinal).ToArray();
+        // An old reference that cannot be opened now may still be there to start from: wait for it.
+        var (reference, known) = ClaudeSessionReference.Read(_layoutSources.Ledger);
+        if (!known) return null;
+        if (reference is not null && keys.Contains(reference.Account))
+        {
+            try
+            {
+                if (ClaudeSessionSync.Baseline(_layoutSources, reference.Account, keys) is not { } baseline) return null;
+                foreach (var agreement in baseline) layout.Record(agreement);
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { return null; }
+            // The user chose the reference just before leaving it.
+            layout.Accounts[reference.Account] = new(_accounts.First(account => account.Key == reference.Account).Label,
+                reference.SetAt);
+        }
+        return layout;
+    }
+
+    /// <summary>The app left an account: what changed there is now the newest, should it disagree with another
+    /// account's change.</summary>
+    private void NoteLeft(string left, DateTimeOffset now)
+    {
+        if (_layout is null || !_layout.Accounts.TryGetValue(left, out var account)) return;
+        _layout.Accounts[left] = account with { LeftAt = now };
+        _layoutChanged = true;
+        SaveLayout();
+    }
+
+    private void SaveLayout()
+    {
+        if (!_layoutChanged || _layout is null) return;
+        try { _layout.Save(_layoutSources.Ledger); _layoutChanged = false; }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { }
     }
 
@@ -354,6 +399,9 @@ internal sealed class ClaudeShelfService : IDisposable
         _timer.Stop(); _timer.Dispose();
         // A pass may still be running; its handles go with the process.
     }
+
+    /// <summary>The layout this widget keeps, for tests: read after a pass, never while one runs.</summary>
+    internal ClaudeSessionLayout? LayoutForTest => _layout;
 }
 
 /// <summary>

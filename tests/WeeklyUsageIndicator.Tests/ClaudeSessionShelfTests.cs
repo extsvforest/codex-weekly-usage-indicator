@@ -24,7 +24,7 @@ internal static class ClaudeSessionShelfTests
         TestWidgetGate();
         await TestFollowingTheAppAccount();
         TestRelaunchReservation();
-        TestSwitchFollowsReference();
+        TestLayoutKeeping();
         TestConversationLineage();
         TestSidebarPrefs();
         TestLineageEdges();
@@ -502,26 +502,11 @@ internal static class ClaudeSessionShelfTests
         var restarted = new ClaudeDesktopLogWatcher(logs);
         Check(restarted.Update(start, [A, B]).Key == B.Key, "a new observer skips main1.log's lines before its unfinished end");
 
-        // Sign-ins are counted across app runs: the lines a run wrote after the last read count with the next run's, a
-        // rotation between them included; once the file read last is gone, the lines after the last read are lost.
-        string Transit(int seconds, string from, string to) =>
-            Line(seconds, $"[account] Login-state transition (loggedOut: true → false, uuid: {from} → {to}), clearing oauth cache");
-        File.Delete(previous);
-        File.WriteAllLines(main, [initA]);
-        var counting = new ClaudeDesktopLogWatcher(logs);
-        counting.Update(start, [A, B]);
-        var counted = counting.SignIns;
-        File.AppendAllLines(main, [Transit(80, AccountA, AccountB), InitB(80)]);
-        Rotate(Line(90, "unrelated"));
-        counting.Update(null, [A, B]);
-        File.AppendAllLines(main, [Transit(101, AccountB, AccountA),
-            Line(101, $"[LocalSessionManager] Initialization succeeded — accountId={AccountA}, orgId={OrgA}, existingSessions=0")]);
-        Check(counting.Update(start.AddSeconds(100), [A, B]).Key == A.Key && !counting.LostLines && counting.SignIns - counted == 2,
-            "the sign-ins a run wrote after the last read count with the next run's, across a rotation");
-        Rotate(Line(110, "one"));
-        Rotate(Line(111, "two"));
-        counting.Update(start.AddSeconds(120), [A, B]);
-        Check(counting.LostLines, "the lines after the last read are lost once the file read last is gone");
+        // A gap is reported as lost lines, so the widget never takes the next account it sees for a switch.
+        Rotate(Line(80, "one"));
+        Rotate(Line(81, "two"));
+        fresh.Update(start, [A, B]);
+        Check(fresh.LostLines, "lines lost to two rotations between reads are reported");
     }
 
     private static void TestRelaunchReservation()
@@ -608,7 +593,7 @@ internal static class ClaudeSessionShelfTests
         Check(!service.Status.RelaunchArmed, "an unused request expires after 30 minutes");
     }
 
-    private static void TestSwitchFollowsReference()
+    private static void TestLayoutKeeping()
     {
         using var fixture = new Fixture();
         // Accounts of their own: the widget's events are per account, and a running widget must not hear this test.
@@ -626,20 +611,17 @@ internal static class ClaudeSessionShelfTests
         var package = new ClaudeDesktopPackage("Claude_9.9.9.9_x64__pzs8sxrjxfjjc", new Version(9, 9, 9, 9), fixture.Root, "Claude_pzs8sxrjxfjjc");
         var runtime = new ClaudeDesktopRuntime(ClaudeDesktopRunState.Running, start);
         var environment = new ClaudeShelfEnvironment(() => runtime, () => package, _ => true, _ => { }, () => now);
+        // Without the app's own stores here, plans teach the widget nothing; it still keeps the accounts and dates leaving them.
+        var sources = new ClaudeSessionSync.Sources(fixture.Sessions, Path.Combine(fixture.Root, "no-local-storage"),
+            Path.Combine(fixture.Root, "no-idb"), fixture.Projects, fixture.Ledger);
         using var owner = new System.Windows.Forms.Control();
-        using var service = new ClaudeShelfService(owner, () => [], fixture.Shelf(), environment, new ClaudeDesktopLogWatcher(logs));
+        using var service = new ClaudeShelfService(owner, () => [], fixture.Shelf(), environment, new ClaudeDesktopLogWatcher(logs), sources);
+        ClaudeSessionLayout? Kept() => ClaudeSessionLayout.Load(fixture.Ledger).Layout;
         service.Work([], null);
+        Check(ClaudeSessionLayout.Load(fixture.Ledger) is (null, false), "nothing is kept before the mapped accounts are known");
         service.SetAccountsForTest([c, d]);
         // C has a session D lacks, so arriving at D leaves sessions to fill.
         fixture.Record(c, "local_c1", fixture.Transcript());
-        ClaudeSessionReference? Reference() => ClaudeSessionReference.Load(fixture.Ledger);
-        // As the plan command does: name the reference the plan was measured against.
-        void Signal(ClaudeShelfAccount account, ClaudeSessionReference measured)
-        {
-            if (!EventWaitHandle.TryOpenExisting(ClaudeSessionSync.AlignedEventName(account.Key, measured.Account, measured.SetAt),
-                    out var signal)) return;
-            using (signal) signal.Set();
-        }
         ClaudeShelfPass Step(params string[] lines)
         {
             File.AppendAllLines(main, lines);
@@ -650,80 +632,46 @@ internal static class ClaudeSessionShelfTests
         }
 
         var first = Step(Init(1, c));
-        Check(first.SwitchedFrom is null && Reference() is null && !service.Status.RelaunchArmed, "the first account seen is no switch");
+        Check(first.SwitchedFrom is null && Kept() is { } kept && kept.Accounts.Count == 2
+              && kept.Accounts[c.Key] == new ClaudeSessionLayout.Account("C", null) && kept.Side(c.Key, d.Key) is null,
+            "the layout starts with the mapped accounts, nothing agreed and none left yet");
         var toD = Step(Switch(10, c, d), Init(11, d));
-        Check(toD.SwitchedFrom == c.Key && Reference()?.Account == c.Key,
-            "with no reference yet, the account the app left becomes one");
+        Check(toD.SwitchedFrom == c.Key && Kept()!.Accounts[c.Key].LeftAt == now, "leaving an account dates it");
         Check(service.Status is { AppProfileId: "p-d", PendingForApp: 1, RelaunchArmed: true },
             "a switch to an account that lacks sessions arms the reopen, so one quit fills the list and brings the app back");
         service.ArmRelaunch(false);
         var back = Step(Switch(20, d, c), Init(21, c));
-        Check(back.SwitchedFrom == d.Key && Reference()?.Account == c.Key && !service.Status.RelaunchArmed,
-            "an account left without being aligned does not become the reference, and nothing is missing at C");
-        Step(Switch(30, c, d), Init(31, d));
-        Check(Reference()?.Account == c.Key, "leaving the reference keeps it");
-        Signal(d, Reference()!);
-        Step();
-        var aligned = Step(Switch(40, d, c), Init(41, c));
-        Check(aligned.SwitchedFrom == d.Key && Reference() is { Account: var account, ProfileId: "p-d", Label: "D" } reference
-              && account == d.Key && reference.Labels[c.Key] == "C",
-            "an account aligned during its stay becomes the reference when the app leaves it");
-        Step(); // the widget listens for the new reference from its next pass
-        Signal(c, Reference()!);
-        Step();
-        Step(Switch(50, c, d), Init(51, d));
-        Step(Switch(60, d, c), Init(61, c));
-        Check(Reference()?.Account == c.Key, "an account aligned before it was left is the reference; D, not aligned this stay, does not take it back");
+        Check(back.SwitchedFrom == d.Key && Kept()!.Accounts[d.Key].LeftAt == now && !service.Status.RelaunchArmed,
+            "every switch dates the account left, and nothing is missing at C");
 
-        // An alignment measured against another reference does not count: the user chose a new one meanwhile.
-        Step(Switch(70, c, d), Init(71, d));
-        Signal(d, Reference()!);
+        // A plan that ran in an account signals the widget, which takes the signal even when it learns nothing from it.
+        Check(EventWaitHandle.TryOpenExisting(ClaudeSessionSync.PlannedEventName(c.Key), out var planned),
+            "the widget listens for plans in each mapped account");
+        using (planned)
+        {
+            planned!.Set();
+            Step();
+            Check(!planned.WaitOne(0) && Kept()!.Side(c.Key, d.Key) is null, "a plan's signal is taken; without the app's stores nothing is recorded");
+        }
+        // Labels follow the account page, and an account no longer mapped is dropped.
+        service.SetAccountsForTest([c with { Label = "C2" }]);
         Step();
-        var chosen = Reference()! with { SetAt = DateTimeOffset.UtcNow.AddSeconds(1) };
-        chosen.Save(fixture.Ledger);
-        Step(Switch(80, d, c), Init(81, c));
-        Check(Reference()?.Account == c.Key, "an alignment against a reference since replaced does not promote");
-        // The same when the reference changes after the plan signalled and before the widget heard it.
-        Step(Switch(82, c, d), Init(83, d));
-        var before = Reference()!;
-        Signal(d, before);
-        (before with { SetAt = before.SetAt.AddSeconds(1) }).Save(fixture.Ledger);
+        Check(Kept()!.Accounts.Keys.SequenceEqual([c.Key]) && Kept()!.Accounts[c.Key].Label == "C2",
+            "a renamed account is kept under its new label, one no longer mapped is dropped");
+        service.SetAccountsForTest([c, d]);
         Step();
-        Step(Switch(84, d, c), Init(85, c));
-        Check(Reference()?.Account == c.Key && Reference()!.SetAt == before.SetAt.AddSeconds(1),
-            "a signal measured against a reference replaced before it was heard is never heard");
 
-        // A round trip the widget saw only in one pass (D, C, then D again): D's alignment from before is dropped, so
-        // leaving D later does not promote it over what C may have changed.
-        Step(Switch(86, c, d), Init(87, d));
-        Step();
-        Signal(d, Reference()!);
-        Step();
-        var roundTrip = Step(Switch(88, d, c), Init(89, c), Switch(90, c, d), Init(91, d));
-        Check(roundTrip.SwitchedFrom is null, "a round trip seen at once is not taken for a switch");
-        Step(Switch(92, d, c), Init(93, c));
-        Check(Reference()?.Account == c.Key, "an alignment from before an unseen round trip does not promote");
-        // The same round trip read over two passes: the sign-in to C, then C confirmed and left for D at once.
-        Step(Switch(93, c, d), Init(94, d));
-        Signal(d, Reference()!);
-        Step();
-        var halfway = Step(Switch(94, d, c));
-        var back2 = Step(Init(94, c), Switch(94, c, d), Init(94, d));
-        Check(halfway.SwitchedFrom is null && back2.SwitchedFrom is null, "sign-ins counted over passes are not taken for switches");
-        Step(Switch(94, d, c), Init(94, c));
-        Check(Reference()?.Account == c.Key, "an alignment from before a round trip read over two passes does not promote");
-
-        // Lost log lines could hide anything: what was learned before them is dropped, and the next account seen is no switch.
+        // Lost log lines could hide anything: the next account seen is no switch.
         File.Delete(main);
         Step();
-        File.WriteAllLines(main, [Init(95, d)]);
+        File.WriteAllLines(main, [Init(30, d)]);
         var afterGap = Step();
-        Check(afterGap.SwitchedFrom is null && Reference()?.Account == c.Key, "after a gap the first account seen is no switch");
+        Check(afterGap.SwitchedFrom is null, "after a gap the first account seen is no switch");
 
         // A choice the user makes while a switch pass runs stands: the pass does not arm the reopen again.
         service.ArmRelaunch(false);
-        Step(Switch(100, d, c), Init(101, c));
-        File.AppendAllLines(main, [Switch(110, c, d), Init(111, d)]);
+        Step(Switch(40, d, c), Init(41, c));
+        File.AppendAllLines(main, [Switch(50, c, d), Init(51, d)]);
         now += TimeSpan.FromSeconds(1);
         var racing = service.Work([], service.ActiveReservation());
         service.ArmRelaunch(false);
@@ -731,27 +679,79 @@ internal static class ClaudeSessionShelfTests
         Check(racing.SwitchedFrom == c.Key && racing.Status.PendingForApp > 0 && !service.Status.RelaunchArmed,
             "a reopen cancelled while the switch pass ran stays cancelled");
 
-        // Across app runs, the lines a run wrote after the widget's last look still count. A round trip in them drops
-        // D's alignment, the app seen closed in between or not ...
-        Signal(d, Reference()!);
-        Step();
-        File.AppendAllLines(main, [Switch(120, d, c), Init(121, c), Switch(122, c, d), Init(123, d)]);
-        runtime = new ClaudeDesktopRuntime(ClaudeDesktopRunState.Closed, null);
-        Step();
-        runtime = new ClaudeDesktopRuntime(ClaudeDesktopRunState.Running, start.AddSeconds(130));
-        var reopened = Step(Init(131, d));
-        Step(Switch(140, d, c), Init(141, c));
-        Check(reopened.SwitchedFrom is null && Reference()?.Account == c.Key,
-            "a round trip in the lines a run wrote after the last look drops the alignment from before it");
-        // ... and a single switch in them is a switch.
-        Step(Switch(150, c, d), Init(151, d));
-        Signal(d, Reference()!);
-        Step();
-        File.AppendAllLines(main, [Switch(160, d, c), Init(161, c)]);
-        runtime = new ClaudeDesktopRuntime(ClaudeDesktopRunState.Running, start.AddSeconds(170));
-        var restarted = Step(Init(171, c));
-        Check(restarted.SwitchedFrom == d.Key && Reference()?.Account == d.Key,
-            "a switch in the lines a run wrote after the last look is a switch");
+        // A layout that is there but cannot be read is never replaced. With the old reference but no readable stores
+        // nothing is started yet, so a plan waits rather than take values never received for changes.
+        var path = Path.Combine(fixture.Ledger, ClaudeSessionLayout.FileName);
+        File.WriteAllText(path, "{broken");
+        using (var later = new ClaudeShelfService(owner, () => [], fixture.Shelf(), environment, new ClaudeDesktopLogWatcher(logs), sources))
+        {
+            later.Work([], null);
+            later.SetAccountsForTest([c, d]);
+            later.Work([], null);
+            Check(File.ReadAllText(path) == "{broken", "an unreadable layout is left as it is");
+            File.Delete(path);
+            new ClaudeSessionReference(c.Key, "C", "p-c", now, new Dictionary<string, string>()).Save(fixture.Ledger);
+            var referenceFile = Path.Combine(fixture.Ledger, ClaudeSessionReference.FileName);
+            using (new FileStream(referenceFile, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+            {
+                later.Work([], null);
+                Check(!File.Exists(path), "an old reference that cannot be opened now holds the start");
+            }
+            fixture.Record(d, "local_d1", fixture.Transcript());
+            later.Work([], null);
+            Check(!File.Exists(path), "with the old reference, the layout waits until the app's stores can be read");
+            File.WriteAllText(referenceFile, "{broken");
+            later.Work([], null);
+            Check(!File.Exists(path), "an old reference that cannot be read as one holds the start, never taken for none");
+            File.Delete(referenceFile);
+            later.Work([], null);
+            Check(File.Exists(path), "with no old reference the layout starts at once");
+        }
+    }
+
+    /// <summary>Read-only: what the first layout (from the old reference) would be, and what each account's first plan
+    /// against it would change. Only a scratch ledger is written.</summary>
+    internal static void LayoutDryRun()
+    {
+        var scratch = Path.Combine(Path.GetTempPath(), "gfs-agent", "claude-layout-dry-run-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(scratch);
+        try
+        {
+            var real = ClaudeSessionSync.Sources.Default();
+            // The widget's mapping cache and ledger, copied: the scratch copies are all that is written.
+            foreach (var name in new[] { "accounts.json", "ledger.json" })
+                if (File.Exists(Path.Combine(real.Ledger, name))) File.Copy(Path.Combine(real.Ledger, name), Path.Combine(scratch, name));
+            var accounts = ClaudeShelfAccounts.Resolve(new ClaudeProfileStore().ListProfiles(), scratch);
+            var sources = real with { Ledger = scratch };
+            var reference = ClaudeSessionReference.Load(real.Ledger);
+            Console.WriteLine($"reference: {reference?.Account} {reference?.Label} {reference?.SetAt:O}");
+            var layout = new ClaudeSessionLayout();
+            foreach (var account in accounts.DistinctBy(account => account.Key)) layout.Accounts[account.Key] = new(account.Label, null);
+            if (reference is not null)
+            {
+                var baseline = ClaudeSessionSync.Baseline(sources, reference.Account, layout.Accounts.Keys.ToArray());
+                Console.WriteLine($"baseline: {(baseline is null ? "unreadable" : baseline.Sum(agreement => agreement.Mine.Count + agreement.Theirs.Count) + " entries")}");
+                foreach (var agreement in baseline ?? []) layout.Record(agreement);
+                layout.Accounts[reference.Account] = layout.Accounts[reference.Account] with { LeftAt = reference.SetAt };
+            }
+            layout.Save(scratch);
+            foreach (var account in layout.Accounts.Keys)
+            {
+                var directory = Directory.EnumerateDirectories(real.SessionsRoot, "*", SearchOption.AllDirectories)
+                    .FirstOrDefault(path => path.Replace(Path.DirectorySeparatorChar, '/').EndsWith(account, StringComparison.OrdinalIgnoreCase));
+                if (directory is null) { Console.WriteLine($"== {layout.Accounts[account].Label}: no list"); continue; }
+                var titles = ClaudeSessionSync.ReadRecords(directory).ToDictionary(record => record.SessionId, record => record.Title ?? record.SessionId);
+                var session = titles.Keys.First();
+                var plan = ClaudeSessionSync.Build(sources, session);
+                Console.WriteLine($"== {layout.Accounts[account].Label}: {plan.Status} warnings=[{string.Join(",", plan.Warnings ?? [])}] archive={plan.Archive?.Count}");
+                foreach (var name in plan.CreateGroups ?? []) Console.WriteLine($"  create group {name}");
+                foreach (var move in plan.Moves ?? [])
+                    Console.WriteLine($"  move to {move.Group ?? "(none)"}: {string.Join(" | ", move.Sessions.Select(id => titles[id]))}");
+                foreach (var pin in plan.Pins ?? []) Console.WriteLine($"  {(pin.Pinned ? "pin" : "unpin")} {pin.Title} (by {pin.By})");
+                foreach (var rename in plan.Renames ?? []) Console.WriteLine($"  rename {rename.From} -> {rename.Title} (by {rename.By})");
+            }
+        }
+        finally { Directory.Delete(scratch, true); }
     }
 
     /// <summary>Read-only report of the real environment: nothing is written outside a temporary cache.</summary>
