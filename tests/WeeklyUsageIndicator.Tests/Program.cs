@@ -5,6 +5,8 @@ if (args.Contains("--english")) UiText.SetLanguage("en");
 if (args.Contains("--live-environment-smoke")) { await LiveEnvironmentSmoke.RunAsync(); return; }
 if (args.Contains("--claude-shelf-live-probe")) { ClaudeSessionShelfTests.LiveProbe(); return; }
 if (args.Contains("--claude-layout-dry-run")) { ClaudeSessionShelfTests.LayoutDryRun(); return; }
+if (args.Contains("--claude-sidebar-store-shape")) { ClaudeSessionShelfTests.SidebarStoreShape(); return; }
+if (args.Contains("--claude-layout-diff")) { ClaudeSessionShelfTests.LayoutDiff(args[Array.IndexOf(args, "--claude-layout-diff") + 1], args[Array.IndexOf(args, "--claude-layout-diff") + 2]); return; }
 if (args.Contains("--claude-shelf-tests")) { await ClaudeSessionShelfTests.RunAsync(); Console.WriteLine("PASS: Claude session shelf"); return; }
 if (args.Contains("--claude-sync-tests")) { await ClaudeSessionSyncTests.RunAsync(); Console.WriteLine("PASS: Claude session sync"); return; }
 if (args.Contains("--claude-menu-smoke")) { await ClaudeAccountMenuSmoke.RunAsync(); return; }
@@ -39,7 +41,7 @@ var tests = new (string Name, Func<Task> Run)[]
     ("stable light tooltip hover, placement and focus", UsageTooltipHoverSmoke.RunAsync),
     ("Claude weekly metric, independent expiry and profile cache", ClaudeMetricTests.RunAll),
     ("Claude official profile identity and shared local work", ClaudeProfileTests.RunAsync),
-    ("Claude session shelf: add-only fill, closed-app writes, account mapping and log observation", ClaudeSessionShelfTests.RunAsync),
+    ("Claude session shelf: fill by adding and advancing, closed-app writes, account mapping and log observation", ClaudeSessionShelfTests.RunAsync),
     ("Claude combined weekly total and session-layout plan", ClaudeSessionSyncTests.RunAsync),
     ("Claude login waits, transient observation and identity invalidation", ClaudeControllerTests.RunAsync),
     ("Claude account menu actions and inactive-profile usage", () => ClaudeAccountMenuSmoke.RunAsync()),

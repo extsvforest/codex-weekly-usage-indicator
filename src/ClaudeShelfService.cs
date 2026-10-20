@@ -1,3 +1,6 @@
+using System.IO.MemoryMappedFiles;
+using System.Text.Json.Nodes;
+
 namespace WeeklyUsageIndicator;
 
 internal enum ClaudeShelfProblem { None, Incompatible, Held, Failed }
@@ -40,12 +43,14 @@ internal sealed record ClaudeShelfPass(ClaudeShelfStatus Status, Guid? Reservati
 /// <summary>
 /// Owned by the widget. Every few seconds it observes Desktop off the UI thread. While Desktop runs it follows the
 /// app's own log to learn the signed-in account and how many sessions that account still lacks. Once Desktop has
-/// been fully closed for a moment it fills every registered account's session list, add-only. It relaunches Desktop
+/// been fully closed for a moment it fills every registered account's session list (adding sessions, or bringing an older
+/// state of a conversation continued elsewhere up to date in place). It relaunches Desktop
 /// when the user asked for that, or after a switch to an account that lacked sessions; otherwise a closed app stays
 /// closed.
-/// <para>It also keeps what the accounts' sidebars last agreed on (<see cref="ClaudeSessionLayout"/>), which the
-/// <c>claude-session-sync</c> plan reads: the mapped accounts and their labels, when the app last left each one, and,
-/// after a plan ran in an account, what that account now shows alike with each other one.</para>
+/// <para>It also keeps what each account changed (<see cref="ClaudeSessionLayout"/>), which the
+/// <c>claude-session-sync</c> plan reads: the mapped accounts and their labels, when the app came to and left each one,
+/// and checkpoints of the account the app comes to and of the account a plan ran in, with what changed there since the
+/// checkpoint before.</para>
 /// </summary>
 internal sealed class ClaudeShelfService : IDisposable
 {
@@ -55,6 +60,8 @@ internal sealed class ClaudeShelfService : IDisposable
     private static readonly TimeSpan RetryInterval = TimeSpan.FromSeconds(60);
     private static readonly TimeSpan RetryWindow = TimeSpan.FromMinutes(30);
     private static readonly TimeSpan RelaunchWindow = TimeSpan.FromMinutes(30);
+    // How long the account the app came to is retried for its first checkpoint, while it cannot be read whole.
+    private static readonly TimeSpan ArrivalWindow = TimeSpan.FromMinutes(2);
     private readonly Control _owner;
     private readonly Func<IReadOnlyList<ClaudeProfile>> _profiles;
     private readonly ClaudeSessionShelf _shelf;
@@ -77,11 +84,17 @@ internal sealed class ClaudeShelfService : IDisposable
     private string? _confirmedKey;
     // Counts the user's reopen choices, so a pass that started before one never overrides it.
     private int _relaunchChoice;
-    // What the accounts' sidebars agreed on, kept by this widget alone; null until read or started.
+    // What each account changed, kept by this widget alone; null until read or started.
     private readonly ClaudeSessionSync.Sources _layoutSources;
     private ClaudeSessionLayout? _layout;
     private bool _layoutChanged;
-    private readonly Dictionary<string, EventWaitHandle> _plannedEvents = new(StringComparer.Ordinal);
+    // Per mapped account, where a plan command asks for its plan (see ClaudeSessionSync.Ask).
+    private readonly Dictionary<string, PlanChannel> _channels = new(StringComparer.Ordinal);
+    // The account the app came to, until its first checkpoint there is taken or the window closes.
+    private (string Account, DateTimeOffset Until)? _arrival;
+    // Until this widget sees the app confirm an account, and again after lines of its log were lost, a switch it then
+    // sees happened at a time it cannot tell: the account left is not dated.
+    private bool _unwatched = true;
     // UI-thread state.
     private bool _busy, _disposed;
     private (Guid Id, DateTimeOffset Until)? _reservation;
@@ -192,7 +205,7 @@ internal sealed class ClaudeShelfService : IDisposable
         var now = _environment.Now();
         var choice = Volatile.Read(ref _relaunchChoice);
         RefreshAccounts(profiles, now);
-        KeepLayout();
+        KeepLayout(now);
         var runtime = _environment.Observe();
         string? switchedFrom = null;
         Guid? accepted = null;
@@ -208,13 +221,25 @@ internal sealed class ClaudeShelfService : IDisposable
                 { _problem = ClaudeShelfProblem.Incompatible; _problemDetail = package?.Version.ToString(); }
                 else if (_problem == ClaudeShelfProblem.Incompatible) { _problem = ClaudeShelfProblem.None; _problemDetail = null; }
                 app = _log.Update(runtime.HostStartedAt, _accounts);
-                // Lost log lines could hide a switch: the next account seen is no switch.
-                if (_log.LostLines) _confirmedKey = null;
-                if (app.Key is { } confirmed && _accounts.Any(account => account.Key == confirmed) && confirmed != _confirmedKey)
+                if (_log.LostLines) _unwatched = true;
+                if (app.Key is { } confirmed && _accounts.Any(account => account.Key == confirmed))
                 {
-                    if (_confirmedKey is { } left) { switchedFrom = left; NoteLeft(left, now); }
-                    _confirmedKey = confirmed;
+                    if (confirmed != _confirmedKey)
+                    {
+                        // When the app confirmed the account, as its log tells.
+                        var at = app.ObservedAt is { } observed && new DateTimeOffset(observed) is var logged && logged <= now ? logged : now;
+                        if (_confirmedKey is not { } left) NoteActive(confirmed);
+                        else if (_unwatched) NoteSwitch(left, confirmed, at, now, leftAt: null);
+                        else { switchedFrom = left; NoteSwitch(left, confirmed, at, now, leftAt: at); }
+                        _confirmedKey = confirmed;
+                    }
+                    _unwatched = false;
+                    // An account without a checkpoint (the first time, or new) is checkpointed as soon as it can be read.
+                    if (_arrival is null && _layout is not null && !_layout.Checkpoints.ContainsKey(confirmed))
+                        _arrival = (confirmed, now + ArrivalWindow);
                 }
+                CheckpointArrival(now);
+                ServePlans(now, app.Key is { } shown && shown == _confirmedKey ? shown : null);
                 if (app.Key is { } key && (key != _pendingFor || now - _pendingAt >= PendingInterval))
                 {
                     try { _pending = _shelf.Plan(_accounts).PendingFor(key); }
@@ -225,6 +250,7 @@ internal sealed class ClaudeShelfService : IDisposable
                 break;
             case ClaudeDesktopRunState.Closed:
                 app = _log.Update(null, _accounts);
+                ServePlans(now, null);
                 _pending = null; _pendingFor = null;
                 _closedSince ??= now;
                 _closureStarted ??= now;
@@ -248,8 +274,8 @@ internal sealed class ClaudeShelfService : IDisposable
     }
 
     /// <summary>Keeps <see cref="ClaudeSessionLayout"/>: starts it the first time, keeps the mapped accounts and their
-    /// labels, and after a plan ran in an account records what that account now shows alike with each other one.</summary>
-    private void KeepLayout()
+    /// labels, and checkpoints the account the app shows when a plan ran there.</summary>
+    private void KeepLayout(DateTimeOffset now)
     {
         if (_layout is null)
         {
@@ -262,81 +288,116 @@ internal sealed class ClaudeShelfService : IDisposable
                 if (_accounts.Count == 0 || StartLayout() is not { } started) return;
                 kept = started; _layoutChanged = true;
             }
+            // The first format kept per-pair agreements: its accounts carry over in the current one.
+            if (kept.Upgraded) _layoutChanged = true;
             _layout = kept;
+            // The account the app showed before this widget started, so a switch made meanwhile is still told.
+            _confirmedKey ??= kept.Active;
         }
         if (_accounts.Count > 0)
         {
             var mapped = _accounts.DistinctBy(account => account.Key)
                 .ToDictionary(account => account.Key, account => account.Label, StringComparer.Ordinal);
             foreach (var key in _layout.Accounts.Keys.Where(key => !mapped.ContainsKey(key)).ToArray())
-            { _layout.Accounts.Remove(key); _layoutChanged = true; }
+            { _layout.Forget(key); _layoutChanged = true; }
             foreach (var (key, label) in mapped)
-                if (!_layout.Accounts.TryGetValue(key, out var known) || known.Label != label)
-                { _layout.Accounts[key] = new(label, known?.LeftAt); _layoutChanged = true; }
+                if (!_layout.Accounts.TryGetValue(key, out var known)) { _layout.Accounts[key] = new(label); _layoutChanged = true; }
+                else if (known.Label != label) { _layout.Accounts[key] = known with { Label = label }; _layoutChanged = true; }
         }
-        var wanted = _layout.Accounts.Keys.ToDictionary(ClaudeSessionSync.PlannedEventName, key => key, StringComparer.Ordinal);
-        foreach (var name in _plannedEvents.Keys.Where(name => !wanted.ContainsKey(name)).ToArray())
-        { _plannedEvents[name].Dispose(); _plannedEvents.Remove(name); }
-        foreach (var (name, key) in wanted)
+        foreach (var key in _channels.Keys.Where(key => !_layout.Accounts.ContainsKey(key)).ToArray())
         {
-            if (!_plannedEvents.TryGetValue(name, out var signal))
-            {
-                try { _plannedEvents[name] = signal = new EventWaitHandle(false, EventResetMode.AutoReset, name); }
-                catch (Exception exception) when (exception is UnauthorizedAccessException or IOException
-                                                      or WaitHandleCannotBeOpenedException) { continue; }
-            }
-            if (!signal.WaitOne(0)) continue;
-            // Unreadable pins or groups teach nothing this time; the next plan signals again.
-            var others = _layout.Accounts.Keys.Where(other => other != key).ToArray();
-            try
-            {
-                foreach (var agreement in ClaudeSessionSync.Agreements(_layoutSources, key, others) ?? [])
-                { _layout.Record(agreement); _layoutChanged = true; }
-            }
-            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { }
+            _channels[key].Dispose();
+            _channels.Remove(key);
         }
+        foreach (var key in _layout.Accounts.Keys.Where(key => !_channels.ContainsKey(key)))
+            if (PlanChannel.Open(key) is { } channel) _channels[key] = channel;
         SaveLayout();
     }
 
-    /// <summary>The first layout: the mapped accounts, each matched against the old reference if there is one, taking
-    /// its values as what they last agreed on. Null when that cannot be read now; a later pass tries again.</summary>
-    private ClaudeSessionLayout? StartLayout()
+    /// <summary>Answers the plan commands waiting: for the account the app shows, it checkpoints the account and makes
+    /// the plan from there, keeping what the plan sets out to change, so the plan applied is the one noted here; for
+    /// another, or while nothing can be saved, a plan for viewing only.</summary>
+    private void ServePlans(DateTimeOffset now, string? shown)
     {
-        var layout = new ClaudeSessionLayout();
-        var keys = _accounts.Select(account => account.Key).Distinct(StringComparer.Ordinal).ToArray();
-        // An old reference that cannot be opened now may still be there to start from: wait for it.
-        var (reference, known) = ClaudeSessionReference.Read(_layoutSources.Ledger);
-        if (!known) return null;
-        if (reference is not null && keys.Contains(reference.Account))
+        if (_layout is null) return;
+        foreach (var (key, channel) in _channels)
         {
+            if (!channel.Planned.WaitOne(0) || channel.Request() is not { } request) continue;
             try
             {
-                if (ClaudeSessionSync.Baseline(_layoutSources, reference.Account, keys) is not { } baseline) return null;
-                foreach (var agreement in baseline) layout.Record(agreement);
+                var plan = ClaudeSessionSync.Serve(_layout, _layoutSources, key, request.Self, active: key == shown, now);
+                if (plan.Checkpointed == true)
+                {
+                    if (_arrival?.Account == key) _arrival = null;
+                    _layoutChanged = true;
+                    if (!SaveLayout()) plan = plan with { Checkpointed = false };
+                }
+                channel.Answer(request.Id, ClaudeSessionSync.Serialize(plan));
             }
-            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { return null; }
-            // The user chose the reference just before leaving it.
-            layout.Accounts[reference.Account] = new(_accounts.First(account => account.Key == reference.Account).Label,
-                reference.SetAt);
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { }
         }
+    }
+
+    /// <summary>The first layout: the mapped accounts, with the account the old reference names (if any) taken as the one
+    /// the app left last, when it was chosen. Null while an old reference that is there cannot be read; a later pass
+    /// tries again.</summary>
+    private ClaudeSessionLayout? StartLayout()
+    {
+        var (reference, known) = ClaudeSessionReference.Read(_layoutSources.Ledger);
+        if (!known) return null;
+        var layout = new ClaudeSessionLayout();
+        foreach (var account in _accounts.DistinctBy(account => account.Key))
+            layout.Accounts[account.Key] = new(account.Label, reference?.Account == account.Key ? reference.SetAt : null);
         return layout;
     }
 
-    /// <summary>The app left an account: what changed there is now the newest, should it disagree with another
-    /// account's change.</summary>
-    private void NoteLeft(string left, DateTimeOffset now)
+    /// <summary>The app left one account for another, coming to it at <paramref name="at"/>: what changed in the account
+    /// it left was changed by <paramref name="leftAt"/> (null when that cannot be told, which leaves its time as it was),
+    /// and the account it came to starts a stay, checkpointed as soon as it can be read.</summary>
+    private void NoteSwitch(string left, string arrived, DateTimeOffset at, DateTimeOffset now, DateTimeOffset? leftAt)
     {
-        if (_layout is null || !_layout.Accounts.TryGetValue(left, out var account)) return;
-        _layout.Accounts[left] = account with { LeftAt = now };
+        _arrival = (arrived, now + ArrivalWindow);
+        if (_layout is null) return;
+        if (leftAt is not null && _layout.Accounts.TryGetValue(left, out var leaving))
+            _layout.Accounts[left] = leaving with { LeftAt = leftAt };
+        if (_layout.Accounts.TryGetValue(arrived, out var coming))
+            _layout.Accounts[arrived] = coming with { ArrivedAt = at, Stay = coming.Stay + 1 };
+        _layout.Active = arrived;
         _layoutChanged = true;
         SaveLayout();
     }
 
-    private void SaveLayout()
+    /// <summary>The first account this widget sees the app confirm, with none known before it.</summary>
+    private void NoteActive(string account)
     {
-        if (!_layoutChanged || _layout is null) return;
-        try { _layout.Save(_layoutSources.Ledger); _layoutChanged = false; }
-        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { }
+        if (_layout is null || _layout.Active == account) return;
+        _layout.Active = account;
+        _layoutChanged = true;
+        SaveLayout();
+    }
+
+    /// <summary>Checkpoints the account the app came to once it can be read, so what changes there from now on is told
+    /// from what it brought from its last stay.</summary>
+    private void CheckpointArrival(DateTimeOffset now)
+    {
+        if (_arrival is not { } arrival || _layout is null) return;
+        if (now > arrival.Until || arrival.Account != _confirmedKey) { _arrival = null; return; }
+        try
+        {
+            if (!ClaudeSessionSync.Checkpoint(_layout, _layoutSources, arrival.Account, now)) return;
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { return; }
+        _arrival = null;
+        _layoutChanged = true;
+        SaveLayout();
+    }
+
+    /// <summary>Saves what changed; false when it could not be saved.</summary>
+    private bool SaveLayout()
+    {
+        if (!_layoutChanged || _layout is null) return true;
+        try { _layout.Save(_layoutSources.Ledger); _layoutChanged = false; return true; }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { return false; }
     }
 
     private void RefreshAccounts(IReadOnlyList<ClaudeProfile> profiles, DateTimeOffset now)
@@ -402,6 +463,62 @@ internal sealed class ClaudeShelfService : IDisposable
 
     /// <summary>The layout this widget keeps, for tests: read after a pass, never while one runs.</summary>
     internal ClaudeSessionLayout? LayoutForTest => _layout;
+}
+
+/// <summary>Where a plan command asks the widget for one account's plan: its request and answer events and the shared
+/// memory that carries both (see <see cref="ClaudeSessionSync.Ask"/>).</summary>
+internal sealed class PlanChannel(EventWaitHandle planned, EventWaitHandle answered, MemoryMappedFile mailbox,
+    MemoryMappedViewAccessor view) : IDisposable
+{
+    internal EventWaitHandle Planned => planned;
+
+    internal static PlanChannel? Open(string account)
+    {
+        EventWaitHandle? planned = null, answered = null;
+        MemoryMappedFile? mailbox = null;
+        try
+        {
+            planned = new EventWaitHandle(false, EventResetMode.AutoReset, ClaudeSessionSync.PlannedEventName(account));
+            answered = new EventWaitHandle(false, EventResetMode.AutoReset, ClaudeSessionSync.CheckpointedEventName(account));
+            mailbox = MemoryMappedFile.CreateOrOpen(ClaudeSessionSync.MailboxName(account), ClaudeSessionSync.MailboxBytes,
+                MemoryMappedFileAccess.ReadWrite, MemoryMappedFileOptions.DelayAllocatePages, HandleInheritability.None);
+            return new(planned, answered, mailbox, mailbox.CreateViewAccessor(0, ClaudeSessionSync.MailboxBytes));
+        }
+        catch (Exception exception) when (exception is UnauthorizedAccessException or IOException
+                                              or WaitHandleCannotBeOpenedException)
+        {
+            planned?.Dispose(); answered?.Dispose(); mailbox?.Dispose();
+            return null;
+        }
+    }
+
+    /// <summary>The request waiting: its id and the calling session; null when it is not one.</summary>
+    internal (string Id, string Self)? Request()
+    {
+        try
+        {
+            if (ClaudeSessionSync.ReadSlot(view, 0, ClaudeSessionSync.AnswerOffset) is not { } text
+                || JsonNode.Parse(text) is not JsonObject request
+                || request["id"] is not JsonValue idValue || !idValue.TryGetValue<string>(out var id) || id.Length is 0 or > 64
+                || request["self"] is not JsonValue selfValue || !selfValue.TryGetValue<string>(out var self)
+                || !self.StartsWith("local_", StringComparison.Ordinal) || self.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
+                return null;
+            return (id, self);
+        }
+        catch (System.Text.Json.JsonException) { return null; }
+    }
+
+    internal void Answer(string id, string plan)
+    {
+        ClaudeSessionSync.WriteSlot(view, ClaudeSessionSync.AnswerOffset, ClaudeSessionSync.MailboxBytes - ClaudeSessionSync.AnswerOffset,
+            System.Text.Encoding.UTF8.GetBytes(id + "\n" + plan));
+        answered.Set();
+    }
+
+    public void Dispose()
+    {
+        view.Dispose(); mailbox.Dispose(); planned.Dispose(); answered.Dispose();
+    }
 }
 
 /// <summary>

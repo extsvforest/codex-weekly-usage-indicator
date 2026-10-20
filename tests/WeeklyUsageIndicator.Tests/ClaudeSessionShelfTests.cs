@@ -30,6 +30,9 @@ internal static class ClaudeSessionShelfTests
         TestLineageEdges();
         TestLocalStorage();
         TestTitlesFollowOriginals();
+        TestAdvancingOlderStates();
+        TestAdvanceHoldsAndRecovery();
+        TestVerifiedContinuation();
     }
 
     private static void TestPlanningAndPublishing()
@@ -596,7 +599,7 @@ internal static class ClaudeSessionShelfTests
     private static void TestLayoutKeeping()
     {
         using var fixture = new Fixture();
-        // Accounts of their own: the widget's events are per account, and a running widget must not hear this test.
+        // Accounts of their own: the widget's events and mailboxes are per account, and a running widget must not hear this test.
         var c = new ClaudeShelfAccount("c0c0c0c0-0000-4000-8000-00000000000c", "c1c1c1c1-0000-4000-8000-00000000000c", "C", "p-c");
         var d = new ClaudeShelfAccount("d0d0d0d0-0000-4000-8000-00000000000d", "d1d1d1d1-0000-4000-8000-00000000000d", "D", "p-d");
         var logs = Directory.CreateDirectory(Path.Combine(fixture.Root, "logs")).FullName;
@@ -607,82 +610,176 @@ internal static class ClaudeSessionShelfTests
             $"[LocalSessionManager] Initialization succeeded — accountId={account.AccountUuid}, orgId={account.OrgUuid}, existingSessions=0");
         string Switch(int seconds, ClaudeShelfAccount from, ClaudeShelfAccount to) => Line(seconds,
             $"[account] Login-state transition (loggedOut: true → false, uuid: {from.AccountUuid} → {to.AccountUuid}), clearing oauth cache");
+        // When the app's log confirmed an account.
+        DateTimeOffset Logged(int seconds) => new(start.AddSeconds(seconds));
         var now = DateTimeOffset.Now;
         var package = new ClaudeDesktopPackage("Claude_9.9.9.9_x64__pzs8sxrjxfjjc", new Version(9, 9, 9, 9), fixture.Root, "Claude_pzs8sxrjxfjjc");
         var runtime = new ClaudeDesktopRuntime(ClaudeDesktopRunState.Running, start);
         var environment = new ClaudeShelfEnvironment(() => runtime, () => package, _ => true, _ => { }, () => now);
-        // Without the app's own stores here, plans teach the widget nothing; it still keeps the accounts and dates leaving them.
-        var sources = new ClaudeSessionSync.Sources(fixture.Sessions, Path.Combine(fixture.Root, "no-local-storage"),
-            Path.Combine(fixture.Root, "no-idb"), fixture.Projects, fixture.Ledger);
+        // The app's own stores under the fixture, not there at first.
+        var storage = Path.Combine(fixture.Root, "Local Storage", "leveldb");
+        var indexedDb = Path.Combine(fixture.Root, "IndexedDB", "https_claude.ai_0.indexeddb.leveldb");
+        var sources = new ClaudeSessionSync.Sources(fixture.Sessions, storage, indexedDb, fixture.Projects, fixture.Ledger);
         using var owner = new System.Windows.Forms.Control();
         using var service = new ClaudeShelfService(owner, () => [], fixture.Shelf(), environment, new ClaudeDesktopLogWatcher(logs), sources);
         ClaudeSessionLayout? Kept() => ClaudeSessionLayout.Load(fixture.Ledger).Layout;
         service.Work([], null);
         Check(ClaudeSessionLayout.Load(fixture.Ledger) is (null, false), "nothing is kept before the mapped accounts are known");
         service.SetAccountsForTest([c, d]);
-        // C has a session D lacks, so arriving at D leaves sessions to fill.
+        // C has a session D lacks, so arriving at D leaves sessions to fill; both list another conversation.
         fixture.Record(c, "local_c1", fixture.Transcript());
-        ClaudeShelfPass Step(params string[] lines)
+        var shared = fixture.Transcript();
+        fixture.Record(c, "local_c0", shared);
+        fixture.Record(d, "local_d0", shared);
+        ClaudeShelfPass Pass()
         {
-            File.AppendAllLines(main, lines);
-            now += TimeSpan.FromSeconds(1); // well within the accounts refresh interval, so the test accounts stay
             var pass = service.Work([], service.ActiveReservation());
             service.Accept(pass);
             return pass;
         }
+        ClaudeShelfPass Step(params string[] lines)
+        {
+            File.AppendAllLines(main, lines);
+            now += TimeSpan.FromSeconds(1); // well within the accounts refresh interval, so the test accounts stay
+            return Pass();
+        }
 
         var first = Step(Init(1, c));
-        Check(first.SwitchedFrom is null && Kept() is { } kept && kept.Accounts.Count == 2
-              && kept.Accounts[c.Key] == new ClaudeSessionLayout.Account("C", null) && kept.Side(c.Key, d.Key) is null,
-            "the layout starts with the mapped accounts, nothing agreed and none left yet");
+        Check(first.SwitchedFrom is null && Kept() is { Active: var shown } kept && shown == c.Key && kept.Accounts.Count == 2
+              && kept.Accounts[c.Key] == new ClaudeSessionLayout.Account("C") && kept.Checkpoints.Count == 0,
+            "the layout starts with the mapped accounts and the account the app shows; without the app's stores nothing is checkpointed");
+        // Opening either throws unless the widget made it.
+        using (EventWaitHandle.OpenExisting(ClaudeSessionSync.PlannedEventName(c.Key)))
+        using (System.IO.MemoryMappedFiles.MemoryMappedFile.OpenExisting(ClaudeSessionSync.MailboxName(d.Key))) { }
+        // The stores appear: the account the app shows, never checkpointed, is checkpointed as soon as it reads whole.
+        ClaudeSessionSyncTests.CreateDatabase(indexedDb);
+        ClaudeSessionSyncTests.AppendRaw(indexedDb, 42, ClaudeSessionSyncTests.PinKey(5), ClaudeSessionSyncTests.PinValue([]));
+        ClaudeSessionSyncTests.CreateDatabase(storage);
+        Check(ClaudeSessionSyncTests.WriteSidebar(storage,
+                new JsonObject { ["state"] = new JsonObject { ["customGroupsByScope"] = new JsonObject() }, ["version"] = 1 },
+                Path.Combine(fixture.Root, "backups")), "the fixture sidebar state is stored");
+        Pass();
+        Check(Kept() is { } seeded && seeded.Checkpoints[c.Key] is { Stay: 0 } && seeded.Changed[c.Key].ContainsKey("local_c1"),
+            "an account seen without a checkpoint is checkpointed once its stores read whole, seeding what it shows");
+        // The user renames a session in C, then the app goes to D and back.
+        var c1 = Path.Combine(fixture.ShelfPath(c), "local_c1.json");
+        var record = JsonNode.Parse(File.ReadAllText(c1))!.AsObject();
+        record["title"] = "새 이름";
+        File.WriteAllText(c1, record.ToJsonString());
         var toD = Step(Switch(10, c, d), Init(11, d));
-        Check(toD.SwitchedFrom == c.Key && Kept()!.Accounts[c.Key].LeftAt == now, "leaving an account dates it");
+        Check(toD.SwitchedFrom == c.Key && Kept() is { Active: var arrived } switched && arrived == d.Key
+              && switched.Accounts[c.Key].LeftAt == Logged(11) && switched.Accounts[d.Key] is { Stay: 1, ArrivedAt: var arrivedAt }
+              && arrivedAt == Logged(11) && switched.Checkpoints[d.Key].Stay == 1,
+            "a switch it watched dates leaving one account and coming to the other by the log line that confirmed it, starts a stay "
+            + "and checkpoints the account it comes to");
         Check(service.Status is { AppProfileId: "p-d", PendingForApp: 1, RelaunchArmed: true },
             "a switch to an account that lacks sessions arms the reopen, so one quit fills the list and brings the app back");
         service.ArmRelaunch(false);
         var back = Step(Switch(20, d, c), Init(21, c));
-        Check(back.SwitchedFrom == d.Key && Kept()!.Accounts[d.Key].LeftAt == now && !service.Status.RelaunchArmed,
-            "every switch dates the account left, and nothing is missing at C");
+        Check(back.SwitchedFrom == d.Key && Kept() is { } returned && returned.Accounts[d.Key].LeftAt == Logged(21)
+              && returned.Accounts[c.Key] is { Stay: 1 } && returned.Checkpoints[c.Key].Stay == 1
+              && returned.Changed[c.Key]["local_c1"].Title == new ClaudeSessionLayout.Stamp<string>("새 이름", Logged(11))
+              && !service.Status.RelaunchArmed,
+            "coming back, what changed there in its last stay is dated to when the app left it");
 
-        // A plan that ran in an account signals the widget, which takes the signal even when it learns nothing from it.
-        Check(EventWaitHandle.TryOpenExisting(ClaudeSessionSync.PlannedEventName(c.Key), out var planned),
-            "the widget listens for plans in each mapped account");
-        using (planned)
+        // A plan command asks the widget through the account's mailbox and takes the answer to its own request.
+        var asking = typeof(ClaudeSessionSync).GetMethod("Ask", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)!;
+        string? Ask(string account, string self) => (string?)asking.Invoke(null, [account, self]);
+        JsonObject Answered(string account, string self)
         {
-            planned!.Set();
-            Step();
-            Check(!planned.WaitOne(0) && Kept()!.Side(c.Key, d.Key) is null, "a plan's signal is taken; without the app's stores nothing is recorded");
+            var request = Task.Run(() => Ask(account, self));
+            for (var tries = 0; !request.IsCompleted && tries < 400; tries++) { Pass(); Thread.Sleep(25); }
+            Check(request.Wait(TimeSpan.FromSeconds(40)) && request.Result is not null, "the widget answers a plan request");
+            return JsonNode.Parse(request.Result!)!.AsObject();
         }
-        // Labels follow the account page, and an account no longer mapped is dropped.
-        service.SetAccountsForTest([c with { Label = "C2" }]);
-        Step();
-        Check(Kept()!.Accounts.Keys.SequenceEqual([c.Key]) && Kept()!.Accounts[c.Key].Label == "C2",
-            "a renamed account is kept under its new label, one no longer mapped is dropped");
-        service.SetAccountsForTest([c, d]);
-        Step();
+        var planned = Answered(c.Key, "local_c1");
+        Check(planned["status"]!.GetValue<string>() == "ok" && planned["checkpointed"]!.GetValue<bool>() && planned["current"]!.GetValue<string>() == c.Key
+              && Kept() is { } served && served.Pendings.ContainsKey(c.Key) && served.Checkpoints[c.Key].At == now,
+            "a plan asked for in the account the app shows is made from a checkpoint the widget keeps, and kept as the plan in progress");
+        var viewed = Answered(d.Key, "local_d0");
+        Check(viewed["status"]!.GetValue<string>() == "ok" && !viewed["checkpointed"]!.GetValue<bool>() && !Kept()!.Pendings.ContainsKey(d.Key),
+            "one asked for in an account the app does not show is for viewing only");
+        using (var planning = EventWaitHandle.OpenExisting(ClaudeSessionSync.PlannedEventName(c.Key)))
+        using (var answering = EventWaitHandle.OpenExisting(ClaudeSessionSync.CheckpointedEventName(c.Key)))
+        using (var mailbox = System.IO.MemoryMappedFiles.MemoryMappedFile.OpenExisting(ClaudeSessionSync.MailboxName(c.Key)))
+        using (var view = mailbox.CreateViewAccessor(0, ClaudeSessionSync.MailboxBytes))
+        {
+            var request = Task.Run(() => Ask(c.Key, "local_c1"));
+            Check(planning.WaitOne(TimeSpan.FromSeconds(10)), "the request is signalled");
+            ClaudeSessionSync.WriteSlot(view, ClaudeSessionSync.AnswerOffset, ClaudeSessionSync.MailboxBytes - ClaudeSessionSync.AnswerOffset,
+                Encoding.UTF8.GetBytes("0123456789abcdef0123456789abcdef\n{\"status\":\"stale\"}"));
+            answering.Set();
+            Thread.Sleep(300);
+            Check(!request.IsCompleted, "an answer to another request, one that ran out of time, is passed over");
+            planning.Set();
+            Pass();
+            Check(request.Wait(TimeSpan.FromSeconds(10)) && JsonNode.Parse(request.Result!)!["status"]!.GetValue<string>() == "ok",
+                "the answer to this request is taken");
+        }
+        Check(Ask("e0e0e0e0-0000-4000-8000-00000000000e/e1e1e1e1-0000-4000-8000-00000000000e", "local_e1") is null,
+            "with no widget listening for an account, nobody answers: the command makes its own plan, for viewing only");
 
-        // Lost log lines could hide anything: the next account seen is no switch.
-        File.Delete(main);
-        Step();
-        File.WriteAllLines(main, [Init(30, d)]);
-        var afterGap = Step();
-        Check(afterGap.SwitchedFrom is null, "after a gap the first account seen is no switch");
+        // Labels follow the account page; an account no longer mapped is forgotten whole, and nothing listens for it.
+        service.SetAccountsForTest([c with { Label = "C2" }]);
+        Pass();
+        Check(Kept() is { } relabelled && relabelled.Accounts.Keys.SequenceEqual([c.Key]) && relabelled.Accounts[c.Key].Label == "C2"
+              && !relabelled.Checkpoints.ContainsKey(d.Key) && !EventWaitHandle.TryOpenExisting(ClaudeSessionSync.PlannedEventName(d.Key), out _),
+            "a renamed account is kept under its new label; one no longer mapped is forgotten whole");
+        service.SetAccountsForTest([c, d]);
+        Pass();
 
         // A choice the user makes while a switch pass runs stands: the pass does not arm the reopen again.
         service.ArmRelaunch(false);
-        Step(Switch(40, d, c), Init(41, c));
-        File.AppendAllLines(main, [Switch(50, c, d), Init(51, d)]);
+        File.AppendAllLines(main, [Switch(30, c, d), Init(31, d)]);
         now += TimeSpan.FromSeconds(1);
         var racing = service.Work([], service.ActiveReservation());
         service.ArmRelaunch(false);
         service.Accept(racing);
         Check(racing.SwitchedFrom == c.Key && racing.Status.PendingForApp > 0 && !service.Status.RelaunchArmed,
             "a reopen cancelled while the switch pass ran stays cancelled");
+        Step(Switch(40, d, c), Init(41, c));
 
-        // A layout that is there but cannot be read is never replaced. With the old reference but no readable stores
-        // nothing is started yet, so a plan waits rather than take values never received for changes.
+        // Lost log lines: a switch found after them is late. The account left keeps the time it had; the one come to starts a stay.
+        File.Delete(main);
+        Pass();
+        File.WriteAllLines(main, [Init(50, d)]);
+        var late = Pass();
+        Check(late.SwitchedFrom is null && Kept() is { Active: var lateActive } after && lateActive == d.Key
+              && after.Accounts[c.Key].LeftAt == Logged(31) && after.Accounts[d.Key] is { Stay: 2, ArrivedAt: var lateAt } && lateAt == Logged(50),
+            "a switch found after lost log lines dates the arrival only: when the account left was left is unknown");
+        // A widget started anew takes up from the account it last confirmed: a switch made meanwhile is late too.
+        File.AppendAllLines(main, [Switch(60, d, c), Init(61, c)]);
+        runtime = new ClaudeDesktopRuntime(ClaudeDesktopRunState.Closed, null);
+        using (var restarted = new ClaudeShelfService(owner, () => [], fixture.Shelf(), environment, new ClaudeDesktopLogWatcher(logs), sources))
+        {
+            restarted.Work([], null);
+            restarted.SetAccountsForTest([c, d]);
+            runtime = new ClaudeDesktopRuntime(ClaudeDesktopRunState.Running, start);
+            var resumed = restarted.Work([], null);
+            Check(resumed.SwitchedFrom is null && Kept() is { Active: var resumedActive } took && resumedActive == c.Key
+                  && took.Accounts[d.Key].LeftAt == Logged(41) && took.Accounts[c.Key] is { Stay: 3, ArrivedAt: var resumedAt }
+                  && resumedAt == Logged(61),
+                "a widget started anew takes up from the account it last confirmed, and a switch made meanwhile dates the arrival only");
+        }
+
+        // The first format is read and saved in the current one: its accounts carry over with the evidence of its agreements.
         var path = Path.Combine(fixture.Ledger, ClaudeSessionLayout.FileName);
+        File.WriteAllText(path, "{\"version\":1,\"accounts\":{\"" + c.Key + "\":{\"label\":\"C\",\"leftAt\":\"2026-10-13T01:02:03+09:00\"},\"" + d.Key
+            + "\":{\"label\":\"D\",\"leftAt\":null}},\"pairs\":{\"" + c.Key + "|" + d.Key + "\":{\"" + c.Key + "\":{\"local_c1\":{\"pinned\":true}}}}}");
+        runtime = new ClaudeDesktopRuntime(ClaudeDesktopRunState.Closed, null);
+        using (var upgrading = new ClaudeShelfService(owner, () => [], fixture.Shelf(), environment, new ClaudeDesktopLogWatcher(logs), sources))
+        {
+            upgrading.Work([], null);
+            Check(File.ReadAllText(path).Contains("\"version\": 2", StringComparison.Ordinal) && Kept() is { Upgraded: false } upgraded
+                  && upgraded.Accounts[c.Key].LeftAt == DateTimeOffset.Parse("2026-10-13T01:02:03+09:00", System.Globalization.CultureInfo.InvariantCulture)
+                  && upgraded.Evidences[c.Key]["local_c1"] == new ClaudeSessionLayout.Evidence(true, false),
+                "a layout of the first format is saved in the current one, its accounts and the evidence of its agreements carried over");
+        }
+
+        // A layout that is there but cannot be read is never replaced. Without one the widget starts it once the mapped
+        // accounts are known: the account the old reference names was left when it was chosen.
         File.WriteAllText(path, "{broken");
+        var referenceFile = Path.Combine(fixture.Ledger, ClaudeSessionReference.FileName);
         using (var later = new ClaudeShelfService(owner, () => [], fixture.Shelf(), environment, new ClaudeDesktopLogWatcher(logs), sources))
         {
             later.Work([], null);
@@ -690,29 +787,119 @@ internal static class ClaudeSessionShelfTests
             later.Work([], null);
             Check(File.ReadAllText(path) == "{broken", "an unreadable layout is left as it is");
             File.Delete(path);
-            new ClaudeSessionReference(c.Key, "C", "p-c", now, new Dictionary<string, string>()).Save(fixture.Ledger);
-            var referenceFile = Path.Combine(fixture.Ledger, ClaudeSessionReference.FileName);
+            var chosen = now.AddDays(-1);
+            new ClaudeSessionReference(c.Key, "C", "p-c", chosen, new Dictionary<string, string>()).Save(fixture.Ledger);
             using (new FileStream(referenceFile, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
             {
                 later.Work([], null);
                 Check(!File.Exists(path), "an old reference that cannot be opened now holds the start");
             }
-            fixture.Record(d, "local_d1", fixture.Transcript());
             later.Work([], null);
-            Check(!File.Exists(path), "with the old reference, the layout waits until the app's stores can be read");
-            File.WriteAllText(referenceFile, "{broken");
-            later.Work([], null);
+            Check(Kept() is { } started && started.Accounts[c.Key].LeftAt == chosen && started.Accounts[d.Key].LeftAt is null,
+                "the first layout takes the account the old reference names as the one the app left last, when it was chosen");
+        }
+        File.Delete(path);
+        File.WriteAllText(referenceFile, "{broken");
+        using (var again = new ClaudeShelfService(owner, () => [], fixture.Shelf(), environment, new ClaudeDesktopLogWatcher(logs), sources))
+        {
+            again.Work([], null);
+            again.SetAccountsForTest([c, d]);
+            again.Work([], null);
             Check(!File.Exists(path), "an old reference that cannot be read as one holds the start, never taken for none");
             File.Delete(referenceFile);
-            later.Work([], null);
-            Check(File.Exists(path), "with no old reference the layout starts at once");
+            again.Work([], null);
+            Check(Kept() is { } plain && plain.Accounts.Count == 2 && plain.Accounts.Values.All(account => account.LeftAt is null),
+                "with no old reference the layout starts at once");
         }
     }
 
-    /// <summary>Read-only: what the first layout (from the old reference) would be, and what each account's first plan
-    /// against it would change. Only a scratch ledger is written.</summary>
+    /// <summary>Read-only: the shape of the app's sidebar store, values elided except names and orders.</summary>
+    internal static void SidebarStoreShape()
+    {
+        Console.OutputEncoding = System.Text.Encoding.UTF8;
+        var sources = ClaudeSessionSync.Sources.Default();
+        var store = new ClaudeLocalStorage(sources.LocalStorage).Read(["dframe-store"], whileOpen: true);
+        var root = System.Text.Json.Nodes.JsonNode.Parse(store.Values["dframe-store"]!)!.AsObject();
+        var state = root["state"]!.AsObject();
+        foreach (var (key, value) in state)
+        {
+            var json = value?.ToJsonString() ?? "null";
+            Console.WriteLine($"state.{key}: " + (value is System.Text.Json.Nodes.JsonObject o
+                ? "keys=" + string.Join(",", o.Select(p => p.Key).Take(8)) : json.Length > 300 ? "len=" + json.Length : json));
+        }
+        if (state["customGroupsByScope"] is System.Text.Json.Nodes.JsonObject scopes)
+            foreach (var (scope, node) in scopes)
+            {
+                var s = node!.AsObject();
+                Console.WriteLine($"scope {scope}: keys=" + string.Join(",", s.Select(p => p.Key)));
+                foreach (var g in s["groups"]?.AsArray() ?? [])
+                    Console.WriteLine("   group " + string.Join(" ", g!.AsObject().Select(p => p.Key + "=" + p.Value?.ToJsonString())));
+                foreach (var (k, v) in s.Where(p => p.Key is not "groups" and not "assignments"))
+                    Console.WriteLine("   " + k + " = " + v?.ToJsonString());
+            }
+        if (state["codeSidebarByScope"] is System.Text.Json.Nodes.JsonObject sidebars)
+            foreach (var (scope, node) in sidebars) Console.WriteLine($"codeSidebar {scope}: {node?.ToJsonString()}");
+        Console.WriteLine("pinnedOrder: " + state["pinnedOrder"]?.ToJsonString());
+        Console.WriteLine("collapsedGroups: " + state["collapsedGroups"]?.ToJsonString());
+        Console.WriteLine("groupByByMode: " + state["groupByByMode"]?.ToJsonString() + " sortByByMode: " + state["sortByByMode"]?.ToJsonString());
+    }
+
+    /// <summary>Read-only: every conversation two accounts both list (same transcript) where their pin, group or title
+    /// differs, with what the widget's last checkpoint of each showed there and the newest change it recorded.</summary>
+    internal static void LayoutDiff(string labelA, string labelB)
+    {
+        Console.OutputEncoding = System.Text.Encoding.UTF8;
+        var sources = ClaudeSessionSync.Sources.Default();
+        var (kept, _) = ClaudeSessionLayout.Load(sources.Ledger);
+        string Key(string label) => kept!.Accounts.First(pair => pair.Value.Label == label).Key;
+        var a = Key(labelA); var b = Key(labelB);
+        string Dir(string key) => Path.Combine(sources.SessionsRoot, key.Split('/')[0], key.Split('/')[1]);
+        var pins = ClaudeSidebarPins.Read(sources.IndexedDb);
+        var store = new ClaudeLocalStorage(sources.LocalStorage).Read(["dframe-store"], whileOpen: true);
+        var state = (JsonNode.Parse(store.Values["dframe-store"]!) as JsonObject)?["state"] as JsonObject;
+        var layoutA = ClaudeSessionSync.LayoutOf(state, a, true)!; var layoutB = ClaudeSessionSync.LayoutOf(state, b, true)!;
+        string? Group(ClaudeSessionSync.Layout layout, string id) => layout.Assignments.TryGetValue(id, out var g)
+            ? layout.Groups.FirstOrDefault(x => x.Id == g)?.Name ?? "(?" + g + ")" : null;
+        var recA = ClaudeSessionSync.ReadRecords(Dir(a), pins); var recB = ClaudeSessionSync.ReadRecords(Dir(b), pins);
+        var byCli = recB.Where(r => r.Cli is not null).GroupBy(r => r.Cli!).ToDictionary(g => g.Key, g => g.ToList());
+        Console.WriteLine($"{labelA}: {recA.Count} records, {labelB}: {recB.Count}; groups {labelA}=[{string.Join(", ", layoutA.Groups.Select(g => g.Name))}] {labelB}=[{string.Join(", ", layoutB.Groups.Select(g => g.Name))}]");
+        foreach (var (label, key) in new[] { (labelA, a), (labelB, b) })
+        {
+            var account = kept!.Accounts[key];
+            var point = kept.Checkpoints.GetValueOrDefault(key);
+            var listed = kept.GroupsChanged.GetValueOrDefault(key);
+            Console.WriteLine($"  {label}: stay {account.Stay} arrived {account.ArrivedAt:O} left {account.LeftAt:O}; checkpoint "
+                + (point is null ? "none" : $"{point.At:O} (stay {point.Stay}) groups=[{string.Join(", ", point.Groups?.Select(g => g.Name) ?? [])}]")
+                + (listed is null ? "" : $"; group list changed to [{string.Join(", ", listed.Order)}] at {listed.At:O}" + (listed.By is null ? "" : " from " + listed.By))
+                + (kept.Pendings.TryGetValue(key, out var pending) ? $"; plan in progress: {pending.Sessions.Count} sessions, {pending.Renamed.Count} groups aside" : ""));
+        }
+        foreach (var x in recA.OrderBy(r => r.Title))
+        {
+            if (x.Cli is null || !byCli.TryGetValue(x.Cli, out var ys)) continue;
+            foreach (var y in ys)
+            {
+                var ga = Group(layoutA, x.SessionId); var gb = Group(layoutB, y.SessionId);
+                if (x.Pinned == y.Pinned && ga == gb && x.Title == y.Title) continue;
+                Console.WriteLine($"- {x.Title} | pin {x.Pinned}/{y.Pinned} group {ga ?? "-"}/{gb ?? "-"}" + (x.Title != y.Title ? $" title vs '{y.Title}'" : "")
+                    + $" | {labelA}: {Show(a, x.SessionId)} {labelB}: {Show(b, y.SessionId)}");
+            }
+        }
+        string Show(string key, string id)
+        {
+            var seen = kept!.Checkpoints.GetValueOrDefault(key)?.Sessions.GetValueOrDefault(id);
+            var change = kept.Changed.GetValueOrDefault(key)?.GetValueOrDefault(id);
+            static string Stamp<T>(string name, ClaudeSessionLayout.Stamp<T>? stamp) => stamp is null ? ""
+                : $" {name}={stamp.Value?.ToString() ?? "-"}@{stamp.At:MM-dd HH:mm}" + (stamp.By is null ? "" : "<" + stamp.By[..8]);
+            return "seen[" + (seen is null ? "none" : $"pin={seen.Pinned?.ToString() ?? "?"} group={(seen.HasGroup ? seen.Group ?? "-" : "?")}") + "]"
+                + " changed[" + (change is null ? "none" : (Stamp("pin", change.Pinned) + Stamp("group", change.Group) + Stamp("title", change.Title)).Trim()) + "]";
+        }
+    }
+
+    /// <summary>Read-only: what the widget would start from (the kept layout as this version reads it, or else the old
+    /// reference), and what each account's plan against it would change. Only a scratch ledger is written.</summary>
     internal static void LayoutDryRun()
     {
+        Console.OutputEncoding = System.Text.Encoding.UTF8;
         var scratch = Path.Combine(Path.GetTempPath(), "gfs-agent", "claude-layout-dry-run-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(scratch);
         try
@@ -721,34 +908,40 @@ internal static class ClaudeSessionShelfTests
             // The widget's mapping cache and ledger, copied: the scratch copies are all that is written.
             foreach (var name in new[] { "accounts.json", "ledger.json" })
                 if (File.Exists(Path.Combine(real.Ledger, name))) File.Copy(Path.Combine(real.Ledger, name), Path.Combine(scratch, name));
-            var accounts = ClaudeShelfAccounts.Resolve(new ClaudeProfileStore().ListProfiles(), scratch);
             var sources = real with { Ledger = scratch };
-            var reference = ClaudeSessionReference.Load(real.Ledger);
-            Console.WriteLine($"reference: {reference?.Account} {reference?.Label} {reference?.SetAt:O}");
-            var layout = new ClaudeSessionLayout();
-            foreach (var account in accounts.DistinctBy(account => account.Key)) layout.Accounts[account.Key] = new(account.Label, null);
-            if (reference is not null)
+            var (layout, exists) = ClaudeSessionLayout.Load(real.Ledger);
+            if (exists && layout is null) { Console.WriteLine("layout: unreadable"); return; }
+            if (layout is null)
             {
-                var baseline = ClaudeSessionSync.Baseline(sources, reference.Account, layout.Accounts.Keys.ToArray());
-                Console.WriteLine($"baseline: {(baseline is null ? "unreadable" : baseline.Sum(agreement => agreement.Mine.Count + agreement.Theirs.Count) + " entries")}");
-                foreach (var agreement in baseline ?? []) layout.Record(agreement);
-                layout.Accounts[reference.Account] = layout.Accounts[reference.Account] with { LeftAt = reference.SetAt };
+                var accounts = ClaudeShelfAccounts.Resolve(new ClaudeProfileStore().ListProfiles(), scratch);
+                var reference = ClaudeSessionReference.Load(real.Ledger);
+                Console.WriteLine($"no layout yet; old reference: {reference?.Account} {reference?.Label} {reference?.SetAt:O}");
+                layout = new ClaudeSessionLayout();
+                foreach (var account in accounts.DistinctBy(account => account.Key))
+                    layout.Accounts[account.Key] = new(account.Label, reference?.Account == account.Key ? reference.SetAt : null);
             }
+            else Console.WriteLine($"layout: {(layout.Upgraded ? "first format, read as the current one" : "current format")}, active {layout.Active}, "
+                + $"{layout.Checkpoints.Count} checkpoints, evidence for {layout.Evidences.Sum(pair => pair.Value.Count)} sessions");
             layout.Save(scratch);
-            foreach (var account in layout.Accounts.Keys)
+            foreach (var (account, known) in layout.Accounts)
             {
                 var directory = Directory.EnumerateDirectories(real.SessionsRoot, "*", SearchOption.AllDirectories)
                     .FirstOrDefault(path => path.Replace(Path.DirectorySeparatorChar, '/').EndsWith(account, StringComparison.OrdinalIgnoreCase));
-                if (directory is null) { Console.WriteLine($"== {layout.Accounts[account].Label}: no list"); continue; }
+                if (directory is null) { Console.WriteLine($"== {known.Label}: no list"); continue; }
                 var titles = ClaudeSessionSync.ReadRecords(directory).ToDictionary(record => record.SessionId, record => record.Title ?? record.SessionId);
-                var session = titles.Keys.First();
-                var plan = ClaudeSessionSync.Build(sources, session);
-                Console.WriteLine($"== {layout.Accounts[account].Label}: {plan.Status} warnings=[{string.Join(",", plan.Warnings ?? [])}] archive={plan.Archive?.Count}");
+                if (titles.Count == 0) { Console.WriteLine($"== {known.Label}: empty list"); continue; }
+                var plan = ClaudeSessionSync.Build(sources, titles.Keys.First());
+                string Title(string id) => titles.GetValueOrDefault(id) ?? id;
+                Console.WriteLine($"== {known.Label}: {plan.Status} left {known.LeftAt:O} warnings=[{string.Join(",", plan.Warnings ?? [])}] archive={plan.Archive?.Count}");
+                foreach (var rename in plan.RenameGroups ?? []) Console.WriteLine($"  set group {rename.From} aside as {rename.To}");
                 foreach (var name in plan.CreateGroups ?? []) Console.WriteLine($"  create group {name}");
                 foreach (var move in plan.Moves ?? [])
-                    Console.WriteLine($"  move to {move.Group ?? "(none)"}: {string.Join(" | ", move.Sessions.Select(id => titles[id]))}");
+                    Console.WriteLine($"  move to {move.Group ?? "(none)"}: {string.Join(" | ", move.Sessions.Select(Title))}");
                 foreach (var pin in plan.Pins ?? []) Console.WriteLine($"  {(pin.Pinned ? "pin" : "unpin")} {pin.Title} (by {pin.By})");
                 foreach (var rename in plan.Renames ?? []) Console.WriteLine($"  rename {rename.From} -> {rename.Title} (by {rename.By})");
+                foreach (var group in plan.DeleteGroups ?? [])
+                    Console.WriteLine($"  delete group {group.Name}" + (group.Remade ? " (made anew)" : "") + (group.Hidden > 0 ? $" ({group.Hidden} archived leave it)" : ""));
+                if (plan.GroupOrder is { } order) Console.WriteLine($"  group order [{string.Join(", ", order)}] from {plan.GroupOrderBy ?? "this account"}");
             }
         }
         finally { Directory.Delete(scratch, true); }
@@ -810,27 +1003,39 @@ internal static class ClaudeSessionShelfTests
     private static void TestConversationLineage()
     {
         using var fixture = new Fixture();
-        // A conversation continued in A: its newer record lists the earlier transcript id.
-        var old = fixture.Transcript(); var newer = fixture.Transcript();
+        // A conversation continued in A: its newer record lists the earlier transcript id, and the transcripts show the
+        // conversation went on from there.
+        var states = Conversation(fixture, 2);
+        var old = states[0]; var newer = states[1];
         fixture.Record(A, "local_a1a1a1a1-0000-4000-8000-000000000001", old);
         fixture.Record(A, "local_a1a1a1a1-0000-4000-8000-000000000002", newer, extra: r => r["priorCliSessionIds"] = new JsonArray(old));
         var plan = fixture.Shelf().Plan([A, B]);
         Check(plan.Actions.Count == 1 && plan.Actions[0].CliSessionId == newer && plan.Skipped.Values.Single()["superseded"] == 1,
             "an older state of a conversation is never copied when a newer one is in the same list");
 
-        // B already has the newer state: an older id is present through its lineage.
+        // B already has the newer state: an older id it lists, and continues, is present.
         fixture.Record(B, "local_b2b2b2b2-0000-4000-8000-000000000001", newer, extra: r => r["priorCliSessionIds"] = new JsonArray(old));
         Check(fixture.Shelf().Plan([A, B]).Actions.Count == 0, "a conversation already listed in a newer state is present");
 
-        // A copy made before the conversation moved on is archived, not deleted, once the newer state is copied.
+        // Transcripts that cannot show the conversation went on (no dated entries here): the earlier state may be a branch.
+        using var undated = new Fixture();
+        var u1 = undated.Transcript(); var u2 = undated.Transcript();
+        undated.Record(A, "local_a1a1a1a1-0000-4000-8000-000000000003", u1);
+        undated.Record(A, "local_a1a1a1a1-0000-4000-8000-000000000004", u2, extra: r => r["priorCliSessionIds"] = new JsonArray(u1));
+        Check(undated.Shelf().Plan([A, B]).Actions.Count == 2, "an earlier state the transcripts cannot show as gone on from is offered too");
+
+        // A copy made before the conversation moved on is archived, not deleted, once a newer record continuing it is in
+        // that list (listed there some other way here: a newer state this utility brings advances the copy in place, see
+        // TestAdvancingOlderStates).
         using var moved = new Fixture();
-        var first = moved.Transcript(); var second = moved.Transcript();
+        var movedStates = Conversation(moved, 2);
+        var first = movedStates[0]; var second = movedStates[1];
         moved.Record(A, "local_c3c3c3c3-0000-4000-8000-000000000001", first);
         var shelf = moved.Shelf();
         Check(shelf.Apply([A, B], () => true).Created == 1, "the first state is copied to B");
         var stale = moved.Files(B).Single();
         File.Delete(moved.Files(A).Single());
-        moved.Record(A, "local_c3c3c3c3-0000-4000-8000-000000000002", second, extra: r => r["priorCliSessionIds"] = new JsonArray(first));
+        moved.Record(B, "local_c3c3c3c3-0000-4000-8000-000000000002", second, extra: r => r["priorCliSessionIds"] = new JsonArray(first));
         var result = shelf.Apply([A, B], () => true);
         var archived = JsonNode.Parse(File.ReadAllText(stale))!.AsObject();
         Check(result.Created == 1 && result.Retired == 1 && File.Exists(stale) && archived["isArchived"]!.GetValue<bool>()
@@ -969,7 +1174,7 @@ internal static class ClaudeSessionShelfTests
         // The pin of an archived copy reaches its successor even when the first sidebar sync could not run.
         using var moving = new Fixture();
         moving.Config = Path.Combine(moving.Root, "claude_desktop_config.json");
-        var one = moving.Transcript(); var two = moving.Transcript();
+        var (one, two) = Two(moving);
         moving.Record(A, "local_b8b8b8b8-0000-4000-8000-000000000001", one);
         var pinning = moving.Shelf();
         pinning.Apply([A, B], () => true);
@@ -977,7 +1182,7 @@ internal static class ClaudeSessionShelfTests
         File.WriteAllText(moving.Config, new JsonObject { ["preferences"] = new JsonObject { ["epitaxyPrefs"] = new JsonObject
             { ["dframe-local-slice"] = new JsonObject { ["pinnedOrder"] = new JsonArray("code:" + stale) } } } }.ToJsonString());
         File.Delete(moving.Files(A).Single());
-        moving.Record(A, "local_b8b8b8b8-0000-4000-8000-000000000002", two, extra: r => r["priorCliSessionIds"] = new JsonArray(one));
+        moving.Record(B, "local_b8b8b8b8-0000-4000-8000-000000000002", two, extra: r => r["priorCliSessionIds"] = new JsonArray(one));
         // The app reopens after the copy is archived and before the settings are written.
         var checks = 0;
         MustThrow<ClaudeDesktopRunningException>(() => pinning.Apply([A, B], () => ++checks <= 4));
@@ -992,7 +1197,7 @@ internal static class ClaudeSessionShelfTests
         // An archive that did not happen is not counted as one: the intent is settled from the file on the next run.
         using var halted = new Fixture();
         halted.Config = Path.Combine(halted.Root, "claude_desktop_config.json");
-        var h1 = halted.Transcript(); var h2 = halted.Transcript();
+        var (h1, h2) = Two(halted);
         halted.Record(A, "local_d0d0d0d0-0000-4000-8000-000000000001", h1);
         var haltedShelf = halted.Shelf();
         haltedShelf.Apply([A, B], () => true);
@@ -1001,7 +1206,7 @@ internal static class ClaudeSessionShelfTests
         File.WriteAllText(halted.Config, new JsonObject { ["preferences"] = new JsonObject { ["epitaxyPrefs"] = new JsonObject
             { ["dframe-local-slice"] = new JsonObject { ["pinnedOrder"] = new JsonArray("code:" + haltedId) } } } }.ToJsonString());
         File.Delete(halted.Files(A).Single());
-        halted.Record(A, "local_d0d0d0d0-0000-4000-8000-000000000002", h2, extra: r => r["priorCliSessionIds"] = new JsonArray(h1));
+        halted.Record(B, "local_d0d0d0d0-0000-4000-8000-000000000002", h2, extra: r => r["priorCliSessionIds"] = new JsonArray(h1));
         // A run stopped after recording its intent and before archiving: simulate with the ledger alone.
         var ledgerPath = Path.Combine(halted.Ledger, "ledger.json");
         var haltedLedger = JsonNode.Parse(File.ReadAllText(ledgerPath))!.AsObject();
@@ -1018,13 +1223,13 @@ internal static class ClaudeSessionShelfTests
         // A sidebar section of an unfamiliar shape leaves the move pending until it can be read.
         using var odd = new Fixture();
         odd.Config = Path.Combine(odd.Root, "claude_desktop_config.json");
-        var o1 = odd.Transcript(); var o2 = odd.Transcript();
+        var (o1, o2) = Two(odd);
         odd.Record(A, "local_e1e1e1e1-0000-4000-8000-000000000001", o1);
         var oddShelf = odd.Shelf();
         oddShelf.Apply([A, B], () => true);
         var oddCopy = Path.GetFileNameWithoutExtension(odd.Files(B).Single());
         File.Delete(odd.Files(A).Single());
-        odd.Record(A, "local_e1e1e1e1-0000-4000-8000-000000000002", o2, extra: r => r["priorCliSessionIds"] = new JsonArray(o1));
+        odd.Record(B, "local_e1e1e1e1-0000-4000-8000-000000000002", o2, extra: r => r["priorCliSessionIds"] = new JsonArray(o1));
         File.WriteAllText(odd.Config, "{\"preferences\":{\"epitaxyPrefs\":[]}}");
         var oddResult = oddShelf.Apply([A, B], () => true);
         Check(oddResult.Retired == 1 && oddResult.Prefs is { Complete: false }, "an unfamiliar sidebar section is not reported as done");
@@ -1038,13 +1243,13 @@ internal static class ClaudeSessionShelfTests
 
         // An archive that cannot be written is reported as unfinished and retried; it is never counted as done.
         using var stuck = new Fixture();
-        var s1 = stuck.Transcript(); var s2 = stuck.Transcript();
+        var (s1, s2) = Two(stuck);
         stuck.Record(A, "local_f2f2f2f2-0000-4000-8000-000000000001", s1);
         var stuckShelf = stuck.Shelf();
         stuckShelf.Apply([A, B], () => true);
         var stuckCopy = stuck.Files(B).Single();
         File.Delete(stuck.Files(A).Single());
-        stuck.Record(A, "local_f2f2f2f2-0000-4000-8000-000000000002", s2, extra: r => r["priorCliSessionIds"] = new JsonArray(s1));
+        stuck.Record(B, "local_f2f2f2f2-0000-4000-8000-000000000002", s2, extra: r => r["priorCliSessionIds"] = new JsonArray(s1));
         File.SetAttributes(stuckCopy, FileAttributes.ReadOnly);
         var failed = stuckShelf.Apply([A, B], () => true);
         File.SetAttributes(stuckCopy, FileAttributes.Normal);
@@ -1055,15 +1260,15 @@ internal static class ClaudeSessionShelfTests
         // Archived, but the run stopped before the ledger said so; the next run cannot read the copy at first.
         using var locked = new Fixture();
         locked.Config = Path.Combine(locked.Root, "claude_desktop_config.json");
-        var l1 = locked.Transcript(); var l2 = locked.Transcript();
+        var (l1, l2) = Two(locked);
         locked.Record(A, "local_f3f3f3f3-0000-4000-8000-000000000001", l1);
         var lockedShelf = locked.Shelf();
         lockedShelf.Apply([A, B], () => true);
         var lockedCopy = locked.Files(B).Single();
         var lockedId = Path.GetFileNameWithoutExtension(lockedCopy);
         File.Delete(locked.Files(A).Single());
-        locked.Record(A, "local_f3f3f3f3-0000-4000-8000-000000000002", l2, extra: r => r["priorCliSessionIds"] = new JsonArray(l1));
-        lockedShelf.Apply([A, B], () => true); // copies the newer state to B (no sidebar file yet: nothing to move)
+        locked.Record(B, "local_f3f3f3f3-0000-4000-8000-000000000002", l2, extra: r => r["priorCliSessionIds"] = new JsonArray(l1));
+        lockedShelf.Apply([A, B], () => true); // archives the copy (no sidebar file yet: nothing to move)
         var lockedSuccessor = Path.GetFileNameWithoutExtension(locked.Files(B).Single(path => path != lockedCopy));
         // Rewind the ledger to "intent recorded, archive written, not yet confirmed" with a pin still on the copy.
         var lockedLedgerPath = Path.Combine(locked.Ledger, "ledger.json");
@@ -1087,7 +1292,7 @@ internal static class ClaudeSessionShelfTests
         // A settings file that exists but cannot be opened is not "no settings": the move stays pending.
         using var busy = new Fixture();
         busy.Config = Path.Combine(busy.Root, "claude_desktop_config.json");
-        var b1 = busy.Transcript(); var b2 = busy.Transcript();
+        var (b1, b2) = Two(busy);
         busy.Record(A, "local_f4f4f4f4-0000-4000-8000-000000000001", b1);
         var busyShelf = busy.Shelf();
         busyShelf.Apply([A, B], () => true);
@@ -1095,7 +1300,7 @@ internal static class ClaudeSessionShelfTests
         File.WriteAllText(busy.Config, new JsonObject { ["preferences"] = new JsonObject { ["epitaxyPrefs"] = new JsonObject
             { ["dframe-local-slice"] = new JsonObject { ["pinnedOrder"] = new JsonArray("code:" + busyCopy) } } } }.ToJsonString());
         File.Delete(busy.Files(A).Single());
-        busy.Record(A, "local_f4f4f4f4-0000-4000-8000-000000000002", b2, extra: r => r["priorCliSessionIds"] = new JsonArray(b1));
+        busy.Record(B, "local_f4f4f4f4-0000-4000-8000-000000000002", b2, extra: r => r["priorCliSessionIds"] = new JsonArray(b1));
         ClaudeShelfResult busyResult;
         using (new FileStream(busy.Config, FileMode.Open, FileAccess.Read, FileShare.None)) busyResult = busyShelf.Apply([A, B], () => true);
         Check(busyResult.Retired == 1 && busyResult.Prefs is { Complete: false, Skipped: "unreadable" }, "an unopenable settings file leaves the move pending");
@@ -1310,6 +1515,450 @@ internal static class ClaudeSessionShelfTests
         // The ledger owns exactly the bytes written; a later change by the app keeps the copy out of undo.
         Set(cleanCopy, r => r["completedTurns"] = 7);
         Check(cleanShelf.Undo(() => true).Removed == 0 && File.Exists(cleanCopy), "a copy changed after retitling is kept by undo");
+    }
+
+    private static readonly ClaudeShelfAccount Third = new("c3c3c3c3-0000-4000-8000-00000000000c", "c4c4c4c4-0000-4000-8000-00000000000c", "Third");
+
+    private static void TestAdvancingOlderStates()
+    {
+        // B's own record of a conversation A went on with: that entry takes the newest state in place.
+        using var fixture = new Fixture();
+        var ids = Conversation(fixture, 2);
+        var edge = Edge(ids[0], ids[1]);
+        const string Older = "local_ad000000-0000-4000-8000-000000000001", Newer = "local_ad000000-0000-4000-8000-000000000002";
+        fixture.Record(B, Older, ids[0], extra: r =>
+        {
+            r["title"] = "서브 이름"; r["titleSource"] = "user"; r["previousTitles"] = new JsonArray("옛 이름"); r["isStarred"] = true;
+            r["permissionMode"] = "bypassPermissions"; r["model"] = "claude-opus-5-5"; r["effort"] = "xhigh";
+            r["sessionSettings"] = new JsonObject { ["ultracode"] = true }; r["enabledMcpTools"] = new JsonObject { ["tool"] = true };
+            r["lastFocusedAt"] = 50; r["completedTurns"] = 3; r["lastActivityAt"] = 100;
+            // Its last turn, and the error it ended on: a turn the conversation went past.
+            r["lastAssistantUuid"] = Guid.NewGuid().ToString("D"); r["postTurnSummary"] = new JsonObject { ["status_category"] = "completed" };
+            r["turnWrapUp"] = new JsonObject { ["description"] = "끝" }; r["error"] = "You've hit your weekly limit"; r["errorAt"] = 90;
+            r["titleTurn"] = 3; r["interruptedAwaitingPerson"] = null; r["promptAppendSnapshot"] = new JsonObject { ["append"] = "x" };
+            r["bridgeSessionIds"] = new JsonArray("session_x");
+        });
+        fixture.Record(A, Newer, ids[1], extra: r =>
+        {
+            r["title"] = "메인 이름"; r["createdAt"] = 22; r["priorCliSessionIds"] = new JsonArray(ids[0]);
+            r["rewindEdges"] = new JsonArray(edge.DeepClone());
+            r["transcriptModelStates"] = new JsonObject { [ids[0]] = new JsonObject { ["model"] = "m" }, [ids[1]] = new JsonObject { ["model"] = "m" } };
+            r["completedTurns"] = 9; r["lastActivityAt"] = 200; r["model"] = "claude-fable"; r["permissionMode"] = "default";
+        });
+        var olderPath = Path.Combine(fixture.ShelfPath(B), Older + ".json");
+        var originalHash = ClaudeSessionShelf.Hash(olderPath);
+        var original = File.ReadAllBytes(olderPath);
+        var shelf = fixture.Shelf();
+        var plan = shelf.Plan([A, B]);
+        Check(plan.Advances.SingleOrDefault() is { File: Older + ".json" } advance && advance.CliSessionId == ids[1]
+              && plan.Actions.Count == 0 && plan.PendingFor(B.Key) == 1,
+            "an older state another account went on from is planned to advance, not to get the newest state beside it");
+        var result = shelf.Apply([A, B], () => true, "test");
+        var record = Json(olderPath);
+        Check(result is { Advanced: 1, Created: 0 } && fixture.Files(B).Count == 1, "the list keeps one entry");
+        Check(record["cliSessionId"]!.GetValue<string>() == ids[1] && record["priorCliSessionIds"]!.AsArray().Single()!.GetValue<string>() == ids[0]
+              && JsonNode.DeepEquals(record["rewindEdges"], new JsonArray(edge.DeepClone())) && record["transcriptModelStates"] is JsonObject { Count: 2 }
+              && record["completedTurns"]!.GetValue<int>() == 9 && record["lastActivityAt"]!.GetValue<int>() == 200,
+            "the conversation, its lineage and progress come from the newest state");
+        Check(record["sessionId"]!.GetValue<string>() == Older && record["title"]!.GetValue<string>() == "서브 이름"
+              && record["titleSource"]!.GetValue<string>() == "user" && record["previousTitles"] is JsonArray { Count: 1 }
+              && record["isStarred"]!.GetValue<bool>() && record["permissionMode"]!.GetValue<string>() == "bypassPermissions"
+              && record["model"]!.GetValue<string>() == "claude-opus-5-5" && record["effort"]!.GetValue<string>() == "xhigh"
+              && record["sessionSettings"]!["ultracode"]!.GetValue<bool>() && record["enabledMcpTools"] is JsonObject { Count: 1 }
+              && record["lastFocusedAt"]!.GetValue<int>() == 50 && record["createdAt"]!.GetValue<int>() == 1,
+            "its id, name, pin and this account's settings stay");
+        Check(new[] { "lastAssistantUuid", "postTurnSummary", "turnWrapUp", "error", "errorAt", "titleTurn", "interruptedAwaitingPerson",
+                  "promptAppendSnapshot", "bridgeSessionIds" }.All(field => !record.ContainsKey(field)),
+            "what described the older state's transcript and last turn goes");
+        var ledger = Json(Path.Combine(fixture.Ledger, "ledger.json"));
+        var entry = ledger["advanced"]!.AsArray().Single()!;
+        Check(entry["dst"]!.GetValue<string>() == B.Key && entry["from"]!.GetValue<string>() == ids[0] && entry["to"]!.GetValue<string>() == ids[1]
+              && entry["state"]!.GetValue<string>() == "done" && entry["before"]!.GetValue<string>() == originalHash
+              && entry["after"]!.GetValue<string>() == ClaudeSessionShelf.Hash(olderPath)
+              && File.ReadAllBytes(Path.Combine(fixture.Ledger, ClaudeShelfLedger.BackupFolder, entry["backup"]!.GetValue<string>())).SequenceEqual(original)
+              && ledger["created"]!.AsArray().Count == 0 && ledger["runs"]!.AsArray()[^1]!["advanced"]!.GetValue<int>() == 1,
+            "the ledger keeps the advance and the record as it was, and takes no ownership of the app's record");
+        Check(fixture.Hashes(A).SequenceEqual(fixture.OriginalHashes), "the newest state's own record is untouched");
+        Check(shelf.Apply([A, B], () => true) is { Advanced: 0, Created: 0 }, "an advanced entry holds the conversation");
+        File.Delete(olderPath);
+        Check(shelf.Apply([A, B], () => true) is { Advanced: 0, Created: 0 }, "an advanced entry the user removed does not come back");
+
+        // A copy this utility made, then used in its account, is advanced as well, and stays the user's from then on.
+        using var copies = new Fixture();
+        var copyIds = Conversation(copies, 2);
+        copies.Record(A, "local_ad100000-0000-4000-8000-000000000001", copyIds[0]);
+        var source = Path.Combine(copies.ShelfPath(A), "local_ad100000-0000-4000-8000-000000000001.json");
+        var copyShelf = copies.Shelf();
+        copyShelf.Apply([A, B], () => true);
+        var copy = copies.Files(B).Single();
+        Change(copy, r => r["lastFocusedAt"] = 7);
+        // The app moved the original to the next transcript as A went on.
+        Change(source, r => { r["cliSessionId"] = copyIds[1]; r["priorCliSessionIds"] = new JsonArray(copyIds[0]); r["lastActivityAt"] = 300; });
+        var written = Json(Path.Combine(copies.Ledger, "ledger.json"))["created"]!.AsArray().Single()!.DeepClone();
+        var advancedCopy = copyShelf.Apply([A, B], () => true);
+        Check(advancedCopy is { Advanced: 1, Created: 0, Retired: 0 } && copies.Files(B).Single() == copy
+              && Json(copy)["cliSessionId"]!.GetValue<string>() == copyIds[1] && Json(copy)["lastFocusedAt"]!.GetValue<int>() == 7,
+            "the copy itself takes the newest state");
+        var kept = Json(Path.Combine(copies.Ledger, "ledger.json"))["created"]!.AsArray().Single()!;
+        Check(kept["cliSessionId"]!.GetValue<string>() == written["cliSessionId"]!.GetValue<string>()
+              && kept["sha256"]!.GetValue<string>() == written["sha256"]!.GetValue<string>(),
+            "the ledger still names the copy as it was written: an advanced copy is never made the utility's again");
+        Change(source, r => r["title"] = "원본 새 이름");
+        Check(copyShelf.Apply([A, B], () => true).Retitled == 0 && Json(copy)["title"]!.GetValue<string>() != "원본 새 이름"
+              && copyShelf.Undo(() => true).Removed == 0 && File.Exists(copy) && !Json(copy)["isArchived"]!.GetValue<bool>(),
+            "nor retitled, archived or undone by it: the session plan keeps its name in step");
+
+        // Three accounts on one line: r in A, then s in B, then t in the third. Each older state takes t once, whatever
+        // order the accounts come in.
+        foreach (var order in new ClaudeShelfAccount[][] { [A, B, Third], [Third, B, A] })
+        {
+            using var line = new Fixture();
+            var states = Conversation(line, 3);
+            var rs = Edge(states[0], states[1]); var st = Edge(states[1], states[2]);
+            line.Record(A, "local_ad200000-0000-4000-8000-000000000001", states[0]);
+            line.Record(B, "local_ad200000-0000-4000-8000-000000000002", states[1], extra: r =>
+            { r["priorCliSessionIds"] = new JsonArray(states[0]); r["rewindEdges"] = new JsonArray(rs.DeepClone()); });
+            line.Record(Third, "local_ad200000-0000-4000-8000-000000000003", states[2], extra: r =>
+            { r["priorCliSessionIds"] = new JsonArray(states[0], states[1]); r["rewindEdges"] = new JsonArray(rs.DeepClone(), st.DeepClone()); });
+            var linePlan = line.Shelf().Plan(order);
+            Check(linePlan.Advances.Count == 2 && linePlan.Advances.All(planned => planned.CliSessionId == states[2])
+                  && linePlan.Advances.Select(planned => planned.Target).Order().SequenceEqual(new[] { A.Key, B.Key }.Order())
+                  && linePlan.Actions.Count == 0, "each older state is planned once, to the newest state");
+            Check(line.Shelf().Apply(order, () => true) is { Advanced: 2, Created: 0 }
+                  && new[] { A, B, Third }.All(account => Json(line.Files(account).Single())["cliSessionId"]!.GetValue<string>() == states[2]),
+                "every account lists the conversation once, at its newest state");
+        }
+
+        // Two accounts went on from the same state in different ways: both branches get an entry, the state they share stays.
+        using var fork = new Fixture();
+        var root = Conversation(fork, 1)[0];
+        var left = GoOn(fork, root, DateTime.UtcNow.Date.AddDays(-15));
+        var right = GoOn(fork, root, DateTime.UtcNow.Date.AddDays(-14));
+        fork.Record(B, "local_ad300000-0000-4000-8000-000000000001", root);
+        fork.Record(A, "local_ad300000-0000-4000-8000-000000000002", left, extra: r => r["priorCliSessionIds"] = new JsonArray(root));
+        fork.Record(Third, "local_ad300000-0000-4000-8000-000000000003", right, extra: r => r["priorCliSessionIds"] = new JsonArray(root));
+        var rootPath = Path.Combine(fork.ShelfPath(B), "local_ad300000-0000-4000-8000-000000000001.json");
+        var rootHash = ClaudeSessionShelf.Hash(rootPath);
+        Check(fork.Shelf().Apply([A, B, Third], () => true).Advanced == 0 && ClaudeSessionShelf.Hash(rootPath) == rootHash
+              && fork.Files(B).Count == 3, "two branches are kept apart and the state they went on from stays as it was");
+
+        // A list holding two older states of the conversation: the latest takes the newest state; the earlier one is left
+        // to the session plan's archiving.
+        using var two = new Fixture();
+        var steps = Conversation(two, 3);
+        two.Record(B, "local_ad400000-0000-4000-8000-000000000001", steps[0]);
+        two.Record(B, "local_ad400000-0000-4000-8000-000000000002", steps[1], extra: r => r["priorCliSessionIds"] = new JsonArray(steps[0]));
+        two.Record(A, "local_ad400000-0000-4000-8000-000000000003", steps[2], extra: r => r["priorCliSessionIds"] = new JsonArray(steps[0], steps[1]));
+        var earliest = Path.Combine(two.ShelfPath(B), "local_ad400000-0000-4000-8000-000000000001.json");
+        var earliestHash = ClaudeSessionShelf.Hash(earliest);
+        Check(two.Shelf().Apply([A, B], () => true) is { Advanced: 1, Created: 0 } && ClaudeSessionShelf.Hash(earliest) == earliestHash
+              && Json(Path.Combine(two.ShelfPath(B), "local_ad400000-0000-4000-8000-000000000002.json"))["cliSessionId"]!.GetValue<string>() == steps[2],
+            "only the latest older state takes the newest state");
+    }
+
+    private static void TestAdvanceHoldsAndRecovery()
+    {
+        const string Mine = "local_ad500000-0000-4000-8000-000000000001", Theirs = "local_ad500000-0000-4000-8000-000000000002";
+        // An older state that must not be rewritten: it stays as it was and the newest state is added beside it, as before.
+        // (Where the transcripts do not show the newer state continuing it, it also goes to the newer state's account.)
+        static void Kept(Fixture fixture, string because)
+        {
+            var path = Path.Combine(fixture.ShelfPath(B), Mine + ".json");
+            var hash = ClaudeSessionShelf.Hash(path);
+            Check(fixture.Shelf().Apply([A, B], () => true).Advanced == 0 && ClaudeSessionShelf.Hash(path) == hash
+                  && fixture.Files(B).Count == 2, because);
+        }
+        // Imports with a staged transcript (the app moves it over the current transcript id when the import is confirmed),
+        // other transcript ids, sessions of a kind of their own, and pending or interrupted work.
+        foreach (var (field, value) in new (string, JsonNode)[]
+                 {
+                     ("stagedTranscriptPath", @"C:\staged\import.jsonl"), ("importedFrom", "code1p"), ("interruptedByQuitAt", 5),
+                     ("interruptedAwaitingPerson", true), ("unarchivedCliSessionId", Guid.NewGuid().ToString("D")),
+                     ("pendingSystemReminder", "remind"), ("spawnedFrom", new JsonObject { ["sessionId"] = "local_parent" })
+                 })
+        {
+            using var held = new Fixture();
+            var ids = Conversation(held, 2);
+            held.Record(B, Mine, ids[0], extra: r => r[field] = value.DeepClone());
+            held.Record(A, Theirs, ids[1], extra: r => r["priorCliSessionIds"] = new JsonArray(ids[0]));
+            Kept(held, $"a record holding {field} is left alone");
+        }
+        // Not one line: written to after the conversation went on elsewhere, a lineage the newer one does not start with
+        // or one listing its own transcript, rewind edges out of order or reaching outside the lineage, a cut the newer
+        // state lacks, another folder, or archived.
+        using (var branch = new Fixture())
+        {
+            var ids = Conversation(branch, 2);
+            branch.Record(B, Mine, ids[0]);
+            branch.Record(A, Theirs, ids[1], extra: r => r["priorCliSessionIds"] = new JsonArray(ids[0]));
+            WriteLater(branch, ids[0]);
+            Kept(branch, "an older state written to after the conversation went on is a branch and stays");
+        }
+        using (var other = new Fixture())
+        {
+            var ids = Conversation(other, 2);
+            other.Record(B, Mine, ids[0], extra: r => r["priorCliSessionIds"] = new JsonArray(other.Transcript()));
+            other.Record(A, Theirs, ids[1], extra: r => r["priorCliSessionIds"] = new JsonArray(ids[0]));
+            Kept(other, "a lineage the newer state does not start with stays");
+        }
+        using (var restored = new Fixture())
+        {
+            var ids = Conversation(restored, 2);
+            restored.Record(B, Mine, ids[0], extra: r => r["priorCliSessionIds"] = new JsonArray(ids[0]));
+            restored.Record(A, Theirs, ids[1], extra: r => r["priorCliSessionIds"] = new JsonArray(ids[0]));
+            Kept(restored, "a restored state listing its own transcript as earlier stays");
+        }
+        using (var edges = new Fixture())
+        {
+            var ids = Conversation(edges, 3);
+            var first = Edge(ids[0], ids[1]); var second = Edge(ids[1], ids[2]);
+            edges.Record(B, Mine, ids[1], extra: r => { r["priorCliSessionIds"] = new JsonArray(ids[0]); r["rewindEdges"] = new JsonArray(first.DeepClone()); });
+            edges.Record(A, Theirs, ids[2], extra: r =>
+            { r["priorCliSessionIds"] = new JsonArray(ids[0], ids[1]); r["rewindEdges"] = new JsonArray(second.DeepClone(), first.DeepClone()); });
+            Kept(edges, "rewind edges out of order stay");
+        }
+        using (var outside = new Fixture())
+        {
+            var ids = Conversation(outside, 2);
+            outside.Record(B, Mine, ids[0]);
+            outside.Record(A, Theirs, ids[1], extra: r =>
+            { r["priorCliSessionIds"] = new JsonArray(ids[0]); r["rewindEdges"] = new JsonArray(Edge(ids[0], outside.Transcript())); });
+            Kept(outside, "a rewind edge reaching outside the lineage stays");
+        }
+        using (var cut = new Fixture())
+        {
+            var ids = Conversation(cut, 2);
+            cut.Record(B, Mine, ids[0], extra: r => r["transcriptCuts"] = new JsonObject { [ids[0]] = Guid.NewGuid().ToString("D") });
+            cut.Record(A, Theirs, ids[1], extra: r => r["priorCliSessionIds"] = new JsonArray(ids[0]));
+            Kept(cut, "a transcript cut the newer state does not keep stays");
+        }
+        using (var folder = new Fixture())
+        {
+            var ids = Conversation(folder, 2);
+            folder.Record(B, Mine, ids[0], cwd: Path.Combine(folder.Root, "elsewhere"));
+            folder.Record(A, Theirs, ids[1], extra: r => r["priorCliSessionIds"] = new JsonArray(ids[0]));
+            Kept(folder, "an older state in another folder stays");
+        }
+        using (var shelved = new Fixture())
+        {
+            var ids = Conversation(shelved, 2);
+            shelved.Record(B, Mine, ids[0], archived: true);
+            shelved.Record(A, Theirs, ids[1], extra: r => r["priorCliSessionIds"] = new JsonArray(ids[0]));
+            Kept(shelved, "an archived older state stays archived");
+        }
+        // A transcript of the lineage being written: nothing is planned there until the writer is gone.
+        using (var writing = new Fixture())
+        {
+            var ids = Conversation(writing, 2);
+            writing.Record(B, Mine, ids[0]);
+            writing.Record(A, Theirs, ids[1], extra: r => r["priorCliSessionIds"] = new JsonArray(ids[0]));
+            var busy = writing.Shelf(() => new ClaudeLiveSessionScan(new HashSet<string> { ids[0] }, false)).Apply([A, B], () => true);
+            Check(busy is { Advanced: 0, Created: 0 } && busy.Plan.HasTransientSkips && writing.Files(B).Count == 1,
+                "while the older state's transcript is written, neither an advance nor a copy is made, and the run is retried");
+            Check(writing.Shelf().Apply([A, B], () => true).Advanced == 1, "once the writer is gone the older state advances");
+        }
+
+        using var race = new Fixture();
+        var raceIds = Conversation(race, 2);
+        race.Record(B, Mine, raceIds[0]);
+        race.Record(A, Theirs, raceIds[1], extra: r => r["priorCliSessionIds"] = new JsonArray(raceIds[0]));
+        var path = Path.Combine(race.ShelfPath(B), Mine + ".json");
+        var ledgerPath = Path.Combine(race.Ledger, "ledger.json");
+        var backups = Path.Combine(race.Ledger, ClaudeShelfLedger.BackupFolder);
+        var hash = ClaudeSessionShelf.Hash(path);
+        // Desktop starts at the very last moment, inside the replacement.
+        var checks = 0;
+        var late = race.Shelf().Apply([A, B], () => ++checks <= 3);
+        Check(late.Advanced == 0 && ClaudeSessionShelf.Hash(path) == hash && late.Plan.Held[B.Key] == "advance_failed" && !late.Plan.IsComplete
+              && Json(ledgerPath)["advanced"]!.AsArray().Count == 0 && !Directory.EnumerateFiles(backups).Any(),
+            "Desktop starting at the last moment writes nothing, and leaves no advance or saved record behind");
+        // The record changes after the final plan read it.
+        var scans = 0;
+        var changed = race.Shelf(() =>
+        {
+            if (++scans == 2) Change(path, r => r["lastFocusedAt"] = 9);
+            return new ClaudeLiveSessionScan(new HashSet<string>(), false);
+        }).Apply([A, B], () => true);
+        Check(changed.Advanced == 0 && Json(path)["lastFocusedAt"]!.GetValue<int>() == 9 && changed.Plan.Held[B.Key] == "advance_failed",
+            "a record that changed after the plan is not overwritten");
+        // A writer starts on the conversation after the plan.
+        var asked = 0;
+        var started = race.Shelf(() => new ClaudeLiveSessionScan(++asked >= 3 ? new HashSet<string> { raceIds[1] } : new HashSet<string>(), false))
+            .Apply([A, B], () => true);
+        Check(started.Advanced == 0 && Json(path)["cliSessionId"]!.GetValue<string>() == raceIds[0] && started.Plan.Held[B.Key] == "advance_failed",
+            "a writer that starts after the plan stops the advance");
+        // The record as it was, and the intent, are in the ledger before the record is replaced.
+        var before = File.ReadAllBytes(path);
+        hash = ClaudeSessionShelf.Hash(path);
+        string? seen = null;
+        var moments = 0;
+        var done = race.Shelf().Apply([A, B], () =>
+        {
+            if (++moments == 4) seen = File.ReadAllText(ledgerPath);
+            return true;
+        });
+        var intent = JsonNode.Parse(seen!)!["advanced"]!.AsArray().Single()!;
+        Check(done.Advanced == 1 && intent["state"]!.GetValue<string>() == "pending" && intent["before"]!.GetValue<string>() == hash
+              && File.ReadAllBytes(Path.Combine(backups, intent["backup"]!.GetValue<string>())).SequenceEqual(before)
+              && Json(ledgerPath)["advanced"]!.AsArray().Single()!["state"]!.GetValue<string>() == "done",
+            "the advance and the record as it was are saved before the record is replaced, and confirmed after");
+        // A run stopped after the intent: the next one settles it from the record.
+        void Interrupt(Action? withRecord = null)
+        {
+            var stopped = Json(ledgerPath);
+            stopped["advanced"]![0]!["state"] = "pending";
+            File.WriteAllText(ledgerPath, stopped.ToJsonString());
+            withRecord?.Invoke();
+        }
+        Interrupt();
+        Check(ClaudeShelfLedger.Load(race.Ledger, race.Sessions).Advanced.Single().State == ClaudeShelfAdvanceState.Done,
+            "a record holding the new state confirms the advance");
+        Interrupt(() => File.WriteAllBytes(path, before));
+        Check(ClaudeShelfLedger.Load(race.Ledger, race.Sessions).Advanced.Count == 0, "a record still as it was cancels it");
+        Interrupt(() => Change(path, r => r["lastFocusedAt"] = 11));
+        Check(ClaudeShelfLedger.Load(race.Ledger, race.Sessions).Advanced.Single() is { State: ClaudeShelfAdvanceState.Unconfirmed, Backup: not null },
+            "a record holding neither keeps the advance on record, with the record as it was");
+    }
+
+    private static void TestVerifiedContinuation()
+    {
+        // B holds r; A holds both s (from r) and t (from s). After t began, s was resumed under its own id and written to
+        // (a CLI can do that): s is a branch, so both reach B and B's r is not advanced. Without that write, s is an older
+        // state of t and r takes t.
+        foreach (var resumed in new[] { true, false })
+        {
+            using var fixture = new Fixture();
+            var ids = Conversation(fixture, 3);
+            fixture.Record(B, "local_af000000-0000-4000-8000-000000000001", ids[0]);
+            fixture.Record(A, "local_af000000-0000-4000-8000-000000000002", ids[1], extra: r => r["priorCliSessionIds"] = new JsonArray(ids[0]));
+            fixture.Record(A, "local_af000000-0000-4000-8000-000000000003", ids[2], extra: r => r["priorCliSessionIds"] = new JsonArray(ids[0], ids[1]));
+            if (resumed) WriteLater(fixture, ids[1]);
+            var older = Path.Combine(fixture.ShelfPath(B), "local_af000000-0000-4000-8000-000000000001.json");
+            var hash = ClaudeSessionShelf.Hash(older);
+            var result = fixture.Shelf().Apply([A, B], () => true);
+            var listed = fixture.Files(B).Select(path => Json(path)["cliSessionId"]!.GetValue<string>()).Order().ToArray();
+            if (resumed)
+                Check(result is { Advanced: 0, Created: 2 } && ClaudeSessionShelf.Hash(older) == hash && listed.SequenceEqual(ids.Order()),
+                    "a state resumed after the conversation went on is a branch: both branches reach the list, and r stays");
+            else
+                Check(result is { Advanced: 1, Created: 0 } && listed.SequenceEqual([ids[2]]), "without the resumed state, r takes t");
+        }
+
+        // Only t is listed anywhere, but s was resumed after t began: going from r to t skips a step that is not one line,
+        // so r is not advanced; t is added beside it. (r itself was left as the conversation went on: A needs no copy.)
+        using var skipped = new Fixture();
+        var steps = Conversation(skipped, 3);
+        skipped.Record(B, "local_af100000-0000-4000-8000-000000000001", steps[0]);
+        skipped.Record(A, "local_af100000-0000-4000-8000-000000000002", steps[2], extra: r => r["priorCliSessionIds"] = new JsonArray(steps[0], steps[1]));
+        WriteLater(skipped, steps[1]);
+        var skippedPath = Path.Combine(skipped.ShelfPath(B), "local_af100000-0000-4000-8000-000000000001.json");
+        var skippedHash = ClaudeSessionShelf.Hash(skippedPath);
+        Check(skipped.Shelf().Apply([A, B], () => true) is { Advanced: 0, Created: 1 } && ClaudeSessionShelf.Hash(skippedPath) == skippedHash,
+            "every step a later state skips is checked before an advance");
+
+        // B lists both a copy this utility made of s and a newer record t. The copy is archived only while its transcript
+        // was left when the conversation went on; resumed under the same id afterwards, it is a branch and stays.
+        foreach (var resumed in new[] { true, false })
+        {
+            using var copies = new Fixture();
+            var (s, t) = Two(copies);
+            copies.Record(A, "local_af200000-0000-4000-8000-000000000001", s);
+            var shelf = copies.Shelf();
+            shelf.Apply([A, B], () => true);
+            var copy = copies.Files(B).Single();
+            copies.Record(B, "local_af200000-0000-4000-8000-000000000002", t, extra: r => r["priorCliSessionIds"] = new JsonArray(s));
+            if (resumed) WriteLater(copies, s);
+            var result = shelf.Apply([A, B], () => true);
+            Check(result.Retired == (resumed ? 0 : 1) && Json(copy)["isArchived"]!.GetValue<bool>() == !resumed,
+                resumed ? "a copy whose transcript was resumed after the conversation went on is not archived"
+                    : "a copy the conversation went on from is archived");
+        }
+
+        // After the plan, a CLI resumes the older state's transcript, writes and exits: no writer is left at the swap, but
+        // what the decision read has changed, so nothing is written and the next run plans again.
+        using var late = new Fixture();
+        var (r0, r1) = Two(late);
+        late.Record(B, "local_af300000-0000-4000-8000-000000000001", r0);
+        late.Record(A, "local_af300000-0000-4000-8000-000000000002", r1, extra: r => r["priorCliSessionIds"] = new JsonArray(r0));
+        var latePath = Path.Combine(late.ShelfPath(B), "local_af300000-0000-4000-8000-000000000001.json");
+        var lateHash = ClaudeSessionShelf.Hash(latePath);
+        var checks = 0;
+        var stale = late.Shelf().Apply([A, B], () =>
+        {
+            if (++checks == 3) WriteLater(late, r0); // between the final plan and the swap
+            return true;
+        });
+        Check(stale.Advanced == 0 && ClaudeSessionShelf.Hash(latePath) == lateHash && stale.Plan.Held[B.Key] == "advance_failed"
+              && !stale.Plan.IsComplete && Json(Path.Combine(late.Ledger, "ledger.json"))["advanced"]!.AsArray().Count == 0,
+            "a transcript written after the plan stops the advance and leaves the run to be retried");
+        Check(late.Shelf().Apply([A, B], () => true) is { Advanced: 0, Created: 2 } && ClaudeSessionShelf.Hash(latePath) == lateHash
+              && late.Files(B).Count == 2 && late.Files(A).Count == 2,
+            "planned again, the resumed older state is a branch: the newest state is added beside it, and it reaches A too");
+
+        // The source record the decision read changes after the plan: nothing is written, and the next run plans again.
+        using var moved = new Fixture();
+        var (m0, m1) = Two(moved);
+        moved.Record(B, "local_af400000-0000-4000-8000-000000000001", m0);
+        moved.Record(A, "local_af400000-0000-4000-8000-000000000002", m1, extra: r => r["priorCliSessionIds"] = new JsonArray(m0));
+        var source = Path.Combine(moved.ShelfPath(A), "local_af400000-0000-4000-8000-000000000002.json");
+        var asked = 0;
+        var changed = moved.Shelf().Apply([A, B], () =>
+        {
+            if (++asked == 3) Change(source, r => r["title"] = "바뀐 이름");
+            return true;
+        });
+        Check(changed.Advanced == 0 && changed.Plan.Held[B.Key] == "advance_failed", "a source record changed after the plan stops the advance");
+        Check(moved.Shelf().Apply([A, B], () => true).Advanced == 1, "planned again from the record as it is, the advance goes ahead");
+    }
+
+    private static string TranscriptPath(Fixture fixture, string id) => Path.Combine(fixture.Projects, "E--work", id + ".jsonl");
+
+    private static string Log(Fixture fixture, DateTime created, IEnumerable<string> lines)
+    {
+        var id = Guid.NewGuid().ToString("D");
+        File.WriteAllLines(TranscriptPath(fixture, id), lines);
+        File.SetCreationTimeUtc(TranscriptPath(fixture, id), created);
+        return id;
+    }
+
+    private static string Entry(DateTime at) => "{\"type\":\"user\",\"uuid\":\"" + Guid.NewGuid().ToString("D") + "\",\"timestamp\":\""
+        + at.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'", System.Globalization.CultureInfo.InvariantCulture) + "\"}";
+
+    /// <summary>The conversation going on from <paramref name="from"/> in a new transcript, as the CLI writes one: copies of
+    /// the earlier entries (ids and times kept), then one of its own half a second after the file was created.</summary>
+    private static string GoOn(Fixture fixture, string from, DateTime created) =>
+        Log(fixture, created, File.ReadAllLines(TranscriptPath(fixture, from)).Append(Entry(created.AddMilliseconds(500))));
+
+    /// <summary>One conversation in <paramref name="states"/> transcripts, each going on from the one before a day later.</summary>
+    private static string[] Conversation(Fixture fixture, int states)
+    {
+        var start = DateTime.UtcNow.Date.AddDays(-20);
+        var ids = new List<string> { Log(fixture, start, [Entry(start.AddMilliseconds(500))]) };
+        while (ids.Count < states) ids.Add(GoOn(fixture, ids[^1], start.AddDays(ids.Count)));
+        return [.. ids];
+    }
+
+    private static (string Earlier, string Later) Two(Fixture fixture) => Conversation(fixture, 2) is [var earlier, var later]
+        ? (earlier, later) : throw new InvalidOperationException();
+
+    /// <summary>An entry written to a transcript long after the conversation went on elsewhere: a branch.</summary>
+    private static void WriteLater(Fixture fixture, string id) =>
+        File.AppendAllLines(TranscriptPath(fixture, id), [Entry(DateTime.UtcNow.Date.AddDays(-1))]);
+
+    // A rewind edge as the app writes it: from one transcript to the next, at a message of the earlier one.
+    private static JsonObject Edge(string parent, string child) => new()
+    {
+        ["id"] = Guid.NewGuid().ToString("D"), ["parent"] = parent, ["child"] = child, ["at"] = 1, ["cwd"] = @"C:\work",
+        ["forkPoint"] = Guid.NewGuid().ToString("D")
+    };
+
+    private static JsonObject Json(string path) => JsonNode.Parse(File.ReadAllText(path))!.AsObject();
+
+    private static void Change(string path, Action<JsonObject> change)
+    {
+        var record = Json(path);
+        change(record);
+        File.WriteAllText(path, record.ToJsonString());
     }
 
     private sealed class Fixture : IDisposable

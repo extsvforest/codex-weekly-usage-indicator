@@ -187,11 +187,11 @@ internal sealed class ClaudeAccountPanel : UserControl
                 status.RelaunchArmed ? UiText.T("다시 열기 취소") : null);
         if (status.RelaunchArmed)
             return (status.AppConfirmed && status.PendingForApp is > 0 and var waiting
-                ? UiText.F($"아직 없는 세션 {waiting}개 · Claude를 종료하면 채운 뒤 다시 엽니다.")
+                ? UiText.F($"채울 세션 {waiting}개 · Claude를 종료하면 채운 뒤 다시 엽니다.")
                 : UiText.T("다시 열기 예약됨 · Claude를 종료하면 세션 목록을 채운 뒤 다시 엽니다."), false, UiText.T("다시 열기 취소"));
         if (status.MappedAccounts < 2) return (UiText.T("Claude 계정을 두 개 이상 연결하면 세션 목록을 서로 채웁니다."), false, null);
         if (status.AppConfirmed && status.PendingForApp is > 0 and var pending)
-            return (UiText.F($"{appLabel ?? ""} 목록에 아직 없는 세션 {pending}개 · Claude를 종료하면 채웁니다."), false,
+            return (UiText.F($"{appLabel ?? ""} 목록에 채울 세션 {pending}개 · Claude를 종료하면 채웁니다."), false,
                 UiText.T("종료하면 다시 열기"));
         if (status.Problem == ClaudeShelfProblem.Failed)
             return (UiText.F($"세션 목록 채우기 실패 · {UiText.Message(status.ProblemDetail ?? "")}"), true, null);

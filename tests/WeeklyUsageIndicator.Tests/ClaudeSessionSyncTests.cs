@@ -2,6 +2,13 @@ using System.Globalization;
 using System.Text;
 using System.Text.Json.Nodes;
 using WeeklyUsageIndicator;
+using Changes = WeeklyUsageIndicator.ClaudeSessionLayout.Changes;
+using OtherAccount = WeeklyUsageIndicator.ClaudeSessionSync.Other;
+using Record = WeeklyUsageIndicator.ClaudeSessionSync.Record;
+using Shown = WeeklyUsageIndicator.ClaudeSessionLayout.Shown;
+using SyncLayout = WeeklyUsageIndicator.ClaudeSessionSync.Layout;
+using SyncPlan = WeeklyUsageIndicator.ClaudeSessionSync.Plan;
+using Target = WeeklyUsageIndicator.ClaudeSessionLayout.Target;
 
 internal static class ClaudeSessionSyncTests
 {
@@ -11,19 +18,145 @@ internal static class ClaudeSessionSyncTests
     private static string ReferenceKey => ReferenceAccount + "/" + ReferenceOrg;
     private const string ThirdAccount = "7a7a7a7a-0000-4000-8000-00000000007a", ThirdOrg = "7b7b7b7b-0000-4000-8000-00000000007b";
     private static string ThirdKey => ThirdAccount + "/" + ThirdOrg;
+    // The three accounts of the stories: 계정1 holds the records the app wrote, 계정2 and 계정3 the widget's copies.
+    private static string K1 => ReferenceKey;
+    private static string K2 => CurrentKey;
+    private static string K3 => ThirdKey;
+    /// <summary>The fixtures' clock: when accounts changed things and when the app came to and left them, in minutes.</summary>
+    private static readonly DateTimeOffset Morning = new(2026, 10, 20, 9, 0, 0, TimeSpan.FromHours(9));
+    private static readonly IReadOnlyDictionary<string, string?> NoCopies = new Dictionary<string, string?>(StringComparer.Ordinal);
 
     internal static Task RunAsync()
     {
         TestCombinedUsage();
         TestPlan();
         TestOlderStates();
-        TestMerge();
+        TestCopies();
+        TestNewestChange();
+        TestGroupOrder();
+        TestSidebarSections();
         TestLayoutStore();
         TestPinList();
         TestTranscript();
         TestBuildFromDisk();
         TestGroupsFromLocalStorage();
+        TestObserve();
+        TestCheckpoint();
+        TestUndoneAfterPlan();
+        TestPassedThrough();
+        TestPartlyApplied();
+        TestSortingResumed();
+        TestSortingOnDisk();
+        TestLastPin();
+        TestFirstFormatEvidence();
+        TestOlderStateFollowsRename();
+        TestReopenedOlderState();
+        TestRenamedWhileAside();
+        TestEditedWhileAside();
+        TestDeletedAsPlanned();
+        TestReorderedWithLeftover();
+        TestRetargetedWhileAside();
+        TestRemovedBeforeApplied();
+        TestUnseenStay();
         return Task.CompletedTask;
+    }
+
+    private static DateTimeOffset At(int minutes) => Morning.AddMinutes(minutes);
+
+    private static string Cli(int number) => "00000000-0000-4000-8000-" + number.ToString("x12", CultureInfo.InvariantCulture);
+
+    private static Record R(string id, string? title, bool pinned, string? cli, string[]? prior = null, long activity = 0,
+        bool branch = false, bool renamed = false) => new(id, title, pinned, cli, prior ?? [], activity, branch, renamed);
+
+    /// <summary>Groups in sidebar order, each written "id=name", and the sessions filed in them.</summary>
+    private static SyncLayout Groups(string[] groups, params (string Session, string Group)[] filed) =>
+        new(groups.Select(group => group.Split('=', 2) is [var id, var name] ? new ClaudeSessionSync.Group(id, name)
+                : throw new ArgumentException(group)).ToArray(),
+            filed.ToDictionary(pair => pair.Session, pair => pair.Group, StringComparer.Ordinal));
+
+    /// <summary>The widget's copies in a list, each with the title the ledger says it wrote (null: not tracked).</summary>
+    private static Dictionary<string, string?> Copies(params (string Id, string? Written)[] copies) =>
+        copies.ToDictionary(copy => copy.Id, copy => copy.Written, StringComparer.Ordinal);
+
+    private static OtherAccount Other(string account, string? label, IReadOnlyList<Record> records, SyncLayout? layout,
+        DateTimeOffset? leftAt = null, IReadOnlyDictionary<string, string?>? copies = null, IReadOnlyList<Record>? archived = null) =>
+        new(account, label, leftAt, records, layout, copies ?? NoCopies, archived);
+
+    /// <summary>A plan for the current account with the widget's copies known (none unless given) and nothing kept unless
+    /// <paramref name="kept"/> holds it. Plans name accounts by the labels the widget keeps.</summary>
+    private static SyncPlan Compute(IReadOnlyList<Record> records, SyncLayout? layout, IReadOnlyList<OtherAccount> others,
+        ClaudeSessionLayout? kept = null, IReadOnlyDictionary<string, string?>? copies = null, bool pinsKnown = true,
+        bool groupsKnown = true, ClaudeSessionSync.Lineage? lineage = null, IReadOnlyList<string>? warnings = null,
+        string? label = null, bool ledgerKnown = true, bool pinsLost = false, IReadOnlyList<Record>? archived = null,
+        bool listsWhole = true)
+    {
+        kept ??= new ClaudeSessionLayout();
+        foreach (var other in others)
+            if (!kept.Accounts.ContainsKey(other.Account)) kept.Accounts[other.Account] = new(other.Label ?? "");
+        return ClaudeSessionSync.Compute(CurrentKey, label, records, layout, others, kept, pinsKnown, lineage, warnings, groupsKnown,
+            ledgerKnown ? copies ?? NoCopies : null, pinsLost, archived, listsWhole);
+    }
+
+    /// <summary>What a record shows, as a checkpoint keeps it.</summary>
+    private static Shown ShownOf(Record record, SyncLayout? layout, string? written = null)
+    {
+        var title = string.IsNullOrWhiteSpace(record.Title) ? null : record.Title;
+        if (layout is null) return new(record.Pinned, false, null, title, written);
+        if (!layout.Assignments.TryGetValue(record.SessionId, out var id)) return new(record.Pinned, true, null, title, written);
+        return layout.Groups.FirstOrDefault(group => group.Id == id) is { } group
+            ? new(record.Pinned, true, group.Name, title, written) : new(record.Pinned, false, null, title, written);
+    }
+
+    /// <summary>A checkpoint of what <paramref name="records"/> show in <paramref name="layout"/>.</summary>
+    private static ClaudeSessionLayout.Checkpoint PointOf(IReadOnlyList<Record> records, SyncLayout? layout, DateTimeOffset at,
+        int stay = 0, IReadOnlyDictionary<string, string?>? copies = null) =>
+        new(at, stay, layout?.Groups.Select(group => new ClaudeSessionLayout.Named(group.Id, group.Name)).ToArray(),
+            records.ToDictionary(record => record.SessionId, record => ShownOf(record, layout, copies?.GetValueOrDefault(record.SessionId)),
+                StringComparer.Ordinal));
+
+    /// <summary>Keeps an account checkpointed showing what it shows now in a stay before the one it is in, so nothing
+    /// changed there since; the app last left it at <paramref name="leftAt"/>.</summary>
+    private static void Steady(ClaudeSessionLayout kept, string account, string label, IReadOnlyList<Record> records, SyncLayout? layout,
+        DateTimeOffset? leftAt, IReadOnlyDictionary<string, string?>? copies = null)
+    {
+        kept.Accounts[account] = new(label, leftAt, null, 1);
+        kept.Checkpoints[account] = PointOf(records, layout, (leftAt ?? Morning).AddMinutes(-5), 0, copies);
+    }
+
+    private static void Changed(ClaudeSessionLayout kept, string account, string session, Changes change)
+    {
+        if (!kept.Changed.TryGetValue(account, out var changes)) kept.Changed[account] = changes = new(StringComparer.Ordinal);
+        changes[session] = change;
+    }
+
+    /// <summary>A change of one or more values of a conversation, all at <paramref name="at"/> (combine with <c>Over</c>
+    /// for different times).</summary>
+    private static Changes Change(DateTimeOffset at, bool? pinned = null, string? group = null, bool ungrouped = false,
+        string? title = null, string? by = null) =>
+        new(pinned is { } pin ? new ClaudeSessionLayout.Stamp<bool>(pin, at, by) : null,
+            group is not null || ungrouped ? new ClaudeSessionLayout.Stamp<string?>(group, at, by) : null,
+            title is null ? null : new ClaudeSessionLayout.Stamp<string>(title, at, by));
+
+    private static ClaudeSessionLayout.GroupChange ListChange(string[] order, DateTimeOffset at, string? by = null,
+        params (string From, string To)[] renamed) =>
+        new(order, renamed.ToDictionary(pair => pair.From, pair => pair.To, StringComparer.Ordinal), at, by);
+
+    /// <summary>Groups a plan in progress renames out of the way, by id: each from its name to that name with the mark.</summary>
+    private static Dictionary<string, ClaudeSessionLayout.Moved> Aside(params (string Id, string From)[] groups) =>
+        groups.ToDictionary(group => group.Id, group => new ClaudeSessionLayout.Moved(group.From, group.From + ClaudeSessionSync.MovingMark + ")"),
+            StringComparer.Ordinal);
+
+    /// <summary>A fresh fixture folder under the test root (GFS_ACCOUNT_TEST_ROOT, else the temporary work area).</summary>
+    private static string TempRoot(string name) => Directory.CreateDirectory(Path.Combine(Path.GetFullPath(
+            Environment.GetEnvironmentVariable("GFS_ACCOUNT_TEST_ROOT") ?? Path.Combine(Path.GetTempPath(), "gfs-agent", "claude-sync-tests")),
+        name + "-" + Guid.NewGuid().ToString("N"))).FullName;
+
+    /// <summary>The widget's layout with these accounts, each with when the app last left it; nothing checkpointed.</summary>
+    private static void Keep(string ledger, params (string Key, string Label, DateTimeOffset? LeftAt)[] accounts)
+    {
+        var layout = new ClaudeSessionLayout();
+        foreach (var (key, label, leftAt) in accounts) layout.Accounts[key] = new(label, leftAt);
+        layout.Save(ledger);
     }
 
     private static void TestCombinedUsage()
@@ -55,76 +188,75 @@ internal static class ClaudeSessionSyncTests
         Check(ClaudeCombinedUsage.From([], now) is { Accounts: 0, Complete: false }, "no accounts, no total");
     }
 
-    private static ClaudeSessionSync.Other Other(string account, string? label, IReadOnlyList<ClaudeSessionSync.Record> records,
-        ClaudeSessionSync.Layout? layout, IReadOnlySet<string>? copies = null,
-        IReadOnlyDictionary<string, ClaudeSessionLayout.Agreed>? agreed = null, DateTimeOffset? leftAt = null,
-        IReadOnlyList<IReadOnlyDictionary<string, ClaudeSessionLayout.Agreed>>? elsewhere = null,
-        IReadOnlyDictionary<string, ClaudeSessionLayout.Agreed>? mine = null) =>
-        new(account, label, leftAt, records, layout, copies ?? new HashSet<string>(), agreed, elsewhere, mine);
-
-    private static ClaudeSessionLayout.Agreed A(bool? pinned = null, bool hasGroup = false, string? group = null, string? title = null) =>
-        new(pinned, hasGroup, group, title);
-
     private static void TestPlan()
     {
-        ClaudeSessionSync.Record Record(string id, string? title, bool pinned, string? cli, params string[] prior) =>
-            new(id, title, pinned, cli, prior, 0);
         var current = new[]
         {
-            Record("local_c1", "옛 이름", true, "x"), Record("local_c2", "같음", false, "y"),
-            Record("local_c3", "이어감", false, "z2", "z"), Record("local_c4", "한쪽에만", true, "w"), Record("local_c5", "뒤", false, "v")
+            R("local_c1", "옛 이름", true, "x"), R("local_c2", "같음", false, "y"), R("local_c3", "이어감", false, "z2", ["z"]),
+            R("local_c4", "한쪽에만", true, "w"), R("local_c5", "뒤", false, "v")
         };
         var reference = new[]
         {
-            Record("local_r1", "새 이름", true, "x"), Record("local_r2", "같음", true, "y"),
-            Record("local_r3", "원래", false, "z"), Record("local_r5", "앞서 이어감", false, "v2", "v")
+            R("local_r1", "새 이름", true, "x"), R("local_r2", "같음", true, "y"), R("local_r3", "원래", false, "z"),
+            R("local_r5", "앞서 이어감", false, "v2", ["v"])
         };
-        var currentLayout = new ClaudeSessionSync.Layout([new("ga", "A")], new Dictionary<string, string> { ["local_c1"] = "ga", ["local_c5"] = "ga" });
-        var referenceLayout = new ClaudeSessionSync.Layout([new("ra", "A"), new("rb", "B"), new("rc", "C")],
-            new Dictionary<string, string> { ["local_r1"] = "rb", ["local_r3"] = "ra" });
-        // Two accounts that never agreed on anything: the other account's own records offer what they show.
-        var plan = ClaudeSessionSync.Compute(CurrentKey, "서브", current, currentLayout, [Other(ReferenceKey, "메인", reference, referenceLayout)]);
-        Check(plan.Status == "ok" && plan.CreateGroups!.SequenceEqual(["B"]), "a group a move needs is created by name, an existing one reused");
-        Check(plan.Moves!.Count == 3 && plan.Moves.Single(move => move.Group == "B").Sessions.SequenceEqual(["local_c1"])
-              && plan.Moves.Single(move => move.Group == "A").Sessions.SequenceEqual(["local_c3"])
-              && plan.Moves.Single(move => move.Group is null).Sessions.SequenceEqual(["local_c5"]),
-            "sessions take the other account's group, a continuation included, and leave a group it does not use");
-        Check(plan.Pins!.Select(pin => (pin.Session, pin.Pinned)).OrderBy(pin => pin.Session).SequenceEqual([("local_c1", true), ("local_c2", true)])
-              && plan.Pins!.Single(pin => pin.Session == "local_c2").By == "메인",
-            "pins follow; one moved into a group is pinned again because the move unpins it");
-        Check(plan.Renames!.Select(rename => (rename.Session, rename.Title)).OrderBy(rename => rename.Session)
-                  .SequenceEqual([("local_c1", "새 이름"), ("local_c3", "원래"), ("local_c5", "앞서 이어감")]),
+        var currentLayout = Groups(["ga=A"], ("local_c1", "ga"), ("local_c5", "ga"));
+        var referenceLayout = Groups(["ra=A", "rb=B", "rc=C"], ("local_r1", "rb"), ("local_r3", "ra"));
+        // Nothing kept yet: each account offers all its own records show, as of when the app last left it, so the account
+        // the app left later wins.
+        var plan = Compute(current, currentLayout, [Other(ReferenceKey, "메인", reference, referenceLayout, At(0))], label: "서브");
+        Check(plan.Status == "ok" && plan.CreateGroups!.SequenceEqual(["B", "C"]) && plan.RenameGroups!.Count == 0
+              && plan.DeleteGroups!.Count == 0 && plan.GroupOrder!.SequenceEqual(["A", "B", "C"]) && plan.GroupOrderBy == "메인",
+            "the group list follows the newer account's: the start already in place stays and the rest is made at the end");
+        Check(plan.Moves!.Count == 3 && plan.Moves[0] is { Group: "A", GroupId: "ga" } toA && toA.Sessions.SequenceEqual(["local_c3"])
+              && plan.Moves[1] is { Group: "B", GroupId: null } toB && toB.Sessions.SequenceEqual(["local_c1"])
+              && plan.Moves[2] is { Group: null } outOf && outOf.Sessions.SequenceEqual(["local_c5"]),
+            "sessions take the newer group, a continuation included: a group that stays by its id, one made anew by name, in list order");
+        Check(plan.Pins!.Select(pin => (pin.Session, pin.Pinned, pin.By)).SequenceEqual([("local_c1", true, "메인"), ("local_c2", true, "메인")]),
+            "pins follow; one moved into a group is pinned again, since the move unpins it");
+        Check(plan.Renames!.Select(rename => (rename.Session, rename.Title)).SequenceEqual(
+                  [("local_c1", "새 이름"), ("local_c3", "원래"), ("local_c5", "앞서 이어감")])
+              && plan.Renames![0] is { From: "옛 이름", By: "메인" },
             "titles follow, matched by transcript id or as a continuation either way");
-        Check(plan.Others!.Single() is { Label: "메인", Matched: 4, OnlyThere.Count: 0 } && plan.Pins!.All(pin => pin.Session != "local_c4")
-              && plan.OnlyHere!.SequenceEqual(["한쪽에만"]),
+        Check(plan.Others!.Single() is { Label: "메인", Matched: 4, OnlyThere.Count: 0 } && plan.OnlyHere!.SequenceEqual(["한쪽에만"])
+              && plan.Pins!.All(pin => pin.Session != "local_c4") && plan.Sidebars!.Count == 2 && plan.Warnings is null,
             "a session only this account has is left alone and named");
-        // A dangling group reference on either side leaves that session where it is.
-        var dangling = ClaudeSessionSync.Compute(CurrentKey, null, current, currentLayout, [Other(ReferenceKey, null, reference,
-            referenceLayout with { Assignments = new Dictionary<string, string> { ["local_r1"] = "gone", ["local_r3"] = "ra" } })]);
-        Check(dangling.Moves!.All(move => !move.Sessions.Contains("local_c1")) && dangling.Pins!.All(pin => pin.Session != "local_c1")
-              && dangling.Warnings!.SequenceEqual(["groups_unresolved"]),
-            "an assignment to a group the other account does not list moves nothing");
+        // Left alike: this account's own values stay.
+        var tie = Compute(current, currentLayout, [Other(ReferenceKey, "메인", reference, referenceLayout)]);
+        Check(tie is { Moves.Count: 0, Pins.Count: 0, Renames.Count: 0, CreateGroups.Count: 0, GroupOrder: null },
+            "what another account offers as of no later than this one's own values changes nothing");
+        // An assignment to a group its account does not list offers no group: that session stays where it is.
+        var danglingThere = Compute(current, currentLayout, [Other(ReferenceKey, null, reference,
+            referenceLayout with { Assignments = new Dictionary<string, string> { ["local_r1"] = "gone", ["local_r3"] = "ra" } }, At(0))]);
+        Check(danglingThere.Moves!.All(move => !move.Sessions.Contains("local_c1")) && danglingThere.Pins!.All(pin => pin.Session != "local_c1")
+              && danglingThere.Warnings is null, "an assignment to a group the other account does not list moves nothing");
+        var danglingHere = Compute(current, currentLayout with
+            {
+                Assignments = new Dictionary<string, string> { ["local_c1"] = "gone", ["local_c5"] = "ga" }
+            },
+            [Other(ReferenceKey, null, reference, referenceLayout, At(0))]);
+        Check(danglingHere.Moves!.All(move => !move.Sessions.Contains("local_c1")) && danglingHere.Warnings!.SequenceEqual(["groups_unresolved"]),
+            "a session here filed under a group this account does not list is not moved, and that is said");
         // One record there serves one session here: an older state or a branch of a matched conversation is left alone.
-        var older = ClaudeSessionSync.Compute(CurrentKey, null,
-            [Record("local_now", "지금", false, "k2", "k"), Record("local_old", "옛 상태", false, "k"), Record("local_branch", "갈래", false, "b2", "k2")],
-            null, [Other(ReferenceKey, null, [Record("local_ref", "기준", false, "k2", "k")], null)]);
+        var older = Compute(
+            [R("local_now", "지금", false, "k2", ["k"]), R("local_old", "옛 상태", false, "k"), R("local_branch", "갈래", false, "b2", ["k2"])],
+            null, [Other(ReferenceKey, null, [R("local_ref", "기준", false, "k2", ["k"])], null, At(0))]);
         Check(older.Renames!.Select(rename => rename.Session).SequenceEqual(["local_now"]) && older.Others!.Single().Matched == 1
-              && older.OnlyHere!.Count == 2,
-            "an older state or a branch of an already matched conversation is not renamed after it");
-        var blind = ClaudeSessionSync.Compute(CurrentKey, null, current, null, [Other(ReferenceKey, null, reference, null)],
-            warnings: ["groups_unreadable"]);
-        Check(blind.CreateGroups!.Count == 0 && blind.Moves!.Count == 0 && blind.Warnings!.Single() == "groups_unreadable"
+              && older.OnlyHere!.Count == 2, "an older state or a branch of an already matched conversation is not renamed after it");
+        var blind = Compute(current, null, [Other(ReferenceKey, null, reference, null, At(0))], warnings: ["groups_unreadable"]);
+        Check(blind.CreateGroups!.Count == 0 && blind.Moves!.Count == 0 && blind.Warnings!.SequenceEqual(["groups_unreadable"])
               && blind.Pins!.Select(pin => pin.Session).SequenceEqual(["local_c2"]), "unreadable groups plan titles and pins only");
-        var held = ClaudeSessionSync.Compute(CurrentKey, null, current, currentLayout, [Other(ReferenceKey, null, reference, referenceLayout)],
-            groupsKnown: false);
-        Check(held.Moves!.Count == 0 && held.CreateGroups!.Count == 0 && held.Pins!.Single().Session == "local_c2",
+        var held = Compute(current, currentLayout, [Other(ReferenceKey, null, reference, referenceLayout, At(0))], groupsKnown: false);
+        Check(held is { Moves.Count: 0, CreateGroups.Count: 0, GroupOrder: null } && held.Pins!.Single().Session == "local_c2",
             "another account's unreadable groups hold every group change");
+        var partial = Compute(current, currentLayout, [Other(ReferenceKey, "메인", reference, referenceLayout, At(0))], listsWhole: false,
+            warnings: ["list_incomplete"]);
+        Check(partial is { Moves.Count: 0, Pins.Count: 0, Renames.Count: 0, CreateGroups.Count: 0 },
+            "a list that could not be read whole decides no title, pin or group");
     }
 
     private static void TestOlderStates()
     {
-        ClaudeSessionSync.Record R(string id, string title, bool pinned, string cli, string[] prior, long activity = 0,
-            bool branch = false) => new(id, title, pinned, cli, prior, activity, branch);
         var origin = DateTimeOffset.Parse("2026-10-01T00:00:00Z");
         // Each transcript: when its file was created, and its last entry (hours after origin).
         ClaudeSessionSync.TranscriptSpan S(double createdHours, double lastHours) =>
@@ -173,255 +305,598 @@ internal static class ClaudeSessionSyncTests
             "an older state has no entry after its conversation moved on; a branch written later, the calling session, a fork's origin, "
             + "an undated one, one whose lineage or newest state cannot be read, one dated only by a copied or restored file, "
             + "and one whose listed and created next transcripts disagree stay");
+        Check(ClaudeSessionSync.OlderStates([mixed[1]], lineage, archived: [mixed[0]]) is { Count: 1 } shelved
+              && shelved["local_old"].Newest.SessionId == "local_new"
+              && ClaudeSessionSync.OlderStates([mixed[0]], lineage, archived: [mixed[1]]).Count == 0
+              && ClaudeSessionSync.OlderStates([mixed[3]], lineage, archived: [mixed[2]]).Count == 0,
+            "an archived record is found as an older state the same way (a branch is not), and never taken to continue one");
 
-        var none = new ClaudeSessionSync.Layout([], new Dictionary<string, string>());
+        var none = Groups([]);
         var current = new[] { R("local_old", "대화", true, "a1", [], 10), R("local_new", "대화", false, "a2", ["a1"], 20) };
         var reference = new[] { R("local_r_old", "대화", true, "a1", [], 10), R("local_r_new", "대화", false, "a2", ["a1"], 20) };
-        var referenceLayout = new ClaudeSessionSync.Layout([new("g", "G")], new Dictionary<string, string> { ["local_r_old"] = "g" });
-        var plan = ClaudeSessionSync.Compute(CurrentKey, "서브", current, none, [Other(ReferenceKey, "메인", reference, referenceLayout)],
-            lineage: lineage);
+        var referenceLayout = Groups(["g=G"], ("local_r_old", "g"));
+        // The newest states are the widget's copies, untouched: what the conversation shows is its older states'.
+        var copiedHere = Copies(("local_new", "대화"));
+        var copiedThere = Copies(("local_r_new", "대화"));
+        var plan = Compute(current, none, [Other(ReferenceKey, "메인", reference, referenceLayout, At(0), copiedThere)], copies: copiedHere,
+            lineage: lineage, label: "서브");
         Check(plan.CreateGroups!.SequenceEqual(["G"]) && plan.Moves!.Single() is { Group: "G" } move && move.Sessions.SequenceEqual(["local_new"])
-              && plan.Pins!.Single() is { Session: "local_new", Pinned: true } && plan.Others!.Single().Matched == 1 && plan.Renames!.Count == 0,
+              && plan.Pins!.Single() is { Session: "local_new", Pinned: true, By: "메인" } && plan.Others!.Single().Matched == 1
+              && plan.Renames!.Count == 0,
             "another account's older state is seen through: its pin and group go to the newest state there and here");
-        Check(plan.Archive!.Single() is { Session: "local_old", Pinned: true, Newest: "local_new", Ready: false },
-            "an older state waits until its newest state holds what it keeps");
-        var moved = new ClaudeSessionSync.Layout([new("g2", "G")], new Dictionary<string, string> { ["local_new"] = "g2" });
-        var after = ClaudeSessionSync.Compute(CurrentKey, "서브", [current[0], current[1] with { Pinned = true }], moved,
-            [Other(ReferenceKey, "메인", reference, referenceLayout)], lineage: lineage);
+        Check(plan.Archive!.Single() is { Session: "local_old", Pinned: true, Newest: "local_new", Ready: false }
+              && plan.Pending!.Sessions["local_old"] is { Pinned: { Value: false } unpin } && unpin.At == DateTimeOffset.MinValue,
+            "an older state waits until its newest state holds what it keeps; unpinning it on the way is nobody's choice");
+        var moved = Groups(["g2=G"], ("local_new", "g2"));
+        var after = Compute([current[0], current[1] with { Pinned = true }], moved,
+            [Other(ReferenceKey, "메인", reference, referenceLayout, At(0), copiedThere)], copies: copiedHere, lineage: lineage, label: "서브");
         Check(after.Moves!.Count == 0 && after.Pins!.Count == 0 && after.Archive!.Single() is { Ready: true, Pinned: true },
             "once the newest state holds the pin and group, the older state is ready (to be unpinned, then archived)");
 
         // A conversation no other account lists keeps what its older state had.
-        var ownLayout = new ClaudeSessionSync.Layout([new("h", "H")], new Dictionary<string, string> { ["local_c1"] = "h" });
-        var alone = ClaudeSessionSync.Compute(CurrentKey, null,
-            [R("local_c1", "여기만", true, "c1", [], 10), R("local_c2", "여기만", false, "c2", ["c1"], 20)], ownLayout,
-            [Other(ReferenceKey, null, [R("local_z", "다른 것", true, "z", [])], none)], lineage: lineage);
-        Check(alone.Moves!.Single() is { Group: "H" } kept && kept.Sessions.SequenceEqual(["local_c2"])
+        var ownLayout = Groups(["h=H"], ("local_c1", "h"));
+        var alone = Compute([R("local_c1", "여기만", true, "c1", [], 10), R("local_c2", "여기만", false, "c2", ["c1"], 20)], ownLayout,
+            [Other(ReferenceKey, null, [R("local_z", "다른 것", true, "z")], none)], copies: Copies(("local_c2", "여기만")), lineage: lineage);
+        Check(alone.Moves!.Single() is { Group: "H", GroupId: "h" } stays && stays.Sessions.SequenceEqual(["local_c2"])
               && alone.Pins!.Single() is { Session: "local_c2", Pinned: true, By: null } && alone.Archive!.Single() is { Ready: false }
               && alone.OnlyHere!.SequenceEqual(["여기만"]) && alone.Others!.Single().Matched == 0,
             "an older state's pin and group go to its newest state even when no other account lists the conversation");
 
         // With nothing to take from, an account only clears its older states, handing their pin and group on first.
-        var mine = new ClaudeSessionSync.Layout([new("g", "G")], new Dictionary<string, string> { ["local_old"] = "g" });
-        var self = ClaudeSessionSync.Compute(CurrentKey, "서브", current, mine, [], lineage: lineage);
+        var mine = Groups(["g=G"], ("local_old", "g"));
+        var self = Compute(current, mine, [], copies: copiedHere, lineage: lineage, label: "서브");
         Check(self is { Status: "ok", Others.Count: 0 } && self.Archive!.Single() is { Session: "local_old", Ready: false }
-              && self.CreateGroups!.Count == 0 && self.Moves!.Single() is { Group: "G" } handed && handed.Sessions.SequenceEqual(["local_new"])
-              && self.Pins!.Single() is { Session: "local_new", Pinned: true } && self.Sidebars!.Count == 1,
+              && self.CreateGroups!.Count == 0 && self.Moves!.Single() is { Group: "G", GroupId: "g" } handed
+              && handed.Sessions.SequenceEqual(["local_new"]) && self.Pins!.Single() is { Session: "local_new", Pinned: true }
+              && self.Sidebars!.Count == 1,
             "one record per conversation is kept, the newest holding the pin and group");
 
-        // An account without a single pin while this one has some looks wiped: it offers no pins, so this account's
-        // pins stay (a session moved into a group is pinned again).
-        var wiped = ClaudeSessionSync.Compute(CurrentKey, null,
-            [R("local_p", "고정", true, "p", []), R("local_q", "보통", false, "q", []), .. current], none,
-            [Other(ReferenceKey, null,
-                [R("local_rp", "고정", false, "p", []), R("local_rq", "보통", false, "q", []), R("local_r_new", "대화", false, "a2", ["a1"], 20)],
-                new ClaudeSessionSync.Layout([new("g", "G")], new Dictionary<string, string> { ["local_rp"] = "g", ["local_rq"] = "g" }))],
-            lineage: lineage);
-        Check(wiped.Warnings!.SequenceEqual(["other_pins_empty"]) && wiped.Pins!.All(pin => pin.Pinned)
-              && wiped.Pins!.Select(pin => pin.Session).Order(StringComparer.Ordinal).SequenceEqual(["local_new", "local_p"])
-              && wiped.Moves!.Single() is { Group: "G" } stay && stay.Sessions.Order(StringComparer.Ordinal).SequenceEqual(["local_p", "local_q"])
-              && wiped.Archive!.Single() is { Ready: false }, "an account with an empty pin list unpins nothing");
-
         // Unreadable pins plan no pins and no groups (a move could unpin); unreadable groups hold archiving too.
-        var blind = ClaudeSessionSync.Compute(CurrentKey, null, current, none, [Other(ReferenceKey, null, reference, referenceLayout)],
+        var blind = Compute(current, none, [Other(ReferenceKey, null, reference, referenceLayout, At(0), copiedThere)], copies: copiedHere,
             pinsKnown: false, lineage: lineage, warnings: ["pins_unreadable"]);
         Check(blind.Pins!.Count == 0 && blind.Moves!.Count == 0 && blind.CreateGroups!.Count == 0
               && blind.Archive!.Single() is { Pinned: false, Ready: false } && blind.Sidebars!.All(sidebar => sidebar.Pinned is null),
             "unknown pins leave pins, groups and older states alone");
-        var ungrouped = ClaudeSessionSync.Compute(CurrentKey, null, [current[0], current[1] with { Pinned = true }], null,
-            [Other(ReferenceKey, null, reference, null)], lineage: lineage, warnings: ["groups_unreadable"]);
+        var ungrouped = Compute([current[0], current[1] with { Pinned = true }], null,
+            [Other(ReferenceKey, null, reference, null, At(0), copiedThere)], copies: copiedHere, lineage: lineage,
+            warnings: ["groups_unreadable"]);
         Check(ungrouped.Pins!.Count == 0 && ungrouped.Archive!.Single() is { Ready: false },
             "unknown groups hold the older state: its group could not be handed on");
         // A group that cannot be resolved on either state leaves the hand-over unproven.
-        var mineDangling = new ClaudeSessionSync.Layout([new("h", "H")],
-            new Dictionary<string, string> { ["local_old"] = "h", ["local_new"] = "gone" });
-        var dangling = ClaudeSessionSync.Compute(CurrentKey, null, [current[0] with { Pinned = false }, current[1]], mineDangling, [],
-            lineage: lineage);
-        Check(dangling.Moves!.Count == 0 && dangling.Archive!.Single() is { Ready: false },
+        var mineDangling = Groups(["h=H"], ("local_old", "h"), ("local_new", "gone"));
+        var dangling = Compute([current[0] with { Pinned = false }, current[1]], mineDangling, [], copies: copiedHere, lineage: lineage);
+        Check(dangling.Moves!.Count == 0 && dangling.Archive!.Single() is { Ready: false } && dangling.Warnings!.SequenceEqual(["groups_unresolved"]),
             "a newest state filed under a group the scope does not list is not taken as holding the older state's group");
-        var oldDangling = new ClaudeSessionSync.Layout([new("h", "H")], new Dictionary<string, string> { ["local_old"] = "gone" });
-        var unknownOld = ClaudeSessionSync.Compute(CurrentKey, null, [current[0] with { Pinned = false }, current[1]], oldDangling, [],
-            lineage: lineage);
+        var oldDangling = Groups(["h=H"], ("local_old", "gone"));
+        var unknownOld = Compute([current[0] with { Pinned = false }, current[1]], oldDangling, [], copies: copiedHere, lineage: lineage);
         Check(unknownOld.Archive!.Single() is { Ready: false }, "an older state in a group the scope does not list is kept");
 
-        // An older state's agreement there stands for its newest state: what the two agreed on before the conversation went
-        // on is not taken for a change made since.
-        var agreedBefore = new Dictionary<string, ClaudeSessionLayout.Agreed> { ["local_r_old"] = A(false, true, null, "대화") };
-        var seen = ClaudeSessionSync.Compute(CurrentKey, null, [R("local_c", "대화", true, "a2", ["a1"], 20)], none,
-            [Other(ReferenceKey, null, [reference[0] with { Pinned = false }, reference[1], R("local_r_x", "다른", true, "x9", [])], none,
-                agreed: agreedBefore)], lineage: lineage);
-        Check(seen.Pins!.Count == 0 && seen.Moves!.Count == 0, "an older state's agreement fills in for its newest state");
+        // Archived older states: what was changed on one still counts for the newest state of its conversation, found again
+        // from the transcripts; a branch archived counts for nothing else, though its transcript is listed as earlier.
+        var archivedOld = R("local_r_old", "옛 이름", false, "a1", [], 10);
+        var there = new[] { R("local_r_new", "대화", false, "a2", ["a1"], 20) };
+        ClaudeSessionLayout Renamed()
+        {
+            var kept = new ClaudeSessionLayout();
+            Steady(kept, ReferenceKey, "메인", there, none, At(30));
+            Changed(kept, ReferenceKey, "local_r_old", Change(At(20), title: "보관 전에 바꾼 이름"));
+            return kept;
+        }
+        var folded = Compute([R("local_c", "대화", false, "a2", ["a1"], 20)], none,
+            [Other(ReferenceKey, "메인", there, none, At(30), archived: [archivedOld])], Renamed(), lineage: lineage);
+        Check(folded.Renames!.Single() is { Session: "local_c", Title: "보관 전에 바꾼 이름", By: "메인" },
+            "an archived older state's change there counts for its newest state");
+        var branchSpans = new Dictionary<string, ClaudeSessionSync.TranscriptSpan>(spans) { ["a1"] = S(0, 5) };
+        var branchLineage = lineage with { Transcript = cli => branchSpans.TryGetValue(cli, out var span) ? span : null };
+        var branched = Compute([R("local_c", "대화", false, "a2", ["a1"], 20)], none,
+            [Other(ReferenceKey, "메인", there, none, At(30), archived: [archivedOld])], Renamed(), lineage: branchLineage);
+        Check(branched.Renames!.Count == 0, "an archived branch's change does not count for the conversation it branched from");
+        var ownKept = new ClaudeSessionLayout();
+        Steady(ownKept, CurrentKey, "서브", [current[1]], none, At(30), copiedHere);
+        Changed(ownKept, CurrentKey, "local_old", Change(At(20), pinned: true));
+        var ownFolded = Compute([current[1]], none, [], ownKept, copiedHere, lineage: lineage, archived: [current[0] with { Pinned = false }]);
+        Check(ownFolded.Pins!.Single() is { Session: "local_new", Pinned: true, By: null } && ownFolded.Archive!.Count == 0,
+            "this account's own archived older state hands its change on too, and is not listed for archiving again");
 
         // The sidebars read as the app shows them: pinned sessions under Pinned only, everything by title.
-        var view = ClaudeSessionSync.Compute(CurrentKey, "서브",
-            [R("local_1", "나중", true, "1", []), R("local_2", "가운데", false, "2", []), R("local_3", "처음", true, "3", [])],
-            new ClaudeSessionSync.Layout([new("g2", "둘"), new("g1", "하나")],
-                new Dictionary<string, string> { ["local_1"] = "g1", ["local_2"] = "g1" }), [Other(ReferenceKey, "메인", [], null)]);
+        var view = Compute([R("local_1", "나중", true, "1"), R("local_2", "가운데", false, "2"), R("local_3", "처음", true, "3")],
+            Groups(["g2=둘", "g1=하나"], ("local_1", "g1"), ("local_2", "g1")), [Other(ReferenceKey, "메인", [], null)], label: "서브");
         Check(view.Sidebars![0] is { Label: "서브", Pinned: { } pinnedTitles, Groups: { } groupViews }
               && pinnedTitles.SequenceEqual(["나중", "처음"]) && groupViews.Select(group => group.Name).SequenceEqual(["둘", "하나"])
               && groupViews[1].Sessions.SequenceEqual(["가운데"]) && view.Sidebars[1].Groups is null,
             "sidebars list pins and groups by title, a pinned session only under Pinned");
     }
 
-    private static void TestMerge()
+    /// <summary>What a record gives without a checkpoint to compare with: a record of the account's own everything it
+    /// shows; the widget's copy only what was chosen there.</summary>
+    private static void TestCopies()
     {
-        ClaudeSessionSync.Record R(string id, string title, bool pinned, string cli, bool renamed = false) =>
-            new(id, title, pinned, cli, [], 0, Renamed: renamed);
-        var groups = new ClaudeSessionSync.Layout([new("g", "G"), new("h", "H")], new Dictionary<string, string>());
-        ClaudeSessionSync.Layout In(string session, string group) =>
-            groups with { Assignments = new Dictionary<string, string> { [session] = group } };
-        var t0 = DateTimeOffset.Parse("2026-10-13T00:00:00Z");
-
-        // Without agreements, a copy the widget made there gives only what was chosen there.
-        var copies = new HashSet<string> { "local_copy" };
+        var groups = Groups(["g=G", "h=H"]);
+        SyncLayout In(string session, string group) => groups with { Assignments = new Dictionary<string, string> { [session] = group } };
         var mine = new[] { R("local_mine", "내 이름", true, "a") };
-        var untouched = ClaudeSessionSync.Compute(CurrentKey, null, mine, groups,
-            [Other(ReferenceKey, null, [R("local_copy", "옛 이름", false, "a"), R("local_other", "다른 것", true, "z")], groups, copies)]);
-        Check(untouched.Pins!.Count == 0 && untouched.Renames!.Count == 0 && untouched.Moves!.Count == 0,
-            "a copy the widget made there, untouched there, unpins and renames nothing");
-        var renamed = ClaudeSessionSync.Compute(CurrentKey, null, mine, groups,
-            [Other(ReferenceKey, null, [R("local_copy", "거기서 바꾼 이름", false, "a", renamed: true)], groups, copies)]);
-        Check(renamed.Renames!.Single() is { Title: "거기서 바꾼 이름" } && renamed.Pins!.Count == 0, "a copy renamed there gives its title, still no pin");
-        // Where the ledger tracks the title the widget wrote, any difference is a rename there, history or not.
-        var recasedThere = ClaudeSessionSync.Compute(CurrentKey, null, mine, groups,
-            [Other(ReferenceKey, null, [R("local_copy", "옛 이름 V2", false, "a")], groups, copies) with
-                { CopyTitles = new Dictionary<string, string?> { ["local_copy"] = "옛 이름 v2" } }]);
-        Check(recasedThere.Renames!.Single().Title == "옛 이름 V2", "a copy recased there gives its title");
-        var asWritten = ClaudeSessionSync.Compute(CurrentKey, null, mine, groups,
-            [Other(ReferenceKey, null, [R("local_copy", "옛 이름", false, "a", renamed: true)], groups, copies) with
-                { CopyTitles = new Dictionary<string, string?> { ["local_copy"] = "옛 이름" } }]);
+        // Nothing kept: the other account's records give what they give as of a later time than this one's.
+        SyncPlan Against(IReadOnlyList<Record> theirs, SyncLayout layout, IReadOnlyDictionary<string, string?>? copies, SyncLayout? here = null) =>
+            Compute(mine, here ?? groups, [Other(ReferenceKey, null, theirs, layout, At(0), copies)]);
+        var untracked = Copies(("local_copy", null));
+        var untouched = Against([R("local_copy", "옛 이름", false, "a"), R("local_other", "다른 것", true, "z")], groups, untracked);
+        Check(untouched is { Pins.Count: 0, Renames.Count: 0, Moves.Count: 0, GroupOrder: null },
+            "a copy the widget made there, untouched there, gives nothing");
+        var renamed = Against([R("local_copy", "거기서 바꾼 이름", false, "a", renamed: true), R("local_other", "다른 것", true, "z")], groups,
+            untracked);
+        Check(renamed.Renames!.Single() is { Title: "거기서 바꾼 이름" } && renamed.Pins!.Count == 0,
+            "a copy renamed there gives its title (where the ledger does not track it, by the app's rename history), still no pin");
+        var recased = Against([R("local_copy", "옛 이름 V2", false, "a"), R("local_other", "다른 것", true, "z")], groups,
+            Copies(("local_copy", "옛 이름 v2")));
+        Check(recased.Renames!.Single().Title == "옛 이름 V2", "where the ledger tracks the title the widget wrote, any difference is a rename there");
+        var asWritten = Against([R("local_copy", "옛 이름", false, "a", renamed: true), R("local_other", "다른 것", true, "z")], groups,
+            Copies(("local_copy", "옛 이름")));
         Check(asWritten.Renames!.Count == 0, "a copy still showing the title the widget wrote gives none, whatever its history");
-        var filedCopy = ClaudeSessionSync.Compute(CurrentKey, null, mine, groups,
-            [Other(ReferenceKey, null, [R("local_copy", "내 이름", false, "a"), R("local_other", "다른 것", true, "z")], In("local_copy", "g"), copies)]);
-        Check(filedCopy.Moves!.Single() is { Group: "G" } && filedCopy.Pins!.Count == 0,
+        var filed = Against([R("local_copy", "내 이름", false, "a"), R("local_other", "다른 것", true, "z")], In("local_copy", "g"), untracked);
+        Check(filed.Moves!.Single() is { Group: "G", GroupId: "g" } && filed.Pins!.Count == 0,
             "a copy filed there gives its group, and the pin it has since: filing it there unpinned it");
-        var filedPinned = ClaudeSessionSync.Compute(CurrentKey, null, mine, groups,
-            [Other(ReferenceKey, null, [R("local_copy", "내 이름", true, "a")], In("local_copy", "g"), copies)]);
+        var filedPinned = Against([R("local_copy", "내 이름", true, "a")], In("local_copy", "g"), untracked);
         Check(filedPinned.Moves!.Single() is { Group: "G" } && filedPinned.Pins!.Single() is { Session: "local_mine", Pinned: true },
             "a copy filed there and pinned again is moved, then pinned again here");
-        var pinnedCopy = ClaudeSessionSync.Compute(CurrentKey, null, mine, In("local_mine", "h"),
-            [Other(ReferenceKey, null, [R("local_copy", "내 이름", true, "a")], groups, copies)]);
+        var pinnedCopy = Against([R("local_copy", "내 이름", true, "a")], groups, untracked, In("local_mine", "h"));
         Check(pinnedCopy.Moves!.Count == 0 && pinnedCopy.Pins!.Count == 0, "a pinned copy without a group keeps this account's group");
-        var original = ClaudeSessionSync.Compute(CurrentKey, null, mine, groups,
-            [Other(ReferenceKey, null, [R("local_copy", "옛 이름", false, "a"), R("local_other", "다른 것", true, "z")], groups)]);
+        var original = Against([R("local_copy", "옛 이름", false, "a"), R("local_other", "다른 것", true, "z")], groups, null);
         Check(original.Pins!.Single() is { Pinned: false } && original.Renames!.Single().Title == "옛 이름",
             "a record the app wrote there offers its pin and title as they are");
 
-        // With agreements: what the other account did not change since the two agreed is not offered, so what changed
-        // here stays (an account the app only passed through overwrites nothing).
-        var agreed = new Dictionary<string, ClaudeSessionLayout.Agreed> { ["local_r"] = A(false, true, null, "옛 제목") };
-        var passedThrough = ClaudeSessionSync.Compute(CurrentKey, null, [R("local_c", "새 제목", true, "a")], In("local_c", "h"),
-            [Other(ReferenceKey, null, [R("local_r", "옛 제목", false, "a"), R("local_x", "다른 것", true, "x")], groups, agreed: agreed,
-                leftAt: t0)]);
-        Check(passedThrough.Pins!.Count == 0 && passedThrough.Renames!.Count == 0 && passedThrough.Moves!.Count == 0,
-            "an account that changed nothing since the two agreed leaves this account's changes alone");
-        // What it did change is taken, field by field, even over a change made here.
-        var changedThere = ClaudeSessionSync.Compute(CurrentKey, null, [R("local_c", "여기 제목", false, "a")], In("local_c", "h"),
-            [Other(ReferenceKey, "메인", [R("local_r", "그쪽 제목", true, "a")], In("local_r", "g"), agreed: agreed)]);
-        Check(changedThere.Renames!.Single() is { Title: "그쪽 제목", By: "메인" } && changedThere.Moves!.Single() is { Group: "G" }
-              && changedThere.Pins!.Single() is { Pinned: true, By: "메인" }, "a change made there is taken");
-        var partly = ClaudeSessionSync.Compute(CurrentKey, null, [R("local_c", "여기 제목", false, "a")], In("local_c", "h"),
-            [Other(ReferenceKey, null, [R("local_r", "옛 제목", true, "a")], groups, agreed: agreed)]);
-        Check(partly.Pins!.Single() is { Pinned: true } && partly.Renames!.Count == 0 && partly.Moves!.Count == 0,
-            "only the fields changed there are taken");
+        // This account's records give the same way: the widget's untouched copy here holds no choice of its own, so even an
+        // older change elsewhere fills it, while a record of this account's own keeps the value it gave later.
+        var kept = new ClaudeSessionLayout();
+        kept.Accounts[CurrentKey] = new("서브", At(50));
+        var theirs = new[] { R("local_m", "제목", true, "n") };
+        var copyHere = Compute([R("local_n", "제목", false, "n")], groups, [Other(ReferenceKey, "메인", theirs, groups, At(10))], kept,
+            copies: Copies(("local_n", "제목")));
+        Check(copyHere.Pins!.Single() is { Session: "local_n", Pinned: true, By: "메인" },
+            "the widget's untouched copy here takes what another account gives, however long ago");
+        var ownHere = Compute([R("local_n", "제목", false, "n")], groups, [Other(ReferenceKey, "메인", theirs, groups, At(10))], kept);
+        Check(ownHere.Pins!.Count == 0, "this account's own record keeps the value it gave later");
+        var filedHere = Compute([R("local_n", "제목", false, "n")], In("local_n", "h"), [Other(ReferenceKey, "메인", theirs, groups, At(10))],
+            kept, copies: Copies(("local_n", "제목")));
+        Check(filedHere is { Moves.Count: 0, Pins.Count: 0 }, "a copy filed here gives its group and, filing having unpinned it, its pin");
+    }
 
-        // Three accounts. Changes that disagree go to the account the app left last.
-        var start = new Dictionary<string, ClaudeSessionLayout.Agreed> { ["local_m"] = A(title: "처음"), ["local_t"] = A(title: "처음") };
-        var main = Other(ReferenceKey, "메인", [R("local_m", "메인에서", false, "a")], groups, agreed: start, leftAt: t0.AddHours(1));
-        var third = Other(ThirdKey, "셋째", [R("local_t", "셋째에서", false, "a")], groups, agreed: start, leftAt: t0.AddHours(2));
-        var recent = ClaudeSessionSync.Compute(CurrentKey, null, [R("local_c", "처음", false, "a")], groups, [main, third]);
-        Check(recent.Renames!.Single() is { Title: "셋째에서", By: "셋째" } && recent.Others!.Count == 2,
-            "changes that disagree go to the account the app left last");
-        var oneChanged = ClaudeSessionSync.Compute(CurrentKey, null, [R("local_c", "처음", false, "a")], groups,
-            [main, third with { Records = [R("local_t", "처음", false, "a")] }]);
-        Check(oneChanged.Renames!.Single() is { Title: "메인에서", By: "메인" }, "a change in any other account is taken, wherever it was made");
-        // An account this one never agreed with offers what it shows, but a value it merely still holds as agreed with a
-        // third yields to one changed since, though that account was left later.
-        var fresh = ClaudeSessionSync.Compute(CurrentKey, null, [R("local_n", "제목", false, "a")], groups,
+    /// <summary>Value by value the newest change wins: what each account changed is recorded with its time, and a value
+    /// nobody changed stays.</summary>
+    private static void TestNewestChange()
+    {
+        var groups = Groups(["g=G"]);
+        var here = new[] { R("local_c", "처음", false, "a"), R("local_c2", "다른 것", true, "b") };
+        var main = new[] { R("local_m", "메인에서", true, "a") };
+        var mainGroups = Groups(["gm=G"]);
+        var third = new[] { R("local_t", "셋째에서", false, "a") };
+        var thirdGroups = Groups(["gt=G"], ("local_t", "gt"));
+        // Every account was checkpointed showing what it shows now, in a stay before; what it changed before that is
+        // recorded with when it changed it.
+        ClaudeSessionLayout Keeping(params (string Account, string Session, Changes Change)[] changes)
+        {
+            var kept = new ClaudeSessionLayout();
+            Steady(kept, CurrentKey, "서브", here, groups, At(0));
+            Steady(kept, ReferenceKey, "메인", main, mainGroups, At(40), Copies(("local_m", "처음")));
+            Steady(kept, ThirdKey, "셋째", third, thirdGroups, At(35), Copies(("local_t", "처음")));
+            foreach (var (account, session, change) in changes) Changed(kept, account, session, change);
+            return kept;
+        }
+        OtherAccount[] Others(DateTimeOffset? mainLeft = null, DateTimeOffset? thirdLeft = null) =>
         [
-            Other(ReferenceKey, "메인", [R("local_m", "제목", false, "a")], groups, leftAt: t0.AddHours(2),
-                elsewhere: [new Dictionary<string, ClaudeSessionLayout.Agreed> { ["local_m"] = A(false) }]),
-            Other(ThirdKey, "셋째", [R("local_t", "제목", true, "a")], groups, leftAt: t0.AddHours(1),
-                elsewhere: [new Dictionary<string, ClaudeSessionLayout.Agreed> { ["local_t"] = A(false) }])
-        ]);
-        Check(fresh.Pins!.Single() is { Pinned: true, By: "셋째" }, "a value still as agreed elsewhere yields to a fresh change");
-        // A stale offer alone fills only a copy the widget made here; this account's own record keeps its value.
-        var staleOnly = Other(ReferenceKey, "메인", [R("local_m", "제목", true, "a")], groups,
-            elsewhere: [new Dictionary<string, ClaudeSessionLayout.Agreed> { ["local_m"] = A(true) }]);
-        var ownRecord = ClaudeSessionSync.Compute(CurrentKey, null, [R("local_n", "제목", false, "a")], groups, [staleOnly]);
-        Check(ownRecord.Pins!.Count == 0, "a value nobody changed since agreeing elsewhere does not undo this account's own");
-        var copyHere = ClaudeSessionSync.Compute(CurrentKey, null, [R("local_n", "제목", false, "a")], groups, [staleOnly],
-            currentCopies: new HashSet<string> { "local_n" });
-        Check(copyHere.Pins!.Single() is { Pinned: true }, "the widget's copy here takes it, holding no choice of its own");
-        // A copy here the user changed keeps the change. A and C, and B and C, agreed on "옛 이름"; A and B never agreed.
-        var thirdAgreed = new Dictionary<string, ClaudeSessionLayout.Agreed> { ["local_t"] = A(true, true, null, "옛 이름") };
-        var staleB = Other(ReferenceKey, "B", [R("local_b", "옛 이름", true, "a")], groups, leftAt: t0.AddHours(2),
-            elsewhere: [new Dictionary<string, ClaudeSessionLayout.Agreed> { ["local_b"] = A(true, true, null, "옛 이름") }]);
-        var steadyC = Other(ThirdKey, "C", [R("local_t", "옛 이름", true, "a")], groups, agreed: thirdAgreed, leftAt: t0.AddHours(1),
-            mine: new Dictionary<string, ClaudeSessionLayout.Agreed> { ["local_n"] = A(true, true, null, "옛 이름") });
-        var copies2 = new HashSet<string> { "local_n" };
-        // The ledger holds the title the widget wrote to the copy: only a copy showing exactly that has an untouched title.
-        var written = new Dictionary<string, string?> { ["local_n"] = "처음 이름" };
-        var renamedHere = ClaudeSessionSync.Compute(CurrentKey, null, [R("local_n", "새 이름", true, "a", renamed: true)], groups,
-            [staleB, steadyC with { Mine = null }], currentCopies: copies2, currentCopyTitles: written);
-        Check(renamedHere.Renames!.Count == 0, "a copy renamed here keeps its name against a stale one");
-        var recased = ClaudeSessionSync.Compute(CurrentKey, null, [R("local_n", "PROJECT", true, "a")], groups,
-            [staleB, steadyC with { Mine = null }], currentCopies: copies2,
-            currentCopyTitles: new Dictionary<string, string?> { ["local_n"] = "Project" });
-        Check(recased.Renames!.Count == 0, "a copy renamed here without a recorded history (case only) keeps its name too");
-        var untracked = ClaudeSessionSync.Compute(CurrentKey, null, [R("local_n", "처음 이름", true, "a")], groups,
-            [staleB, steadyC with { Mine = null }], currentCopies: copies2);
-        Check(untracked.Renames!.Count == 0, "a copy whose written title the ledger does not track keeps its name");
-        var untouchedHere = ClaudeSessionSync.Compute(CurrentKey, null, [R("local_n", "처음 이름", true, "a")], groups,
-            [staleB, steadyC with { Mine = null }], currentCopies: copies2, currentCopyTitles: written);
-        Check(untouchedHere.Renames!.Single().Title == "옛 이름", "an untouched copy that never agreed on its name takes the stale one");
-        var agreedHere = ClaudeSessionSync.Compute(CurrentKey, null, [R("local_n", "처음 이름", true, "a")], groups,
-            [staleB, steadyC], currentCopies: copies2, currentCopyTitles: written);
-        Check(agreedHere.Renames!.Count == 0, "a name this account agreed on before is not undone by a stale one");
-        var unpinnedOffer = Other(ReferenceKey, "B", [R("local_b", "제목", false, "a"), R("local_x", "다른 것", true, "x")], groups,
-            elsewhere: [new Dictionary<string, ClaudeSessionLayout.Agreed> { ["local_b"] = A(false, true, null) }]);
-        var pinnedHere = ClaudeSessionSync.Compute(CurrentKey, null, [R("local_n", "제목", true, "a")], groups, [unpinnedOffer],
-            currentCopies: copies2);
-        Check(pinnedHere.Pins!.Count == 0, "a copy pinned here stays pinned against a stale unpin");
-        var filedHere = ClaudeSessionSync.Compute(CurrentKey, null, [R("local_n", "제목", false, "a")], In("local_n", "h"), [unpinnedOffer],
-            currentCopies: copies2);
-        Check(filedHere.Moves!.Count == 0, "a copy filed here stays in its group against a stale one");
+            Other(ReferenceKey, "메인", main, mainGroups, mainLeft ?? At(40), Copies(("local_m", "처음"))),
+            Other(ThirdKey, "셋째", third, thirdGroups, thirdLeft ?? At(35), Copies(("local_t", "처음")))
+        ];
+        var mainChanges = Change(At(30), pinned: true).Over(Change(At(10), title: "메인에서"));
+        var thirdChanges = Change(At(25), group: "G").Over(Change(At(20), title: "셋째에서"));
+        var changed = Keeping((ReferenceKey, "local_m", mainChanges), (ThirdKey, "local_t", thirdChanges));
+        var plan = Compute(here, groups, Others(), changed);
+        Check(plan.Renames!.Single() is { Session: "local_c", Title: "셋째에서", By: "셋째" }
+              && plan.Moves!.Single() is { Group: "G", GroupId: "g" } move && move.Sessions.SequenceEqual(["local_c"])
+              && plan.Pins!.Single() is { Session: "local_c", Pinned: true, By: "메인", Title: "셋째에서" } && plan.GroupOrder is null,
+            "value by value the newest change wins, wherever it was made: the title and group from one account, the pin from another");
+        Check(plan.OnlyHere!.SequenceEqual(["다른 것"]) && plan.Others!.All(other => other.Matched == 1) && plan.Warnings is null,
+            "a conversation only this account lists keeps what it shows");
+        Check(plan.Pending is { Stay: 1 } pending && pending.Sessions["local_c"] is { Filed: true } target
+              && target.Pinned == new ClaudeSessionLayout.Stamp<bool>(true, At(30), ReferenceKey)
+              && target.Group == new ClaudeSessionLayout.Stamp<string?>("G", At(25), ThirdKey)
+              && target.Title == new ClaudeSessionLayout.Stamp<string>("셋째에서", At(20), ThirdKey),
+            "the plan keeps each value it sets out to give with the change it comes from");
+        Check(Compute(here, groups, Others(), Keeping()) is { Renames.Count: 0, Moves.Count: 0, Pins.Count: 0 },
+            "a value shown otherwise elsewhere that nobody changed since the checkpoints stays as it is here");
+        // A change a plan brought into an account counts as the account it came from.
+        var relayed = Keeping((ThirdKey, "local_t", Change(At(25), pinned: false, by: ReferenceKey)));
+        Check(Compute([here[0] with { Pinned = true }, here[1]], groups, Others(), relayed).Pins!.Single() is { Pinned: false, By: "메인" },
+            "a change one account took from another in a plan is offered as that other account's");
+
+        // Changes made at the same time go to this account, then to the account the app left last.
+        var alike = Keeping((ReferenceKey, "local_m", Change(At(10), title: "메인에서")), (ThirdKey, "local_t", Change(At(10), title: "셋째에서")));
+        Check(Compute(here, groups, Others(), alike).Renames!.Single() is { Title: "메인에서", By: "메인" }
+              && Compute(here, groups, Others(thirdLeft: At(45)), alike).Renames!.Single() is { Title: "셋째에서", By: "셋째" },
+            "changes made at the same time go to the account the app left last");
+        var ownAlike = Keeping((ReferenceKey, "local_m", Change(At(10), title: "메인에서")), (CurrentKey, "local_c", Change(At(10), title: "처음")));
+        Check(Compute(here, groups, Others(), ownAlike).Renames!.Count == 0, "this account's own change made at the same time stays");
+
+        // Without the widget's copies known, a copy could pass for a choice: nothing is planned.
+        var noLedger = Compute(here, groups, Others(), changed, ledgerKnown: false);
+        var noLedgerThere = Compute(here, groups, [Others()[0], Others()[1] with { CopyTitles = null }], changed);
+        Check(noLedger is { Renames.Count: 0, Pins.Count: 0, Moves.Count: 0, CreateGroups.Count: 0 }
+              && noLedgerThere is { Renames.Count: 0, Pins.Count: 0, Moves.Count: 0, CreateGroups.Count: 0 },
+            "a ledger that cannot be read, here or there, plans no pin, title or group");
+
+        // The group list follows its newest change too.
+        var lists = Keeping();
+        lists.GroupsChanged[ReferenceKey] = ListChange(["G", "K"], At(10));
+        lists.GroupsChanged[ThirdKey] = ListChange(["K", "G"], At(20));
+        var listed = Compute(here, groups, Others(), lists);
+        Check(listed.GroupOrder!.SequenceEqual(["K", "G"]) && listed.GroupOrderBy == "셋째" && listed.CreateGroups!.SequenceEqual(["K", "G"]),
+            "the group list follows the newest change of it");
+        lists.GroupsChanged[CurrentKey] = ListChange(["G"], At(20));
+        Check(Compute(here, groups, Others(), lists) is { GroupOrder: null, CreateGroups.Count: 0, RenameGroups.Count: 0 },
+            "this account's own group list changed at the same time stays");
+    }
+
+    /// <summary>Putting the groups in the newest list's order with what the app's tools can do: new groups go at the end
+    /// and no tool reorders, so the longest start already in order stays and the rest is made anew; the list is final.</summary>
+    private static void TestGroupOrder()
+    {
+        // 계정3's sidebar, whose group list is the newest, and 계정2 here with the same groups in another order.
+        string[] tiers = ["티어 2", "티어 3 (보관)", "스킬 생태계", "태림 오리지널 콘텐츠", "도구"];
+        var origin = DateTimeOffset.Parse("2026-10-01T00:00:00Z");
+        var spans = new Dictionary<string, ClaudeSessionSync.TranscriptSpan>
+        {
+            ["c3-old"] = new(origin, origin.AddHours(1), origin.AddHours(1)),
+            ["c3"] = new(origin.AddHours(2), origin.AddHours(24), origin.AddHours(24))
+        };
+        var lineage = new ClaudeSessionSync.Lineage(null, cli => spans.GetValueOrDefault(cli),
+            (_, next) => spans.TryGetValue(next, out var span) ? span.Created : null);
+        var here = new[]
+        {
+            R("local_s1", "하나", false, "c1"), R("local_s2", "둘", true, "c2"), R("local_s3", "셋", false, "c3", ["c3-old"], 20),
+            R("local_s3_old", "셋", false, "c3-old", [], 10), R("local_s4", "넷", false, "c4"), R("local_s5", "다섯", false, "c5")
+        };
+        var hereLayout = Groups(["g-t2=티어 2", "g-tool=도구", "g-skill=스킬 생태계", "g-t3=티어 3 (보관)", "g-orig=태림 오리지널 콘텐츠"],
+            ("local_s1", "g-t2"), ("local_s2", "g-tool"), ("local_s3", "g-skill"), ("local_s3_old", "g-skill"), ("local_s4", "g-t3"),
+            ("local_s5", "g-t2"));
+        var third = new[]
+        {
+            R("local_t1", "하나", false, "c1"), R("local_t2", "둘", true, "c2"), R("local_t3", "셋", false, "c3"), R("local_t4", "넷", false, "c4"),
+            R("local_t5", "다섯", false, "c5")
+        };
+        var thirdLayout = Groups(["h-t2=티어 2", "h-t3=티어 3 (보관)", "h-skill=스킬 생태계", "h-orig=태림 오리지널 콘텐츠", "h-tool=도구"],
+            ("local_t1", "h-t2"), ("local_t2", "h-tool"), ("local_t3", "h-skill"), ("local_t4", "h-t3"), ("local_t5", "h-t3"));
+        var kept = new ClaudeSessionLayout();
+        Steady(kept, CurrentKey, "계정2", here, hereLayout, At(0));
+        Steady(kept, ThirdKey, "계정3", third, thirdLayout, At(50));
+        kept.GroupsChanged[ThirdKey] = ListChange(tiers, At(40));
+        Changed(kept, ThirdKey, "local_t5", Change(At(40), group: "티어 3 (보관)"));
+        OtherAccount[] others = [Other(ThirdKey, "계정3", third, thirdLayout, At(50))];
+        var plan = Compute(here, hereLayout, others, kept, lineage: lineage, label: "계정2");
+        Check(plan.GroupOrder!.SequenceEqual(tiers) && plan.GroupOrderBy == "계정3"
+              && plan.CreateGroups!.SequenceEqual(["스킬 생태계", "태림 오리지널 콘텐츠", "도구"]),
+            "the start of the newest list already in order here stays (티어 2, 티어 3 (보관)); the rest is made anew at the end, in order");
+        Check(plan.RenameGroups!.Select(rename => (rename.Id, rename.From, rename.To)).SequenceEqual(
+                  [("g-tool", "도구", "도구 (옮기는 중)"), ("g-skill", "스킬 생태계", "스킬 생태계 (옮기는 중)"),
+                   ("g-orig", "태림 오리지널 콘텐츠", "태림 오리지널 콘텐츠 (옮기는 중)")])
+              && plan.DeleteGroups!.Select(group => (group.Id, group.Name, group.Remade)).SequenceEqual(
+                  [("g-tool", "도구 (옮기는 중)", true), ("g-skill", "스킬 생태계 (옮기는 중)", true), ("g-orig", "태림 오리지널 콘텐츠 (옮기는 중)", true)]),
+            "a group out of place steps aside under the moving mark before its name is made anew, and goes once the moves empty it");
+        Check(plan.Moves!.Select(move => (move.Group, move.GroupId, string.Join(",", move.Sessions))).SequenceEqual(
+                  [("티어 3 (보관)", "g-t3", "local_s5"), ("스킬 생태계", null, "local_s3,local_s3_old"), ("도구", null, "local_s2")]),
+            "a session goes to a group that stays by its id and to one made anew by name; an older state follows its group");
+        Check(plan.Pins!.Single() is { Session: "local_s2", Pinned: true, By: null }, "a pinned session moved into a group is pinned again after the move");
+        Check(plan.Pending is { Groups: { At: var listAt, By: var listBy } } && listAt == At(40) && listBy == ThirdKey
+              && plan.Pending.Renamed.Keys.Order(StringComparer.Ordinal).SequenceEqual(["g-orig", "g-skill", "g-tool"])
+              && plan.Pending.Sessions["local_s2"].Group is { At: var remadeAt } && remadeAt == DateTimeOffset.MinValue,
+            "the plan keeps the list it follows with its change, the groups it renames out of the way, and moves into a group made anew "
+            + "as nobody's choice");
+
+        var steady = new ClaudeSessionLayout();
+        Steady(steady, CurrentKey, "계정2", here, hereLayout, At(0));
+        Steady(steady, ThirdKey, "계정3", third, thirdLayout, At(50));
+        Check(Compute(here, hereLayout, others, steady, lineage: lineage) is
+                  { RenameGroups.Count: 0, CreateGroups.Count: 0, DeleteGroups.Count: 0, Moves.Count: 0, GroupOrder: null },
+            "with no change of the group list anywhere, the groups here stand in their order");
+
+        // Two groups of one name (an older app made them) become one: the second's sessions join the first, and it goes.
+        var twins = Groups(["g-a=A", "g-b1=B", "g-b2=B"], ("local_x", "g-b1"), ("local_y", "g-b2"));
+        var pair = new[] { R("local_x", "엑스", false, "x"), R("local_y", "와이", false, "y") };
+        var merged = Compute(pair, twins, []);
+        Check(merged.Moves!.Single() is { Group: "B", GroupId: "g-b1" } join && join.Sessions.SequenceEqual(["local_y"])
+              && merged.RenameGroups!.Single() is { Id: "g-b2", From: "B", To: "B (옮기는 중)" }
+              && merged.DeleteGroups!.Single() is { Id: "g-b2", Name: "B (옮기는 중)" } && merged.CreateGroups!.Count == 0
+              && merged.GroupOrder!.SequenceEqual(["A", "B"]),
+            "two groups of one name become one");
+
+        // A plan stopped part way: "C" stepped aside and was made anew at the end, its sessions not moved yet. The list
+        // here, mid-move, is nobody's choice; planning again carries the sorting on.
+        var halfway = Groups(["g-a=A", "g-c-old=C (옮기는 중)", "g-b=B", "g-c=C"], ("local_x", "g-c-old"), ("local_y", "g-b"));
+        var halfKept = new ClaudeSessionLayout();
+        Steady(halfKept, CurrentKey, "계정2", pair, Groups(["g-a=A", "g-c-old=C", "g-b=B"], ("local_x", "g-c-old"), ("local_y", "g-b")), At(0));
+        halfKept.GroupsChanged[ThirdKey] = ListChange(["A", "B", "C"], At(30));
+        var resumed = Compute(pair, halfway, [Other(ThirdKey, "계정3", [], null, At(50))], halfKept);
+        Check(resumed.Moves!.Single() is { Group: "C", GroupId: "g-c" } carry && carry.Sessions.SequenceEqual(["local_x"])
+              && resumed.RenameGroups!.Count == 0 && resumed.CreateGroups!.Count == 0
+              && resumed.DeleteGroups!.Single() is { Id: "g-c-old", Name: "C (옮기는 중)", Remade: true } && resumed.GroupOrder!.SequenceEqual(["A", "B", "C"]),
+            "a plan again after one stopped part way empties the group under the moving mark into the new one, which then goes");
+        // A rename the plan in progress set out to do but that was not done yet is planned again.
+        var notRenamed = Groups(["g-a=A", "g-c=C", "g-b=B"], ("local_x", "g-c"), ("local_y", "g-b"));
+        var unapplied = new ClaudeSessionLayout();
+        Steady(unapplied, CurrentKey, "계정2", pair, notRenamed, At(0));
+        unapplied.Pendings[CurrentKey] = new(1, new Dictionary<string, Target>(), null, Aside(("g-c", "C")));
+        unapplied.GroupsChanged[ThirdKey] = ListChange(["A", "B", "C"], At(30));
+        Check(Compute(pair, notRenamed, [Other(ThirdKey, "계정3", [], null, At(50))], unapplied) is
+                  { RenameGroups: [{ Id: "g-c", To: "C (옮기는 중)" }], CreateGroups: ["C"] } again
+              && again.Moves!.Single() is { Group: "C", GroupId: null },
+            "a group the plan in progress was to rename out of the way, still under its name, is not taken as aside");
+
+        // The list is final: a group it lacks goes, and its sessions follow the group's renaming, or else leave for no group.
+        var chainHere = new[] { R("local_x", "엑스", false, "x") };
+        var chainLayout = Groups(["g=G"], ("local_x", "g"), ("local_z", "g"));
+        var chainKept = new ClaudeSessionLayout();
+        Steady(chainKept, CurrentKey, "계정2", chainHere, chainLayout, At(0));
+        chainKept.GroupsChanged[ReferenceKey] = ListChange(["H"], At(10), null, ("G", "H"));
+        chainKept.GroupsChanged[ThirdKey] = ListChange(["I"], At(20), null, ("H", "I"));
+        var shelved = new[] { R("local_z", "보관된 것", false, "z") };
+        var chain = Compute(chainHere, chainLayout, [Other(ReferenceKey, "계정1", [], null, At(10)), Other(ThirdKey, "계정3", [], null, At(20))],
+            chainKept, archived: shelved);
+        Check(chain.GroupOrder!.SequenceEqual(["I"]) && chain.GroupOrderBy == "계정3" && chain.CreateGroups!.SequenceEqual(["I"])
+              && chain.Moves!.Single() is { Group: "I" } toI && toI.Sessions.Order(StringComparer.Ordinal).SequenceEqual(["local_x", "local_z"])
+              && chain.DeleteGroups!.Single() is { Id: "g", Remade: true, Hidden: 0 },
+            "a group renamed G → H in one account and H → I in another passes what was filed under G to I, archived sessions included");
+        var dropped = new ClaudeSessionLayout();
+        Steady(dropped, CurrentKey, "계정2", chainHere, chainLayout, At(0));
+        dropped.GroupsChanged[ThirdKey] = ListChange(["I"], At(20));
+        var gone = Compute(chainHere, chainLayout, [Other(ThirdKey, "계정3", [], null, At(20))], dropped, archived: shelved);
+        Check(gone.Moves!.Single() is { Group: null } outOf && outOf.Sessions.SequenceEqual(["local_x"])
+              && gone.DeleteGroups!.Single() is { Id: "g", Name: "G (옮기는 중)", Remade: false, Hidden: 1 },
+            "a group the newest list lacks goes: its sessions leave for no group, and the archived ones filed there are counted");
+        // Remaking a group for its order moves its archived sessions too.
+        var reorder = Groups(["g=G", "h=H"], ("local_x", "g"), ("local_z", "g"));
+        var reordered = new ClaudeSessionLayout();
+        Steady(reordered, CurrentKey, "계정2", chainHere, reorder, At(0));
+        reordered.GroupsChanged[ThirdKey] = ListChange(["H", "G"], At(20));
+        var remade = Compute(chainHere, reorder, [Other(ThirdKey, "계정3", [], null, At(20))], reordered, archived: shelved);
+        Check(remade.CreateGroups!.SequenceEqual(["G"]) && remade.Moves!.Single() is { Group: "G", GroupId: null } toG
+              && toG.Sessions.Order(StringComparer.Ordinal).SequenceEqual(["local_x", "local_z"])
+              && remade.DeleteGroups!.Single() is { Id: "g", Remade: true, Hidden: 0 },
+            "a group made anew for its order takes every session filed under it, archived ones included");
+        // A group this stay filed a session under stays on the list, though the newest list lacks it.
+        var filedLayout = Groups(["g=G", "z=Z"], ("local_x", "z"));
+        var filedNow = new ClaudeSessionLayout();
+        filedNow.Accounts[CurrentKey] = new("계정2", At(0), At(30), 2);
+        filedNow.Checkpoints[CurrentKey] = PointOf([R("local_x", "엑스", false, "x")], Groups(["g=G", "z=Z"]), At(31), 2);
+        filedNow.GroupsChanged[ThirdKey] = ListChange(["G"], At(20));
+        var keptZ = Compute(chainHere, filedLayout, [Other(ThirdKey, "계정3", [], null, At(20))], filedNow);
+        Check(keptZ is { Moves.Count: 0, DeleteGroups.Count: 0 } && keptZ.GroupOrder is null,
+            "a group the user filed a session under in this stay stays on the list");
+        filedNow.Checkpoints[CurrentKey] = PointOf([R("local_x", "엑스", false, "x")], filedLayout, At(31), 2);
+        Changed(filedNow, CurrentKey, "local_x", Change(At(32), group: "Z"));
+        Check(Compute(chainHere, filedLayout, [Other(ThirdKey, "계정3", [], null, At(20))], filedNow) is { Moves.Count: 0, DeleteGroups.Count: 0 },
+            "and still after a checkpoint recorded that filing in this stay");
+        filedNow.Accounts[CurrentKey] = new("계정2", At(0), At(40), 3);
+        var later = Compute(chainHere, filedLayout, [Other(ThirdKey, "계정3", [], null, At(35))], filedNow);
+        Check(later.Moves!.Single() is { Group: null } && later.DeleteGroups!.Single() is { Id: "z", Remade: false },
+            "but a filing of an earlier stay yields to a newer list that lacks its group");
+    }
+
+    /// <summary>The groups' order and folding come from the sidebar's sections (<c>codeSidebarByScope</c>); the stored group
+    /// list is in no particular order.</summary>
+    private static void TestSidebarSections()
+    {
+        static JsonObject Parse(string json) => (JsonObject)JsonNode.Parse(json)!;
+        var key = CurrentKey;
+        const string Three = "[{\"id\":\"g1\",\"name\":\"하나\"},{\"id\":\"g2\",\"name\":\"둘\"},{\"id\":\"g3\",\"name\":\"셋\"}]";
+        const string Filed = "{\"code:local_a\":\"g1\",\"code:local_b\":\"g3\",\"cowork:local_x\":\"g2\"}";
+        const string Scope = "{\"groups\":" + Three + ",\"assignments\":" + Filed + ",\"order\":{}}";
+        const string Sections = "{\"sections\":[{\"id\":\"pinned\",\"kind\":\"pinned\",\"order\":0},"
+            + "{\"id\":\"g3\",\"kind\":\"manual\",\"name\":\"셋\",\"order\":1,\"collapsed\":true,\"shown\":true},"
+            + "{\"id\":\"g1\",\"kind\":\"manual\",\"name\":\"하나\",\"order\":2.5,\"collapsed\":false},"
+            + "{\"id\":\"sessions\",\"kind\":\"sessions\",\"order\":3}]}";
+        JsonObject State(string scope = Scope, string? sidebar = Sections, string? sidebars = null) =>
+            Parse("{\"customGroupsByScope\":{\"" + key + "\":" + scope + "}"
+                  + (sidebars ?? (sidebar is null ? "" : ",\"codeSidebarByScope\":{\"" + key + "\":" + sidebar + "}")) + "}");
+        var layout = ClaudeSessionSync.LayoutOf(State(), key, missingIsEmpty: false);
+        Check(layout is { Groups: [{ Name: "셋", Collapsed: true }, { Name: "하나", Collapsed: false }, { Name: "둘", Collapsed: false }] }
+              && layout.Assignments.Count == 2 && layout.Assignments["local_a"] == "g1" && layout.Assignments["local_b"] == "g3",
+            "the sections give the groups' order and folding; a group they do not place follows the rest; only Code sessions count");
+        Check(ClaudeSessionSync.LayoutOf(State(), key.ToUpperInvariant(), missingIsEmpty: false)?.Groups.Select(group => group.Name)
+                  .SequenceEqual(["셋", "하나", "둘"]) == true, "a scope is found whatever the case of its key");
+        Check(ClaudeSessionSync.LayoutOf(State(sidebar: null), key, false)?.Groups.Select(group => (group.Name, group.Collapsed))
+                  .SequenceEqual([("하나", false), ("둘", false), ("셋", false)]) == true
+              && ClaudeSessionSync.LayoutOf(State(sidebars: ",\"codeSidebarByScope\":{}"), key, false)?.Groups[0].Name == "하나",
+            "a scope without sections keeps its groups in their stored order");
+        foreach (var (state, what) in new (JsonObject, string)[]
+                 {
+                     (State(sidebars: ",\"codeSidebarByScope\":\"x\""), "sections of another kind"),
+                     (State(sidebar: "\"x\""), "a scope's sidebar that is no object"),
+                     (State(sidebar: "{\"sections\":{}}"), "sections that are no list"),
+                     (State(sidebar: "{\"sections\":[{\"order\":1}]}"), "a section without an id"),
+                     (State(sidebar: "{\"sections\":[{\"id\":\"g1\",\"order\":\"1\"}]}"), "a section placed by text"),
+                     (State(scope: "{\"groups\":[{\"id\":\"g1\"}],\"assignments\":{}}"), "a group without a name"),
+                     (State(scope: "{\"groups\":{},\"assignments\":{}}"), "groups that are no list"),
+                     (State(scope: "{\"groups\":[],\"assignments\":null}"), "assignments that are null"),
+                     (State(scope: "{\"groups\":[],\"assignments\":{\"code:local_a\":1}}"), "an assignment that is no id"),
+                     (State(scope: "[]"), "a scope that is no object")
+                 })
+            Check(ClaudeSessionSync.LayoutOf(state, key, missingIsEmpty: true) is null, "an unfamiliar shape is not guessed at: " + what);
+        Check(ClaudeSessionSync.LayoutOf(State(), ThirdKey, missingIsEmpty: true) is { Groups.Count: 0, Assignments.Count: 0 }
+              && ClaudeSessionSync.LayoutOf(State(), ThirdKey, missingIsEmpty: false) is null && ClaudeSessionSync.LayoutOf(null, key, true) is null,
+            "a missing scope is no groups only where that may be assumed; no sidebar state at all is unknown");
+        // A plan's sidebars show what the app shows: pinned sessions under Pinned only, groups in order with their folding.
+        var plan = Compute([R("local_a", "가", false, "a"), R("local_b", "나", true, "b"), R("local_c", "다", false, "c")], layout,
+            [Other(ReferenceKey, "메인", [], null)], label: "서브");
+        Check(plan.Sidebars![0] is
+              {
+                  Label: "서브", Pinned: ["나"],
+                  Groups: [{ Name: "셋", Collapsed: true, Sessions.Count: 0 }, { Name: "하나", Collapsed: false, Sessions: ["가"] }, { Name: "둘" }]
+              },
+            "a plan's sidebars list the groups in sidebar order with their folding");
+        // Read from the app's store the same way: the fixture stores the groups out of order, as the app may.
+        using var world = new SessionWorld("sections");
+        world.Record(CurrentKey, "local_a", "가", Cli(1));
+        world.Record(ReferenceKey, "local_b", "가", Cli(1));
+        foreach (var (name, collapsed) in new[] { ("첫째", false), ("둘째", true), ("셋째", false) }) world.Group(CurrentKey, name, collapsed);
+        world.Put(CurrentKey, "local_a", world.GroupId(CurrentKey, "둘째"));
+        world.Flush();
+        Keep(world.Ledger, (CurrentKey, "서브", null), (ReferenceKey, "메인", null));
+        Check(ClaudeSessionSync.Build(world.Sources, "local_a") is
+              {
+                  Status: "ok",
+                  Sidebars: [{ Groups: [{ Name: "첫째", Collapsed: false }, { Name: "둘째", Collapsed: true, Sessions: ["가"] }, { Name: "셋째" }] },
+                      { Groups: null }]
+              },
+            "a plan reads the groups' order and folding from the app's sidebar sections");
     }
 
     private static void TestLayoutStore()
     {
         Check(ClaudeSessionSync.PlannedEventName(CurrentKey.ToUpperInvariant())
-              == @"Local\CodexWeeklyUsageIndicator.SessionsPlanned." + CurrentAccount + "_" + CurrentOrg,
-            "the event names the account the plan ran in");
-        var root = Directory.CreateTempSubdirectory("gfs-session-layout-").FullName;
+              == @"Local\CodexWeeklyUsageIndicator.SessionsPlanned." + CurrentAccount + "_" + CurrentOrg
+              && ClaudeSessionSync.CheckpointedEventName(CurrentKey).EndsWith("SessionsCheckpointed." + CurrentAccount + "_" + CurrentOrg, StringComparison.Ordinal)
+              && ClaudeSessionSync.MailboxName(CurrentKey).EndsWith("SessionsPlanMailbox." + CurrentAccount + "_" + CurrentOrg, StringComparison.Ordinal)
+              && ClaudeSessionSync.PlanLockName(CurrentKey).EndsWith("SessionsPlanLock." + CurrentAccount + "_" + CurrentOrg, StringComparison.Ordinal),
+            "the plan request's kernel objects name the account it is for");
+        var root = TempRoot("layout");
         try
         {
+            var path = Path.Combine(root, ClaudeSessionLayout.FileName);
             Check(ClaudeSessionLayout.Load(root) is (null, false), "no layout yet");
             var left = DateTimeOffset.Parse("2026-10-13T01:02:03.4567891+09:00", CultureInfo.InvariantCulture);
-            var layout = new ClaudeSessionLayout();
-            layout.Accounts[CurrentKey] = new("서브", null);
-            layout.Accounts[ReferenceKey] = new("메인", left);
-            layout.Record(new(CurrentKey, ReferenceKey,
-                new Dictionary<string, ClaudeSessionLayout.Agreed> { ["local_c"] = A(true, true, null, "제목"), ["local_gone"] = A(false) },
-                new Dictionary<string, ClaudeSessionLayout.Agreed> { ["local_r"] = A(true, true, null, "제목") },
-                new HashSet<string> { "local_c", "local_gone", "local_open" }, new HashSet<string> { "local_r" }));
-            layout.Record(new(ReferenceKey, CurrentKey,
-                new Dictionary<string, ClaudeSessionLayout.Agreed> { ["local_r"] = A(hasGroup: true, group: "대기") },
-                new Dictionary<string, ClaudeSessionLayout.Agreed> { ["local_c"] = A(hasGroup: true, group: "대기"), ["local_open"] = A(hasGroup: true) },
-                new HashSet<string> { "local_r" }, new HashSet<string> { "local_c", "local_open" }));
+            var layout = new ClaudeSessionLayout { Active = CurrentKey };
+            layout.Accounts[CurrentKey] = new("서브", left, At(30), 3);
+            layout.Accounts[ReferenceKey] = new("메인");
+            layout.Checkpoints[CurrentKey] = new(At(31), 3, [new("g-1", "티어 2"), new("g-2", "도구")], new Dictionary<string, Shown>
+            {
+                ["local_a"] = new(true, true, "도구", "제목"), ["local_b"] = new(false, true, null, null, "쓴 제목"),
+                ["local_c"] = new(null, false, null, "이름만")
+            });
+            layout.Checkpoints[ReferenceKey] = new(At(5), 0, null, new Dictionary<string, Shown>());
+            layout.Changed[CurrentKey] = new(StringComparer.Ordinal)
+            {
+                ["local_a"] = new(new(true, At(1)), new("도구", At(2), ReferenceKey), new("제목", At(3))), ["local_b"] = new(Group: new(null, At(4)))
+            };
+            layout.Changed[ReferenceKey] = new(StringComparer.Ordinal);
+            layout.GroupsChanged[CurrentKey] = ListChange(["티어 2", "도구"], At(6), ReferenceKey, ("티어 1", "티어 2"));
+            layout.Pendings[CurrentKey] = new(3, new Dictionary<string, Target>
+            {
+                ["local_a"] = new(new(false, DateTimeOffset.MinValue), new("티어 2", At(7), ThirdKey), Filed: true),
+                ["local_b"] = new(Title: new("새 이름", At(8)))
+            }, ListChange(["도구", "티어 2"], At(9), ThirdKey), Aside(("g-2", "도구")));
+            layout.Evidences[ReferenceKey] = new(StringComparer.Ordinal) { ["local_r"] = new(true, false), ["local_s"] = new(false, true) };
+            layout.Renamings[CurrentKey] = [new("티어 1", "티어 2", At(6)), new("임시", "도구", At(7))];
             layout.Save(root);
+            var text = File.ReadAllText(path);
             var (loaded, exists) = ClaudeSessionLayout.Load(root);
-            Check(exists && loaded is not null && loaded.Accounts[ReferenceKey] == new ClaudeSessionLayout.Account("메인", left)
-                  && loaded.Accounts[CurrentKey].LeftAt is null, "accounts round-trip with their labels and when the app left them");
-            var side = loaded!.Side(CurrentKey, ReferenceKey)!;
-            Check(side["local_c"] == A(true, true, "대기", "제목") && loaded.Side(ReferenceKey, CurrentKey)!["local_r"] == A(true, true, "대기", "제목")
-                  && !side.ContainsKey("local_gone") && side["local_open"] == A(hasGroup: true) && loaded.Side(CurrentKey, ThirdKey) is null,
-                "agreements merge field by field over earlier ones, keep \"in no group\", forget sessions no longer listed, and stay per pair");
-            File.WriteAllText(Path.Combine(root, ClaudeSessionLayout.FileName), "{\"accounts\":{\"x\":{}},\"pairs\":{}}");
-            Check(ClaudeSessionLayout.Load(root) is (null, true), "a layout that cannot be read whole is reported, not taken as empty");
-            File.WriteAllText(Path.Combine(root, ClaudeSessionLayout.FileName), "{\"accounts\":{},\"pairs\":{\"" + CurrentKey + "|" + ReferenceKey
-                + "\":{\"" + CurrentKey + "\":{\"local_c\":{\"pinned\":\"yes\"}}}}}");
-            Check(ClaudeSessionLayout.Load(root) is (null, true), "an agreement of an unfamiliar shape is not guessed at");
+            Check(exists && loaded is { Upgraded: false, Active: var active } && active == CurrentKey
+                  && loaded.Accounts[CurrentKey] == new ClaudeSessionLayout.Account("서브", left, At(30), 3)
+                  && loaded.Accounts[ReferenceKey] == new ClaudeSessionLayout.Account("메인"),
+                "accounts round-trip with their labels, stays and when the app last left and came to them, with the account it shows");
+            var point = loaded!.Checkpoints[CurrentKey];
+            Check(point.At == At(31) && point.Stay == 3 && point.Groups!.SequenceEqual([new("g-1", "티어 2"), new("g-2", "도구")])
+                  && point.Sessions.Count == 3 && point.Sessions["local_a"] == new Shown(true, true, "도구", "제목")
+                  && point.Sessions["local_b"] == new Shown(false, true, null, null, "쓴 제목") && point.Sessions["local_c"] == new Shown(null, false, null, "이름만")
+                  && loaded.Checkpoints[ReferenceKey] is { Groups: null, Sessions.Count: 0 } empty && empty.At == At(5),
+                "a checkpoint keeps its time, stay, groups by id and name in order (or none known), and each session's pin, group, title and written title");
+            Check(loaded.Changed[CurrentKey]["local_a"] == new Changes(new(true, At(1)), new("도구", At(2), ReferenceKey), new("제목", At(3)))
+                  && loaded.Changed[CurrentKey]["local_b"] == new Changes(Group: new(null, At(4))) && !loaded.Changed.ContainsKey(ReferenceKey)
+                  && loaded.GroupsChanged[CurrentKey] is { Order: ["티어 2", "도구"], By: var listBy } groups && groups.At == At(6)
+                  && listBy == ReferenceKey && groups.Renamed["티어 1"] == "티어 2",
+                "each value's newest change keeps its value, time and the account it came from; the group list keeps its renamings");
+            Check(loaded.Pendings[CurrentKey] is { Stay: 3 } pending && pending.Sessions["local_a"] == layout.Pendings[CurrentKey].Sessions["local_a"]
+                  && pending.Sessions["local_b"] == new Target(Title: new("새 이름", At(8))) && pending.Groups is { Order: ["도구", "티어 2"] }
+                  && pending.Renamed["g-2"] == new ClaudeSessionLayout.Moved("도구", "도구 (옮기는 중)")
+                  && loaded.Evidences[ReferenceKey]["local_r"] == new ClaudeSessionLayout.Evidence(true, false)
+                  && loaded.Evidences[ReferenceKey]["local_s"] == new ClaudeSessionLayout.Evidence(false, true)
+                  && loaded.Renamings[CurrentKey].SequenceEqual([new("티어 1", "티어 2", At(6)), new("임시", "도구", At(7))])
+                  && !loaded.Renamings.ContainsKey(ReferenceKey),
+                "the plan in progress, the groups renamed by hand and the first format's evidence round-trip");
+            loaded.Save(root);
+            Check(File.ReadAllText(path) == text, "a layout read and saved again is the same");
+
+            // The first format kept per-pair agreements: its accounts carry over, and what an agreement showed a pin or group for is evidence.
+            File.WriteAllText(path, "{\"version\":1,\"accounts\":{\"" + CurrentKey + "\":{\"label\":\"서브\",\"leftAt\":null},\""
+                + ReferenceKey.ToUpperInvariant() + "\":{\"label\":\"메인\",\"leftAt\":\"2026-10-13T01:02:03.4567891+09:00\"}},\"pairs\":{\""
+                + CurrentKey + "|" + ReferenceKey + "\":{\"" + CurrentKey + "\":{\"local_c\":{\"pinned\":false,\"group\":null,\"title\":\"제목\"},"
+                + "\"local_t\":{\"title\":\"제목만\"}},\"" + ReferenceKey + "\":{\"local_r\":{\"group\":\"대기\"}}},\""
+                + CurrentKey + "|" + ThirdKey + "\":{\"" + ThirdKey + "\":{\"local_x\":{\"pinned\":true}}}}}");
+            var (upgraded, _) = ClaudeSessionLayout.Load(root);
+            Check(upgraded is { Upgraded: true, Active: null } && upgraded.Accounts.Count == 2
+                  && upgraded.Accounts[CurrentKey] == new ClaudeSessionLayout.Account("서브")
+                  && upgraded.Accounts[ReferenceKey] == new ClaudeSessionLayout.Account("메인", left)
+                  && upgraded.Checkpoints.Count == 0 && upgraded.Changed.Count == 0 && upgraded.GroupsChanged.Count == 0
+                  && upgraded.Evidences[CurrentKey]["local_c"] == new ClaudeSessionLayout.Evidence(true, true)
+                  && upgraded.Evidences[CurrentKey]["local_t"] == new ClaudeSessionLayout.Evidence(false, false)
+                  && upgraded.Evidences[ReferenceKey]["local_r"] == new ClaudeSessionLayout.Evidence(false, true)
+                  && !upgraded.Evidences.ContainsKey(ThirdKey),
+                "the first format's accounts carry over with when the app left them, and its agreements as evidence of a shown pin or group");
+            upgraded!.Save(root);
+            Check(ClaudeSessionLayout.Load(root) is ({ Upgraded: false } again, true) && again.Accounts[ReferenceKey].LeftAt == left
+                  && File.ReadAllText(path).Contains("\"version\": 2", StringComparison.Ordinal) && !File.ReadAllText(path).Contains("pairs", StringComparison.Ordinal),
+                "saved again it is in the current format");
+            File.WriteAllText(path, "{\"version\":1,\"accounts\":{},\"pairs\":{\"x\":5}}");
+            Check(ClaudeSessionLayout.Load(root) is (null, true), "first-format agreements of an unfamiliar shape are not guessed at");
+
+            var at = "\"" + At(0).ToString("O", CultureInfo.InvariantCulture) + "\"";
+            string Account(string fields) => "{\"version\":2,\"accounts\":{\"" + CurrentKey + "\":{\"label\":\"서브\"" + fields + "}}}";
+            foreach (var (bad, what) in new[]
+                     {
+                         ("{broken", "a torn file"),
+                         ("{\"accounts\":{}}", "no version"),
+                         ("{\"version\":3,\"accounts\":{}}", "a later version"),
+                         ("{\"version\":2,\"accounts\":[]}", "accounts that are no map"),
+                         ("{\"version\":2,\"accounts\":{\"x\":{\"label\":\"a\"}}}", "an account that is no account/organization key"),
+                         ("{\"version\":2,\"accounts\":{\"" + CurrentKey + "\":{}}}", "an account without a label"),
+                         (Account(",\"leftAt\":\"어제\""), "a time that is no time"),
+                         (Account(",\"arrivedAt\":5"), "a time that is a number"),
+                         (Account(",\"stay\":-1"), "a stay below zero"),
+                         (Account(",\"stay\":\"2\""), "a stay that is text"),
+                         ("{\"version\":2,\"active\":\"x\",\"accounts\":{}}", "an active account that is no key"),
+                         ("{\"version\":2,\"active\":5,\"accounts\":{}}", "an active account that is no text"),
+                         (Account(",\"checkpoint\":{\"sessions\":{}}"), "a checkpoint without its time"),
+                         (Account(",\"checkpoint\":{\"at\":" + at + "}"), "a checkpoint without sessions"),
+                         (Account(",\"checkpoint\":{\"at\":" + at + ",\"groups\":[\"티어 2\"],\"sessions\":{}}"), "groups without ids"),
+                         (Account(",\"checkpoint\":{\"at\":" + at + ",\"sessions\":{\"local_a\":{\"pinned\":\"yes\"}}}"), "a pin that is text"),
+                         (Account(",\"checkpoint\":{\"at\":" + at + ",\"sessions\":{\"local_a\":{\"written\":5}}}"), "a written title that is a number"),
+                         (Account(",\"checkpoint\":{\"at\":" + at + ",\"sessions\":{\"local_a\":{\"color\":\"red\"}}}"), "an unknown field"),
+                         (Account(",\"checkpoint\":[]"), "a checkpoint that is no object"),
+                         (Account(",\"groupsChanged\":{\"order\":[\"A\"],\"renamed\":{}}"), "a group-list change without its time"),
+                         (Account(",\"groupsChanged\":{\"order\":[\"A\"],\"at\":" + at + "}"), "a group-list change without its renamings"),
+                         (Account(",\"groupsChanged\":{\"order\":[\"A\"],\"renamed\":{\"A\":1},\"at\":" + at + "}"), "a renaming that is no name"),
+                         (Account(",\"groupsChanged\":{\"order\":[\"A\"],\"renamed\":{},\"at\":" + at + ",\"by\":\"x\"}"), "a change by no account"),
+                         (Account(",\"changed\":[]"), "changes that are no map"),
+                         (Account(",\"changed\":{\"local_a\":[]}"), "a session's changes that are no object"),
+                         (Account(",\"changed\":{\"local_a\":{\"pinned\":{\"value\":true}}}"), "a change without its time"),
+                         (Account(",\"changed\":{\"local_a\":{\"pinned\":{\"value\":\"yes\",\"at\":" + at + "}}}"), "a pin change that is text"),
+                         (Account(",\"changed\":{\"local_a\":{\"color\":{\"value\":1,\"at\":" + at + "}}}"), "a change of an unknown field"),
+                         (Account(",\"changed\":{\"local_a\":{\"title\":{\"value\":\"t\",\"at\":" + at + ",\"from\":\"x\"}}}"), "a change with more to it"),
+                         (Account(",\"pending\":{\"stay\":1,\"sessions\":{}}"), "a plan in progress without its renamed groups"),
+                         (Account(",\"pending\":{\"stay\":1,\"sessions\":{\"local_a\":{\"filed\":\"yes\"}},\"renamed\":{}}"), "a filing that is text"),
+                         (Account(",\"pending\":{\"stay\":1,\"sessions\":{},\"groups\":[],\"renamed\":{}}"), "a list target that is no change"),
+                         (Account(",\"evidence\":{\"local_a\":{\"pinned\":\"yes\"}}"), "evidence that is text"),
+                         (Account(",\"pending\":{\"stay\":1,\"sessions\":{},\"renamed\":{\"g\":\"G\"}}"), "a group set aside without where it went"),
+                         (Account(",\"renamings\":{}"), "renamings that are no list"),
+                         (Account(",\"renamings\":[{\"from\":\"G\",\"to\":\"H\"}]"), "a renaming without its time"),
+                         (Account(",\"renamings\":[{\"from\":\"G\",\"to\":5,\"at\":" + at + "}]"), "a renaming to no name")
+                     })
+            {
+                File.WriteAllText(path, bad);
+                Check(ClaudeSessionLayout.Load(root) is (null, true), "a layout that cannot be read whole is reported, not taken as empty: " + what);
+            }
+            File.WriteAllText(path, "{\"version\":2,\"active\":\"" + ReferenceKey + "\",\"accounts\":{\"" + CurrentKey + "\":{\"label\":\"서브\"}}}");
+            Check(ClaudeSessionLayout.Load(root) is ({ Active: null } unmapped, true) && unmapped.Accounts.Count == 1,
+                "an active account no longer kept is let go");
+
+            var forgetting = new ClaudeSessionLayout { Active = ReferenceKey };
+            forgetting.Accounts[ReferenceKey] = new("메인");
+            forgetting.Checkpoints[ReferenceKey] = new(At(0), 0, [], new Dictionary<string, Shown>());
+            forgetting.Changed[ReferenceKey] = new(StringComparer.Ordinal);
+            forgetting.GroupsChanged[ReferenceKey] = ListChange([], At(0));
+            forgetting.Pendings[ReferenceKey] = new(0, new Dictionary<string, Target>(), null, Aside());
+            forgetting.Evidences[ReferenceKey] = new(StringComparer.Ordinal);
+            forgetting.Renamings[ReferenceKey] = [new("G", "H", At(0))];
+            forgetting.Forget(ReferenceKey);
+            Check(forgetting is { Active: null, Accounts.Count: 0, Checkpoints.Count: 0, Changed.Count: 0, GroupsChanged.Count: 0, Pendings.Count: 0,
+                      Evidences.Count: 0, Renamings.Count: 0 },
+                "an account no longer mapped is forgotten whole");
         }
         finally { Directory.Delete(root, true); }
     }
@@ -454,7 +929,7 @@ internal static class ClaudeSessionSyncTests
             throw new InvalidOperationException("accepted " + why);
         }
 
-        var root = Directory.CreateTempSubdirectory("gfs-session-sync-pins-").FullName;
+        var root = TempRoot("pins");
         try
         {
             var db = CreateDatabase(Path.Combine(root, "idb"));
@@ -479,7 +954,7 @@ internal static class ClaudeSessionSyncTests
 
     private static void TestTranscript()
     {
-        var root = Directory.CreateTempSubdirectory("gfs-session-sync-transcripts-").FullName;
+        var root = TempRoot("transcripts");
         try
         {
             var id = Guid.NewGuid().ToString("D");
@@ -529,20 +1004,36 @@ internal static class ClaudeSessionSyncTests
             Check(ClaudeSessionSync.HandOver(root, id, next) is null && ClaudeSessionSync.Transcript(root, next) is null,
                 "a broken first new entry dates no hand-over, rather than a later one");
             Check(ClaudeSessionSync.Transcript(root, "..\\x") is null, "only transcript ids are looked up");
+            // Only turns of the conversation count: what the app or the harness adds on its own does not.
+            var noted = Guid.NewGuid().ToString("D");
+            File.WriteAllLines(Path.Combine(project, noted + ".jsonl"),
+            [
+                "{\"type\":\"user\",\"uuid\":\"10000000-0000-0000-0000-000000000001\",\"timestamp\":\"2026-10-02T05:00:00Z\"}",
+                "{\"type\":\"assistant\",\"uuid\":\"10000000-0000-0000-0000-000000000002\",\"timestamp\":\"2026-10-02T05:01:00Z\",\"message\":{\"model\":\"claude-opus\",\"content\":[]}}",
+                "{\"type\":\"user\",\"uuid\":\"10000000-0000-0000-0000-000000000003\",\"timestamp\":\"2026-10-05T00:00:00Z\",\"origin\":{\"kind\":\"task-notification\"}}",
+                "{\"type\":\"assistant\",\"uuid\":\"10000000-0000-0000-0000-000000000004\",\"timestamp\":\"2026-10-05T00:00:01Z\",\"message\":{\"model\":\"<synthetic>\"}}",
+                "{\"type\":\"user\",\"uuid\":\"10000000-0000-0000-0000-000000000005\",\"timestamp\":\"2026-10-05T00:00:02Z\",\"isMeta\":true}",
+                "{\"type\":\"queue-operation\",\"timestamp\":\"2026-10-05T00:00:03Z\"}",
+                "{\"type\":\"summary\",\"uuid\":\"10000000-0000-0000-0000-000000000006\",\"timestamp\":\"2026-10-05T00:00:04Z\"}"
+            ]);
+            Check(ClaudeSessionSync.Transcript(root, noted)?.LastEntry == DateTimeOffset.Parse("2026-10-02T05:01:00Z"),
+                "a transcript's newest entry is its newest turn: a background task's notice, its stand-in reply, meta messages and records do not count");
+            var goneOn = Guid.NewGuid().ToString("D");
+            File.WriteAllLines(Path.Combine(project, goneOn + ".jsonl"),
+            [
+                "{\"type\":\"user\",\"uuid\":\"10000000-0000-0000-0000-000000000001\",\"timestamp\":\"2026-10-02T05:00:00Z\"}",
+                "{\"type\":\"user\",\"uuid\":\"20000000-0000-0000-0000-000000000001\",\"timestamp\":\"2026-10-02T05:30:00Z\",\"origin\":{\"kind\":\"task-notification\"}}",
+                "{\"type\":\"user\",\"uuid\":\"20000000-0000-0000-0000-000000000002\",\"timestamp\":\"2026-10-02T06:00:00Z\"}"
+            ]);
+            Check(ClaudeSessionSync.HandOver(root, noted, goneOn) == DateTimeOffset.Parse("2026-10-02T06:00:00Z"),
+                "the hand-over is dated by the later transcript's first turn of its own");
         }
         finally { Directory.Delete(root, true); }
     }
 
-    private static void Keep(string ledger, params (string Key, string Label)[] accounts)
-    {
-        var layout = new ClaudeSessionLayout();
-        foreach (var (key, label) in accounts) layout.Accounts[key] = new(label, null);
-        layout.Save(ledger);
-    }
-
     private static void TestBuildFromDisk()
     {
-        var root = Directory.CreateTempSubdirectory("gfs-session-sync-").FullName;
+        var root = TempRoot("build");
         try
         {
             var sessions = Path.Combine(root, "sessions"); var ledger = Directory.CreateDirectory(Path.Combine(root, "ledger")).FullName;
@@ -558,22 +1049,21 @@ internal static class ClaudeSessionSyncTests
             Write(ReferenceAccount, ReferenceOrg, "local_ref_gone", new() { ["title"] = "보관된 기준", ["cliSessionId"] = "bbb" });
             var idb = CreateDatabase(Path.Combine(root, "idb"));
             AppendRaw(idb, 42, PinKey(5), PinValue(["local_ref"]));
-            var missingStorage = Path.Combine(root, "no-local-storage");
-            var sources = new ClaudeSessionSync.Sources(sessions, missingStorage, idb, Path.Combine(root, "projects"), ledger);
+            var sources = new ClaudeSessionSync.Sources(sessions, Path.Combine(root, "no-local-storage"), idb, Path.Combine(root, "projects"), ledger);
             Check(ClaudeSessionSync.Build(sources, "local_nowhere").Status == "unknown_session", "an unknown session is reported");
             Check(ClaudeSessionSync.Build(sources, "local_self") is { Status: "widget_not_ready", Current: var current } && current == CurrentKey,
-                "without what the accounts agreed on nothing is planned");
+                "before the widget keeps what the accounts changed, nothing is planned");
             File.WriteAllText(Path.Combine(ledger, ClaudeSessionLayout.FileName), "{\"accounts\":");
             Check(ClaudeSessionSync.Build(sources, "local_self").Status == "layout_unreadable", "a layout that cannot be read is reported");
-            Keep(ledger, (CurrentKey, "서브"));
+            Keep(ledger, (CurrentKey, "서브", null));
             Check(ClaudeSessionSync.Build(sources, "local_self") is { Status: "no_other_accounts", CurrentLabel: "서브" },
                 "with no other account there is nothing to take");
-            Keep(ledger, (CurrentKey, "서브"), (ThirdKey, "셋째"));
-            Check(ClaudeSessionSync.Build(sources, "local_self").Status == "no_other_accounts",
-                "an account without a session list here is passed over");
-            Keep(ledger, (CurrentKey, "서브"), (ReferenceKey.ToUpperInvariant(), "메인"), (ThirdKey, "셋째"));
+            Keep(ledger, (CurrentKey, "서브", null), (ThirdKey, "셋째", At(0)));
+            Check(ClaudeSessionSync.Build(sources, "local_self").Status == "no_other_accounts", "an account without a session list here is passed over");
+            // Nothing checkpointed yet: the account the app left later gives what its own records show.
+            Keep(ledger, (CurrentKey, "서브", null), (ReferenceKey.ToUpperInvariant(), "메인", At(0)), (ThirdKey, "셋째", null));
             var plan = ClaudeSessionSync.Build(sources, "local_self");
-            Check(plan is { Status: "ok", CurrentLabel: "서브", Others: [{ Label: "메인", Matched: 1 }] }
+            Check(plan is { Status: "ok", CurrentLabel: "서브", Checkpointed: null, Others: [{ Label: "메인", Matched: 1, OnlyThere: ["보관된 기준"] }] }
                   && plan.Renames!.Single() is { Session: "local_self", Title: "기준 이름", From: "지금", By: "메인" }
                   && plan.Pins!.Single() is { Session: "local_self", Pinned: true } && plan.Moves!.Count == 0
                   && plan.Warnings!.SequenceEqual(["groups_unreadable"]),
@@ -592,13 +1082,20 @@ internal static class ClaudeSessionSyncTests
             Check(unknownCopies.Pins!.Count == 0 && unknownCopies.Renames!.Count == 0 && unknownCopies.Warnings!.Contains("ledger_unreadable"),
                 "a ledger that cannot be read leaves pins and names alone, rather than take copies for choices");
             File.WriteAllText(Path.Combine(ledger, "ledger.json"), "{\"created\":[{\"dst\":\"" + ReferenceKey + "\",\"file\":\"local_ref.json\"}]}");
-            Check(ClaudeSessionSync.Build(sources, "local_self") is { Renames.Count: 0 } copied
-                  && copied.Pins!.Single() is { Session: "local_self", Pinned: true },
+            Check(ClaudeSessionSync.Build(sources, "local_self") is { Renames.Count: 0 } copied && copied.Pins!.Single() is { Session: "local_self", Pinned: true },
                 "the widget's copy in the other account gives the pin it has there, not its title");
             File.Delete(Path.Combine(ledger, "ledger.json"));
             var unpinned = ClaudeSessionSync.Build(sources with { IndexedDb = Path.Combine(root, "no-idb") }, "local_self");
             Check(unpinned.Pins!.Count == 0 && unpinned.Renames!.Count == 1 && unpinned.Warnings!.SequenceEqual(["groups_unreadable", "pins_unreadable"]),
                 "without the pin list no pin is planned, never one taken from records");
+            // A record that cannot be read now, here or in another list, could be the newest: nothing is decided.
+            foreach (var (account, org, id) in new[] { (CurrentAccount, CurrentOrg, "local_gone"), (ReferenceAccount, ReferenceOrg, "local_ref_gone") })
+                using (new FileStream(Path.Combine(sessions, account, org, id + ".json"), FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+                {
+                    var partial = ClaudeSessionSync.Build(sources, "local_self");
+                    Check(partial is { Status: "ok", Pins.Count: 0, Renames.Count: 0, Moves.Count: 0 } && partial.Warnings!.Contains("list_incomplete"),
+                        "a list that cannot be read whole plans no title, pin or group");
+                }
             // An older state beside its continuation: listed when nothing was written to it after the next transcript began.
             var projects = Directory.CreateDirectory(Path.Combine(root, "projects", "E--p")).FullName;
             string Transcript(string created, params string[] entries)
@@ -606,7 +1103,7 @@ internal static class ClaudeSessionSyncTests
                 var id = Guid.NewGuid().ToString("D");
                 var path = Path.Combine(projects, id + ".jsonl");
                 File.WriteAllLines(path, entries.Select(entry => entry.Split('@') is [var uuid, var at]
-                    ? "{\"uuid\":\"" + uuid + "\",\"timestamp\":\"" + at + "\"}" : entry));
+                    ? "{\"type\":\"user\",\"uuid\":\"" + uuid + "\",\"timestamp\":\"" + at + "\"}" : entry));
                 File.SetCreationTimeUtc(path, DateTime.Parse(created, CultureInfo.InvariantCulture, DateTimeStyles.AdjustToUniversal));
                 return id;
             }
@@ -619,7 +1116,8 @@ internal static class ClaudeSessionSyncTests
                 ["title"] = "둘", ["cliSessionId"] = later, ["priorCliSessionIds"] = new JsonArray(earlier.ToUpperInvariant())
             });
             var listed = ClaudeSessionSync.Build(sources, "local_self").Archive!.Single();
-            File.AppendAllText(Path.Combine(projects, earlier + ".jsonl"), "{\"uuid\":\"00000000-0000-0000-0000-0000000000a3\",\"timestamp\":\"2026-10-03");
+            Check(ClaudeSessionSync.Build(sources, "local_was").Archive!.Count == 0, "the calling session is never listed as an older state");
+            File.AppendAllText(Path.Combine(projects, earlier + ".jsonl"), "{\"type\":\"user\",\"uuid\":\"00000000-0000-0000-0000-0000000000a3\",\"timestamp\":\"2026-10-03");
             Check(ClaudeSessionSync.Build(sources, "local_self").Archive!.Count == 0, "an older state whose transcript ends in a broken line stays");
             Check(listed is { Session: "local_was", Newest: "local_is", Ready: false },
                 "an older state is dated from the transcripts and listed for archiving");
@@ -631,15 +1129,15 @@ internal static class ClaudeSessionSyncTests
             File.WriteAllText(Path.Combine(ledger, ClaudeSessionReference.FileName), "{\"account\":\"not-an-account\"}");
             Check(ClaudeSessionReference.Read(ledger) is (null, false), "a malformed old reference is unknown, never taken for none");
             File.Delete(Path.Combine(ledger, ClaudeSessionLayout.FileName));
-            Check(ClaudeSessionSync.Build(sources, "local_self").Status == "reference_unreadable",
-                "until the widget can start from it, a plan says the old reference cannot be read");
+            Check(ClaudeSessionSync.Build(sources, "local_self").Status == "widget_not_ready",
+                "a plan waits for the widget's layout whatever the old reference holds");
         }
         finally { Directory.Delete(root, true); }
     }
 
     private static void TestGroupsFromLocalStorage()
     {
-        var root = Directory.CreateTempSubdirectory("gfs-session-sync-ls-").FullName;
+        var root = TempRoot("groups");
         try
         {
             var sessions = Path.Combine(root, "sessions"); var ledger = Directory.CreateDirectory(Path.Combine(root, "ledger")).FullName;
@@ -649,7 +1147,8 @@ internal static class ClaudeSessionSyncTests
                 File.WriteAllText(Path.Combine(directory, id + ".json"), new JsonObject { ["sessionId"] = id, ["title"] = "t", ["cliSessionId"] = cli }.ToJsonString());
             }
             Write(CurrentAccount, CurrentOrg, "local_c", "same"); Write(ReferenceAccount, ReferenceOrg, "local_r", "same");
-            Keep(ledger, (CurrentKey, "서브"), (ReferenceKey, "메인"));
+            // The other account was left later, so what it shows is newer.
+            Keep(ledger, (CurrentKey, "서브", null), (ReferenceKey, "메인", At(0)));
             var db = CreateDatabase(Path.Combine(root, "leveldb"));
             var idb = CreateDatabase(Path.Combine(root, "idb"));
             AppendRaw(idb, 42, PinKey(5), PinValue([]));
@@ -670,55 +1169,22 @@ internal static class ClaudeSessionSyncTests
                 },
                 ["version"] = 1
             };
-            var store = new ClaudeLocalStorage(db);
-            Check(store.Write(store.Read(["dframe-store"]), new Dictionary<string, string> { ["dframe-store"] = state.ToJsonString() },
-                Path.Combine(root, "backups"), () => true), "the fixture sidebar state is stored");
+            var backups = Path.Combine(root, "backups");
+            Check(WriteSidebar(db, state, backups), "the fixture sidebar state is stored");
             var log = Path.Combine(db, "000005.log");
             ClaudeSessionSync.Plan plan;
             // The app holds its log open for writing while it runs.
             using (new FileStream(log, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite))
                 plan = ClaudeSessionSync.Build(sources, "local_c");
-            Check(plan.Status == "ok" && plan.CreateGroups!.SequenceEqual(["대기"]) && plan.Moves!.Single() is { Group: "대기" } move
+            Check(plan.Status == "ok" && plan.CreateGroups!.SequenceEqual(["대기"]) && plan.Moves!.Single() is { Group: "대기", GroupId: null } move
                   && move.Sessions.SequenceEqual(["local_c"]) && plan.Warnings is null,
                 "groups are read from the app's local storage while it is open, and a missing group is created");
 
-            // After a plan, the widget learns what the two show alike; the first time, it starts from the old reference.
-            var agreements = ClaudeSessionSync.Agreements(sources, CurrentKey, [ReferenceKey, ThirdKey]);
-            Check(agreements is [{ Account: var mine, Other: var theirs } alike] && mine == CurrentKey && theirs == ReferenceKey
-                  && alike.Mine["local_c"] == A(false, false, null, "t") && alike.Theirs["local_r"] == A(false, false, null, "t")
-                  && alike.MyIds.SetEquals(["local_c"]) && alike.TheirIds.SetEquals(["local_r"]),
-                "only what both show alike is agreed: the pin and title, not the group one of them changed");
-            var baseline = ClaudeSessionSync.Baseline(sources, ReferenceKey, [CurrentKey, ReferenceKey]);
-            Check(baseline is [{ Account: var account, Other: var reference } start] && account == CurrentKey && reference == ReferenceKey
-                  && start.Mine["local_c"] == A(false, true, null, "t") && start.Theirs["local_r"] == A(false, true, null, "t"),
-                "the first agreements take each other account's values, so what the old reference shows differently is its change");
-            File.WriteAllText(Path.Combine(ledger, "ledger.json"), "{\"created\":[{\"dst\":\"" + ReferenceKey + "\",\"file\":\"local_r.json\"}]}");
-            Check(ClaudeSessionSync.Baseline(sources, ReferenceKey, [CurrentKey]) is [{ Theirs.Count: 0 } copied] && copied.Mine.Count == 1,
-                "a copy the widget made in the old reference gets no agreement there: the copies rule tells what it offers");
-            File.WriteAllText(Path.Combine(ledger, "ledger.json"), "{\"created\":");
-            Check(ClaudeSessionSync.Baseline(sources, ReferenceKey, [CurrentKey]) is null, "without the ledger nothing is started");
-            File.Delete(Path.Combine(ledger, "ledger.json"));
-            Check(ClaudeSessionSync.Agreements(sources with { IndexedDb = Path.Combine(root, "no-idb") }, CurrentKey, [ReferenceKey]) is null,
-                "without the pin list nothing is learned");
-            // A record that cannot be read now would look gone: nothing is learned from a list not read whole.
-            var theirRecord = Path.Combine(sessions, ReferenceAccount, ReferenceOrg, "local_r.json");
-            using (new FileStream(theirRecord, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
-            {
-                Check(ClaudeSessionSync.Agreements(sources, CurrentKey, [ReferenceKey]) is { Count: 0 },
-                    "a pair whose other list cannot be read whole is passed over, its agreements kept");
-                Check(ClaudeSessionSync.Baseline(sources, ReferenceKey, [CurrentKey]) is null, "nothing is started from a list not read whole");
-            }
-            using (new FileStream(Path.Combine(sessions, CurrentAccount, CurrentOrg, "local_c.json"), FileMode.Open, FileAccess.ReadWrite, FileShare.None))
-                Check(ClaudeSessionSync.Agreements(sources, CurrentKey, [ReferenceKey]) is null, "nothing is learned while this account's list is not read whole");
-            File.WriteAllText(Path.Combine(sessions, ReferenceAccount, ReferenceOrg, "local_half.json"), "");
-            Check(ClaudeSessionSync.Agreements(sources, CurrentKey, [ReferenceKey]) is { Count: 0 }, "a record being written is not taken as gone");
-            File.Delete(Path.Combine(sessions, ReferenceAccount, ReferenceOrg, "local_half.json"));
-
             // Another account's scope that is missing offers no groups; one there but unfamiliar holds every group change.
-            JsonArray Groups() => new(new JsonObject { ["id"] = "cg-1", ["name"] = "대기" });
+            JsonArray Waiting() => new(new JsonObject { ["id"] = "cg-1", ["name"] = "대기" });
             foreach (var other in new JsonNode?[] { null, new JsonObject(), new JsonObject { ["groups"] = "x", ["assignments"] = new JsonObject() },
                          new JsonObject { ["groups"] = new JsonArray(new JsonObject { ["id"] = "cg-1" }), ["assignments"] = new JsonObject() },
-                         new JsonObject { ["groups"] = Groups() }, new JsonObject { ["groups"] = Groups(), ["assignments"] = null },
+                         new JsonObject { ["groups"] = Waiting() }, new JsonObject { ["groups"] = Waiting(), ["assignments"] = null },
                          new JsonObject { ["assignments"] = new JsonObject() }, new JsonObject { ["groups"] = null, ["assignments"] = new JsonObject() } })
             {
                 var changed = (JsonObject)state.DeepClone();
@@ -729,8 +1195,7 @@ internal static class ClaudeSessionSyncTests
                     ["assignments"] = new JsonObject { ["code:local_c"] = "cg-9" }
                 };
                 if (other is null) scopes.Remove(ReferenceKey); else scopes[ReferenceKey] = other;
-                Check(store.Write(store.Read(["dframe-store"]), new Dictionary<string, string> { ["dframe-store"] = changed.ToJsonString() },
-                    Path.Combine(root, "backups"), () => true), "the fixture sidebar state is replaced");
+                Check(WriteSidebar(db, changed, backups), "the fixture sidebar state is replaced");
                 var unconfirmed = ClaudeSessionSync.Build(sources, "local_c");
                 Check(unconfirmed.Moves!.Count == 0 && unconfirmed.CreateGroups!.Count == 0
                       && (other is null ? unconfirmed.Warnings is null : unconfirmed.Warnings!.SequenceEqual(["groups_unreadable"])),
@@ -740,7 +1205,7 @@ internal static class ClaudeSessionSyncTests
             // Header of a 100-byte full record, then only two of its bytes.
             using (var stream = new FileStream(log, FileMode.Append, FileAccess.Write, FileShare.ReadWrite))
                 stream.Write([0x10, 0x20, 0x30, 0x40, 0x64, 0x00, 0x01, 0x05, 0x06]);
-            Check(!store.Read(["dframe-store"]).Clean, "the fixture log ends inside a record");
+            Check(!new ClaudeLocalStorage(db).Read(["dframe-store"]).Clean, "the fixture log ends inside a record");
             var torn = ClaudeSessionSync.Build(sources, "local_c");
             Check(torn.Moves!.Count == 0 && torn.Warnings!.SequenceEqual(["groups_unreadable"]),
                 "a torn log is not taken as the app's current groups");
@@ -748,11 +1213,1152 @@ internal static class ClaudeSessionSyncTests
         finally { Directory.Delete(root, true); }
     }
 
+    /// <summary>What an account changed since its checkpoint, told apart from what the plan in progress there set out to
+    /// do: what it reached is the change it came from, what it has not reached yet (or a pin its move undid) is no change,
+    /// and anything else is the account's own.</summary>
+    private static void TestObserve()
+    {
+        var layout = Groups(["g=G", "h=H"], ("local_b", "g"));
+        var records = new[] { R("local_a", "가", true, "a"), R("local_b", "나", false, "b"), R("local_c", "다", false, "c"), R("local_d", "라", false, "d") };
+        ClaudeSessionSync.State State(IReadOnlyList<Record> shown, SyncLayout? groups = null, IReadOnlyDictionary<string, string?>? copies = null) =>
+            new(shown, groups ?? layout, true, copies ?? NoCopies);
+        var before = PointOf(records, layout, At(0), 1);
+        var moved = layout with { Assignments = new Dictionary<string, string> { ["local_b"] = "h" } };
+        var plain = ClaudeSessionSync.Observe(State([records[0] with { Pinned = false }, records[1], records[2] with { Title = "다다" }, records[3]], moved),
+            before, At(10));
+        Check(plain.Changes["local_a"] == new Changes(Pinned: new(false, At(10))) && plain.Changes["local_b"] == new Changes(Group: new("H", At(10)))
+              && plain.Changes["local_c"] == new Changes(Title: new("다다", At(10))) && !plain.Changes.ContainsKey("local_d")
+              && plain.Groups is null && plain.Open.Count == 0 && !plain.GroupsMoving,
+            "a value that differs from the checkpoint's is a change, dated as asked");
+
+        // The plan in progress set out to pin 라 (메인's change at 5), to file 다 under H and pin it (its move unpins it), to
+        // rename 나 (셋째's change at 7), and to unpin 가 on its way to the archive (nobody's choice).
+        var pending = new ClaudeSessionLayout.Pending(1, new Dictionary<string, Target>
+        {
+            ["local_d"] = new(Pinned: new(true, At(5), ReferenceKey)),
+            ["local_c"] = new(Pinned: new(true, At(6), ReferenceKey), Group: new("H", At(6), ReferenceKey), Filed: true),
+            ["local_b"] = new(Title: new("나나", At(7), ThirdKey)),
+            ["local_a"] = new(Pinned: new(false, DateTimeOffset.MinValue))
+        }, null, Aside());
+        var cInH = layout with { Assignments = new Dictionary<string, string> { ["local_b"] = "g", ["local_c"] = "h" } };
+        var done = ClaudeSessionSync.Observe(State([records[0] with { Pinned = false }, records[1] with { Title = "나나" },
+            records[2] with { Pinned = true }, records[3] with { Pinned = true }], cInH), before, At(10), pending);
+        Check(done.Changes["local_d"] == new Changes(Pinned: new(true, At(5), ReferenceKey))
+              && done.Changes["local_c"] == new Changes(new(true, At(6), ReferenceKey), new("H", At(6), ReferenceKey))
+              && done.Changes["local_b"] == new Changes(Title: new("나나", At(7), ThirdKey)) && !done.Changes.ContainsKey("local_a")
+              && done.Open.Count == 0,
+            "what the plan reached counts as the change it came from, at its time and from its account; an operational value as none");
+        var untouched = ClaudeSessionSync.Observe(State(records), before, At(10), pending);
+        Check(untouched.Changes.Count == 0 && untouched.Open.Keys.Order(StringComparer.Ordinal).SequenceEqual(["local_a", "local_b", "local_c", "local_d"])
+              && untouched.Open["local_c"] is { Filed: true, Pinned: not null, Group: not null },
+            "what the plan has not reached yet is no change, and stays in progress");
+        var halfway = ClaudeSessionSync.Observe(State(records, cInH), before, At(10), pending);
+        Check(halfway.Changes["local_c"] == new Changes(Group: new("H", At(6), ReferenceKey)) && halfway.Open["local_c"] is { Pinned: not null, Group: null },
+            "a pin its move into a group undid is no unpinning: it stays in progress while the group counts as reached");
+        var otherwise = ClaudeSessionSync.Observe(State([records[0], records[1] with { Title = "딴 이름" }, records[2], records[3]]), before, At(10), pending);
+        Check(otherwise.Changes["local_b"] == new Changes(Title: new("딴 이름", At(10))) && !otherwise.Open.ContainsKey("local_b"),
+            "anything else than the target or the checkpoint's value is the account's own change");
+        var ownTarget = pending with
+        {
+            Sessions = new Dictionary<string, Target> { ["local_d"] = new(Pinned: new(true, DateTimeOffset.MaxValue)) }
+        };
+        Check(ClaudeSessionSync.Observe(State([records[0], records[1], records[2], records[3] with { Pinned = true }]), before, At(10), ownTarget)
+                  .Changes["local_d"] == new Changes(Pinned: new(true, At(10))),
+            "a target this account chose in its own stay, reached, is its change as of now");
+
+        // The group list.
+        var list = new ClaudeSessionLayout.Pending(1, new Dictionary<string, Target>(), ListChange(["H", "G"], At(8), ReferenceKey),
+            Aside(("g", "G")));
+        var aside = ClaudeSessionSync.Observe(State(records, Groups(["g=G (옮기는 중)", "h=H"], ("local_b", "g"))), before, At(10), list);
+        Check(aside is { Groups: null, GroupsMoving: true, GroupsAside: true, Renamings.Count: 0 } && !aside.Changes.ContainsKey("local_b"),
+            "a list holding a group the plan renamed out of the way, before the plan made it anew, is mid-move, no change; its sessions keep the name it stood for");
+        var leftAside = ClaudeSessionSync.Observe(State(records, Groups(["g=G (옮기는 중)", "h=H", "g2=G"], ("local_b", "g"))), before, At(10), list);
+        Check(leftAside is { GroupsMoving: false, GroupsAside: true, Renamings.Count: 0 } && leftAside.Groups is { Order: ["H", "G"] } leftList
+              && leftList.At == At(8) && !leftAside.Changes.ContainsKey("local_b"),
+            "once the plan made every group of its list, the groups not aside are the list (reached here), a group still aside apart");
+        var renamedMidMove = ClaudeSessionSync.Observe(State(records, Groups(["g=G (옮기는 중)", "h=H2"], ("local_b", "g"))), before, At(10), list);
+        Check(renamedMidMove is { Groups: null, GroupsMoving: true } && renamedMidMove.Renamings.SequenceEqual([new("H", "H2", At(10))]),
+            "a group renamed by hand is seen even while the list is mid-move");
+        var notYet = ClaudeSessionSync.Observe(State(records, Groups(["g=G", "h=H"], ("local_b", "g"))), before, At(10), list);
+        Check(notYet is { Groups: null, GroupsMoving: false }, "a rename the plan did not do yet is not mid-move");
+        var marked = ClaudeSessionSync.Observe(State(records, Groups(["g=G (옮기는 중)", "h=H"], ("local_b", "g"))), before, At(10));
+        Check(marked is { Groups: null, GroupsMoving: true } && !marked.Changes.ContainsKey("local_b"),
+            "without the plan in progress the moving mark tells a group mid-move");
+        var reached = ClaudeSessionSync.Observe(State(records, Groups(["h=H", "g2=G"], ("local_b", "g2"))), before, At(10), list);
+        Check(reached.Groups is { Order: ["H", "G"], By: var reachedBy } reachedList && reachedList.At == At(8) && reachedBy == ReferenceKey,
+            "a list the plan reached counts as the change it came from");
+        var renamedInPlace = ClaudeSessionSync.Observe(State(records, Groups(["g=G2", "h=H"], ("local_b", "g"))), before, At(10));
+        Check(renamedInPlace.Groups is { Order: ["G2", "H"] } renaming && renaming.Renamed["G"] == "G2" && renaming.At == At(10)
+              && renamedInPlace.Renamings.SequenceEqual([new("G", "G2", At(10))])
+              && renamedInPlace.Changes["local_b"] == new Changes(Group: new("G2", At(10))),
+            "a group renamed in place (same id) is a list change that carries the renaming");
+        Check(ClaudeSessionSync.Observe(State(records), null, At(10)).Groups is { Order: ["G", "H"] } seeded && seeded.At == At(10)
+              && ClaudeSessionSync.Observe(State(records, Groups([])), null, At(10)).Groups is null,
+            "without a checkpoint a list that has groups is given; an empty one gives nothing");
+
+        // Titles of the widget's copies.
+        var copy = new[] { R("local_x", "새 원본 이름", false, "x") };
+        var written = PointOf([R("local_x", "원본 이름", false, "x")], layout, At(0), 1, Copies(("local_x", "원본 이름")));
+        Check(ClaudeSessionSync.Observe(State(copy, copies: Copies(("local_x", "새 원본 이름"))), written, At(10)).Changes.Count == 0,
+            "a copy's title the widget wrote since the checkpoint, following its original, is no change");
+        var renamedByUser = PointOf([R("local_x", "사용자 이름", false, "x")], layout, At(0), 1, Copies(("local_x", "원본 이름")));
+        Check(ClaudeSessionSync.Observe(State([R("local_x", "원본 이름", false, "x")], copies: Copies(("local_x", "원본 이름"))), renamedByUser, At(10))
+                  .Changes["local_x"] == new Changes(Title: new("원본 이름", At(10))),
+            "a copy renamed back to the title the widget wrote (A → B → A) is the user's change");
+
+        // Evidence from the first format.
+        var shown = new[] { R("local_y", "와이", false, "y") };
+        var evidence = new Dictionary<string, ClaudeSessionLayout.Evidence> { ["local_y"] = new(true, true) };
+        Check(ClaudeSessionSync.Observe(State(shown, copies: Copies(("local_y", "와이"))), null, At(10), null, evidence).Changes["local_y"]
+                  == new Changes(new(false, At(10)), new(null, At(10)))
+              && !ClaudeSessionSync.Observe(State(shown, copies: Copies(("local_y", "와이"))), null, At(10)).Changes.ContainsKey("local_y"),
+            "a copy the first format showed with a pin and a group gives its no pin and no group; without that evidence it gives nothing");
+    }
+
+    /// <summary>The widget's checkpoint, read from the stores: when it can be taken, how it dates what changed, and what it
+    /// keeps of a plan in progress and of the first format.</summary>
+    private static void TestCheckpoint()
+    {
+        using var world = new SessionWorld("checkpoint");
+        var layout = new ClaudeSessionLayout();
+        layout.Accounts[K1] = new("계정1", At(0));
+        world.Record(K1, "local_a", "가", Cli(1));
+        world.Record(K1, "local_b", "나", Cli(2));
+        world.Record(K1, "local_c", "다", Cli(3));
+        world.Copied(K1, "local_c", "다");
+        world.Record(K1, "local_x", "엑스", Cli(5));
+        world.Record(K2, "local_z", "제트", Cli(4));
+        world.Pin("local_a");
+        world.Pin("local_z");
+        world.Put(K1, "local_b", world.Group(K1, "G"));
+        world.Flush();
+        bool Take(DateTimeOffset now, ClaudeSessionLayout? into = null, string? account = null) =>
+            ClaudeSessionSync.Checkpoint(into ?? layout, world.Sources, account ?? K1, now);
+        Check(!Take(At(5), account: K3), "an account without a list here is not checkpointed");
+        Check(!ClaudeSessionSync.Checkpoint(layout, world.Sources with { IndexedDb = Path.Combine(world.Root, "no-idb") }, K1, At(5))
+              && !ClaudeSessionSync.Checkpoint(layout, world.Sources with { LocalStorage = Path.Combine(world.Root, "no-ls") }, K1, At(5))
+              && layout.Checkpoints.Count == 0, "without the pin list or the sidebar nothing is checkpointed");
+        using (new FileStream(world.RecordPath(K1, "local_c"), FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+            Check(!Take(At(5)), "nor while a record cannot be read: it would look gone");
+        File.WriteAllText(Path.Combine(world.Ledger, "ledger.json"), "{\"created\":");
+        Check(!Take(At(5)), "nor while the ledger cannot be read: a copy would pass for a choice");
+        world.Copied(K1, "local_c", "다");
+        Check(Take(At(5)) && layout.Checkpoints[K1] is { Stay: 0 } first && first.At == At(5)
+              && first.Groups!.Select(group => group.Name).SequenceEqual(["G"])
+              && layout.Changed[K1]["local_a"] == new Changes(new(true, At(0)), new(null, At(0)), new("가", At(0)))
+              && layout.Changed[K1]["local_b"] == new Changes(new(false, At(0)), new("G", At(0)), new("나", At(0)))
+              && !layout.Changed[K1].ContainsKey("local_c") && layout.GroupsChanged[K1] is { Order: ["G"] } seeded && seeded.At == At(0),
+            "a first checkpoint seeds what each record gives (a copy only what was chosen there), dated when the app last left the account");
+        world.Retitle(K1, "local_a", "가가");
+        Check(Take(At(7)) && layout.Changed[K1]["local_a"].Title == new ClaudeSessionLayout.Stamp<string>("가가", At(7)),
+            "a checkpoint in the same stay dates what changed since to now");
+        world.Pin("local_a", false);
+        world.Flush();
+        layout.Accounts[K1] = layout.Accounts[K1] with { LeftAt = At(9), ArrivedAt = At(20), Stay = 1 };
+        Check(Take(At(21)) && layout.Changed[K1]["local_a"].Pinned == new ClaudeSessionLayout.Stamp<bool>(false, At(9))
+              && layout.Checkpoints[K1].Stay == 1,
+            "the first checkpoint of a stay dates what changed since the last one to when the app left the account");
+        // The app's one pin list for every account loses every pin at once (an app update did).
+        world.Pin("local_b");
+        world.Flush();
+        Check(Take(At(22)) && layout.Changed[K1]["local_b"].Pinned == new ClaudeSessionLayout.Stamp<bool>(true, At(22)), "a pin is a change");
+        world.ClearPins();
+        world.Flush();
+        Check(Take(At(23)) && layout.Changed[K1]["local_b"].Pinned == new ClaudeSessionLayout.Stamp<bool>(true, At(22))
+              && layout.Checkpoints[K1].Sessions["local_b"].Pinned == true,
+            "while the one pin list is empty though a checkpoint showed pins, no unpinning is taken and the checkpoint keeps its pins");
+        world.Pin("local_b"); world.Pin("local_z");
+        world.Flush();
+        // An archived session keeps its changes for its conversation; one whose record is gone for good loses them.
+        world.Archive(K1, "local_a");
+        File.Delete(world.RecordPath(K1, "local_b"));
+        Check(Take(At(24)) && layout.Changed[K1].ContainsKey("local_a") && !layout.Changed[K1].ContainsKey("local_b"),
+            "an archived session keeps its changes; one whose record is gone loses them");
+        // A group renamed in place is a renaming, kept through later changes of the list.
+        world.RenameGroup(K1, world.GroupId(K1, "G"), "H");
+        world.Flush();
+        Check(Take(At(25)) && layout.GroupsChanged[K1] is { Order: ["H"] } renamed && renamed.Renamed["G"] == "H",
+            "a group renamed in place (same id) is a renaming");
+        world.Group(K1, "K");
+        world.Flush();
+        Check(Take(At(26)) && layout.GroupsChanged[K1] is { Order: ["H", "K"] } longer && longer.Renamed["G"] == "H" && longer.At == At(26),
+            "a renaming stays known through later changes of the list");
+        // A plan in progress: what it has not reached stays; reached, it counts as the change it came from (newer than what
+        // this account recorded for it, or the plan would not have set out to give it) and is done.
+        layout.Pendings[K1] = new(1, new Dictionary<string, Target> { ["local_x"] = new(Title: new("새 이름", At(1), K2)) }, null, Aside());
+        Check(Take(At(28)) && layout.Pendings[K1].Sessions["local_x"].Title is { Value: "새 이름" },
+            "a plan of this stay stays in progress with what it has not reached yet");
+        world.Retitle(K1, "local_x", "새 이름");
+        Check(Take(At(29)) && !layout.Pendings.ContainsKey(K1)
+              && layout.Changed[K1]["local_x"].Title == new ClaudeSessionLayout.Stamp<string>("새 이름", At(1), K2),
+            "reached, it counts as the change it came from, and the plan is done");
+        var h = world.GroupId(K1, "H");
+        layout.Pendings[K1] = new(1, new Dictionary<string, Target> { ["local_x"] = new(Title: new("또", At(2), K2)) }, ListChange(["K", "H"], At(2), K2),
+            Aside((h, "H")));
+        world.RenameGroup(K1, h, "H (옮기는 중)");
+        world.Flush();
+        layout.Accounts[K1] = layout.Accounts[K1] with { LeftAt = At(30), ArrivedAt = At(40), Stay = 2 };
+        Check(Take(At(41)) && layout.Pendings[K1] is { Sessions.Count: 0, Groups: not null } carried && carried.Renamed[h].From == "H"
+              && layout.Checkpoints[K1].Groups!.Select(group => group.Name).SequenceEqual(["H", "K"]),
+            "a plan of an earlier stay ends, but a group it renamed out of the way stays known while it is there, and the list mid-move is not taken");
+        world.DeleteGroup(K1, h);
+        world.Flush();
+        Check(Take(At(42)) && !layout.Pendings.ContainsKey(K1), "once that group is gone, so is the plan");
+
+        // Evidence from the first format is spent by the first checkpoint, or kept for pins while the pin list is lost.
+        world.Record(K3, "local_e", "이", Cli(6));
+        world.Copied(K3, "local_e", "이");
+        world.Flush();
+        var fresh = new ClaudeSessionLayout();
+        fresh.Accounts[K3] = new("계정3", At(0));
+        fresh.Evidences[K3] = new(StringComparer.Ordinal) { ["local_e"] = new(true, true) };
+        Check(Take(At(5), fresh, K3) && fresh.Changed[K3]["local_e"] == new Changes(new(false, At(0)), new(null, At(0)))
+              && !fresh.Evidences.ContainsKey(K3),
+            "a copy the first format showed with a pin and a group gives its no pin and no group, and the evidence is spent");
+        var wiped = new ClaudeSessionLayout();
+        wiped.Accounts[K3] = new("계정3", At(0));
+        wiped.Evidences[K3] = new(StringComparer.Ordinal) { ["local_e"] = new(true, true) };
+        wiped.Checkpoints[K2] = PointOf([R("local_z", "제트", true, Cli(4))], null, At(-5));
+        world.ClearPins();
+        world.Flush();
+        Check(Take(At(5), wiped, K3) && wiped.Evidences[K3]["local_e"] == new ClaudeSessionLayout.Evidence(true, false),
+            "while the pin list is lost, the pin evidence waits for the next checkpoint");
+    }
+
+    /// <summary>The 10/20 failure, step by step through the widget: 계정3 took 계정1's pin and group in a plan, then the user
+    /// undid both there; 계정2, planned next, follows 계정3 (with per-pair agreements 계정1 won), and so does 계정1.</summary>
+    private static void TestUndoneAfterPlan()
+    {
+        var (world, widget) = Accounts3("aba", ("p", "P"), ("q", "Q"));
+        using var _ = world;
+        widget.Start(K2, At(-60)); widget.Switch(K3, At(-50)); widget.Switch(K1, At(-40));
+        world.Pin("local_p1");
+        world.Put(K1, "local_q1", world.Group(K1, "G"));
+        widget.Switch(K3, At(10));
+        var plan = widget.Plan(At(15));
+        Check(plan is { Checkpointed: true } && plan.Pins!.Single() is { Session: "local_p3", Pinned: true, By: "계정1" }
+              && plan.CreateGroups!.SequenceEqual(["G"]) && plan.Moves!.Single() is { Group: "G" } toG && toG.Sessions.SequenceEqual(["local_q3"])
+              && plan.GroupOrderBy == "계정1", "계정3 takes what 계정1 changed");
+        world.Apply(K3, plan);
+        Check(widget.Plan(At(16)) is { Checkpointed: true, Pins.Count: 0, Moves.Count: 0, CreateGroups.Count: 0, GroupOrder: null },
+            "planned again once applied, nothing is left to do");
+        Check(widget.Layout.Changed[K3]["local_p3"].Pinned == new ClaudeSessionLayout.Stamp<bool>(true, At(10), K1)
+              && widget.Layout.Changed[K3]["local_q3"].Group == new ClaudeSessionLayout.Stamp<string?>("G", At(10), K1)
+              && widget.Layout.GroupsChanged[K3] is { At: var listedAt, By: var listedBy } && listedAt == At(10) && listedBy == K1,
+            "what a plan brought in keeps the time and the account of the change it came from, not the time it was applied");
+        world.Pin("local_p3", false);
+        world.Put(K3, "local_q3", null);
+        world.DeleteGroup(K3, world.GroupId(K3, "G"));
+        widget.Switch(K2, At(40));
+        Check(widget.Plan(At(45)) is { Checkpointed: true, Pins.Count: 0, Moves.Count: 0, CreateGroups.Count: 0, GroupOrder: null },
+            "계정2 follows what the user did last, in 계정3: P stays unpinned, Q in no group, and G is not made");
+        widget.Switch(K1, At(60));
+        var back = widget.Plan(At(65));
+        Check(back.Pins!.Single() is { Session: "local_p1", Pinned: false, By: "계정3" }
+              && back.Moves!.Single() is { Group: null } outOf && outOf.Sessions.SequenceEqual(["local_q1"])
+              && back.DeleteGroups!.Single() is { Name: "G (옮기는 중)", Remade: false } && back.GroupOrder is { Count: 0 }
+              && back.GroupOrderBy == "계정3", "계정1, where it began, follows too, and its G goes");
+        world.Apply(K1, back);
+        Check(world.Shows(K1) == world.Shows(K3) && world.Shows(K2) == world.Shows(K3), "the three accounts look alike");
+        // A plan asked for in an account the app does not show is for viewing only: nothing is checkpointed or kept.
+        var shown = widget.Layout.Checkpoints[K3];
+        var pending = widget.Layout.Pendings.GetValueOrDefault(K3);
+        var view = widget.Plan(At(70), K3);
+        Check(view is { Status: "ok", Checkpointed: false } && ReferenceEquals(widget.Layout.Checkpoints[K3], shown)
+              && ReferenceEquals(widget.Layout.Pendings.GetValueOrDefault(K3), pending),
+            "a plan for an account the app does not show is for viewing only: nothing is checkpointed or kept");
+    }
+
+    /// <summary>An account the app only passed through overwrites nothing, and what the user changes in a stay, before or
+    /// after a plan, stays.</summary>
+    private static void TestPassedThrough()
+    {
+        var (world, widget) = Accounts3("passed", ("p", "P"));
+        using var _ = world;
+        widget.Start(K1, At(-60)); widget.Switch(K2, At(-50)); widget.Switch(K3, At(-40)); widget.Switch(K1, At(-30));
+        world.Pin("local_p1");
+        widget.Switch(K2, At(0));
+        widget.Switch(K3, At(10));
+        var plan = widget.Plan(At(15));
+        Check(plan.Pins!.Single() is { Session: "local_p3", Pinned: true, By: "계정1" },
+            "an account only passed through, though left later, overwrites nothing: its stale value is no change");
+        world.Apply(K3, plan);
+        widget.Plan(At(16));
+        world.Pin("local_p3", false);
+        Check(widget.Plan(At(20)) is { Pins.Count: 0 }, "what the user changed after a plan in the same stay stays at the next plan");
+        widget.Switch(K1, At(30));
+        world.Put(K1, "local_p1", world.Group(K1, "H"));
+        Check(widget.Plan(At(35)) is { Pins.Count: 0, Moves.Count: 0, CreateGroups.Count: 0, RenameGroups.Count: 0, DeleteGroups.Count: 0 },
+            "what the user changed in this stay before planning stays, and the group they filed it under stays on the list");
+    }
+
+    /// <summary>R1/R2: a plan stopped part way. The move into a group unpinned the session before it was pinned again; that
+    /// is nobody's choice, neither here nor seen from another account, in this stay or the next.</summary>
+    private static void TestPartlyApplied()
+    {
+        var (world, widget) = Accounts3("partly", ("p", "P"));
+        using var _ = world;
+        widget.Start(K2, At(-60)); widget.Switch(K3, At(-50)); widget.Switch(K1, At(-40));
+        world.Put(K1, "local_p1", world.Group(K1, "H"));
+        world.Pin("local_p1");
+        widget.Switch(K3, At(0));
+        var plan = widget.Plan(At(5));
+        Check(plan.Moves!.Single() is { Group: "H" } && plan.Pins!.Single() is { Session: "local_p3", Pinned: true }, "계정3 is to file P under H and pin it");
+        // Stopped after the move.
+        world.Put(K3, "local_p3", world.Group(K3, "H"));
+        widget.Switch(K2, At(10));
+        var there = widget.Plan(At(15));
+        Check(there.Pins!.Single() is { Session: "local_p2", Pinned: true, By: "계정1" } && there.Moves!.Single() is { Group: "H" },
+            "a plan stopped part way in 계정3 does not spread: 계정2 still gets the pin the move undid there");
+        widget.Switch(K3, At(20));
+        var again = widget.Plan(At(25));
+        Check(again.Pins!.Single() is { Session: "local_p3", Pinned: true } && again.Moves!.Count == 0
+              && widget.Layout.Changed[K3]["local_p3"].Pinned is null or { Value: true },
+            "back in 계정3, in a new stay, the pin its move undid is pinned again and was never taken for the user's unpinning");
+        world.Apply(K3, again);
+        Check(widget.Plan(At(26)) is { Pins.Count: 0 } && widget.Layout.Changed[K3]["local_p3"].Pinned == new ClaudeSessionLayout.Stamp<bool>(true, At(0), K1),
+            "confirmed, the pin counts as the change it came from");
+        world.Pin("local_p3", false);
+        widget.Plan(At(27));
+        widget.Switch(K2, At(30));
+        Check(widget.Plan(At(35)).Pins!.Count == 0 && widget.Layout.Changed[K3]["local_p3"].Pinned is { Value: false },
+            "once the pin was reached, the user's unpinning afterwards is theirs and reaches the next account");
+    }
+
+    /// <summary>R2: sorting the groups stopped part way, then a new stay: the group renamed out of the way is still told by
+    /// its id, and the plan carries the sorting on.</summary>
+    private static void TestSortingResumed()
+    {
+        var (world, widget) = Accounts3("resume", ("p", "P"), ("q", "Q"));
+        using var _ = world;
+        foreach (var account in new[] { K1, K3 }) { world.Group(account, "B"); world.Group(account, "A"); }
+        world.Put(K1, "local_p1", world.GroupId(K1, "B"));
+        world.Put(K3, "local_p3", world.GroupId(K3, "B"));
+        widget.Start(K2, At(-60)); widget.Switch(K3, At(-50)); widget.Switch(K1, At(-40));
+        world.Reorder(K1, "A", "B");
+        widget.Switch(K3, At(0));
+        var plan = widget.Plan(At(5));
+        var oldB = world.GroupId(K3, "B");
+        Check(plan.RenameGroups!.Single() is { From: "B", To: "B (옮기는 중)" } && plan.CreateGroups!.SequenceEqual(["B"])
+              && plan.Moves!.Single() is { Group: "B", GroupId: null } && plan.DeleteGroups!.Single() is { Remade: true },
+            "B steps aside and is made anew after A");
+        // Stopped after making the new B: P is still in the old one.
+        world.RenameGroup(K3, oldB, "B (옮기는 중)");
+        world.Group(K3, "B");
+        widget.Switch(K2, At(10));
+        widget.Switch(K3, At(20));
+        var resumed = widget.Plan(At(25));
+        Check(resumed.RenameGroups!.Count == 0 && resumed.CreateGroups!.Count == 0
+              && resumed.Moves!.Single() is { Group: "B", GroupId: { } into } carry && into != oldB && carry.Sessions.SequenceEqual(["local_p3"])
+              && resumed.DeleteGroups!.Single() is { Id: var gone, Remade: true } && gone == oldB,
+            "in a later stay the sorting carries on: P goes to the new B and the old one goes");
+        world.Apply(K3, resumed);
+        Check(world.Shows(K3) == world.Shows(K1), "and 계정3 shows what 계정1 shows");
+    }
+
+    /// <summary>The user's expectation of 10/20 on disk: 계정3, used last, put its groups in a new order and moved a session;
+    /// planned and applied in 계정2, the sidebar looks like 계정3's, and planning again finds nothing to do.</summary>
+    private static void TestSortingOnDisk()
+    {
+        using var world = new SessionWorld("sorting");
+        var widget = new Widget(world);
+        string[] tiers = ["티어 2", "티어 3 (보관)", "스킬 생태계", "태림 오리지널 콘텐츠", "도구"];
+        string[] before = ["티어 2", "도구", "스킬 생태계", "티어 3 (보관)", "태림 오리지널 콘텐츠"];
+        string[] titles = ["하나", "둘", "셋", "넷", "다섯"];
+        string[] homes = ["티어 2", "도구", "스킬 생태계", "티어 3 (보관)", "티어 2"];
+        foreach (var (account, label, prefix) in new[] { (K2, "계정2", "local_c"), (K3, "계정3", "local_t") })
+        {
+            widget.Map(account, label);
+            foreach (var name in before) world.Group(account, name);
+            for (var index = 0; index < titles.Length; index++)
+            {
+                var id = prefix + (index + 1).ToString(CultureInfo.InvariantCulture);
+                world.Record(account, id, titles[index], Cli(index + 1));
+                world.Put(account, id, world.GroupId(account, homes[index]));
+            }
+            world.Pin(prefix + "2");
+        }
+        widget.Start(K2, At(-60));
+        widget.Switch(K3, At(-50));
+        world.Reorder(K3, tiers);
+        world.Put(K3, "local_t5", world.GroupId(K3, "티어 3 (보관)"));
+        widget.Switch(K2, At(0));
+        var plan = widget.Plan(At(5));
+        Check(plan is { Status: "ok", Checkpointed: true, GroupOrderBy: "계정3" } && plan.GroupOrder!.SequenceEqual(tiers),
+            "the plan follows 계정3's group list, the newest");
+        world.Apply(K2, plan);
+        Check(world.Shows(K2) == world.Shows(K3),
+            "applied, this account shows what 계정3 shows: the same pins, the groups in the same order with the same sessions");
+        Check(widget.Plan(At(6)) is { RenameGroups.Count: 0, CreateGroups.Count: 0, DeleteGroups.Count: 0, Moves.Count: 0, Pins.Count: 0, Renames.Count: 0 },
+            "a plan made again once it is applied finds nothing left to do");
+    }
+
+    /// <summary>R1: the last pin of one account is a value like any other; only the whole pin list emptied at once is taken
+    /// for lost, and then the pins are planned back from the changes.</summary>
+    private static void TestLastPin()
+    {
+        var (world, widget) = Accounts3("pins", ("p", "P"), ("y", "Y"));
+        using var _ = world;
+        world.Pin("local_p1"); world.Pin("local_p2"); world.Pin("local_p3"); world.Pin("local_y2");
+        widget.Start(K2, At(-60)); widget.Switch(K3, At(-50)); widget.Switch(K1, At(-40));
+        world.Pin("local_p1", false);
+        widget.Switch(K2, At(0));
+        var plan = widget.Plan(At(5));
+        Check(plan.Pins!.Single() is { Session: "local_p2", Pinned: false, By: "계정1" } && plan.Warnings is null,
+            "an account's last pin, unpinned, is a change like any other and reaches the others");
+        world.Apply(K2, plan);
+        widget.Plan(At(6));
+        world.ClearPins();
+        var lost = widget.Plan(At(10));
+        Check(lost.Warnings!.Contains("pins_lost") && lost.Pins!.Select(pin => (pin.Session, pin.Pinned)).SequenceEqual([("local_y2", true)]),
+            "the one pin list emptied at once is taken as lost: the pins are planned back from the changes, nothing unpinned");
+    }
+
+    /// <summary>R1: upgrading from the first format, a copy that had received a pin and a group (its agreement says so) and
+    /// was since unpinned and taken out of the group gives that, rather than letting an older pin and group come back.</summary>
+    private static void TestFirstFormatEvidence()
+    {
+        using var world = new SessionWorld("evidence");
+        foreach (var (account, id) in new[] { (K1, "local_p1"), (K2, "local_p2"), (K3, "local_p3") })
+        {
+            world.Record(account, id, "P", Cli(1));
+            if (account != K1) world.Copied(account, id, "P");
+        }
+        world.Put(K1, "local_p1", world.Group(K1, "G"));
+        world.Pin("local_p1");
+        // 계정3 still has G; the user took P out of it there.
+        world.Group(K3, "G");
+        world.Flush();
+        string Entry(string key, string label, DateTimeOffset? leftAt) =>
+            "\"" + key + "\":{\"label\":\"" + label + "\",\"leftAt\":" + (leftAt is { } left ? "\"" + left.ToString("O", CultureInfo.InvariantCulture) + "\"" : "null") + "}";
+        string FirstFormat(bool agreed) =>
+            "{\"version\":1,\"accounts\":{" + Entry(K1, "계정1", At(0)) + "," + Entry(K2, "계정2", null) + "," + Entry(K3, "계정3", At(10)) + "},\"pairs\":{"
+            + (agreed ? "\"" + K1 + "|" + K3 + "\":{\"" + K3 + "\":{\"local_p3\":{\"pinned\":true,\"group\":\"G\",\"title\":\"P\"}}}" : "") + "}}";
+        File.WriteAllText(Path.Combine(world.Ledger, ClaudeSessionLayout.FileName), FirstFormat(agreed: true));
+        Check(ClaudeSessionSync.Build(world.Sources, "local_p2") is { Status: "ok", Pins.Count: 0, Moves.Count: 0 },
+            "the copy in 계정3, left last, gives its no pin and no group: the first format shows it had received them");
+        File.WriteAllText(Path.Combine(world.Ledger, ClaudeSessionLayout.FileName), FirstFormat(agreed: false));
+        Check(ClaudeSessionSync.Build(world.Sources, "local_p2") is { Status: "ok" } without
+              && without.Pins!.Single() is { Session: "local_p2", Pinned: true } && without.Moves!.Single() is { Group: "G" },
+            "without that evidence a copy's defaults give nothing, and 계정1's older pin and group come");
+    }
+
+    /// <summary>R4: an older state moved with its group (G, renamed H in another account) is the plan's doing, not the
+    /// user's: planned again once applied, the newest state stays in the group the user chose for it.</summary>
+    private static void TestOlderStateFollowsRename()
+    {
+        using var world = new SessionWorld("older-move");
+        var widget = new Widget(world);
+        widget.Map(K1, "계정1");
+        widget.Map(K2, "계정2");
+        const string First = "30000000-0000-0000-0000-000000000001", Second = "30000000-0000-0000-0000-000000000002";
+        var r = world.Transcript("2026-10-01T00:00:00Z", First + "@2026-10-01T00:00:10Z");
+        var n = world.Transcript("2026-10-01T02:00:00Z", First + "@2026-10-01T00:00:10Z", Second + "@2026-10-01T02:00:00Z");
+        world.Record(K2, "local_r", "대화", r, activity: 10);
+        world.Record(K2, "local_n", "대화", n, [r], activity: 20);
+        world.Record(K1, "local_k", "다른 것", Cli(9));
+        foreach (var account in new[] { K1, K2 }) { world.Group(account, "J"); world.Group(account, "G"); }
+        world.Put(K2, "local_r", world.GroupId(K2, "G"));
+        world.Put(K2, "local_n", world.GroupId(K2, "J"));
+        widget.Start(K2, At(-60));
+        widget.Switch(K1, At(-50));
+        world.RenameGroup(K1, world.GroupId(K1, "G"), "H");
+        widget.Switch(K2, At(0));
+        var plan = widget.Plan(At(5));
+        Check(plan.GroupOrder!.SequenceEqual(["J", "H"]) && plan.Moves!.Single() is { Group: "H" } toH && toH.Sessions.SequenceEqual(["local_r"])
+              && plan.Archive!.Single() is { Session: "local_r", Newest: "local_n" }
+              && plan.Pending!.Sessions["local_r"].Group is { Value: "H" } move && move.At == DateTimeOffset.MinValue,
+            "the older state follows its group to H, a move that is nobody's choice");
+        world.Apply(K2, plan);
+        var confirm = widget.Plan(At(6));
+        Check(confirm is { Moves.Count: 0, Pins.Count: 0, CreateGroups.Count: 0 } && confirm.Archive!.Single() is { Session: "local_r", Ready: true }
+              && !widget.Layout.Changed[K2].TryGetValue("local_r", out var olderChange) | olderChange?.Group is not { Value: "H" },
+            "planned again, the newest state stays in J, where the user put it, and the older state is ready to go");
+    }
+
+    /// <summary>An older state the app opened again gets a notice that a background task ended and a stand-in reply
+    /// appended: that is not the user going on with it, so it is still an older state. A turn of the user's is.</summary>
+    private static void TestReopenedOlderState()
+    {
+        using var world = new SessionWorld("reopened");
+        const string First = "40000000-0000-0000-0000-000000000001", Second = "40000000-0000-0000-0000-000000000002";
+        var r = world.Transcript("2026-10-01T00:00:00Z", First + "@2026-10-01T00:00:10Z",
+            "{\"type\":\"user\",\"uuid\":\"40000000-0000-0000-0000-000000000003\",\"timestamp\":\"2026-10-03T00:00:00Z\",\"origin\":{\"kind\":\"task-notification\"}}",
+            "{\"type\":\"assistant\",\"uuid\":\"40000000-0000-0000-0000-000000000004\",\"timestamp\":\"2026-10-03T00:00:01Z\",\"message\":{\"model\":\"<synthetic>\"}}");
+        var n = world.Transcript("2026-10-01T02:00:00Z", First + "@2026-10-01T00:00:10Z", Second + "@2026-10-01T02:00:00Z");
+        world.Record(K2, "local_r", "대화", r, activity: 10);
+        world.Record(K2, "local_n", "대화", n, [r], activity: 20);
+        world.Record(K1, "local_k", "다른 것", Cli(9));
+        world.Flush();
+        Keep(world.Ledger, (K2, "계정2", null), (K1, "계정1", At(0)));
+        Check(ClaudeSessionSync.Build(world.Sources, "local_n").Archive!.Single() is { Session: "local_r", Newest: "local_n" },
+            "an older state the app opened again, with a background task's notice and a stand-in reply appended, is still an older state");
+        File.AppendAllLines(Path.Combine(world.Projects, "E--work", r + ".jsonl"),
+            ["{\"type\":\"user\",\"uuid\":\"40000000-0000-0000-0000-000000000005\",\"timestamp\":\"2026-10-03T00:10:00Z\"}"]);
+        Check(ClaudeSessionSync.Build(world.Sources, "local_n").Archive!.Count == 0, "one the user went on with is a branch and stays");
+    }
+
+    /// <summary>R5: a plan set G and K aside to make them anew in order; only K was set aside when the user renamed the
+    /// empty G to X. Planned again, X stays (G is not made again) and K's move carries on.</summary>
+    private static void TestRenamedWhileAside()
+    {
+        using var world = new SessionWorld("renamed-aside");
+        var widget = new Widget(world);
+        widget.Map(K1, "계정1");
+        widget.Map(K3, "계정3");
+        foreach (var (account, id) in new[] { (K1, "local_k1"), (K3, "local_k3") })
+        {
+            world.Record(account, id, "케이", Cli(1));
+            foreach (var name in new[] { "G", "K", "A" }) world.Group(account, name);
+            world.Put(account, id, world.GroupId(account, "K"));
+        }
+        world.Copied(K3, "local_k3", "케이");
+        widget.Start(K3, At(-60));
+        widget.Switch(K1, At(-50));
+        world.Reorder(K1, "A", "G", "K");
+        widget.Switch(K3, At(0));
+        var plan = widget.Plan(At(5));
+        var g = world.GroupId(K3, "G");
+        var k = world.GroupId(K3, "K");
+        Check(plan.GroupOrder!.SequenceEqual(["A", "G", "K"]) && plan.CreateGroups!.SequenceEqual(["G", "K"])
+              && plan.RenameGroups!.Select(rename => rename.Id).Order(StringComparer.Ordinal).SequenceEqual(new[] { g, k }.Order(StringComparer.Ordinal)),
+            "G and K step aside to be made anew after A");
+        world.RenameGroup(K3, k, "K (옮기는 중)");
+        world.RenameGroup(K3, g, "X");
+        var again = widget.Plan(At(10));
+        Check(again.GroupOrder!.SequenceEqual(["A", "X", "K"]) && !again.CreateGroups!.Contains("G")
+              && again.Moves!.Single() is { Group: "K", GroupId: null } toK && toK.Sessions.SequenceEqual(["local_k3"])
+              && again.DeleteGroups!.Any(group => group.Id == k && group.Remade) && again.RenameGroups!.All(rename => rename.Id != k),
+            "the user's renaming of G to X stands in the list, G is not made again, and K's move carries on");
+        world.Apply(K3, again);
+        Check(world.Of(K3).Groups.Select(group => group.Name).SequenceEqual(["A", "X", "K"]) && world.GroupOf(K3, "local_k3") == "K",
+            "applied, 계정3 has A, X and K in order, with its session in K");
+    }
+
+    /// <summary>R6: while one group is aside mid-move, a group the user adds by hand stays, and one the user removes by
+    /// hand is not made again.</summary>
+    private static void TestEditedWhileAside()
+    {
+        foreach (var removing in new[] { false, true })
+        {
+            using var world = new SessionWorld(removing ? "removed-aside" : "added-aside");
+            var widget = new Widget(world);
+            widget.Map(K1, "계정1");
+            widget.Map(K3, "계정3");
+            foreach (var (account, id) in new[] { (K1, "local_k1"), (K3, "local_k3") })
+            {
+                world.Record(account, id, "케이", Cli(1));
+                foreach (var name in new[] { "G", "K", "A" }) world.Group(account, name);
+                world.Put(account, id, world.GroupId(account, "K"));
+            }
+            world.Copied(K3, "local_k3", "케이");
+            widget.Start(K3, At(-60));
+            widget.Switch(K1, At(-50));
+            world.Reorder(K1, "A", "G", "K");
+            widget.Switch(K3, At(0));
+            var plan = widget.Plan(At(5));
+            Check(plan.GroupOrder!.SequenceEqual(["A", "G", "K"]), "the plan puts A first");
+            var k = world.GroupId(K3, "K");
+            world.RenameGroup(K3, k, "K (옮기는 중)");
+            if (removing) world.DeleteGroup(K3, world.GroupId(K3, "A"));
+            else world.Group(K3, "X");
+            var again = widget.Plan(At(10));
+            if (removing)
+                Check(again.GroupOrder is null || !again.GroupOrder.Contains("A") && !again.CreateGroups!.Contains("A"),
+                    "a group the user removed while another was aside is not made again");
+            else
+                Check(again.GroupOrder!.SequenceEqual(["A", "G", "K", "X"]) && again.DeleteGroups!.All(group => !group.Name.StartsWith("X", StringComparison.Ordinal) || group.Remade),
+                    "an empty group the user added while another was aside stays in the list");
+            world.Apply(K3, again);
+            var names = world.Of(K3).Groups.Select(group => group.Name).ToArray();
+            Check(removing ? names.SequenceEqual(["G", "K"]) : names.SequenceEqual(["A", "G", "K", "X"]),
+                removing ? "applied, 계정3 keeps G and K without A" : "applied, 계정3 has A, G, K and X in order");
+        }
+    }
+
+    /// <summary>R7: a group the plan deleted as it meant, while another it renamed out of the way is still there, is not
+    /// taken for the user's deletion: asked again, the plan keeps the list and the group made anew. R8: what the user
+    /// then does to the group made anew (removes it, renames it) is seen, and the plan does not make the old one again.</summary>
+    private static void TestDeletedAsPlanned()
+    {
+        foreach (var edit in new[] { "none", "removed", "renamed" })
+        {
+            using var world = new SessionWorld("deleted-as-planned-" + edit);
+            var widget = new Widget(world);
+            widget.Map(K1, "계정1");
+            widget.Map(K3, "계정3");
+            foreach (var (account, id) in new[] { (K1, "local_k1"), (K3, "local_k3") })
+            {
+                world.Record(account, id, "케이", Cli(1));
+                foreach (var name in new[] { "G", "K", "A" }) world.Group(account, name);
+                world.Put(account, id, world.GroupId(account, "K"));
+            }
+            world.Copied(K3, "local_k3", "케이");
+            widget.Start(K3, At(-60));
+            widget.Switch(K1, At(-50));
+            world.Reorder(K1, "A", "G", "K");
+            widget.Switch(K3, At(0));
+            var plan = widget.Plan(At(5));
+            Check(plan.GroupOrder!.SequenceEqual(["A", "G", "K"]), "the plan puts A first");
+            // Applied all but the last deletion: the old K is still there, aside.
+            var oldG = world.GroupId(K3, "G");
+            var oldK = world.GroupId(K3, "K");
+            world.RenameGroup(K3, oldG, "G (옮기는 중)");
+            world.RenameGroup(K3, oldK, "K (옮기는 중)");
+            var newG = world.Group(K3, "G");
+            var newK = world.Group(K3, "K");
+            world.Put(K3, "local_k3", newK);
+            world.DeleteGroup(K3, oldG);
+            foreach (var at in new[] { At(10), At(15) })
+            {
+                var again = widget.Plan(at);
+                Check(again.CreateGroups!.Count == 0 && again.DeleteGroups!.Select(group => group.Id).SequenceEqual([oldK])
+                      && again.DeleteGroups!.All(group => group.Id != newG) && (again.GroupOrder is null || again.GroupOrder.SequenceEqual(["A", "G", "K"])),
+                    "asked again, the plan only deletes the old K, keeping the G made anew");
+            }
+            // The stalled sync reported, the user then removes or renames the G made anew, and syncs again.
+            if (edit == "removed") world.DeleteGroup(K3, newG);
+            else if (edit == "renamed") world.RenameGroup(K3, newG, "X");
+            string[] want = edit switch { "removed" => ["A", "K"], "renamed" => ["A", "X", "K"], _ => ["A", "G", "K"] };
+            var last = widget.Plan(At(20));
+            Check(last.CreateGroups!.Count == 0 && last.DeleteGroups!.Select(group => group.Id).SequenceEqual([oldK])
+                  && (last.GroupOrder is null || last.GroupOrder.SequenceEqual(want)),
+                edit == "none" ? "asked once more, the plan still only deletes the old K"
+                    : "a group made anew that the user " + edit + " is not made again, and only the old K goes");
+            world.Apply(K3, last);
+            Check(world.Of(K3).Groups.Select(group => group.Name).SequenceEqual(want) && world.GroupOf(K3, "local_k3") == "K"
+                  && (edit == "removed" || world.GroupId(K3, want[1]) == newG),
+                edit == "none" ? "applied, 계정3 has A, G and K with the G made anew kept"
+                    : "applied, 계정3 keeps what the user did to the G made anew");
+        }
+    }
+
+    /// <summary>A group the app would not empty (archived sessions) may stay aside long after the rest of the plan is
+    /// done: the list then is the groups not aside, so the user's reordering by hand meanwhile counts and is not undone.</summary>
+    private static void TestReorderedWithLeftover()
+    {
+        using var world = new SessionWorld("reordered-with-leftover");
+        var widget = new Widget(world);
+        widget.Map(K1, "계정1");
+        widget.Map(K3, "계정3");
+        foreach (var (account, id) in new[] { (K1, "local_k1"), (K3, "local_k3") })
+        {
+            world.Record(account, id, "케이", Cli(1));
+            foreach (var name in new[] { "G", "K", "A" }) world.Group(account, name);
+            world.Put(account, id, world.GroupId(account, "K"));
+        }
+        world.Copied(K3, "local_k3", "케이");
+        widget.Start(K3, At(-60));
+        widget.Switch(K1, At(-50));
+        world.Reorder(K1, "A", "G", "K");
+        widget.Switch(K3, At(0));
+        Check(widget.Plan(At(5)).GroupOrder!.SequenceEqual(["A", "G", "K"]), "the plan puts A first");
+        // Applied all but the last deletion, which the app refused: the old K stays aside.
+        var oldG = world.GroupId(K3, "G");
+        var oldK = world.GroupId(K3, "K");
+        world.RenameGroup(K3, oldG, "G (옮기는 중)");
+        world.RenameGroup(K3, oldK, "K (옮기는 중)");
+        world.Group(K3, "G");
+        var newK = world.Group(K3, "K");
+        world.Put(K3, "local_k3", newK);
+        world.DeleteGroup(K3, oldG);
+        var checking = widget.Plan(At(10));
+        Check(checking.CreateGroups!.Count == 0 && checking.DeleteGroups!.Select(group => group.Id).SequenceEqual([oldK]),
+            "checked, the plan only deletes the old K left aside");
+        // The user goes to 계정1 and back, then puts K first by hand, and syncs again.
+        widget.Switch(K1, At(12));
+        widget.Switch(K3, At(14));
+        world.Reorder(K3, "K", "A", "G");
+        var again = widget.Plan(At(20));
+        Check(again.CreateGroups!.Count == 0 && again.RenameGroups!.Count == 0
+              && again.DeleteGroups!.Select(group => group.Id).SequenceEqual([oldK])
+              && (again.GroupOrder is null || again.GroupOrder.SequenceEqual(["K", "A", "G"])),
+            "the user's order made while the old K stayed aside is kept, and only the old K goes");
+        world.Apply(K3, again);
+        Check(world.Of(K3).Groups.Select(group => group.Name).SequenceEqual(["K", "A", "G"]) && world.GroupOf(K3, "local_k3") == "K",
+            "applied, 계정3 keeps K, A and G in the user's order");
+    }
+
+    /// <summary>R9: a sync stopped with K aside, and another account then removed K: asked twice without applying, the
+    /// plan keeps the newer list from that account, and the order shown here (K aside left out) is no change of this
+    /// account's own.</summary>
+    private static void TestRetargetedWhileAside()
+    {
+        using var world = new SessionWorld("retargeted-aside");
+        var widget = new Widget(world);
+        widget.Map(K1, "계정1");
+        widget.Map(K3, "계정3");
+        foreach (var (account, id) in new[] { (K1, "local_k1"), (K3, "local_k3") })
+        {
+            world.Record(account, id, "케이", Cli(1));
+            foreach (var name in new[] { "G", "K", "A" }) world.Group(account, name);
+            world.Put(account, id, world.GroupId(account, "K"));
+        }
+        world.Copied(K3, "local_k3", "케이");
+        widget.Start(K3, At(-60));
+        widget.Switch(K1, At(-50));
+        world.Reorder(K1, "A", "G", "K");
+        widget.Switch(K3, At(0));
+        Check(widget.Plan(At(5)).GroupOrder!.SequenceEqual(["A", "G", "K"]), "the plan puts A first");
+        // Only K was put aside before the sync stopped.
+        world.RenameGroup(K3, world.GroupId(K3, "K"), "K (옮기는 중)");
+        widget.Plan(At(10));
+        // 계정1 then removes K, and the user comes back.
+        widget.Switch(K1, At(20));
+        world.DeleteGroup(K1, world.GroupId(K1, "K"));
+        widget.Switch(K3, At(30));
+        var first = widget.Plan(At(35));
+        Check(first.GroupOrder!.SequenceEqual(["A", "G"]) && first.GroupOrderBy == "계정1", "back in 계정3, the plan follows 계정1's newer list");
+        var stored = widget.Layout.GroupsChanged.GetValueOrDefault(K3);
+        var again = widget.Plan(At(40));
+        Check(again.GroupOrder!.SequenceEqual(["A", "G"]) && again.GroupOrderBy == "계정1"
+              && widget.Layout.GroupsChanged.GetValueOrDefault(K3) == stored,
+            "asked again without applying, the plan still follows 계정1, and 계정3's order is no change of its own");
+        world.Apply(K3, again);
+        Check(world.Of(K3).Groups.Select(group => group.Name).SequenceEqual(["A", "G"]) && world.GroupOf(K3, "local_k3") is null,
+            "applied, 계정3 has A and G, and the session leaves the group 계정1 removed");
+    }
+
+    /// <summary>R10: a group the plan set out to put aside and make anew, removed by the user before the plan got to it (the
+    /// sync stopped first), is the user's removal: the next plan does not make it again — with no other group aside (the
+    /// list shows it) and with another still aside (the edit by id shows it).</summary>
+    private static void TestRemovedBeforeApplied()
+    {
+        foreach (var otherAside in new[] { false, true })
+        {
+            using var world = new SessionWorld(otherAside ? "removed-before-applied-aside" : "removed-before-applied");
+            var widget = new Widget(world);
+            widget.Map(K1, "계정1");
+            widget.Map(K3, "계정3");
+            string[] start = otherAside ? ["G", "K", "A"] : ["G", "A"];
+            foreach (var (account, id) in new[] { (K1, "local_k1"), (K3, "local_k3") })
+            {
+                world.Record(account, id, "에이", Cli(1));
+                foreach (var name in start) world.Group(account, name);
+                world.Put(account, id, world.GroupId(account, "A"));
+            }
+            world.Copied(K3, "local_k3", "에이");
+            widget.Start(K3, At(-60));
+            widget.Switch(K1, At(-50));
+            if (otherAside) world.Reorder(K1, "A", "G", "K"); else world.Reorder(K1, "A", "G");
+            widget.Switch(K3, At(0));
+            var plan = widget.Plan(At(5));
+            Check(plan.RenameGroups!.Any(group => group.From == "G") && plan.CreateGroups!.Contains("G"),
+                "the plan puts G aside to make it anew after A");
+            // The sync stops: nothing done, or only K put aside. Checked, then the user removes G by hand and syncs again.
+            if (otherAside) world.RenameGroup(K3, world.GroupId(K3, "K"), "K (옮기는 중)");
+            widget.Plan(At(10));
+            world.DeleteGroup(K3, world.GroupId(K3, "G"));
+            var again = widget.Plan(At(20));
+            Check(!again.CreateGroups!.Contains("G") && (again.GroupOrder is null || !again.GroupOrder.Contains("G")),
+                otherAside ? "with K still aside, the G the user removed is not made again"
+                    : "the G the user removed before the plan got to it is not made again");
+            world.Apply(K3, again);
+            Check(world.Of(K3).Groups.Select(group => group.Name).SequenceEqual(otherAside ? ["A", "K"] : ["A"]) && world.GroupOf(K3, "local_k3") == "A",
+                otherAside ? "applied, 계정3 has A and K, without G" : "applied, 계정3 has A, without G");
+        }
+    }
+
+    /// <summary>The widget starts (here: comes from the first format) while the app already shows 계정2, having come from
+    /// 계정3 without the widget seeing it: what 계정2 shows dates to just after it came, so the user's rename and pin there
+    /// are the newest — they stay, and 계정3 gets them. A first look that dated them to when the app had left 계정2 before
+    /// (2026-10-21 install) is moved there too.</summary>
+    private static void TestUnseenStay()
+    {
+        foreach (var earlierLook in new[] { false, true })
+        {
+            using var world = new SessionWorld(earlierLook ? "unseen-stay-redated" : "unseen-stay");
+            var widget = new Widget(world);
+            widget.Map(K2, "계정2");
+            widget.Map(K3, "계정3");
+            world.Record(K3, "local_x3", "개발", Cli(1));
+            world.Record(K2, "local_x2", "개발", Cli(1));
+            world.Copied(K2, "local_x2", "개발");
+            // The app left 계정2 long ago; it shows 계정2 again, and the user renamed and pinned the conversation there.
+            widget.Layout.Accounts[K2] = widget.Layout.Accounts[K2] with { LeftAt = At(-100) };
+            widget.Layout.Active = K2;
+            world.Retitle(K2, "local_x2", "언리얼 개발");
+            world.Pin("local_x2");
+            if (earlierLook)
+            {
+                // A first look the old way, before 계정3's leaving was known: it dated what it found to At(-100).
+                world.Flush();
+                Check(ClaudeSessionSync.Checkpoint(widget.Layout, world.Sources, K2, At(-5)), "the earlier first look is taken");
+                Check(widget.Layout.Changed[K2]["local_x2"].Title is { At: var dated } && dated == At(-100), "it dated the rename to when the app had left 계정2");
+            }
+            // The app came to 계정2 when it left 계정3.
+            widget.Layout.Accounts[K3] = widget.Layout.Accounts[K3] with { LeftAt = At(-10) };
+            var here = widget.Plan(At(0));
+            Check(here.Renames!.Count == 0 && here.Pins!.Count == 0 && widget.Layout.Accounts[K2].ArrivedAt == At(-10),
+                earlierLook ? "after the earlier first look, 계정2's rename and pin still stay" : "in 계정2 the user's rename and pin stay");
+            widget.Switch(K3, At(10));
+            var there = widget.Plan(At(15));
+            Check(there.Renames!.Any(rename => rename is { Session: "local_x3", Title: "언리얼 개발", By: "계정2" })
+                  && there.Pins!.Any(pin => pin is { Session: "local_x3", Pinned: true, By: "계정2" }),
+                "in 계정3 the plan brings 계정2's rename and pin");
+        }
+        // What is moved: only the account's own changes dated by then, its group list and its group edits; what a plan
+        // brought in from another account keeps its time.
+        var layout = new ClaudeSessionLayout();
+        layout.Changed[K2] = new(StringComparer.Ordinal)
+        {
+            ["local_a"] = new(new(true, At(-100)), new("G", At(-150), ThirdKey), new("가", At(-120))),
+            ["local_b"] = new(Title: new("나", At(5)))
+        };
+        layout.GroupsChanged[K2] = new(["G"], new Dictionary<string, string>(), At(-100));
+        layout.GroupsChanged[K3] = new(["H"], new Dictionary<string, string>(), At(-100));
+        layout.Renamings[K2] = [new("G", "G2", At(-100)), new(null, "X", At(5))];
+        layout.Redate(K2, At(-100), At(-10));
+        Check(layout.Changed[K2]["local_a"] == new Changes(new(true, At(-10)), new("G", At(-150), ThirdKey), new("가", At(-10)))
+              && layout.Changed[K2]["local_b"] == new Changes(Title: new("나", At(5)))
+              && layout.GroupsChanged[K2].At == At(-10) && layout.GroupsChanged[K3].At == At(-100)
+              && layout.Renamings[K2][0].At == At(-10) && layout.Renamings[K2][1].At == At(5),
+            "only the account's own changes dated by then move; what a plan brought in, later changes and other accounts keep theirs");
+    }
+
+    /// <summary>Three accounts the widget maps, each listing the given conversations: 계정1 holds the records the app wrote,
+    /// 계정2 and 계정3 the widget's copies of them.</summary>
+    private static (SessionWorld World, Widget Widget) Accounts3(string name, params (string Name, string Title)[] conversations)
+    {
+        var world = new SessionWorld(name);
+        var widget = new Widget(world);
+        foreach (var (account, label, suffix) in new[] { (K1, "계정1", "1"), (K2, "계정2", "2"), (K3, "계정3", "3") })
+        {
+            widget.Map(account, label);
+            for (var index = 0; index < conversations.Length; index++)
+            {
+                var id = "local_" + conversations[index].Name + suffix;
+                world.Record(account, id, conversations[index].Title, Cli(index + 1));
+                if (account != K1) world.Copied(account, id, conversations[index].Title);
+            }
+        }
+        return (world, widget);
+    }
+
+    /// <summary>What the widget does with the layout, without its timer and log: a switch it watched dates leaving and
+    /// arriving, starts a stay and checkpoints the account it comes to; a plan asked for in the account the app shows is
+    /// served from a checkpoint and kept as the plan in progress.</summary>
+    private sealed class Widget(SessionWorld world)
+    {
+        internal ClaudeSessionLayout Layout { get; } = new();
+
+        internal void Map(string account, string label) => Layout.Accounts[account] = new(label);
+
+        internal void Start(string account, DateTimeOffset at)
+        {
+            world.Flush();
+            Layout.Active = account;
+            Check(ClaudeSessionSync.Checkpoint(Layout, world.Sources, account, at), "the account the app shows first is checkpointed");
+        }
+
+        internal void Switch(string to, DateTimeOffset at)
+        {
+            world.Flush();
+            var from = Layout.Active!;
+            Layout.Accounts[from] = Layout.Accounts[from] with { LeftAt = at };
+            var coming = Layout.Accounts[to];
+            Layout.Accounts[to] = coming with { ArrivedAt = at, Stay = coming.Stay + 1 };
+            Layout.Active = to;
+            Check(ClaudeSessionSync.Checkpoint(Layout, world.Sources, to, at), "the account the app comes to is checkpointed");
+        }
+
+        /// <summary>A plan asked for in <paramref name="account"/>, the one the app shows unless named.</summary>
+        internal SyncPlan Plan(DateTimeOffset now, string? account = null)
+        {
+            world.Flush();
+            var asked = account ?? Layout.Active!;
+            return ClaudeSessionSync.Serve(Layout, world.Sources, asked, null, active: asked == Layout.Active, now);
+        }
+    }
+
+    /// <summary>
+    /// A disk fixture of what the plan and the widget read, written the way the app writes it: each account's session
+    /// records, the app's one pin list for every account (IndexedDB), its sidebar state (localStorage <c>dframe-store</c>:
+    /// each scope's groups and assignments, and the sections that give the groups' order and folding), transcripts, and
+    /// the widget's ledger of copies. Pins and the sidebar are kept here and written by <see cref="Flush"/>.
+    /// </summary>
+    internal sealed class SessionWorld : IDisposable
+    {
+        private readonly Dictionary<string, Sidebar> _sidebars = new(StringComparer.Ordinal);
+        private readonly HashSet<string> _pins = new(StringComparer.Ordinal);
+        private readonly List<JsonObject> _created = [];
+        private ulong _pinSequence = 41;
+        private int _groupNumber;
+        private bool _pinsChanged = true, _sidebarChanged = true;
+
+        /// <summary>One scope's groups in sidebar order, and where each session is filed.</summary>
+        internal sealed class Sidebar
+        {
+            internal List<(string Id, string Name, bool Collapsed)> Groups { get; } = [];
+            internal Dictionary<string, string> Assignments { get; } = new(StringComparer.Ordinal);
+        }
+
+        internal SessionWorld(string name)
+        {
+            Root = TempRoot(name);
+            foreach (var folder in new[] { Sessions, Path.Combine(Projects, "E--work"), Ledger }) Directory.CreateDirectory(folder);
+            CreateDatabase(Storage);
+            CreateDatabase(Idb);
+        }
+
+        internal string Root { get; }
+        internal string Sessions => Path.Combine(Root, "claude-code-sessions");
+        internal string Storage => Path.Combine(Root, "Local Storage", "leveldb");
+        internal string Idb => Path.Combine(Root, "IndexedDB", "https_claude.ai_0.indexeddb.leveldb");
+        internal string Projects => Path.Combine(Root, "projects");
+        internal string Ledger => Path.Combine(Root, "ledger");
+        internal ClaudeSessionSync.Sources Sources => new(Sessions, Storage, Idb, Projects, Ledger);
+        private string Backups => Path.Combine(Root, "backups");
+
+        internal string ListOf(string account) => Path.Combine(Sessions, account.Split('/')[0], account.Split('/')[1]);
+
+        internal string RecordPath(string account, string id) => Path.Combine(ListOf(account), id + ".json");
+
+        /// <summary>Writes a session record as the app does, with the fields the plan reads and a few it does not.</summary>
+        internal void Record(string account, string id, string? title, string? cli, string[]? prior = null, long activity = 1,
+            bool archived = false, Action<JsonObject>? extra = null)
+        {
+            var record = new JsonObject
+            {
+                ["sessionId"] = id, ["cliSessionId"] = cli, ["title"] = title, ["cwd"] = @"C:\work", ["createdAt"] = 1,
+                ["lastActivityAt"] = activity, ["isArchived"] = archived, ["model"] = "fable"
+            };
+            if (prior is { Length: > 0 }) record["priorCliSessionIds"] = new JsonArray(prior.Select(item => (JsonNode?)item).ToArray());
+            extra?.Invoke(record);
+            Directory.CreateDirectory(ListOf(account));
+            Save(account, id, record);
+        }
+
+        internal JsonObject Load(string account, string id) => (JsonObject)JsonNode.Parse(File.ReadAllText(RecordPath(account, id)))!;
+
+        private void Save(string account, string id, JsonObject record) => File.WriteAllText(RecordPath(account, id), record.ToJsonString());
+
+        /// <summary>A rename in the app: the new title, with the old one among the record's earlier titles.</summary>
+        internal void Retitle(string account, string id, string title)
+        {
+            var record = Load(account, id);
+            if (record["previousTitles"] is not JsonArray earlier) record["previousTitles"] = earlier = new JsonArray();
+            earlier.Add((string?)record["title"]);
+            record["title"] = title;
+            Save(account, id, record);
+        }
+
+        internal void Archive(string account, string id)
+        {
+            var record = Load(account, id);
+            record["isArchived"] = true;
+            Save(account, id, record);
+        }
+
+        /// <summary>The account's unarchived records, pinned as the pin list here says.</summary>
+        internal IReadOnlyList<ClaudeSessionSync.Record> Records(string account) => ClaudeSessionSync.ReadRecords(ListOf(account), _pins);
+
+        /// <summary>The widget copied a session into <paramref name="account"/>'s list, writing <paramref name="written"/> as its
+        /// title (null: a ledger entry from before titles were kept).</summary>
+        internal void Copied(string account, string id, string? written)
+        {
+            var entry = new JsonObject { ["dst"] = account, ["file"] = id + ".json" };
+            if (written is not null) entry["title"] = written;
+            _created.Add(entry);
+            WriteLedger();
+        }
+
+        /// <summary>The fill renamed its copy after the original: the record, and the title the ledger says it wrote.</summary>
+        internal void Followed(string account, string id, string title)
+        {
+            var record = Load(account, id);
+            record["title"] = title;
+            Save(account, id, record);
+            foreach (var entry in _created.Where(entry => (string?)entry["dst"] == account && (string?)entry["file"] == id + ".json"))
+                entry["title"] = title;
+            WriteLedger();
+        }
+
+        private void WriteLedger() => File.WriteAllText(Path.Combine(Ledger, "ledger.json"),
+            new JsonObject { ["created"] = new JsonArray(_created.Select(entry => entry.DeepClone()).ToArray()) }.ToJsonString());
+
+        internal bool IsPinned(string id) => _pins.Contains(id);
+
+        /// <summary>Pins or unpins a session in the app's one pin list (every account's sessions are in it).</summary>
+        internal void Pin(string id, bool pinned = true)
+        {
+            if (pinned ? _pins.Add(id) : _pins.Remove(id)) _pinsChanged = true;
+        }
+
+        /// <summary>The pin list emptied, as an app update once did.</summary>
+        internal void ClearPins() { _pins.Clear(); _pinsChanged = true; }
+
+        internal Sidebar Of(string account) => _sidebars.TryGetValue(account, out var sidebar) ? sidebar : _sidebars[account] = new();
+
+        /// <summary>Makes a group at the end of the sidebar as the app does: a name already there gets that group back,
+        /// unless <paramref name="twin"/> makes a second one (as an older app did).</summary>
+        internal string Group(string account, string name, bool collapsed = false, bool twin = false)
+        {
+            var groups = Of(account).Groups;
+            if (!twin && groups.FindIndex(group => group.Name == name) is var at and >= 0) return groups[at].Id;
+            var id = "cg-" + (++_groupNumber).ToString("D3", CultureInfo.InvariantCulture);
+            groups.Add((id, name, collapsed));
+            _sidebarChanged = true;
+            return id;
+        }
+
+        internal string GroupId(string account, string name) => Of(account).Groups.First(group => group.Name == name).Id;
+
+        internal string? GroupOf(string account, string session) =>
+            Of(account).Assignments.TryGetValue(session, out var id) ? Of(account).Groups.First(group => group.Id == id).Name : null;
+
+        /// <summary>Files a session in a group, or in none; filing it in a group unpins it, as the app does.</summary>
+        internal void Put(string account, string session, string? groupId)
+        {
+            var assignments = Of(account).Assignments;
+            if (groupId is null) assignments.Remove(session);
+            else { assignments[session] = groupId; Pin(session, false); }
+            _sidebarChanged = true;
+        }
+
+        internal void RenameGroup(string account, string id, string name)
+        {
+            var groups = Of(account).Groups;
+            var at = groups.FindIndex(group => group.Id == id);
+            groups[at] = (id, name, groups[at].Collapsed);
+            _sidebarChanged = true;
+        }
+
+        /// <summary>Deletes a group as the app does: its sessions are left in no group.</summary>
+        internal void DeleteGroup(string account, string id)
+        {
+            var sidebar = Of(account);
+            sidebar.Groups.RemoveAll(group => group.Id == id);
+            foreach (var session in sidebar.Assignments.Where(pair => pair.Value == id).Select(pair => pair.Key).ToArray())
+                sidebar.Assignments.Remove(session);
+            _sidebarChanged = true;
+        }
+
+        /// <summary>The user drags the groups into this order; groups it does not name keep theirs after them.</summary>
+        internal void Reorder(string account, params string[] names)
+        {
+            var groups = Of(account).Groups;
+            var ordered = groups.Select((group, index) => (Group: group, Index: index))
+                .OrderBy(item => Array.IndexOf(names, item.Group.Name) is var at and >= 0 ? at : names.Length + item.Index)
+                .Select(item => item.Group).ToList();
+            groups.Clear();
+            groups.AddRange(ordered);
+            _sidebarChanged = true;
+        }
+
+        /// <summary>Writes the pin list and the sidebar state where they changed, as the app would.</summary>
+        internal void Flush()
+        {
+            if (_pinsChanged) AppendRaw(Idb, ++_pinSequence, PinKey(5), PinValue(_pins.Order(StringComparer.Ordinal)));
+            if (_sidebarChanged) Check(WriteSidebar(Storage, SidebarState(), Backups), "the fixture sidebar is stored");
+            _pinsChanged = _sidebarChanged = false;
+        }
+
+        /// <summary>The sidebar state the app keeps: per scope its groups (stored in another order than the sidebar's,
+        /// which the sections give) and assignments, and its sections with their order and folding.</summary>
+        internal JsonObject SidebarState()
+        {
+            var scopes = new JsonObject();
+            var sidebars = new JsonObject();
+            foreach (var (account, sidebar) in _sidebars.OrderBy(pair => pair.Key, StringComparer.Ordinal))
+            {
+                var assignments = new JsonObject();
+                foreach (var (session, group) in sidebar.Assignments.OrderBy(pair => pair.Key, StringComparer.Ordinal))
+                    assignments["code:" + session] = group;
+                scopes[account] = new JsonObject
+                {
+                    ["groups"] = new JsonArray(sidebar.Groups.AsEnumerable().Reverse()
+                        .Select(group => (JsonNode?)new JsonObject { ["id"] = group.Id, ["name"] = group.Name }).ToArray()),
+                    ["assignments"] = assignments,
+                    ["order"] = new JsonObject()
+                };
+                var sections = new JsonArray(new JsonObject
+                {
+                    ["id"] = "pinned", ["kind"] = "pinned", ["order"] = 0, ["collapsed"] = false, ["shown"] = true
+                });
+                for (var index = 0; index < sidebar.Groups.Count; index++)
+                {
+                    var (id, name, collapsed) = sidebar.Groups[index];
+                    sections.Add(new JsonObject
+                    {
+                        ["id"] = id, ["kind"] = "manual", ["name"] = name, ["order"] = index + 1, ["collapsed"] = collapsed, ["shown"] = true
+                    });
+                }
+                sections.Add(new JsonObject
+                {
+                    ["id"] = "sessions", ["kind"] = "sessions", ["order"] = sidebar.Groups.Count + 1, ["collapsed"] = false, ["shown"] = true
+                });
+                sidebars[account] = new JsonObject { ["sections"] = sections };
+            }
+            return new JsonObject
+            {
+                ["state"] = new JsonObject { ["customGroupsByScope"] = scopes, ["codeSidebarByScope"] = sidebars }, ["version"] = 1
+            };
+        }
+
+        /// <summary>An account's groups as a plan reads them from the stored state.</summary>
+        internal ClaudeSessionSync.Layout? LayoutOf(string account) =>
+            ClaudeSessionSync.LayoutOf(JsonNode.Parse(SidebarState().ToJsonString())!["state"] as JsonObject, account, missingIsEmpty: true);
+
+        /// <summary>A transcript: lines given as "uuid@time" (a message the user wrote; others as they are), its file created
+        /// at <paramref name="created"/>.</summary>
+        internal string Transcript(string created, params string[] entries)
+        {
+            var id = Guid.NewGuid().ToString("D");
+            var path = Path.Combine(Projects, "E--work", id + ".jsonl");
+            File.WriteAllLines(path, entries.Select(entry => entry.Split('@') is [var uuid, var at]
+                ? "{\"type\":\"user\",\"uuid\":\"" + uuid + "\",\"timestamp\":\"" + at + "\"}" : entry));
+            File.SetCreationTimeUtc(path, DateTime.Parse(created, CultureInfo.InvariantCulture, DateTimeStyles.AdjustToUniversal));
+            return id;
+        }
+
+        /// <summary>Applies a plan in <paramref name="account"/> the way the skill does it with the app's tools: groups renamed
+        /// out of the way, made at the end (a name already there gets that group back), sessions moved (into a group
+        /// unpins), pins, titles, then the groups the moves emptied deleted. Older states wait for the user's consent.</summary>
+        internal void Apply(string account, ClaudeSessionSync.Plan plan)
+        {
+            foreach (var rename in plan.RenameGroups ?? []) RenameGroup(account, rename.Id, rename.To);
+            foreach (var name in plan.CreateGroups ?? []) Group(account, name);
+            foreach (var move in plan.Moves ?? [])
+                foreach (var session in move.Sessions)
+                    Put(account, session, move.Group is null ? null : move.GroupId ?? GroupId(account, move.Group));
+            foreach (var pin in plan.Pins ?? []) Pin(pin.Session, pin.Pinned);
+            foreach (var rename in plan.Renames ?? []) Retitle(account, rename.Session, rename.Title);
+            foreach (var group in plan.DeleteGroups ?? []) DeleteGroup(account, group.Id);
+            Flush();
+        }
+
+        /// <summary>What the app shows for an account, by title: its pinned sessions (with the group each keeps), each group
+        /// with its other sessions in sidebar order, then the sessions in no group.</summary>
+        internal string Shows(string account)
+        {
+            var records = Records(account);
+            var sidebar = Of(account);
+            static string Titles(IEnumerable<ClaudeSessionSync.Record> listed) =>
+                string.Join(", ", listed.Select(record => record.Title ?? record.SessionId).Order(StringComparer.Ordinal));
+            var shown = new List<string>
+            {
+                "고정: " + string.Join(", ", records.Where(record => record.Pinned)
+                    .Select(record => record.Title + "(" + (GroupOf(account, record.SessionId) ?? "-") + ")").Order(StringComparer.Ordinal))
+            };
+            foreach (var group in sidebar.Groups)
+                shown.Add(group.Name + ": " + Titles(records.Where(record => !record.Pinned
+                    && sidebar.Assignments.GetValueOrDefault(record.SessionId) == group.Id)));
+            shown.Add("그룹 없음: " + Titles(records.Where(record => !record.Pinned && !sidebar.Assignments.ContainsKey(record.SessionId))));
+            return string.Join(" | ", shown);
+        }
+
+        public void Dispose()
+        {
+            try { Directory.Delete(Root, recursive: true); }
+            catch (IOException) { }
+        }
+    }
+
     /// <summary>A minimal Chromium localStorage database: a manifest naming log 5 and a VERSION entry.</summary>
-    private static string CreateDatabase(string directory)
+    internal static string CreateDatabase(string directory)
     {
         var db = Directory.CreateDirectory(directory).FullName;
-        static byte[] Varint(ulong value) { var bytes = new List<byte>(); while (value >= 0x80) { bytes.Add((byte)(value | 0x80)); value >>= 7; } bytes.Add((byte)value); return bytes.ToArray(); }
         var edit = new List<byte>();
         edit.AddRange(Varint(2)); edit.AddRange(Varint(5)); edit.AddRange(Varint(3)); edit.AddRange(Varint(7));
         edit.AddRange(Varint(4)); edit.AddRange(Varint(41));
@@ -765,11 +2371,19 @@ internal static class ClaudeSessionSyncTests
         return db;
     }
 
+    /// <summary>Stores the app's sidebar state in a fixture localStorage as the app would (one appended batch).</summary>
+    internal static bool WriteSidebar(string db, JsonObject state, string backups)
+    {
+        var store = new ClaudeLocalStorage(db);
+        return store.Write(store.Read(["dframe-store"]), new Dictionary<string, string> { ["dframe-store"] = state.ToJsonString() }, backups,
+            () => true);
+    }
+
     /// <summary>The Code tab's pin list row of an IndexedDB database (object store 1, data index 1).</summary>
-    private static byte[] PinKey(byte database) => [0x00, database, 0x01, 0x01, .. ClaudeSidebarPins.EncodedKey];
+    internal static byte[] PinKey(byte database) => [0x00, database, 0x01, 0x01, .. ClaudeSidebarPins.EncodedKey];
 
     /// <summary>A pin list as the app stores it: record version, Blink's envelope, then V8's string.</summary>
-    private static byte[] PinValue(IEnumerable<string> ids, bool twoByte = false, bool trailer = true, string? json = null)
+    internal static byte[] PinValue(IEnumerable<string> ids, bool twoByte = false, bool trailer = true, string? json = null)
     {
         json ??= new JsonObject
         {
@@ -788,7 +2402,7 @@ internal static class ClaudeSessionSyncTests
     }
 
     /// <summary>Appends one batch of a single put (or, with no value, a delete) to the fixture's live log.</summary>
-    private static void AppendRaw(string db, ulong sequence, byte[] key, byte[]? value)
+    internal static void AppendRaw(string db, ulong sequence, byte[] key, byte[]? value)
     {
         var batch = new List<byte>();
         batch.AddRange(BitConverter.GetBytes(sequence)); batch.AddRange(BitConverter.GetBytes(1));
