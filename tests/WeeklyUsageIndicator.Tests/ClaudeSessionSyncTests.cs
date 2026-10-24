@@ -58,6 +58,9 @@ internal static class ClaudeSessionSyncTests
         TestRetargetedWhileAside();
         TestRemovedBeforeApplied();
         TestUnseenStay();
+        TestNestedLinks();
+        TestNestedPlan();
+        TestNestedOnDisk();
         return Task.CompletedTask;
     }
 
@@ -2016,6 +2019,168 @@ internal static class ClaudeSessionSyncTests
             "only the account's own changes dated by then move; what a plan brought in, later changes and other accounts keep theirs");
     }
 
+    /// <summary>Where the app nests a session, read from its record as the app reads it: a suggested task, Claude's side
+    /// session and a fork under the session they came from, none once moved to top level; then each family's top in a
+    /// list, archived sessions included.</summary>
+    private static void TestNestedLinks()
+    {
+        using var world = new SessionWorld("nested-links");
+        static JsonObject Started(string by, bool side = false, bool userFork = false, string? deleted = null)
+        {
+            var spawned = new JsonObject { ["sessionId"] = by, ["taskId"] = "task_1", ["title"] = "일" };
+            if (side) spawned["sideSession"] = true;
+            if (userFork) spawned["userFork"] = true;
+            if (deleted is not null) spawned["deletedParent"] = new JsonObject { ["sessionId"] = deleted };
+            return spawned;
+        }
+        world.Record(K1, "local_task", "제안에서", Cli(1), extra: record => record["spawnedFrom"] = Started("local_top"));
+        world.Record(K1, "local_side", "곁가지", Cli(2), extra: record => record["spawnedFrom"] = Started("local_top", side: true));
+        world.Record(K1, "local_forked", "갈래", Cli(3), extra: record => record["forkedFromSessionId"] = "local_top");
+        world.Record(K1, "local_btw", "옆 대화", Cli(4), extra: record =>
+        {
+            record["spawnedFrom"] = Started("local_top", side: true, userFork: true);
+            record["forkedFromSessionId"] = "local_other";
+        });
+        world.Record(K1, "local_moved", "옮겨 붙음", Cli(5), extra: record =>
+        {
+            record["spawnedFrom"] = Started("local_top", side: true, deleted: "local_gone");
+            record["forkedFromSessionId"] = "local_gone";
+        });
+        world.Record(K1, "local_refork", "다른 데서 갈래", Cli(6), extra: record =>
+        {
+            record["spawnedFrom"] = Started("local_top", side: true);
+            record["forkedFromSessionId"] = "local_other";
+        });
+        world.Record(K1, "local_detached", "떼어 냄", Cli(7), extra: record =>
+        {
+            record["spawnedFrom"] = Started("local_top", side: true);
+            record["lineageDetached"] = true;
+        });
+        world.Record(K1, "local_self", "제 자신", Cli(8), extra: record => record["spawnedFrom"] = Started("local_self"));
+        world.Record(K1, "local_top", "맨 위", Cli(9));
+        var parents = world.Records(K1).ToDictionary(record => record.SessionId, record => record.Parent, StringComparer.Ordinal);
+        Check(parents["local_task"] == "local_top" && parents["local_side"] == "local_top" && parents["local_forked"] == "local_top",
+            "a suggested task, Claude's side session and a fork link to the session they came from");
+        Check(parents["local_btw"] == "local_other" && parents["local_refork"] == "local_other" && parents["local_moved"] == "local_top",
+            "a side session forked from another session links to that one, unless the fork is its deleted starter's");
+        Check(parents["local_detached"] is null && parents["local_self"] is null && parents["local_top"] is null,
+            "one moved to top level, one linked to itself and one with no link have none");
+        static Record Under(string id, string? parent) => new(id, id, false, null, [], 0, Parent: parent);
+        var nests = ClaudeSessionSync.Nests(
+            [Under("local_top", null), Under("local_mid", "local_top"), Under("local_leaf", "local_mid"), Under("local_lost", "local_gone"),
+             Under("local_through", "local_shelf"), Under("local_stranded", "local_shut"), Under("local_a", "local_b"), Under("local_b", "local_a")],
+            [Under("local_shelf", "local_top"), Under("local_shut", null), Under("local_kept", "local_shut")]);
+        Check(nests["local_mid"] == "local_top" && nests["local_leaf"] == "local_top" && !nests.ContainsKey("local_top")
+              && !nests.ContainsKey("local_lost"), "a family climbs to its top, and a parent the list lacks nests nothing");
+        Check(nests["local_through"] == "local_top" && !nests.ContainsKey("local_stranded")
+              && nests["local_shelf"] == "local_top" && nests["local_kept"] == "local_shut",
+            "a live session whose parent is archived sits under the nearest live one above, or under none; an archived one stays under its parent");
+        Check(nests.ContainsKey("local_a") && nests.ContainsKey("local_b"), "a family that loops still ends");
+    }
+
+    /// <summary>A nested session in a plan: never moved, its own assignment counts for nothing, and another account's nested
+    /// session offers the group of its family's top rather than its own stale filing.</summary>
+    private static void TestNestedPlan()
+    {
+        var parent = R("local_p", "부모", false, Cli(1));
+        var child = R("local_c", "곁가지", false, Cli(2)) with { Parent = "local_p" };
+        // 메인 keeps only A, where it files both; here the nested session's own assignment says B.
+        var here = Compute([parent, child], Groups(["g1=A", "g2=B"], ("local_p", "g1"), ("local_c", "g2")),
+            [Other(ReferenceKey, "메인", [R("local_q", "부모", false, Cli(1)), R("local_d", "곁가지", false, Cli(2))],
+                Groups(["h1=A"], ("local_q", "h1"), ("local_d", "h1")), At(0))]);
+        Check(here.Moves!.Count == 0 && here.GroupOrder!.SequenceEqual(["A"])
+              && here.DeleteGroups!.Single() is { Name: "B (옮기는 중)", Hidden: 0, Remade: false }
+              && here.Sidebars![0].Groups!.Single(group => group.Name == "A").Sessions.SequenceEqual(["곁가지", "부모"])
+              && here.Sidebars[0].Nested!.Single() == new ClaudeSessionSync.NestedView("곁가지", "부모") && here.Sidebars[1].Nested is null,
+            "a nested session is not moved: it shows its family's group, and B, holding only its own assignment, is empty");
+        // The same conversation nested in 메인 under 부모, which is filed under A; its own stale filing says B.
+        var there = Compute([R("local_p", "부모", false, Cli(1)), R("local_c", "곁가지", false, Cli(2))], Groups(["g1=A"], ("local_p", "g1")),
+            [Other(ReferenceKey, "메인", [R("local_q", "부모", false, Cli(1)), R("local_d", "곁가지", false, Cli(2)) with { Parent = "local_q" }],
+                Groups(["h1=A", "h2=B"], ("local_q", "h1"), ("local_d", "h2")), At(0))]);
+        Check(there.Moves!.Single() is { Group: "A", GroupId: "g1" } toA && toA.Sessions.SequenceEqual(["local_c"])
+              && there.Sidebars![1].Nested!.Single().Under == "부모",
+            "another account's nested session offers its family's group, not its own stale filing");
+        // What 메인 did to the family's group it offers for the nested session; what a plan brought 부모 there from another
+        // account was that account's change to 부모 alone, and offers nothing for it.
+        foreach (var brought in new[] { false, true })
+        {
+            var kept = new ClaudeSessionLayout();
+            var theirs = new[] { R("local_q", "부모", false, Cli(1)), R("local_d", "곁가지", false, Cli(2)) with { Parent = "local_q" } };
+            var layout = Groups(["h1=A"], ("local_q", "h1"));
+            Steady(kept, ReferenceKey, "메인", theirs, layout, At(0));
+            Changed(kept, ReferenceKey, "local_q", Change(At(10), group: "A", by: brought ? ThirdKey : null));
+            var plan = Compute([R("local_p", "부모", false, Cli(1)), R("local_c", "곁가지", false, Cli(2))], Groups(["g1=A"], ("local_p", "g1")),
+                [Other(ReferenceKey, "메인", theirs, layout, At(0))], kept);
+            Check(brought ? plan.Moves!.Count == 0 : plan.Moves!.Single() is { Group: "A" } move && move.Sessions.SequenceEqual(["local_c"]),
+                brought ? "a family's group a plan brought from another account is offered for no nested session"
+                    : "the family's group 메인 chose itself is offered for its nested session");
+        }
+    }
+
+    /// <summary>10/24: in 계정1 a session started from a suggestion is nested under the session that made it, while 계정2 and
+    /// 계정3 hold copies of both as sessions of their own. The plan never moves the nested session, which the app refuses,
+    /// nor takes its group for a change of its own; elsewhere its copy follows its family, and a filing the copy got by
+    /// itself stays.</summary>
+    private static void TestNestedOnDisk()
+    {
+        var (world, widget) = Accounts3("nested", ("p", "부모"), ("c", "곁가지"));
+        using var _ = world;
+        world.Record(K1, "local_c1", "곁가지", Cli(2), extra: record =>
+            record["spawnedFrom"] = new JsonObject { ["sessionId"] = "local_p1", ["taskId"] = "task_1", ["title"] = "곁가지" });
+        foreach (var (account, suffix) in new[] { (K1, "1"), (K2, "2"), (K3, "3") })
+        {
+            world.Group(account, "스킬 생태계");
+            var tools = world.Group(account, "도구");
+            world.Put(account, "local_p" + suffix, tools);
+            // In 계정1 an assignment from before the session was nested, which the app ignores.
+            world.Put(account, "local_c" + suffix, tools);
+        }
+        widget.Start(K1, At(-60)); widget.Switch(K3, At(-50)); widget.Switch(K2, At(-40));
+        world.Put(K2, "local_p2", world.GroupId(K2, "스킬 생태계"));
+        world.Put(K2, "local_c2", world.GroupId(K2, "스킬 생태계"));
+        widget.Switch(K1, At(0));
+        var plan = widget.Plan(At(5));
+        Check(plan.Moves!.Single() is { Group: "스킬 생태계" } toSkills && toSkills.Sessions.SequenceEqual(["local_p1"])
+              && plan.Sidebars![0].Nested!.Single() == new ClaudeSessionSync.NestedView("곁가지", "부모"),
+            "in 계정1 the plan moves 부모, whose family goes with it, never the nested session by itself");
+        world.Apply(K1, plan);
+        Check(widget.Plan(At(6)) is { Moves.Count: 0, Pins.Count: 0 } && world.Shows(K1) == world.Shows(K2)
+              && widget.Layout.Changed[K1].GetValueOrDefault("local_c1")?.Group is null,
+            "applied, 계정1 shows what 계정2 shows, and the nested session's group is no change of its own");
+        // What the earlier widget recorded on 10/24: the nested session taken out of its group, as 계정1's own change.
+        Changed(widget.Layout, K1, "local_c1", Change(At(7), ungrouped: true));
+        widget.Switch(K3, At(10));
+        var there = widget.Plan(At(15));
+        Check(there.Moves!.Single() is { Group: "스킬 생태계" } intoSkills
+              && intoSkills.Sessions.Order(StringComparer.Ordinal).SequenceEqual(["local_c3", "local_p3"]),
+            "in 계정3 both follow 계정2: what was recorded for the nested session in 계정1 takes nothing out of its group");
+        world.Apply(K3, there);
+        widget.Plan(At(16));
+        Check(world.Shows(K3) == world.Shows(K1), "and 계정3 shows what 계정1 shows");
+        widget.Switch(K1, At(20));
+        Check(widget.Layout.Changed[K1].GetValueOrDefault("local_c1")?.Group is null,
+            "back in 계정1, the group recorded for the nested session is gone");
+        // The user moves 부모 in 계정1, its nested session with it: elsewhere the copy follows.
+        world.Put(K1, "local_p1", world.GroupId(K1, "도구"));
+        widget.Switch(K2, At(30));
+        var follow = widget.Plan(At(35));
+        Check(follow.Moves!.Single() is { Group: "도구" } intoTools
+              && intoTools.Sessions.Order(StringComparer.Ordinal).SequenceEqual(["local_c2", "local_p2"]),
+            "in 계정2 the copy of the nested session follows its family's move");
+        world.Apply(K2, follow);
+        widget.Plan(At(36));
+        Check(world.Shows(K2) == world.Shows(K1), "and 계정2 shows what 계정1 shows");
+        // The user files the copy by itself in 계정2: 계정1 cannot follow, 계정3 does.
+        world.Put(K2, "local_c2", world.GroupId(K2, "스킬 생태계"));
+        widget.Switch(K1, At(40));
+        Check(widget.Plan(At(45)) is { Moves.Count: 0 } stays && stays.Sidebars![0].Nested!.Single().Under == "부모",
+            "in 계정1 the nested session stays with its family, and the plan says why");
+        widget.Switch(K3, At(50));
+        var apart = widget.Plan(At(55));
+        Check(apart.Moves!.Single() is { Group: "도구" } back && back.Sessions.SequenceEqual(["local_p3"]),
+            "in 계정3 the copy keeps the filing 계정2 gave it by itself, and 부모 follows 계정1");
+    }
+
     /// <summary>Three accounts the widget maps, each listing the given conversations: 계정1 holds the records the app wrote,
     /// 계정2 and 계정3 the widget's copies of them.</summary>
     private static (SessionWorld World, Widget Widget) Accounts3(string name, params (string Name, string Title)[] conversations)
@@ -2152,6 +2317,13 @@ internal static class ClaudeSessionSyncTests
 
         /// <summary>The account's unarchived records, pinned as the pin list here says.</summary>
         internal IReadOnlyList<ClaudeSessionSync.Record> Records(string account) => ClaudeSessionSync.ReadRecords(ListOf(account), _pins);
+
+        /// <summary>The account's nested sessions, each with the session at the top of its family, as the app nests them.</summary>
+        internal IReadOnlyDictionary<string, string> NestsOf(string account)
+        {
+            var records = ClaudeSessionSync.ReadRecords(ListOf(account), _pins, out _, out var archived);
+            return ClaudeSessionSync.Nests(records, archived);
+        }
 
         /// <summary>The widget copied a session into <paramref name="account"/>'s list, writing <paramref name="written"/> as its
         /// title (null: a ledger entry from before titles were kept).</summary>
@@ -2314,14 +2486,29 @@ internal static class ClaudeSessionSyncTests
 
         /// <summary>Applies a plan in <paramref name="account"/> the way the skill does it with the app's tools: groups renamed
         /// out of the way, made at the end (a name already there gets that group back), sessions moved (into a group
-        /// unpins), pins, titles, then the groups the moves emptied deleted. Older states wait for the user's consent.</summary>
+        /// unpins), pins, titles, then the groups the moves emptied deleted. Older states wait for the user's consent. As
+        /// the app does, a move naming a nested session without the session at the top of its family is refused whole, and
+        /// one naming both files the family by that session, dropping the nested one's own assignment.</summary>
         internal void Apply(string account, ClaudeSessionSync.Plan plan)
         {
             foreach (var rename in plan.RenameGroups ?? []) RenameGroup(account, rename.Id, rename.To);
             foreach (var name in plan.CreateGroups ?? []) Group(account, name);
             foreach (var move in plan.Moves ?? [])
+            {
+                var nests = NestsOf(account);
+                if (move.Sessions.FirstOrDefault(session => nests.TryGetValue(session, out var top) && !move.Sessions.Contains(top)) is { } nested)
+                    throw new InvalidOperationException("Session " + nested + " is nested under " + nests[nested]
+                        + ", and nested sessions move with their parent. Nothing was moved.");
+                var group = move.Group is null ? null : move.GroupId ?? GroupId(account, move.Group);
                 foreach (var session in move.Sessions)
-                    Put(account, session, move.Group is null ? null : move.GroupId ?? GroupId(account, move.Group));
+                    if (nests.TryGetValue(session, out var top))
+                    {
+                        Put(account, top, group);
+                        Of(account).Assignments.Remove(session);
+                        if (group is not null) Pin(session, false);
+                    }
+                    else Put(account, session, group);
+            }
             foreach (var pin in plan.Pins ?? []) Pin(pin.Session, pin.Pinned);
             foreach (var rename in plan.Renames ?? []) Retitle(account, rename.Session, rename.Title);
             foreach (var group in plan.DeleteGroups ?? []) DeleteGroup(account, group.Id);
@@ -2329,22 +2516,25 @@ internal static class ClaudeSessionSyncTests
         }
 
         /// <summary>What the app shows for an account, by title: its pinned sessions (with the group each keeps), each group
-        /// with its other sessions in sidebar order, then the sessions in no group.</summary>
+        /// with its other sessions in sidebar order, then the sessions in no group. A nested session shows the group of the
+        /// session at the top of its family.</summary>
         internal string Shows(string account)
         {
             var records = Records(account);
             var sidebar = Of(account);
+            var nests = NestsOf(account);
+            string Home(string session) => nests.GetValueOrDefault(session) ?? session;
             static string Titles(IEnumerable<ClaudeSessionSync.Record> listed) =>
                 string.Join(", ", listed.Select(record => record.Title ?? record.SessionId).Order(StringComparer.Ordinal));
             var shown = new List<string>
             {
                 "고정: " + string.Join(", ", records.Where(record => record.Pinned)
-                    .Select(record => record.Title + "(" + (GroupOf(account, record.SessionId) ?? "-") + ")").Order(StringComparer.Ordinal))
+                    .Select(record => record.Title + "(" + (GroupOf(account, Home(record.SessionId)) ?? "-") + ")").Order(StringComparer.Ordinal))
             };
             foreach (var group in sidebar.Groups)
                 shown.Add(group.Name + ": " + Titles(records.Where(record => !record.Pinned
-                    && sidebar.Assignments.GetValueOrDefault(record.SessionId) == group.Id)));
-            shown.Add("그룹 없음: " + Titles(records.Where(record => !record.Pinned && !sidebar.Assignments.ContainsKey(record.SessionId))));
+                    && sidebar.Assignments.GetValueOrDefault(Home(record.SessionId)) == group.Id)));
+            shown.Add("그룹 없음: " + Titles(records.Where(record => !record.Pinned && !sidebar.Assignments.ContainsKey(Home(record.SessionId)))));
             return string.Join(" | ", shown);
         }
 

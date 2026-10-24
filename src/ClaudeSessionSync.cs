@@ -686,6 +686,11 @@ internal static class ClaudeSidebarPins
 /// <para>A conversation continued in another account can come back as a second record beside its older state. The plan
 /// lists such older states for archiving (reversible); their changes count for the newest state. Nothing is deleted but
 /// groups left empty; sessions only one side has are otherwise left alone.</para>
+/// <para>A session the app nests under another (a side session under the session that started it, say) shows the group
+/// of the session at the top of its family and moves only with it (see <see cref="Nests"/>). Its group is therefore that
+/// session's: never a change of its own and never moved by itself. The widget's copies carry no such link, so elsewhere
+/// the conversation is a session of its own, which follows what its account did to the family's group, not what a plan
+/// brought to the top session there from another account.</para>
 /// </summary>
 internal static class ClaudeSessionSync
 {
@@ -712,11 +717,15 @@ internal static class ClaudeSessionSync
 
     /// <param name="Branch">A fork or a session spawned from another: a conversation of its own, never a newer state.</param>
     /// <param name="Renamed">The app recorded an earlier title (<c>previousTitles</c>): someone renamed it in this list.</param>
+    /// <param name="Parent">The session its lineage links it to (see <see cref="ParentOf"/>), under which the app may nest it.</param>
     internal sealed record Record(string SessionId, string? Title, bool Pinned, string? Cli, IReadOnlyList<string> Prior,
-        long LastActivityAt, bool Branch = false, bool Renamed = false);
+        long LastActivityAt, bool Branch = false, bool Renamed = false, string? Parent = null);
     internal sealed record Group(string Id, string Name, bool Collapsed = false);
     /// <param name="Groups">In sidebar order.</param>
-    internal sealed record Layout(IReadOnlyList<Group> Groups, IReadOnlyDictionary<string, string> Assignments);
+    /// <param name="Nested">The sessions the app nests under another, each with the session at the top of its family, whose
+    /// group it shows (see <see cref="Nests"/>); its own assignment is ignored.</param>
+    internal sealed record Layout(IReadOnlyList<Group> Groups, IReadOnlyDictionary<string, string> Assignments,
+        IReadOnlyDictionary<string, string>? Nested = null);
     /// <param name="GroupId">The group's id where it already stands; null for a group the plan makes (found by name
     /// once made) and for no group.</param>
     internal sealed record Move(string? Group, IReadOnlyList<string> Sessions, string? GroupId = null);
@@ -736,9 +745,13 @@ internal static class ClaudeSessionSync
     internal sealed record Retire(string Session, string? Title, bool Pinned, string Newest, string? NewestTitle, bool Ready,
         DateTimeOffset LastWritten, DateTimeOffset MovedOn);
     internal sealed record GroupView(string Name, IReadOnlyList<string> Sessions, bool Collapsed = false);
+    /// <summary>A session nested under another, by title: it shows that one's group and moves only with it.</summary>
+    internal sealed record NestedView(string Title, string Under);
     /// <summary>An account's sidebar as the app shows it, by title: the pinned sessions, then each group's others, in
-    /// sidebar order. A null list could not be read.</summary>
-    internal sealed record Sidebar(string Account, string? Label, IReadOnlyList<string>? Pinned, IReadOnlyList<GroupView>? Groups);
+    /// sidebar order, a nested session in the group of its family. A null list could not be read. <c>Nested</c> lists
+    /// the nested sessions; null when there are none.</summary>
+    internal sealed record Sidebar(string Account, string? Label, IReadOnlyList<string>? Pinned, IReadOnlyList<GroupView>? Groups,
+        IReadOnlyList<NestedView>? Nested = null);
     /// <summary>When a transcript file was created and last written, and its newest turn (null when it has none; see
     /// <c>TryEntry</c>). A file created after it was last written was copied or restored, so its creation time dates
     /// nothing.</summary>
@@ -1056,6 +1069,9 @@ internal static class ClaudeSessionSync
         var notes = warnings?.ToList() ?? [];
         string? Label(string? account) => account is null ? null
             : account == current ? currentLabel : kept.Accounts.TryGetValue(account, out var known) ? known.Label : null;
+        // A nested session shows the group of the session at the top of its family and moves only with it.
+        var nests = Nests(currentRecords, archived);
+        if (currentLayout is not null) currentLayout = currentLayout with { Nested = nests };
         // This account's older states are archived and the others' are seen through: either way what was changed on
         // them counts for the newest state of the conversation, as does what was changed on an older state already
         // archived — found again here, so an archived branch never counts for another conversation.
@@ -1113,13 +1129,10 @@ internal static class ClaudeSessionSync
             // Every change made to the conversation: this account's, its older states' and archived records' included,
             // then each other account's.
             var offers = new List<(ClaudeSessionLayout.Changes Change, int Rank, string Account)>();
-            foreach (var change in Fold(record, ownOlderOf[record.SessionId], mine)) offers.Add((change, 0, current));
+            foreach (var change in Fold(record.SessionId, ownOlderOf[record.SessionId], mine)) offers.Add((change, 0, current));
             foreach (var side in found)
-            {
-                var match = side.Matches[record.SessionId];
-                foreach (var change in Fold(match, side.OlderOf[match.SessionId], side.Changes))
+                foreach (var change in side.Fold(side.Matches[record.SessionId]))
                     offers.Add((change, side.Rank, side.Other.Account));
-            }
             if (decidable && Newest(offers, change => change.Title) is { } title && !string.IsNullOrWhiteSpace(title.Value)
                 && title.Value != record.Title)
             {
@@ -1127,7 +1140,8 @@ internal static class ClaudeSessionSync
                 titleFrom[record.SessionId] = title;
             }
             var pin = pinPlan ? Newest(offers, change => change.Pinned) : null;
-            var group = groups ? Newest(offers, change => change.Group) : null;
+            // A nested session keeps the group of its family: nothing here moves it.
+            var group = groups && !nests.ContainsKey(record.SessionId) ? Newest(offers, change => change.Group) : null;
             // Filed by hand in this stay: that group stays even where the list lacks it.
             if (group is { Value: { } filedUnder, By: var filer, At: var filedAt } && filer == current
                 && (filedAt == DateTimeOffset.MaxValue || filedAt > stayStart)) filedHere.Add(filedUnder);
@@ -1231,7 +1245,8 @@ internal static class ClaudeSessionSync
                 }
                 moved.Add(session);
             }
-            foreach (var record in newest)
+            // A nested session moves with the session at the top of its family, never by itself: the app refuses that.
+            foreach (var record in newest.Where(record => !nests.ContainsKey(record.SessionId)))
             {
                 var (pin, want, from) = targets[record.SessionId];
                 if (!want.Known || GroupNameOf(currentLayout!, record.SessionId, renamedHere) is not { Known: true }) { unresolved = true; continue; }
@@ -1240,7 +1255,7 @@ internal static class ClaudeSessionSync
                 targets[record.SessionId] = (pin, (true, goal), from);
             }
             // An older state follows its group when that is made anew or renamed, and its newest state when its group goes.
-            foreach (var record in currentRecords.Where(record => retiring.ContainsKey(record.SessionId)))
+            foreach (var record in currentRecords.Where(record => retiring.ContainsKey(record.SessionId) && !nests.ContainsKey(record.SessionId)))
             {
                 if (GroupNameOf(currentLayout!, record.SessionId, renamedHere) is not { Known: true, Name: { } name }
                     || keptIds.Contains(currentLayout!.Assignments[record.SessionId])) continue;
@@ -1257,7 +1272,9 @@ internal static class ClaudeSessionSync
             var archivedIds = (archived ?? []).Select(record => record.SessionId).ToHashSet(StringComparer.Ordinal);
             foreach (var group in here.Where(group => !keptIds.Contains(group.Id)))
             {
-                var members = currentLayout!.Assignments.Where(pair => pair.Value == group.Id).Select(pair => pair.Key).ToArray();
+                // A nested session's own assignment counts for nothing: it leaves with its family.
+                var members = currentLayout!.Assignments.Where(pair => pair.Value == group.Id && !nests.ContainsKey(pair.Key))
+                    .Select(pair => pair.Key).ToArray();
                 // Where its sessions go: its own name, or where its renaming leads, when the list has that.
                 var heir = Settle(Stands(group));
                 var remade = heir is not null;
@@ -1305,8 +1322,9 @@ internal static class ClaudeSessionSync
                     older.Newest.Title, Ready(record, byId[older.Newest.SessionId]), older.LastWritten, older.MovedOn);
             })
             .OrderBy(retire => retire.Title, StringComparer.Ordinal).ToList();
-        var sidebars = new List<Sidebar> { View(current, currentLabel, currentRecords, currentLayout, pinsKnown) };
-        sidebars.AddRange(others.Select(other => View(other.Account, other.Label, other.Records, other.Layout, pinsKnown)));
+        var sidebars = new List<Sidebar> { View(current, currentLabel, currentRecords, currentLayout, nests, pinsKnown) };
+        sidebars.AddRange(others.Select(other => View(other.Account, other.Label, other.Records, other.Layout,
+            Nests(other.Records, other.Archived), pinsKnown)));
         var views = seen.OrderBy(side => side.Other.Account, StringComparer.Ordinal).Select(side => new OtherView(side.Other.Account,
                 side.Other.Label, side.Other.LeftAt, side.Matches.Count,
                 side.View.Where(record => !side.Claimed.Contains(record.SessionId)).Select(Name).Order(StringComparer.Ordinal).ToArray()))
@@ -1369,10 +1387,10 @@ internal static class ClaudeSessionSync
     /// <summary>The changes that count for a record: its own, and its older states' (the most recently active first),
     /// archived ones included — each found again as an older state of this record, so a branch keeps its changes to
     /// itself.</summary>
-    private static IEnumerable<ClaudeSessionLayout.Changes> Fold(Record record, IEnumerable<string> olderIds,
+    private static IEnumerable<ClaudeSessionLayout.Changes> Fold(string sessionId, IEnumerable<string> olderIds,
         IReadOnlyDictionary<string, ClaudeSessionLayout.Changes> changes)
     {
-        foreach (var id in olderIds.Prepend(record.SessionId))
+        foreach (var id in olderIds.Prepend(sessionId))
             if (changes.TryGetValue(id, out var change)) yield return change;
     }
 
@@ -1404,6 +1422,22 @@ internal static class ClaudeSessionSync
         internal required ClaudeSessionLayout.GroupChange? GroupsChanged { get; init; }
         // The groups it renamed by hand, recorded and since its last checkpoint (dated to when the app left it).
         internal required IReadOnlyList<ClaudeSessionLayout.GroupRenaming> Renamings { get; init; }
+        // Its nested sessions, each with the session at the top of its family.
+        internal required IReadOnlyDictionary<string, string> Nested { get; init; }
+
+        /// <summary>The changes that count for one of its records (see <see cref="ClaudeSessionSync.Fold"/>). A nested one's
+        /// group is its family's, whatever was recorded for it: the newest change of the top session's group, when this
+        /// account made it. One a plan brought there was another account's change to that session, which is a session of
+        /// its own there, as this conversation is.</summary>
+        internal IEnumerable<ClaudeSessionLayout.Changes> Fold(Record record)
+        {
+            var changes = ClaudeSessionSync.Fold(record.SessionId, OlderOf[record.SessionId], Changes);
+            if (!Nested.TryGetValue(record.SessionId, out var top)) return changes;
+            var family = ClaudeSessionSync.Fold(top, OlderOf[top], Changes).Select(change => change.Group)
+                .OfType<ClaudeSessionLayout.Stamp<string?>>().MaxBy(stamp => stamp.At);
+            return changes.Select(change => change with { Group = null })
+                .Append(new ClaudeSessionLayout.Changes(Group: family is { By: null } ? family : null));
+        }
 
         internal static Seen Of(Other other, int rank, ClaudeSessionLayout kept, IReadOnlyList<Record> newest,
             Lineage? lineage, bool pinsCount, bool copiesKnown)
@@ -1414,10 +1448,11 @@ internal static class ClaudeSessionSync
                 StringComparer.Ordinal);
             var view = other.Records.Where(record => !older.ContainsKey(record.SessionId)).ToArray();
             var (matches, claimed) = Match(newest, view);
+            var nested = Nests(other.Records, other.Archived);
             var observed = copiesKnown && other.CopyTitles is { } copyTitles
-                ? Observe(new(other.Records, other.Layout, pinsCount, copyTitles), kept.Checkpoints.GetValueOrDefault(other.Account),
-                    other.LeftAt ?? DateTimeOffset.MinValue, kept.Pendings.GetValueOrDefault(other.Account),
-                    kept.Evidences.GetValueOrDefault(other.Account))
+                ? Observe(new(other.Records, other.Layout is { } layout ? layout with { Nested = nested } : null, pinsCount, copyTitles),
+                    kept.Checkpoints.GetValueOrDefault(other.Account), other.LeftAt ?? DateTimeOffset.MinValue,
+                    kept.Pendings.GetValueOrDefault(other.Account), kept.Evidences.GetValueOrDefault(other.Account))
                 : null;
             var groups = kept.GroupsChanged.GetValueOrDefault(other.Account);
             if (observed?.Groups is { } order && (groups is null || order.At >= groups.At)) groups = order;
@@ -1428,7 +1463,8 @@ internal static class ClaudeSessionSync
                     .ToLookup(pair => pair.Value.Newest.SessionId, pair => pair.Key, StringComparer.Ordinal),
                 Changes = Merge(kept.Changed.GetValueOrDefault(other.Account), observed?.Changes ?? NoChanges()),
                 GroupsChanged = groups,
-                Renamings = (kept.Renamings.GetValueOrDefault(other.Account) ?? []).Concat(observed?.Renamings ?? []).ToArray()
+                Renamings = (kept.Renamings.GetValueOrDefault(other.Account) ?? []).Concat(observed?.Renamings ?? []).ToArray(),
+                Nested = nested
             };
         }
     }
@@ -1460,11 +1496,12 @@ internal static class ClaudeSessionSync
         !layout.Assignments.TryGetValue(sessionId, out var id) ? (true, null)
         : layout.Groups.FirstOrDefault(group => group.Id == id) is { } group ? (true, group.Name) : (false, null);
 
-    /// <summary>A session's group by the name it stands for (see <see cref="Standing"/>).</summary>
+    /// <summary>A session's group by the name it stands for (see <see cref="Standing"/>); a nested session's is the group of
+    /// the session at the top of its family, as the app shows it.</summary>
     private static (bool Known, string? Name) GroupNameOf(Layout layout, string sessionId,
         IReadOnlyDictionary<string, ClaudeSessionLayout.Moved>? renamed)
     {
-        if (!layout.Assignments.TryGetValue(sessionId, out var id)) return (true, null);
+        if (!layout.Assignments.TryGetValue(layout.Nested?.GetValueOrDefault(sessionId) ?? sessionId, out var id)) return (true, null);
         if (layout.Groups.FirstOrDefault(group => group.Id == id) is not { } group) return (false, null);
         return (true, Standing(group, renamed) ?? group.Name);
     }
@@ -1524,9 +1561,10 @@ internal static class ClaudeSessionSync
     /// checkpoint, everything it gives. A value unknown on either side is no change, nor is a copy's title the widget
     /// wrote there since the checkpoint. A value the plan in progress set out to give is no change of its own: reached,
     /// it counts as the change it came from; not reached yet, or a pin its move undid on the way, it stays in progress;
-    /// anything else is a change. The group list is the groups not aside: mid-move (groups aside, and the plan in progress
-    /// has not made every group of its list yet, or no plan is known) it is no change; one the plan reached counts as the
-    /// change it came from; with groups renamed (same id, new name) the change carries the renaming.
+    /// anything else is a change. A nested session's group is its family's (see <see cref="Nests"/>), never a change of its
+    /// own. The group list is the groups not aside: mid-move (groups aside, and the plan in progress has not made every
+    /// group of its list yet, or no plan is known) it is no change; one the plan reached counts as the change it came from;
+    /// with groups renamed (same id, new name) the change carries the renaming.
     /// </summary>
     internal static Observation Observe(State state, ClaudeSessionLayout.Checkpoint? checkpoint, DateTimeOffset at,
         ClaudeSessionLayout.Pending? pending = null, IReadOnlyDictionary<string, ClaudeSessionLayout.Evidence>? evidence = null)
@@ -1540,6 +1578,7 @@ internal static class ClaudeSessionSync
             want.At == DateTimeOffset.MinValue ? null : want.At == DateTimeOffset.MaxValue ? want with { At = at, By = null } : want;
         foreach (var record in state.Records)
         {
+            var nested = state.Layout?.Nested?.ContainsKey(record.SessionId) == true;
             var shown = ShownOf(record, state.Layout, state.PinsCount, state.CopyTitles, renamed);
             var before = checkpoint?.Sessions.GetValueOrDefault(record.SessionId);
             ClaudeSessionLayout.Shown changed;
@@ -1555,7 +1594,7 @@ internal static class ClaudeSessionSync
             }
             else changed = Gives(record, shown, state.CopyTitles, checkpoint is null ? evidence?.GetValueOrDefault(record.SessionId) : null);
             ClaudeSessionLayout.Stamp<bool>? pin = changed.Pinned is { } pinnedNow ? new(pinnedNow, at) : null;
-            ClaudeSessionLayout.Stamp<string?>? filing = changed.HasGroup ? new(changed.Group, at) : null;
+            ClaudeSessionLayout.Stamp<string?>? filing = changed.HasGroup && !nested ? new(changed.Group, at) : null;
             ClaudeSessionLayout.Stamp<string>? naming = changed.Title is { } titleNow ? new(titleNow, at) : null;
             if (pending?.Sessions.GetValueOrDefault(record.SessionId) is { } target)
             {
@@ -1571,7 +1610,7 @@ internal static class ClaudeSessionSync
                     if (hasPin == wantPin.Value) pin = Reached(wantPin);
                     else if (before?.Pinned == hasPin || undone) { pin = null; openPin = wantPin; }
                 }
-                if (target.Group is { } wantGroup && shown.HasGroup)
+                if (target.Group is { } wantGroup && shown.HasGroup && !nested)
                 {
                     if (shown.Group == wantGroup.Value) filing = Reached(wantGroup);
                     else if (before is { HasGroup: true } && before.Group == shown.Group) { filing = null; openGroup = wantGroup; }
@@ -1646,8 +1685,8 @@ internal static class ClaudeSessionSync
     /// checkpoint, settles the plan in progress there, and checkpoints what it shows now. A first checkpoint, and the first
     /// of a stay, date what they find to when the app last left the account (and end a plan of an earlier stay); later
     /// ones date it <paramref name="now"/>. A lost pin list and a group list mid-move are not taken: the checkpoint keeps
-    /// what it had. False when something cannot be read whole now (a later pass tries again) or the account has no list
-    /// here.</summary>
+    /// what it had. A nested session shows the group of its family, which is never recorded as its change. False when
+    /// something cannot be read whole now (a later pass tries again) or the account has no list here.</summary>
     internal static bool Checkpoint(ClaudeSessionLayout layout, Sources sources, string account, DateTimeOffset now) =>
         Checkpoint(layout, Read(sources, [account]), account, now);
 
@@ -1661,6 +1700,7 @@ internal static class ClaudeSessionSync
         if (!listing.Whole) return false;
         var directory = listing.Directory;
         var records = listing.Records;
+        groups = groups with { Nested = Nests(records, listing.Archived) };
         var known = layout.Accounts.GetValueOrDefault(account);
         // The widget started (or came from the first format) while the app showed this account, so it did not see the app
         // come: that was when the app last left another account. What the account shows then may hold that stay's own
@@ -1686,6 +1726,12 @@ internal static class ClaudeSessionSync
             previous is null ? layout.Evidences.GetValueOrDefault(account) : null);
         if (!layout.Changed.TryGetValue(account, out var changed)) layout.Changed[account] = changed = new(StringComparer.Ordinal);
         foreach (var (id, change) in observed.Changes) changed[id] = change.Over(changed.GetValueOrDefault(id));
+        // A nested session's group is its family's: a group an earlier look recorded as its own goes.
+        foreach (var id in groups.Nested!.Keys.Where(id => changed.GetValueOrDefault(id)?.Group is not null).ToArray())
+        {
+            var own = changed[id] with { Group = null };
+            if (own.IsEmpty) changed.Remove(id); else changed[id] = own;
+        }
         // A session whose record is gone for good has nothing left to change; an archived one keeps its changes for the
         // conversation it belongs to.
         var shown = records.Select(record => record.SessionId).ToHashSet(StringComparer.Ordinal);
@@ -1862,19 +1908,59 @@ internal static class ClaudeSessionSync
         return at >= 0 && at + 1 < order.Count ? order[at + 1] : null;
     }
 
+    /// <summary>
+    /// The sessions the app nests under another in one list, each with the session at the top of its family, as its
+    /// sidebar reads them (Claude 3.1623): a session sits under its parent (<see cref="Record.Parent"/>) when that is in the
+    /// list and live, or archived along with it; a live one whose parent is archived sits under the nearest live session
+    /// above it, or under none; and a family climbs to its top. A nested session shows the top session's group whatever
+    /// its own assignment says, and moves only with it: the app refuses to move it alone.
+    /// </summary>
+    /// <param name="archived">The archived records of the list: parents too, and nested themselves.</param>
+    internal static Dictionary<string, string> Nests(IReadOnlyList<Record> records, IReadOnlyList<Record>? archived = null)
+    {
+        var all = new Dictionary<string, (Record Record, bool Shelved)>(StringComparer.Ordinal);
+        foreach (var record in records) all[record.SessionId] = (record, false);
+        foreach (var record in archived ?? []) all.TryAdd(record.SessionId, (record, true));
+        string? Above(string id)
+        {
+            var (record, shelved) = all[id];
+            if (record.Parent is not { } parent || parent == id || !all.TryGetValue(parent, out var up)) return null;
+            if (shelved || !up.Shelved) return parent;
+            var passed = new HashSet<string>(StringComparer.Ordinal) { id };
+            for (string? at = parent; at is not null && passed.Add(at) && all.TryGetValue(at, out var step); at = step.Record.Parent)
+                if (!step.Shelved) return at;
+            return null;
+        }
+        var nested = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var id in all.Keys)
+        {
+            if (Above(id) is not { } top) continue;
+            var family = new HashSet<string>(StringComparer.Ordinal) { id, top };
+            while (Above(top) is { } higher && family.Add(higher)) top = higher;
+            nested[id] = top;
+        }
+        return nested;
+    }
+
     private static string Name(Record record) => string.IsNullOrWhiteSpace(record.Title) ? record.SessionId : record.Title;
 
-    private static Sidebar View(string account, string? label, IReadOnlyList<Record> records, Layout? layout, bool pinsKnown)
+    private static Sidebar View(string account, string? label, IReadOnlyList<Record> records, Layout? layout,
+        IReadOnlyDictionary<string, string> nests, bool pinsKnown)
     {
         var pinned = pinsKnown ? records.Where(record => record.Pinned).Select(Name).Order(StringComparer.Ordinal).ToArray() : null;
-        // A pinned session keeps its group but is shown under Pinned only.
-        if (layout is null) return new(account, label, pinned, null);
+        var byId = records.ToDictionary(record => record.SessionId, StringComparer.Ordinal);
+        var nested = records.Where(record => nests.ContainsKey(record.SessionId))
+            .Select(record => new NestedView(Name(record), byId.TryGetValue(nests[record.SessionId], out var top) ? Name(top) : nests[record.SessionId]))
+            .OrderBy(view => view.Title, StringComparer.Ordinal).ToArray() is { Length: > 0 } listed ? listed : null;
+        // A pinned session keeps its group but is shown under Pinned only; a nested one shows its family's.
+        if (layout is null) return new(account, label, pinned, null, nested);
         var groups = layout.Groups.Select(group => new GroupView(group.Name, records
                 .Where(record => !(pinsKnown && record.Pinned)
-                                 && layout.Assignments.TryGetValue(record.SessionId, out var id) && id == group.Id)
+                                 && layout.Assignments.TryGetValue(nests.GetValueOrDefault(record.SessionId) ?? record.SessionId, out var id)
+                                 && id == group.Id)
                 .Select(Name).Order(StringComparer.Ordinal).ToArray(), group.Collapsed))
             .ToArray();
-        return new(account, label, pinned, groups);
+        return new(account, label, pinned, groups, nested);
     }
 
     /// <summary>One account's groups as the app stores them, in sidebar order with their folding; null when they cannot
@@ -2130,13 +2216,36 @@ internal static class ClaudeSessionSync
                 Text(record, "cliSessionId")?.ToLowerInvariant(), prior,
                 record["lastActivityAt"] is JsonValue at && at.TryGetValue<long>(out var activity) ? activity : 0,
                 Branch: !string.IsNullOrEmpty(Text(record, "forkedFromSessionId")) || record["spawnedFrom"] is JsonObject,
-                Renamed: record["previousTitles"] is JsonArray { Count: > 0 }));
+                Renamed: record["previousTitles"] is JsonArray { Count: > 0 }, Parent: ParentOf(record, sessionId)));
         }
         return records;
     }
 
+    /// <summary>The session a record's lineage links it to, as the app reads it (Claude 3.1623): none once the user moved
+    /// it to top level (<c>lineageDetached</c>); else the session that started it, when Claude started it as a side
+    /// session and it was not forked from another; else the session it was forked from; else the session that started it
+    /// (from a suggestion, say). A link to itself is none. The widget's copies carry no link.</summary>
+    private static string? ParentOf(JsonObject record, string sessionId)
+    {
+        if (Flag(record, "lineageDetached")) return null;
+        var spawned = record["spawnedFrom"] as JsonObject;
+        var starter = spawned is null ? null : Text(spawned, "sessionId");
+        if (string.IsNullOrEmpty(starter) || starter == sessionId) starter = null;
+        var forked = Text(record, "forkedFromSessionId");
+        if (string.IsNullOrEmpty(forked) || forked == sessionId) forked = null;
+        // A side session that took its starter's conversation is also forked from it; when that starter is deleted, the app
+        // moves it under the next session up, and the fork still names the deleted one.
+        if (starter is not null && Flag(spawned!, "sideSession") && !Flag(spawned!, "userFork")
+            && (forked is null || forked == starter || spawned!["deletedParent"] is JsonObject deleted && forked == Text(deleted, "sessionId")))
+            return starter;
+        return forked ?? starter;
+    }
+
     private static string? Text(JsonObject record, string field) =>
         record[field] is JsonValue value && value.TryGetValue<string>(out var text) ? text : null;
+
+    private static bool Flag(JsonObject record, string field) =>
+        record[field] is JsonValue value && value.TryGetValue<bool>(out var flag) && flag;
 
     private static int Print(string plan, int exitCode)
     {
