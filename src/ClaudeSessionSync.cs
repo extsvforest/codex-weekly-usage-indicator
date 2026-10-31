@@ -1080,7 +1080,7 @@ internal static class ClaudeSessionSync
         var retiring = older.Where(pair => byId.ContainsKey(pair.Key)).ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.Ordinal);
         var activity = currentRecords.Concat(archived ?? []).ToDictionary(record => record.SessionId, record => record.LastActivityAt, StringComparer.Ordinal);
         var ownOlderOf = older.OrderByDescending(pair => activity.GetValueOrDefault(pair.Key))
-            .ToLookup(pair => pair.Value.Newest.SessionId, pair => pair.Key, StringComparer.Ordinal);
+            .ToLookup(pair => pair.Value.Newest.SessionId, pair => (Id: pair.Key, pair.Value.MovedOn), StringComparer.Ordinal);
         var newest = currentRecords.Where(record => !retiring.ContainsKey(record.SessionId))
             .OrderByDescending(record => record.LastActivityAt).ToArray();
         // Without knowing which records are the widget's copies, a copy would be taken for a choice: only older states
@@ -1386,12 +1386,19 @@ internal static class ClaudeSessionSync
 
     /// <summary>The changes that count for a record: its own, and its older states' (the most recently active first),
     /// archived ones included — each found again as an older state of this record, so a branch keeps its changes to
-    /// itself.</summary>
-    private static IEnumerable<ClaudeSessionLayout.Changes> Fold(string sessionId, IEnumerable<string> olderIds,
-        IReadOnlyDictionary<string, ClaudeSessionLayout.Changes> changes)
+    /// itself. A pin or a group taken off an older state after the conversation moved on only put that line away, so it
+    /// says nothing about the conversation.</summary>
+    private static IEnumerable<ClaudeSessionLayout.Changes> Fold(string sessionId,
+        IEnumerable<(string Id, DateTimeOffset MovedOn)> olderStates, IReadOnlyDictionary<string, ClaudeSessionLayout.Changes> changes)
     {
-        foreach (var id in olderIds.Prepend(sessionId))
-            if (changes.TryGetValue(id, out var change)) yield return change;
+        if (changes.TryGetValue(sessionId, out var own)) yield return own;
+        foreach (var (id, movedOn) in olderStates)
+            if (changes.TryGetValue(id, out var change))
+                yield return change with
+                {
+                    Pinned = change.Pinned is { Value: false } unpinned && unpinned.At > movedOn ? null : change.Pinned,
+                    Group = change.Group is { Value: null } ungrouped && ungrouped.At > movedOn ? null : change.Group
+                };
     }
 
     private static Dictionary<string, ClaudeSessionLayout.Changes> NoChanges() => new(StringComparer.Ordinal);
@@ -1416,8 +1423,8 @@ internal static class ClaudeSessionSync
         internal required IReadOnlyList<Record> View { get; init; }
         internal required Dictionary<string, Record> Matches { get; init; }
         internal required HashSet<string> Claimed { get; init; }
-        // A newest state's id → its older states' ids, the most recently active first.
-        internal required ILookup<string, string> OlderOf { get; init; }
+        // A newest state's id → its older states, the most recently active first.
+        internal required ILookup<string, (string Id, DateTimeOffset MovedOn)> OlderOf { get; init; }
         internal required IReadOnlyDictionary<string, ClaudeSessionLayout.Changes> Changes { get; init; }
         internal required ClaudeSessionLayout.GroupChange? GroupsChanged { get; init; }
         // The groups it renamed by hand, recorded and since its last checkpoint (dated to when the app left it).
@@ -1460,7 +1467,7 @@ internal static class ClaudeSessionSync
             {
                 Other = other, Rank = rank, View = view, Matches = matches, Claimed = claimed,
                 OlderOf = older.OrderByDescending(pair => activity.GetValueOrDefault(pair.Key))
-                    .ToLookup(pair => pair.Value.Newest.SessionId, pair => pair.Key, StringComparer.Ordinal),
+                    .ToLookup(pair => pair.Value.Newest.SessionId, pair => (Id: pair.Key, pair.Value.MovedOn), StringComparer.Ordinal),
                 Changes = Merge(kept.Changed.GetValueOrDefault(other.Account), observed?.Changes ?? NoChanges()),
                 GroupsChanged = groups,
                 Renamings = (kept.Renamings.GetValueOrDefault(other.Account) ?? []).Concat(observed?.Renamings ?? []).ToArray(),
@@ -2056,13 +2063,16 @@ internal static class ClaudeSessionSync
 
     /// <summary>When the conversation in transcript <paramref name="older"/> went on in <paramref name="next"/>: the oldest
     /// entry of the later transcript that the earlier one does not hold. Null when either cannot be read, has a broken
-    /// line, or the later one holds nothing new.</summary>
+    /// line, or the later one holds nothing new. A line of nothing but NUL bytes in the earlier one (what a crash leaves)
+    /// is not broken: what it held is lost to the app too, it was written before the lines after it, whose time
+    /// <see cref="Transcript"/> dates, and an entry of it the later one holds only makes the hand-over earlier, which
+    /// keeps the older state. In the later one such a line could be the first new entry, so it stays broken.</summary>
     internal static DateTimeOffset? HandOver(string projectsRoot, string older, string next)
     {
         if (Locate(projectsRoot, older) is not { } olderPath || Locate(projectsRoot, next) is not { } nextPath) return null;
         try
         {
-            if (Entries(ReadWhole(olderPath), partialStart: false) is not { } earlier
+            if (Entries(ReadWhole(olderPath), partialStart: false, skipLost: true) is not { } earlier
                 || Entries(ReadWhole(nextPath), partialStart: false) is not { } later) return null;
             var known = earlier.Select(entry => entry.Id).OfType<string>().ToHashSet(StringComparer.Ordinal);
             return later.Where(entry => entry.Id is { } id && !known.Contains(id)).Select(entry => (DateTimeOffset?)entry.At).Min();
@@ -2087,8 +2097,8 @@ internal static class ClaudeSessionSync
     /// <summary>Each line's own id and time (top-level <c>uuid</c> and <c>timestamp</c>; nested values do not count).
     /// Blank lines and complete lines without a time are skipped; any other line that is not one complete JSON object
     /// makes the whole read null. Only the fragment a tail read cuts off at the start (<paramref name="partialStart"/>)
-    /// is dropped unread.</summary>
-    private static List<(string? Id, DateTimeOffset At)>? Entries(byte[] data, bool partialStart)
+    /// is dropped unread, and with <paramref name="skipLost"/> a line of nothing but NUL bytes.</summary>
+    private static List<(string? Id, DateTimeOffset At)>? Entries(byte[] data, bool partialStart, bool skipLost = false)
     {
         var entries = new List<(string? Id, DateTimeOffset At)>();
         var start = 0;
@@ -2097,9 +2107,11 @@ internal static class ClaudeSessionSync
         {
             var end = Array.IndexOf(data, (byte)'\n', start);
             if (end < 0) end = data.Length;
-            if (!TryEntry(data.AsSpan(start, end - start), out var entry)) return null;
-            if (entry is { } found) entries.Add(found);
+            var line = data.AsSpan(start, end - start);
             start = end + 1;
+            if (skipLost && line.Trim(" \t\r\0"u8).IsEmpty) continue;
+            if (!TryEntry(line, out var entry)) return null;
+            if (entry is { } found) entries.Add(found);
         }
         return entries;
     }

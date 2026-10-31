@@ -64,14 +64,19 @@ internal static class ClaudeDesktopProbe
     // Data flow the deletion protection depends on, checked with back-references so renamed variables still match
     // but a changed flow does not: (1) every record's current and earlier transcript ids go into the claims set,
     // (2) the reap decision fails closed on unreadable records and refuses ids in that set, with nothing allowing
-    // deletion before that test, (3) the session delete releases only ids outside that set, and its reap check is that
-    // decision (the link group names one function in both flows), alone or behind a guard whose other branch is a keep
-    // call, with nothing applied to the result, (4) transcripts are removed only when the reap check returned true:
-    // nothing reassigns the result before the removal, and a failed check only logs and keeps, (5) the walk behind that
-    // set takes every account's folder, failing closed on one it cannot list: the current account is told apart only to
-    // skip records it holds in memory, and every other account's record counts: on the way to the id loop that flag
-    // appears nowhere else but as an argument and in claiming its own stem. What the keep call returns is not checked;
-    // this is a drift guard, not a proof.
+    // deletion before that test, (3) the checks a session delete uses release only ids outside that set, and their reap
+    // check is that decision, alone or behind a guard whose other branch is a keep call, with nothing applied to the
+    // result, (4) the session delete makes those checks from the manager's and hands them, unchanged, to the removal,
+    // (5) transcripts are removed only when the reap check returned true: nothing reassigns the result before the
+    // removal, and a failed check only logs and keeps, (6) the walk behind that set takes every account's folder, failing
+    // closed on one it cannot list: the current account is told apart only to skip records it holds in memory, and every
+    // other account's record counts: on the way to the id loop that flag appears nowhere else but as an argument and in
+    // claiming its own stem, (7) a delete owed to Remote Control sets transcripts aside under those same checks and later
+    // finishes under a check that keeps on anything claimed or unreadable, (8) setting aside moves nothing until the
+    // release test and the reap decision allow it, and any refusal or failure keeps them all, (9) finishing removes only
+    // when its check allowed it, a failed check keeping, and puts the transcript back otherwise. A shared group (see
+    // SharedGroups) names one function in every flow it appears in. What the keep call returns is not checked; this is
+    // a drift guard, not a proof.
     internal static readonly (string Anchor, int Before, int After, Regex Flow)[] ContractFlows =
     [
         // (1) Earlier ids are iterated directly (2.16120–2.19675) or spread first into an array that may add more ids,
@@ -83,16 +88,36 @@ internal static class ClaudeDesktopProbe
         ("\"claimed_elsewhere\",\"is claimed by a session of another account or profile on this computer\"", 1100, 100, new Regex(
             @"async function (?<link>[\w$]+)\((?<c>[\w$]+),(?<id>[\w$]+),(?:(?!return!0).){0,1000}?let (?<l>[\w$]+)=await \k<c>\.claimedOnDisk\(\);return \k<l>===null\?[\w$]+\(""records_unreadable""[^)]*\):\k<l>\.has\(\k<id>\)\?[\w$]+\(""claimed_elsewhere""",
             RegexOptions.CultureInvariant | RegexOptions.Singleline)),
-        ("mayRelease:async ", 0, 600, new Regex(
-            @"^mayRelease:async (?<e>[\w$]+)=>!\(\(await this\.cliSessionIdsClaimedOnDisk\(\)\)\?\.has\(\k<e>\)(?:\?\?![01])?\),reapIf:async\((?<t>[\w$]+),(?<r>[\w$]+)\)=>(?:[^;{}?:]{1,200}\?[\w$]+\(\k<t>,""[\w-]+"",""[^""\\]*"",[^;{}?:()]{0,60}\):)?(?<link>[\w$]+)\(this\.reapChecks,\k<t>,\k<r>(?:,(?:[\w$.]+|[\w$]+\([\w$]*\)))*\)(?:,[\w$]+:|\})",
+        // (3) Inline in the session delete until 4.29; since 4.4212 a function given the manager's checks makes them.
+        ("mayRelease:async ", 200, 600, new Regex(
+            @"function (?<maker>[\w$]+)\((?<c>[\w$]+),[^()]*\)\{(?:let [^;{}]{0,120};)?return\{mayRelease:async (?<e>[\w$]+)=>!\(\(await \k<c>\.claimedOnDisk\(\)\)\?\.has\(\k<e>\)(?:\?\?![01])?\),reapIf:async\((?<t>[\w$]+),(?<r>[\w$]+)\)=>(?:[^;{}?:]{1,200}\?[\w$]+\(\k<t>,""[\w-]+"",""[^""\\]*"",[^;{}?:()]{0,60}\):)?(?<link>[\w$]+)\(\k<c>,\k<t>,\k<r>(?:,(?:[\w$.]+|[\w$]+\([\w$]*\)))*\)(?:,[\w$]+:|\})",
             RegexOptions.CultureInvariant)),
-        ("desktop-released marker: reap check failed", 1600, 200, new Regex(
-            @"if\((?<m>[\w$]+)\.mayRelease&&!await \k<m>\.mayRelease\((?<c>[\w$]+)\)\)return\}catch\{return\}.{0,900}?if\([\w$]+===null\|\|![\w$]+\|\|!\k<m>\.reapIf\)return;let (?<d>[\w$]+)=!1;try\{(?:(?!(?<![\w$.])\k<d>=(?!=)).){0,700}?(?<![\w$.])\k<d>=await \k<m>\.reapIf\(\k<c>,\{[^{}]*\}\)\}+catch\([\w$]+\)\{[\w$.]+\.debug\(""desktop-released marker: reap check failed"",\{[^{}]*\}\);try\{\k<m>\.keptInDoubt\?\.\(\k<c>\)\}catch\{\}\}(?:if\(\k<d>\)for\(|if\(!\k<d>\)return;)",
+        // (4)
+        ("(this.reapChecks,", 60, 2400, new Regex(
+            @"let (?<v>[\w$]+)=(?<maker>[\w$]+)\(this\.reapChecks,[^;]{0,400}?(?<aside>[\w$]+)\(this\.reapChecks,\k<v>,(?:(?!(?<![\w$.])\k<v>=(?!=)).){0,2300}?(?<remover>[\w$]+)\(this\.diskTranscript,[^;]{0,120},""delete"",\k<v>\)",
             RegexOptions.CultureInvariant | RegexOptions.Singleline)),
+        // (5)
+        ("desktop-released marker: reap check failed", 1600, 200, new Regex(
+            @"async function (?<remover>[\w$]+)\([^()]*\)\{.{0,160}?if\((?<m>[\w$]+)\.mayRelease&&!await \k<m>\.mayRelease\((?<c>[\w$]+)\)\)return\}catch\{return\}.{0,900}?if\([\w$]+===null\|\|![\w$]+\|\|!\k<m>\.reapIf\)return;let (?<d>[\w$]+)=!1;try\{(?:(?!(?<![\w$.])\k<d>=(?!=)).){0,700}?(?<![\w$.])\k<d>=await \k<m>\.reapIf\(\k<c>,\{[^{}]*\}\)\}+catch\([\w$]+\)\{[\w$.]+\.debug\(""desktop-released marker: reap check failed"",\{[^{}]*\}\);try\{\k<m>\.keptInDoubt\?\.\(\k<c>\)\}catch\{\}\}(?:if\(\k<d>\)for\(|if\(!\k<d>\)return;)",
+            RegexOptions.CultureInvariant | RegexOptions.Singleline)),
+        // (6)
         ("skipOwnRecordsOf?.has(", 1500, 1300, new Regex(
             @"for\(let (?<a>[\w$]+) of [\w$]+\)\{if\(!\k<a>\.isDirectory\(\)\)continue;let (?<ad>[\w$]+)=\(0,[\w$]+\.join\)\([\w$]+,\k<a>\.name\),(?<os>[\w$]+);try\{\k<os>=await [\w$.]+\.readdir\(\k<ad>,\{withFileTypes:!0\}\)\}catch\([\w$]+\)\{if\([\w$]+\?\.failClosed\)throw [\w$]+;.{0,200}?continue\}for\(let (?<o>[\w$]+) of \k<os>\)\{if\(!\k<o>\.isDirectory\(\)\)continue;let (?<od>[\w$]+)=\(0,[\w$]+\.join\)\(\k<ad>,\k<o>\.name\),(?<own>[\w$]+)=[\w$]+===void 0&&\k<a>\.name===[\w$]+\(\)\.accountId&&\k<o>\.name===[\w$]+\(\)\.orgId,(?<fs>[\w$]+);try\{\k<fs>=await [\w$.]+\.readdir\(\k<od>,\{withFileTypes:!0\}\)\}catch\([\w$]+\)\{if\([\w$]+\?\.failClosed\)throw [\w$]+;.{0,200}?continue\}for\(let [\w$]+ of \k<fs>\)\{(?:(?!(?<![\w$.])\k<own>(?![\w$])|accountId).){0,700}?\|\|\k<own>&&[\w$]+\?\.skipOwnRecordsOf\?\.has\([^;]{0,60}\)continue;let (?<s>[\w$]+)=[^;]{0,60};if\(!\k<own>\)[\w$]+\.add\(\k<s>\);else if\((?:(?<=,)\k<own>,|(?<=if\()\k<own>&&[\w$]+\.add\(\k<s>\),|(?!(?<![\w$.])\k<own>(?![\w$])|accountId).){0,1200}?for\(let [\w$]+ of\[[\w$]+\.cliSessionId,",
+            RegexOptions.CultureInvariant | RegexOptions.Singleline)),
+        // (7) Since 4.4212.
+        ("setAside:(", 200, 500, new Regex(
+            @"function (?<aside>[\w$]+)\((?<c>[\w$]+),(?<l>[\w$]+),(?<s>[\w$]+),(?<o>[\w$]+)\)\{let (?<x>[\w$]+)=(?<y>[\w$]+)=>\k<c>\.claims\(\)\.localIdsClaimedByOthers\(\k<s>,\{adopting:!0\}\)\.has\(\k<y>\);return\{setAside:\((?<a>[\w$]+),(?<b>[\w$]+)\)=>\(\k<o>\.beforeSetAside\(\),(?<setter>[\w$]+)\(\k<o>\.resolver,\k<o>\.ids,\k<o>\.hints,\{\.\.\.\k<l>,nonce:\k<a>,notWrittenSince:\k<b>,mayRelease:async (?<m>[\w$]+)=>!\k<x>\(\k<m>\)&&await \k<l>\.mayRelease\(\k<m>\)\}\)\),finish:async\((?<p>[\w$]+),(?<q>[\w$]+)\)=>\{let [\w$]+=await (?<finisher>[\w$]+)\(\k<p>,\k<q>,\(async (?<z>[\w$]+)=>\k<x>\(\k<z>\)\|\|await \k<c>\.claimedOnDisk\(\)===null\|\|!await \k<l>\.mayRelease\(\k<z>\)\)\);",
+            RegexOptions.CultureInvariant)),
+        // (8) Since 4.4212. A moved transcript is named by the nonce, so nothing before the decision may use it.
+        (".notWrittenSince||", 1200, 900, new Regex(
+            @"async function (?<setter>[\w$]+)\([^()]*\)\{.{0,240}?try\{if\(![\w$]+\((?<t>[\w$]+)\)\|\|!await (?<r>[\w$]+)\.mayRelease\(\k<t>\)\)\{(?<a>[\w$]+)=!0;return\}(?:(?!\k<r>\.nonce|(?<![\w$.])\k<a>=!1).){0,900}?if\([\w$]+>\k<r>\.notWrittenSince\|\|!await \k<r>\.reapIf\(\k<t>,\{.{0,240}?\}\)\.catch\(\(\(\)=>\(\k<r>\.keptInDoubt\?\.\(\k<t>\),!1\)\)\)\)\{\k<a>=!0;return\}(?:(?!(?<![\w$.])\k<a>=!1).){0,400}?\}catch\{\k<a>=!0\}finally\{[^{}]{0,60}\}.{0,40}?,!\k<a>\)return [\w$]+;",
+            RegexOptions.CultureInvariant | RegexOptions.Singleline)),
+        // (9) Since 4.4212.
+        (".asidePath", 500, 600, new Regex(
+            @"async function (?<finisher>[\w$]+)\([\w$]+,[\w$]+,(?<r>[\w$]+)\)\{let (?<i>[\w$]+)=!1,.{0,200}?let (?<o>[\w$]+)=await \k<r>\([\w$]+\)\.catch\(\(\(\)=>!0\)\),.{0,160}?if\(!\(!\k<o>&&[^{}]{0,300}\)\)\{\k<i>=!0,await [\w$]+\([\w$]+\.asidePath,[^;{}]{0,40}\);continue\}(?:(?!(?<![\w$.])\k<o>(?![\w$])).){0,300}?\.rm\([\w$]+\.asidePath,",
             RegexOptions.CultureInvariant | RegexOptions.Singleline))
     ];
+    private static readonly string[] SharedGroups = ["link", "maker", "remover", "aside", "setter", "finisher"];
     private static readonly object ContractGate = new();
     private static (string Key, bool Compatible)? _contract;
 
@@ -196,7 +221,7 @@ internal static class ClaudeDesktopProbe
             }
             if (!satisfied) return false;
         }
-        string? link = null;
+        var shared = new Dictionary<string, string>(StringComparer.Ordinal);
         foreach (var (anchor, before, after, flow) in ContractFlows)
         {
             var anchorBytes = Encoding.UTF8.GetBytes(anchor);
@@ -208,11 +233,10 @@ internal static class ClaudeDesktopProbe
                 var end = Math.Min(bundle.Length, offset + found + after);
                 var match = flow.Match(Encoding.UTF8.GetString(bundle[start..end]));
                 satisfied = match.Success;
-                if (satisfied && match.Groups["link"] is { Success: true } named)
-                {
-                    if (link is not null && link != named.Value) return false;
-                    link = named.Value;
-                }
+                if (!satisfied) continue;
+                foreach (var name in SharedGroups)
+                    if (match.Groups[name] is { Success: true } named && !shared.TryAdd(name, named.Value)
+                        && shared[name] != named.Value) return false;
             }
             if (!satisfied) return false;
         }

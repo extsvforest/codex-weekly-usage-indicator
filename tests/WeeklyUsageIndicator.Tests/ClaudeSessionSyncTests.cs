@@ -401,6 +401,43 @@ internal static class ClaudeSessionSyncTests
         Check(ownFolded.Pins!.Single() is { Session: "local_new", Pinned: true, By: null } && ownFolded.Archive!.Count == 0,
             "this account's own archived older state hands its change on too, and is not listed for archiving again");
 
+        // Taking a pin or a group off an older state after the conversation moved on only puts that line away.
+        var putAway = new ClaudeSessionLayout();
+        var heldHere = new[] { current[0] with { Pinned = false }, current[1] with { Pinned = true } };
+        var heldLayout = Groups(["g=G"], ("local_new", "g"));
+        Steady(putAway, CurrentKey, "서브", heldHere, heldLayout, At(30), copiedHere);
+        var movedOnAt = origin.AddHours(2);
+        Changed(putAway, CurrentKey, "local_old", Change(movedOnAt.AddHours(1), pinned: false, ungrouped: true));
+        Changed(putAway, CurrentKey, "local_new", Change(movedOnAt.AddHours(-1), pinned: true, group: "G"));
+        var clearedHere = Compute(heldHere, heldLayout, [], putAway, copiedHere, lineage: lineage, label: "서브");
+        Check(clearedHere.Pins!.Count == 0 && clearedHere.Moves!.Count == 0 && clearedHere.Archive!.Single() is { Session: "local_old", Ready: true },
+            "a pin and a group taken off an older state after the conversation moved on leave its newest state as it is");
+        var theirs = new[] { reference[0] with { Pinned = false }, reference[1] };
+        var putAwayThere = new ClaudeSessionLayout();
+        Steady(putAwayThere, CurrentKey, "서브", heldHere[1..], heldLayout, At(40), copiedHere);
+        Steady(putAwayThere, ReferenceKey, "메인", theirs, none, At(30), copiedThere);
+        Changed(putAwayThere, CurrentKey, "local_new", Change(movedOnAt.AddHours(-1), pinned: true, group: "G"));
+        Changed(putAwayThere, ReferenceKey, "local_r_old", Change(movedOnAt.AddHours(1), pinned: false, ungrouped: true));
+        var clearedThere = Compute(heldHere[1..], heldLayout, [Other(ReferenceKey, "메인", theirs, none, At(30), copiedThere)], putAwayThere,
+            copiedHere, lineage: lineage, label: "서브");
+        Check(clearedThere.Pins!.Count == 0 && clearedThere.Moves!.Count == 0,
+            "the same on another account's older state");
+        var before = new ClaudeSessionLayout();
+        Steady(before, CurrentKey, "서브", heldHere, heldLayout, At(30), copiedHere);
+        Changed(before, CurrentKey, "local_old", Change(movedOnAt.AddHours(-1), pinned: false, ungrouped: true));
+        Changed(before, CurrentKey, "local_new", Change(movedOnAt.AddHours(-2), pinned: true, group: "G"));
+        var clearedBefore = Compute(heldHere, heldLayout, [], before, copiedHere, lineage: lineage, label: "서브");
+        Check(clearedBefore.Pins!.Single() is { Session: "local_new", Pinned: false } && clearedBefore.Moves!.Single() is { Group: null },
+            "taken off while it was still the conversation, a pin and a group count for it");
+        var pinnedLate = new ClaudeSessionLayout();
+        var twoGroups = Groups(["g=G", "h=H"], ("local_new", "g"));
+        Steady(pinnedLate, CurrentKey, "서브", heldHere, twoGroups, At(30), copiedHere);
+        Changed(pinnedLate, CurrentKey, "local_old", Change(movedOnAt.AddHours(1), group: "H", title: "늦게 바꾼 이름"));
+        Changed(pinnedLate, CurrentKey, "local_new", Change(movedOnAt.AddHours(-1), group: "G"));
+        var setLate = Compute(heldHere, twoGroups, [], pinnedLate, copiedHere, lineage: lineage, label: "서브");
+        Check(setLate.Moves!.Single() is { Group: "H" } && setLate.Renames!.Single() is { Title: "늦게 바꾼 이름" },
+            "what is set on an older state, not taken off, still counts for the conversation");
+
         // The sidebars read as the app shows them: pinned sessions under Pinned only, everything by title.
         var view = Compute([R("local_1", "나중", true, "1"), R("local_2", "가운데", false, "2"), R("local_3", "처음", true, "3")],
             Groups(["g2=둘", "g1=하나"], ("local_1", "g1"), ("local_2", "g1")), [Other(ReferenceKey, "메인", [], null)], label: "서브");
@@ -1006,6 +1043,31 @@ internal static class ClaudeSessionSyncTests
                 + "{\"type\":\"user\",\"uuid\":\"00000000-0000-0000-0000-000000000004\",\"timestamp\":\"2026-10-02T06:00:00Z\"}\n");
             Check(ClaudeSessionSync.HandOver(root, id, next) is null && ClaudeSessionSync.Transcript(root, next) is null,
                 "a broken first new entry dates no hand-over, rather than a later one");
+            // What a crash leaves in an earlier transcript: lost lines of NUL bytes, later lines intact (a real 86 MiB case).
+            const string Kept = "{\"type\":\"user\",\"uuid\":\"00000000-0000-0000-0000-000000000001\",\"timestamp\":\"2026-10-02T05:04:41.426Z\"}\n";
+            const string Later = "{\"type\":\"assistant\",\"uuid\":\"00000000-0000-0000-0000-000000000002\",\"timestamp\":\"2026-10-02T05:05:00Z\"}\n";
+            const string New = "{\"type\":\"user\",\"uuid\":\"00000000-0000-0000-0000-000000000003\",\"timestamp\":\"2026-10-02T05:07:07Z\"}\n";
+            var lost = new string('\0', 10158);
+            File.WriteAllText(Path.Combine(project, next + ".jsonl"), Kept + Later + New);
+            File.WriteAllText(path, Kept + lost + "\n" + Later);
+            Check(ClaudeSessionSync.HandOver(root, id, next) == DateTimeOffset.Parse("2026-10-02T05:07:07Z"),
+                "a lost line of NUL bytes in the earlier transcript still dates the hand-over");
+            File.WriteAllText(path, Kept + lost + "\r\n" + Later);
+            Check(ClaudeSessionSync.HandOver(root, id, next) == DateTimeOffset.Parse("2026-10-02T05:07:07Z"),
+                "a lost line ending in a carriage return is lost all the same");
+            File.WriteAllText(path, Kept + lost + "\n");
+            Check(ClaudeSessionSync.HandOver(root, id, next) == DateTimeOffset.Parse("2026-10-02T05:05:00Z"),
+                "an entry only the lost line held makes the hand-over earlier, never later");
+            Check(ClaudeSessionSync.Transcript(root, id) is null,
+                "a lost line in a transcript's tail still leaves it undated: what it held may be its newest entry");
+            File.WriteAllText(path, Kept + lost + "{\"type\":\"x\"}\n" + Later);
+            Check(ClaudeSessionSync.HandOver(root, id, next) is null, "NUL bytes before a line's content are a broken line");
+            File.WriteAllText(path, Kept + "\0{\"type\":\"user\",\"timestamp\":\"2026-10-02T09:00:00Z\"}\n");
+            Check(ClaudeSessionSync.HandOver(root, id, next) is null, "a single NUL before an entry is a broken line, not a lost one");
+            File.WriteAllText(path, Kept + Later);
+            File.WriteAllText(Path.Combine(project, next + ".jsonl"), Kept + Later + lost + "\n" + New);
+            Check(ClaudeSessionSync.HandOver(root, id, next) is null,
+                "a lost line in the later transcript could be its first new entry: no hand-over, rather than a later one");
             Check(ClaudeSessionSync.Transcript(root, "..\\x") is null, "only transcript ids are looked up");
             // Only turns of the conversation count: what the app or the harness adds on its own does not.
             var noted = Guid.NewGuid().ToString("D");
