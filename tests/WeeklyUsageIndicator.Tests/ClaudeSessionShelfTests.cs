@@ -291,18 +291,24 @@ internal static class ClaudeSessionShelfTests
     // 2.26454.0.0: earlier ids are spread into one array with, for mirrors, remote earlier ids.
     private const string CollectIds26454 =
         "for(let n of[i.cliSessionId,i.unarchivedCliSessionId])typeof n==\"string\"&&(!a?.localOnly||t.m4(n))&&e.add(n);for(let t of[...n.hn(i.priorCliSessionIds)??[],...a?.mirrors&&n.hn(i.priorRemoteCliSessionIds)||[]])e.add(t)}catch(n){}";
+    // 4.29.0.0: the reap decision is a function given the manager's checks, with refusals around the test on disk.
     private const string Reap =
-        "async mayReapTranscript(e,n,r,i,a){let o=r!==void 0,s=(t,n)=>pF(e,t,n,o);let c=1;let l=await this.cliSessionIdsClaimedOnDisk();return l===null?s(\"records_unreadable\",\"could not be checked against the session records on disk\"):l.has(e)?s(\"claimed_elsewhere\",\"is claimed by a session of another account or profile on this computer\"):!0}";
+        "async function c1(e,t){return!((await e.lastEntryMs()??e.mtimeMs)<t)}async function f1(e,n,r,i,a,o){let s=i!==void 0,c=(e,t)=>u1(n,e,t,s);if(i!==void 0&&await c1(r,i))return c(\"written_since_idle_cutoff\",\"was written into after the cleanup's idle cutoff\");let l=await(await e.discovery()).liveOwnershipRefusal(n);if(l?.reason===t.e8.Running)return c(\"writer_running\",\"is in use by a Claude Code process\");let u=await e.claimedOnDisk();return u===null?c(\"records_unreadable\",\"could not be checked against the session records on disk\"):u.has(n)?c(\"claimed_elsewhere\",\"is claimed by a session of another account or profile on this computer\"):!e.claims().localIdsClaimedByOthers(a,{adopting:!0}).has(n)||c(\"claimed_elsewhere\",\"is claimed by another session\")}";
+    // The folder walk of 4.29.0.0 up to the id loop, verbatim: every account, and only the current one told apart.
+    private const string Walk =
+        "for(let r of l){if(!r.isDirectory())continue;let l=(0,X.join)(c,r.name),u;try{u=await Z.default.promises.readdir(l,{withFileTypes:!0})}catch(e){if(a?.failClosed)throw e;s&&MW(e)&&(s.indexUnreadable=!0,t.Rst.warn(`${t.P9} session index account dir unreadable (${t._st(e)})`));continue}for(let c of u){if(!c.isDirectory())continue;let u=(0,X.join)(l,c.name),d=o===void 0&&r.name===i().accountId&&c.name===i().orgId,f;try{f=await Z.default.promises.readdir(u,{withFileTypes:!0})}catch(e){if(a?.failClosed)throw e;s&&MW(e)&&(s.indexUnreadable=!0,t.Rst.warn(`${t.P9} session index org dir unreadable (${t._st(e)})`));continue}for(let i of f){if(!i.isFile())continue;if(i.name.startsWith(\"deleted_\")){a?.recordsOnly||e.add(i.name.slice(_W.length)),s&&NW(s,await VW((0,X.join)(u,i.name),s),\"delete tombstone\");continue}if(s&&i.name===qW){for(let e of await HW((0,X.join)(u,i.name),s))NW(s,e,\"scheduled task\");continue}let o=a?.mirrors&&i.name.endsWith(\".json.tmp\")?\".json.tmp\":\".json\";if(!i.name.startsWith(\"local_\")||!i.name.endsWith(o)||d&&a?.skipOwnRecordsOf?.has(i.name.slice(0,-o.length)))continue;let l=i.name.slice(t.btt.length,-o.length);if(!d)e.add(l);else if(a?.foldedSessionStems?.has(l)){e.add(l);continue}let f=(0,X.join)(u,i.name),p=async(n,o,s)=>{let l=await UW(n,void 0,{failClosed:!0});e.add(o);for(let t of[...l.live,...l.lineage,...a?.mirrors?l.remoteLineage:[]])e.add(t);t.Rst.warn(`[CCD] session record ${r.name}/${c.name}/${i.name} ${s}; its ids kept as claims`)};try{let r=await Z.default.promises.stat(f);if(r.size>10485760){if(a?.failClosed){await p(f,l,`oversized (${r.size} bytes)`);continue}a?.localOnly||IW(await UW(f,s),e,d,s,l);continue}let i=JSON.parse(await Z.default.promises.readFile(f,\"utf-8\"));if(d&&e.add(l),(i.sshConfig||i.wslConfig)&&typeof i.lastAssistantUuid==\"string\"&&t.glt(i.lastAssistantUuid)&&a?.lastAnswers?.add(i.lastAssistantUuid),s&&FW(s,{...i,stem:l,priorCliSessionIds:n.wr(i.priorCliSessionIds)},\"session record\"),a?.localOnly&&(i.sshConfig||i.wslConfig||t.VE({violinBow:i.violinBow===!0})))continue;";
+    private const string ReapChecks =
+        "this.reapChecks={discovery:()=>this.getCliSessionDiscovery(),claimedOnDisk:()=>this.cliSessionIdsClaimedOnDisk(),claims:()=>this.transcriptIdClaims}";
     private const string Claims =
         "cliSessionIdsClaimedOnDisk(){let i={failClosed:!0,localOnly:!0,recordsOnly:!0,skipOwnRecordsOf:new Set},a=(async()=>{await Wj(e,{},(()=>this.getAccountIds()),i)})}";
     private const string Release =
-        "vR(this.diskTranscript,C.filter((e=>!t.has(e))),d,\"delete\",{mayRelease:async e=>!((await this.cliSessionIdsClaimedOnDisk())?.has(e)??!1),reapIf:async(t,r)=>x!==void 0&&!await x?pF(t,\"own_process_running\",\"may still be written by this session's Claude Code process, whose exit could not be confirmed\",n!==void 0):this.mayReapTranscript(t,r,n,e,uF(d)),keptInDoubt:e=>mF(e,n!==void 0)})";
+        "vR(this.diskTranscript,C.filter((e=>!t.has(e))),d,\"delete\",{mayRelease:async e=>!((await this.cliSessionIdsClaimedOnDisk())?.has(e)??!1),reapIf:async(t,r)=>x!==void 0&&!await x?pF(t,\"own_process_running\",\"may still be written by this session's Claude Code process, whose exit could not be confirmed\",n!==void 0):f1(this.reapChecks,t,r,n,e,uF(d)),keptInDoubt:e=>mF(e,n!==void 0)})";
     private const string Remove =
         "async function vR(e,n,r,i,a={}){let o=[],s;for(let c of new Set(n))!c||!oR(c)||o.push(cR(c,(async()=>{try{if(a.mayRelease&&!await a.mayRelease(c))return}catch{return}let{resolved:n,dirs:o}=await hR(e,c,r,(()=>s??=pR())),l=[],u=!1;for(let e of o){try{await t.mQ(e,{v:1,reason:i}),l.push(e),u||=e===n}catch(e){}}if(n===null||!u||!a.reapIf)return;let d=!1;try{let e=await _R(mR(n,c));if(e!==null){d=await a.reapIf(c,{mtimeMs:e.mtimeMs})}}catch(e){t.qZ.debug(\"desktop-released marker: reap check failed\",{cliSessionId:c,err:e});try{a.keptInDoubt?.(c)}catch{}}if(d)for(let e of l){await J.default.promises.rm(mR(e,c),{force:!0})}})))}";
 
-    private static byte[] Bundle(string collect = CollectIds, string reap = Reap, string release = Release, string remove = Remove) =>
-        Encoding.UTF8.GetBytes(string.Join("\n", ClaudeDesktopProbe.ContractMarkers.Select(spellings => spellings[0])) + "\n" + collect
-            + "\n" + reap + "\n" + Claims + "\n" + release + "\n" + remove);
+    private static byte[] Bundle(string collect = CollectIds, string reap = Reap, string release = Release, string remove = Remove, string walk = Walk) =>
+        Encoding.UTF8.GetBytes(string.Join("\n", ClaudeDesktopProbe.ContractMarkers.Select(spellings => spellings[0])) + "\n" + walk + collect
+            + "\n" + reap + "\n" + ReapChecks + "\n" + Claims + "\n" + release + "\n" + remove);
 
     private static void TestContractGuard()
     {
@@ -321,16 +327,16 @@ internal static class ClaudeSessionShelfTests
             "claiming only remote earlier ids pauses writes");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(collect: CollectIds26454.Replace("])e.add(t)}", "])o.add(t)}"))),
             "earlier ids added to another set pause writes");
-        Check(!ClaudeDesktopProbe.IsCompatible(Bundle(reap: Reap.Replace("l.has(e)?", "l.has(n)?"))),
+        Check(!ClaudeDesktopProbe.IsCompatible(Bundle(reap: Reap.Replace("u.has(n)?", "u.has(r)?"))),
             "a reap check that no longer tests the transcript being deleted pauses writes");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(reap: Reap.Replace("\"records_unreadable\"", "\"records_ignored\""))),
             "a deletion path that no longer fails closed pauses writes");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(release: Release.Replace("?.has(e)", "?.has(t)"))),
             "a release decision that stops consulting the claims pauses writes");
-        Check(!ClaudeDesktopProbe.IsCompatible(Bundle(release: Release.Replace(":this.mayReapTranscript(t,r,n,e,uF(d))", ":!0"))),
+        Check(!ClaudeDesktopProbe.IsCompatible(Bundle(release: Release.Replace(":f1(this.reapChecks,t,r,n,e,uF(d))", ":!0"))),
             "a session delete that no longer asks the reap decision pauses writes");
         Check(ClaudeDesktopProbe.IsCompatible(Bundle(release: Release[..Release.IndexOf("reapIf:", StringComparison.Ordinal)]
-                + "reapIf:async(t,r)=>this.mayReapTranscript(t,r)})")),
+                + "reapIf:async(t,r)=>f1(this.reapChecks,t,r)})")),
             "a simpler delete call that still asks the reap decision stays compatible");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(remove: Remove.Replace("if(d)for(", "if(!0)for("))),
             "removing transcripts regardless of the reap decision pauses writes");
@@ -344,11 +350,44 @@ internal static class ClaudeSessionShelfTests
             "setting the decision before the reap check pauses writes");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(release: Release.Replace("uF(d)),keptInDoubt", "uF(d))||!0,keptInDoubt"))),
             "changing the reap check's result pauses writes");
-        var keep = Release[Release.IndexOf("?pF(", StringComparison.Ordinal)..(Release.IndexOf("):this.mayReapTranscript", StringComparison.Ordinal) + 2)];
+        var keep = Release[Release.IndexOf("?pF(", StringComparison.Ordinal)..(Release.IndexOf("):f1(this.reapChecks", StringComparison.Ordinal) + 2)];
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(release: Release.Replace(keep, "?!0:"))),
             "a guard branch that allows deletion without the reap check pauses writes");
-        Check(!ClaudeDesktopProbe.IsCompatible(Bundle(reap: Reap.Replace("async mayReapTranscript(e,n,r,i,a){",
-            "async mayReapTranscript(e,n,r,i,a){" + new string(' ', 4000)))), "protection detached from its function pauses writes");
+        Check(!ClaudeDesktopProbe.IsCompatible(Bundle(reap: Reap.Replace("async function f1(e,n,r,i,a,o){",
+            "async function f1(e,n,r,i,a,o){" + new string(' ', 4000)))), "protection detached from its function pauses writes");
+        Check(!ClaudeDesktopProbe.IsCompatible(Bundle(reap: Reap.Replace("let u=await e.claimedOnDisk();", "return!0;let u=await e.claimedOnDisk();"))),
+            "allowing deletion before the test on disk pauses writes");
+        Check(!ClaudeDesktopProbe.IsCompatible(Bundle(reap: Reap.Replace("await e.claimedOnDisk()", "await o.claimedOnDisk()"))),
+            "a decision that reads its claims from elsewhere pauses writes");
+        Check(!ClaudeDesktopProbe.IsCompatible(Bundle(release: Release.Replace(":f1(this.reapChecks,", ":g7(this.reapChecks,"))),
+            "a session delete that asks another function than the reviewed decision pauses writes");
+        Check(!ClaudeDesktopProbe.IsCompatible(Encoding.UTF8.GetBytes(Encoding.UTF8.GetString(Bundle())
+                .Replace("claimedOnDisk:()=>this.cliSessionIdsClaimedOnDisk()", "claimedOnDisk:async()=>new Set"))),
+            "checks that no longer reach the records on disk pause writes");
+        Check(!ClaudeDesktopProbe.IsCompatible(Bundle(walk: Walk.Replace("continue}for(let i of f){", "continue}if(!d)continue;for(let i of f){"))),
+            "a walk narrowed to the current account's folder pauses writes");
+        Check(!ClaudeDesktopProbe.IsCompatible(Bundle(walk: Walk.Replace("if(!r.isDirectory())continue;", "if(!r.isDirectory()||r.name!==i().accountId)continue;"))),
+            "a walk that leaves other accounts out pauses writes");
+        Check(!ClaudeDesktopProbe.IsCompatible(Bundle(walk: Walk.Replace("||d&&a?.skipOwnRecordsOf", "||a?.skipOwnRecordsOf"))),
+            "skipping records in every account's folder pauses writes");
+        Check(!ClaudeDesktopProbe.IsCompatible(Bundle(walk: Walk.Replace("if(!d)e.add(l);else if(a?.foldedSessionStems?.has(l)){e.add(l);continue}",
+                "if(!d)e.add(l);else if(a?.foldedSessionStems?.has(l)){e.add(l);continue}if(!d)continue;"))),
+            "reading ids only from the current account's records pauses writes");
+        Check(!ClaudeDesktopProbe.IsCompatible(Bundle(walk: Walk.Replace("if(!d)e.add(l);else if(a?.foldedSessionStems?.has(l)){e.add(l);continue}",
+                "if(!d)e.add(l);else if(a?.foldedSessionStems?.has(l)){e.add(l);continue}if(!d&&a?.localOnly)continue;"))),
+            "reading local ids only from the current account's records pauses writes");
+        Check(!ClaudeDesktopProbe.IsCompatible(Bundle(walk: Walk.Replace("if(!d)e.add(l);else if(a?.foldedSessionStems?.has(l)){e.add(l);continue}",
+                "if(!d)e.add(l);else if(a?.foldedSessionStems?.has(l)){e.add(l);continue}if(g.name!==h().accountId)continue;"))),
+            "telling accounts apart a new way on the way to the ids pauses writes");
+        Check(!ClaudeDesktopProbe.IsCompatible(Bundle(walk: Walk.Replace("if(a?.failClosed)throw e;s&&MW(e)&&(s.indexUnreadable=!0,t.Rst.warn(`${t.P9} session index org dir", "s&&MW(e)&&(s.indexUnreadable=!0,t.Rst.warn(`${t.P9} session index org dir"))),
+            "an account folder that cannot be listed no longer failing closed pauses writes");
+        const string ReapResult = "if(!d)return;let m=1;for(";
+        Check(ClaudeDesktopProbe.IsCompatible(Bundle(remove: Remove.Replace("if(d)for(", ReapResult))),
+            "the reviewed 4.29 shape that returns when the check refuses is compatible");
+        Check(!ClaudeDesktopProbe.IsCompatible(Bundle(remove: Remove.Replace("if(d)for(", ReapResult.Replace("if(!d)", "if(d)")))),
+            "returning when the check allows pauses writes");
+        Check(!ClaudeDesktopProbe.IsCompatible(Bundle(remove: Remove.Replace("if(d)for(", ReapResult.Replace("if(!d)", "if(!0)")))),
+            "ignoring the check's result pauses writes");
     }
 
     private static void TestWidgetGate()

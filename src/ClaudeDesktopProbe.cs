@@ -57,18 +57,21 @@ internal static class ClaudeDesktopProbe
     // and those claims include each record's earlier transcript ids.
     internal static readonly (string Anchor, int Window, string[] Required)[] ContractWindows =
     [
-        ("async mayReapTranscript(", 1600, ["cliSessionIdsClaimedOnDisk()", "\"records_unreadable\"",
-            "\"claimed_elsewhere\",\"is claimed by a session of another account or profile on this computer\""]),
+        ("this.reapChecks={", 200, ["claimedOnDisk:()=>this.cliSessionIdsClaimedOnDisk()"]),
         ("cliSessionIdsClaimedOnDisk(){", 900, ["failClosed:!0,localOnly:!0,recordsOnly:!0", "this.getAccountIds()"]),
         ("unarchivedCliSessionId])typeof", 300, ["priorCliSessionIds)??[]"])
     ];
     // Data flow the deletion protection depends on, checked with back-references so renamed variables still match
     // but a changed flow does not: (1) every record's current and earlier transcript ids go into the claims set,
-    // (2) the reap decision fails closed on unreadable records and refuses ids in that set, (3) the session delete
-    // releases only ids outside that set, and its reap check is that decision, alone or behind a guard whose other
-    // branch is a keep call, with nothing applied to the result, (4) transcripts are removed only when the reap check
-    // returned true: nothing reassigns the result before the removal, and a failed check only logs and keeps. What the
-    // keep call returns is not checked; this is a drift guard, not a proof.
+    // (2) the reap decision fails closed on unreadable records and refuses ids in that set, with nothing allowing
+    // deletion before that test, (3) the session delete releases only ids outside that set, and its reap check is that
+    // decision (the link group names one function in both flows), alone or behind a guard whose other branch is a keep
+    // call, with nothing applied to the result, (4) transcripts are removed only when the reap check returned true:
+    // nothing reassigns the result before the removal, and a failed check only logs and keeps, (5) the walk behind that
+    // set takes every account's folder, failing closed on one it cannot list: the current account is told apart only to
+    // skip records it holds in memory, and every other account's record counts: on the way to the id loop that flag
+    // appears nowhere else but as an argument and in claiming its own stem. What the keep call returns is not checked;
+    // this is a drift guard, not a proof.
     internal static readonly (string Anchor, int Before, int After, Regex Flow)[] ContractFlows =
     [
         // (1) Earlier ids are iterated directly (2.16120–2.19675) or spread first into an array that may add more ids,
@@ -76,14 +79,18 @@ internal static class ClaudeDesktopProbe
         ("unarchivedCliSessionId])typeof", 120, 320, new Regex(
             @"for\(let (?<v>[\w$]+) of\[(?<r>[\w$]+)\.cliSessionId,\k<r>\.unarchivedCliSessionId\]\)typeof \k<v>==""string""&&[^;]{0,80}?(?<set>[\w$]+)\.add\(\k<v>\);for\(let (?<p>[\w$]+) of(?: [\w$.]+\(\k<r>\.priorCliSessionIds\)\?\?\[\]|\[\.\.\.[\w$.]+\(\k<r>\.priorCliSessionIds\)\?\?\[\](?:,\.\.\.[^;{}]{0,160}?)?\])\)\k<set>\.add\(\k<p>\)",
             RegexOptions.CultureInvariant)),
-        ("async mayReapTranscript(", 0, 1600, new Regex(
-            @"^async mayReapTranscript\((?<id>[\w$]+),.{0,1200}?let (?<l>[\w$]+)=await this\.cliSessionIdsClaimedOnDisk\(\);return \k<l>===null\?[\w$]+\(""records_unreadable""[^)]*\):\k<l>\.has\(\k<id>\)\?[\w$]+\(""claimed_elsewhere",
+        // (2) A method until 2.x; since 4.29 a function given the manager's checks, which adds refusals around this test.
+        ("\"claimed_elsewhere\",\"is claimed by a session of another account or profile on this computer\"", 1100, 100, new Regex(
+            @"async function (?<link>[\w$]+)\((?<c>[\w$]+),(?<id>[\w$]+),(?:(?!return!0).){0,1000}?let (?<l>[\w$]+)=await \k<c>\.claimedOnDisk\(\);return \k<l>===null\?[\w$]+\(""records_unreadable""[^)]*\):\k<l>\.has\(\k<id>\)\?[\w$]+\(""claimed_elsewhere""",
             RegexOptions.CultureInvariant | RegexOptions.Singleline)),
         ("mayRelease:async ", 0, 600, new Regex(
-            @"^mayRelease:async (?<e>[\w$]+)=>!\(\(await this\.cliSessionIdsClaimedOnDisk\(\)\)\?\.has\(\k<e>\)(?:\?\?![01])?\),reapIf:async\((?<t>[\w$]+),(?<r>[\w$]+)\)=>(?:[^;{}?:]{1,200}\?[\w$]+\(\k<t>,""[\w-]+"",""[^""\\]*"",[^;{}?:()]{0,60}\):)?this\.mayReapTranscript\(\k<t>,\k<r>(?:,(?:[\w$.]+|[\w$]+\([\w$]*\)))*\)(?:,[\w$]+:|\})",
+            @"^mayRelease:async (?<e>[\w$]+)=>!\(\(await this\.cliSessionIdsClaimedOnDisk\(\)\)\?\.has\(\k<e>\)(?:\?\?![01])?\),reapIf:async\((?<t>[\w$]+),(?<r>[\w$]+)\)=>(?:[^;{}?:]{1,200}\?[\w$]+\(\k<t>,""[\w-]+"",""[^""\\]*"",[^;{}?:()]{0,60}\):)?(?<link>[\w$]+)\(this\.reapChecks,\k<t>,\k<r>(?:,(?:[\w$.]+|[\w$]+\([\w$]*\)))*\)(?:,[\w$]+:|\})",
             RegexOptions.CultureInvariant)),
         ("desktop-released marker: reap check failed", 1600, 200, new Regex(
-            @"if\((?<m>[\w$]+)\.mayRelease&&!await \k<m>\.mayRelease\((?<c>[\w$]+)\)\)return\}catch\{return\}.{0,900}?if\([\w$]+===null\|\|![\w$]+\|\|!\k<m>\.reapIf\)return;let (?<d>[\w$]+)=!1;try\{(?:(?!(?<![\w$.])\k<d>=(?!=)).){0,700}?(?<![\w$.])\k<d>=await \k<m>\.reapIf\(\k<c>,\{[^{}]*\}\)\}+catch\([\w$]+\)\{[\w$.]+\.debug\(""desktop-released marker: reap check failed"",\{[^{}]*\}\);try\{\k<m>\.keptInDoubt\?\.\(\k<c>\)\}catch\{\}\}if\(\k<d>\)for\(",
+            @"if\((?<m>[\w$]+)\.mayRelease&&!await \k<m>\.mayRelease\((?<c>[\w$]+)\)\)return\}catch\{return\}.{0,900}?if\([\w$]+===null\|\|![\w$]+\|\|!\k<m>\.reapIf\)return;let (?<d>[\w$]+)=!1;try\{(?:(?!(?<![\w$.])\k<d>=(?!=)).){0,700}?(?<![\w$.])\k<d>=await \k<m>\.reapIf\(\k<c>,\{[^{}]*\}\)\}+catch\([\w$]+\)\{[\w$.]+\.debug\(""desktop-released marker: reap check failed"",\{[^{}]*\}\);try\{\k<m>\.keptInDoubt\?\.\(\k<c>\)\}catch\{\}\}(?:if\(\k<d>\)for\(|if\(!\k<d>\)return;)",
+            RegexOptions.CultureInvariant | RegexOptions.Singleline)),
+        ("skipOwnRecordsOf?.has(", 1500, 1300, new Regex(
+            @"for\(let (?<a>[\w$]+) of [\w$]+\)\{if\(!\k<a>\.isDirectory\(\)\)continue;let (?<ad>[\w$]+)=\(0,[\w$]+\.join\)\([\w$]+,\k<a>\.name\),(?<os>[\w$]+);try\{\k<os>=await [\w$.]+\.readdir\(\k<ad>,\{withFileTypes:!0\}\)\}catch\([\w$]+\)\{if\([\w$]+\?\.failClosed\)throw [\w$]+;.{0,200}?continue\}for\(let (?<o>[\w$]+) of \k<os>\)\{if\(!\k<o>\.isDirectory\(\)\)continue;let (?<od>[\w$]+)=\(0,[\w$]+\.join\)\(\k<ad>,\k<o>\.name\),(?<own>[\w$]+)=[\w$]+===void 0&&\k<a>\.name===[\w$]+\(\)\.accountId&&\k<o>\.name===[\w$]+\(\)\.orgId,(?<fs>[\w$]+);try\{\k<fs>=await [\w$.]+\.readdir\(\k<od>,\{withFileTypes:!0\}\)\}catch\([\w$]+\)\{if\([\w$]+\?\.failClosed\)throw [\w$]+;.{0,200}?continue\}for\(let [\w$]+ of \k<fs>\)\{(?:(?!(?<![\w$.])\k<own>(?![\w$])|accountId).){0,700}?\|\|\k<own>&&[\w$]+\?\.skipOwnRecordsOf\?\.has\([^;]{0,60}\)continue;let (?<s>[\w$]+)=[^;]{0,60};if\(!\k<own>\)[\w$]+\.add\(\k<s>\);else if\((?:(?<=,)\k<own>,|(?<=if\()\k<own>&&[\w$]+\.add\(\k<s>\),|(?!(?<![\w$.])\k<own>(?![\w$])|accountId).){0,1200}?for\(let [\w$]+ of\[[\w$]+\.cliSessionId,",
             RegexOptions.CultureInvariant | RegexOptions.Singleline))
     ];
     private static readonly object ContractGate = new();
@@ -189,6 +196,7 @@ internal static class ClaudeDesktopProbe
             }
             if (!satisfied) return false;
         }
+        string? link = null;
         foreach (var (anchor, before, after, flow) in ContractFlows)
         {
             var anchorBytes = Encoding.UTF8.GetBytes(anchor);
@@ -198,8 +206,13 @@ internal static class ClaudeDesktopProbe
             {
                 var start = Math.Max(0, offset + found - before);
                 var end = Math.Min(bundle.Length, offset + found + after);
-                var region = Encoding.UTF8.GetString(bundle[start..end]);
-                satisfied = flow.IsMatch(region);
+                var match = flow.Match(Encoding.UTF8.GetString(bundle[start..end]));
+                satisfied = match.Success;
+                if (satisfied && match.Groups["link"] is { Success: true } named)
+                {
+                    if (link is not null && link != named.Value) return false;
+                    link = named.Value;
+                }
             }
             if (!satisfied) return false;
         }
