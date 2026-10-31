@@ -37,8 +37,11 @@ internal sealed record ClaudeShelfPaths(string SessionsRoot, string ProjectsRoot
     }
 }
 
+/// <summary>A record to add to a list. It is written only while the original is still there as planned (<c>SourceHash</c>:
+/// its conversation, lineage, folder and kind) and so is its transcript (<c>Transcript</c>), so a conversation the user
+/// deleted or archived meanwhile is not shared.</summary>
 internal sealed record ClaudeShelfAction(string Source, string SourceFile, string Target, string CliSessionId,
-    JsonObject Record);
+    JsonObject Record, string? SourceHash = null, string? Transcript = null);
 
 /// <summary>A record of a list that holds an older state of a conversation another account continued, to be rewritten in
 /// place to that conversation's newest state (<see cref="ClaudeSessionShelf.AdvanceRecord"/>), so the list keeps one
@@ -65,16 +68,23 @@ internal sealed class ClaudeShelfPlan
     internal SortedDictionary<string, SortedDictionary<string, int>> Skipped { get; } = new(StringComparer.Ordinal);
     internal SortedDictionary<string, string> Held { get; } = new(StringComparer.Ordinal);
     internal SortedDictionary<string, SortedDictionary<string, string>> Fingerprints { get; } = new(StringComparer.Ordinal);
-    /// <summary>Transcript ids live CLIs were writing when the plan was made.</summary>
-    internal IReadOnlySet<string> LiveIds { get; set; } = new HashSet<string>();
     /// <summary>Entries the next fill adds to a list or brings up to date there.</summary>
     internal int PendingFor(string targetKey) =>
         Actions.Count(action => action.Target == targetKey) + Advances.Count(advance => advance.Target == targetKey);
     internal bool HasTransientSkips => Skipped.Values.Any(reasons => TransientReasons.Any(reasons.ContainsKey));
     internal bool IsComplete => Held.Count == 0 && !HasTransientSkips;
 
-    internal bool SameShelvesAs(ClaudeShelfPlan other) =>
-        Fingerprints.Count == other.Fingerprints.Count && Fingerprints.All(pair =>
+    /// <summary>Whether nothing for these lists was held or left for a writer to finish (skips are counted per
+    /// "source->target" pair of key prefixes).</summary>
+    internal bool IsCompleteFor(IReadOnlyCollection<string> targets) =>
+        !Held.Keys.Any(targets.Contains) && !Skipped.Any(pair => TransientReasons.Any(pair.Value.ContainsKey)
+            && targets.Any(target => pair.Key.EndsWith("->" + target[..8], StringComparison.Ordinal)));
+
+    /// <summary>Whether the lists hash as in the other plan: every list, or only <paramref name="targets"/> (the lists a
+    /// run writes while the app runs, which keeps changing the one it shows).</summary>
+    internal bool SameShelvesAs(ClaudeShelfPlan other, IReadOnlySet<string>? targets = null) =>
+        (targets is not null || Fingerprints.Count == other.Fingerprints.Count)
+        && Fingerprints.Where(pair => targets?.Contains(pair.Key) != false).All(pair =>
             other.Fingerprints.TryGetValue(pair.Key, out var files) && files.Count == pair.Value.Count
             && pair.Value.All(file => files.TryGetValue(file.Key, out var hash) && hash == file.Value));
 
@@ -85,10 +95,16 @@ internal sealed class ClaudeShelfPlan
     }
 }
 
+/// <param name="Targets">The lists the run wrote to: every list while the app was closed, the ones it allowed while it ran.</param>
 internal sealed record ClaudeShelfResult(int Created, ClaudeShelfPlan Plan, int Retired = 0,
-    ClaudeSidebarPrefs.Outcome? Prefs = null, int Retitled = 0, int Advanced = 0);
+    ClaudeSidebarPrefs.Outcome? Prefs = null, int Retitled = 0, int Advanced = 0, IReadOnlySet<string>? Targets = null)
+{
+    internal int Written => Created + Advanced + Retired + Retitled;
+}
 
-/// <param name="created">Records the run had written (added or advanced) when the app started.</param>
+/// <summary>A run stopped before a file: the app started, or, while it runs, came to a list the run writes (signed in to
+/// it or showed it).</summary>
+/// <param name="created">Records the run had written (added or advanced) when it stopped.</param>
 internal sealed class ClaudeDesktopRunningException(int created = 0)
     : InvalidOperationException(created == 0 ? "Claude 앱이 실행 중이라 세션 목록을 채우지 않았습니다."
         : "Claude 앱이 켜져 세션 목록 채우기를 중간에 멈췄습니다.")
@@ -102,8 +118,8 @@ internal sealed class ClaudeDesktopRunningException(int created = 0)
 /// account continued a conversation a list holds in an older state, that record is brought to the newest state in place
 /// instead, as the app does when a conversation goes on within one account, so the list keeps one entry. Invariants:
 /// add records, or advance an older state of a conversation another account continued to that conversation's newest
-/// state in place; never delete; write only while Desktop and its Code CLIs are fully closed; never read or touch
-/// authentication data.
+/// state in place; never delete; write a list only while the app leaves it alone (Desktop and its Code CLIs fully
+/// closed, or, while the app runs, a list it has not shown for a while); never read or touch authentication data.
 /// </summary>
 internal sealed class ClaudeSessionShelf
 {
@@ -118,7 +134,16 @@ internal sealed class ClaudeSessionShelf
     private static readonly string[] LineageFields = ["priorCliSessionIds", "rewindEdges", "transcriptCuts"];
     private static readonly string[] EffortLevels = ["low", "medium", "high", "xhigh", "max"];
     private static readonly string[] RemoteFields = ["sshConfig", "wslConfig", "cloudSessionId", "movedToCloud"];
+    // A session in a worktree the app made is copied with its folder (cwd) only, as the app's own import makes it: the
+    // worktree stays the source account's to keep or remove. One whose worktree is not made yet (lazy) is not copied.
     private static readonly string[] WorktreeFields = ["worktreePath", "worktreeName", "worktreeLazy"];
+    // What an advance decides from a source record (its conversation, folder and kind). The rest (activity times, title,
+    // turns) keeps changing while the app shows the conversation, and an advance takes it as it was planned.
+    private static readonly string[] DecisionFields =
+    [
+        "cliSessionId", "priorCliSessionIds", "rewindEdges", "transcriptCuts", "forkedFromSessionId", "spawnedFrom", "cwd",
+        "originCwd", "isArchived", .. RemoteFields, .. WorktreeFields
+    ];
     // Only an ordinary local session is advanced (fields read from Claude 2.42304's record loader, its fork of a session
     // and its own transcript-id switches). These name a transcript besides the current one: an import's staged file
     // (confirming the import moves it over the current transcript id, removing what is there if a move fails),
@@ -160,8 +185,8 @@ internal sealed class ClaudeSessionShelf
     private readonly Func<IDisposable> _acquireLease;
     private readonly TimeProvider _time;
     // Plans repeat every minute while the app runs and a hand-over reads two transcripts whole: remember each verdict per
-    // state of the two files.
-    private readonly Dictionary<string, bool> _handOvers = new(StringComparer.Ordinal);
+    // state of the earlier file and the later file's length (see WentOn).
+    private readonly Dictionary<string, (bool Went, long Length, bool Settled)> _handOvers = new(StringComparer.Ordinal);
     internal ClaudeShelfPaths Paths => _paths;
 
     internal ClaudeSessionShelf(ClaudeShelfPaths? paths = null, Func<ClaudeLiveSessionScan>? liveWriters = null,
@@ -190,7 +215,6 @@ internal sealed class ClaudeSessionShelf
         var live = _liveWriters();
         // An unreadable registration could name any session: hold everything rather than guess.
         if (live.Unknown) { foreach (var account in distinct) plan.Held[account.Key] = "writer_unknown"; return plan; }
-        plan.LiveIds = live.Ids;
         var transcripts = TranscriptIds();
         // Continuing a conversation gives it a new transcript id and lists the earlier ones. A record whose current id
         // another record lists as earlier is an older state of that conversation only when the transcripts show it went
@@ -222,11 +246,12 @@ internal sealed class ClaudeSessionShelf
                     if (record is null) { plan.Skip(pair, "unreadable"); continue; }
                     var reason = Ineligible(record, transcripts);
                     var cli = Text(record, "cliSessionId")?.ToLowerInvariant();
-                    // An older state of a conversation its own list holds further on is never offered.
+                    // An older state of a conversation its own list holds further on is never offered. A conversation being
+                    // written is: the new record only points at its transcript, and the app shows it as it is when it
+                    // comes to that list.
                     if (reason is null && lineage[source.Key].SupersededBy(file, record)
                             .Any(newer => from.Records[newer] is { } later && WentOnFrom(record, later, transcripts)))
                         reason = "superseded";
-                    if (reason is null && live.Ids.Contains(cli!)) reason = "live_writer";
                     // Nor is a conversation this list holds at that state or further on.
                     if (reason is null && (present.Contains(cli!) || planned.Contains(cli!)
                             || lineage[target.Key].ListersOf(cli!).Any(later => WentOnFrom(record, later, transcripts))))
@@ -234,20 +259,21 @@ internal sealed class ClaudeSessionShelf
                     if (reason is null && (deleted.Contains(cli!) || removed.Contains(cli!))) reason = "deleted_in_target";
                     if (reason is not null) { plan.Skip(pair, reason); continue; }
                     planned.Add(cli!);
-                    offers.Add(new Offer(source.Key, ShelfDirectory(source), file, record, pair, from.Fingerprint[file]));
+                    offers.Add(new Offer(source.Key, ShelfDirectory(source), file, record, pair, DecisionHash(record)));
                 }
             }
             var taken = PlanAdvances(plan, target.Key, shelf, lineage[target.Key], offers, live, transcripts);
             foreach (var offer in offers.Where(offer => !taken.Contains(offer)))
                 plan.Actions.Add(new ClaudeShelfAction(offer.Source, offer.File, target.Key, Text(offer.Record, "cliSessionId")!,
-                    BuildRecord(offer.Record)));
+                    BuildRecord(offer.Record), offer.Hash,
+                    transcripts.GetValueOrDefault(Text(offer.Record, "cliSessionId")!.ToLowerInvariant())));
             PlanRetirements(plan, ledger, target.Key, shelf, live, transcripts);
         }
         return plan;
     }
 
-    /// <summary>A record of another account that a list lacks: where it is, its hash when planned, and the counter its
-    /// skips go to.</summary>
+    /// <summary>A record of another account that a list lacks: where it is, what an advance decides from it when planned
+    /// (<see cref="DecisionHash"/>), and the counter its skips go to.</summary>
     private sealed record Offer(string Source, string Directory, string File, JsonObject Record, string Pair, string Hash);
 
     /// <summary>
@@ -256,9 +282,12 @@ internal sealed class ClaudeSessionShelf
     /// an offer whose state another one holds further on (see <see cref="WentOnFrom"/>) drops out; when exactly one is
     /// left and it continues the record as one line, every step proven (see <see cref="Continues"/>), that newest state
     /// advances the record, once, whatever order the accounts came in. Two or more left are branches: like a record that
-    /// may not be advanced, they leave the group to be added as before. A group touching a transcript being written
-    /// waits. The transcripts are stamped before the decision reads them, and the advance carries those stamps and the
-    /// source records' hashes, so it is written only while all of it is as it was read.
+    /// may not be advanced, they leave the group to be added as before. A group waits while a transcript it reads before
+    /// an offer's current one is being written; the current one may be, as it is whenever the app shows that
+    /// conversation, since what is added to it later changes nothing the decision read. The transcripts are stamped before
+    /// the decision reads them (the newest state's current one as one that may grow), and the advance carries those stamps
+    /// and what it decided from the source records (<see cref="DecisionHash"/>), so it is written only while all of it is as
+    /// it was read.
     /// </summary>
     private HashSet<Offer> PlanAdvances(ClaudeShelfPlan plan, string target, Shelf shelf, Lineage lineage,
         IReadOnlyList<Offer> offers, ClaudeLiveSessionScan live, IReadOnlyDictionary<string, string> transcripts)
@@ -275,13 +304,14 @@ internal sealed class ClaudeSessionShelf
             var from = Text(older, "cliSessionId")!.ToLowerInvariant();
             var ids = members.SelectMany(member => Chain(member.Record)!.SkipWhile(id => id != from))
                 .Distinct(StringComparer.Ordinal).ToArray();
-            if (ids.Any(live.Ids.Contains))
+            if (members.SelectMany(member => Chain(member.Record)!.SkipWhile(id => id != from).SkipLast(1)).Any(live.Ids.Contains))
             {
                 foreach (var member in members) plan.Skip(member.Pair, "live_writer");
                 taken.UnionWith(members);
                 continue;
             }
-            if (Stamps(ids, transcripts) is not { } stamps) continue;
+            var heads = members.Select(member => Text(member.Record, "cliSessionId")!.ToLowerInvariant()).ToArray();
+            if (Stamps(ids, transcripts) is not { } stamps || Stamps(heads, transcripts, growing: true) is not { } growing) continue;
             var newest = members.Where(member => !members.Any(other => other != member
                 && WentOnFrom(member.Record, other.Record, transcripts))).ToArray();
             if (newest is not [var head] || !SameFolder(older, head.Record) || !KeepsLineage(older, head.Record)
@@ -291,38 +321,52 @@ internal sealed class ClaudeSessionShelf
                 Text(older, "cliSessionId")!, Text(head.Record, "cliSessionId")!, lineageIds, AdvanceRecord(older, head.Record),
                 members.ToDictionary(member => Path.Combine(member.Directory, member.File), member => member.Hash,
                     StringComparer.OrdinalIgnoreCase),
-                lineageIds.Select(id => transcripts[id]).ToDictionary(path => path, path => stamps[path], StringComparer.OrdinalIgnoreCase)));
+                lineageIds.Select((id, at) => (Path: transcripts[id], Head: at == lineageIds.Length - 1))
+                    .ToDictionary(item => item.Path, item => item.Head ? growing[item.Path] : stamps[item.Path],
+                        StringComparer.OrdinalIgnoreCase)));
             taken.UnionWith(members);
             foreach (var member in members.Where(member => member != head)) plan.Skip(member.Pair, "superseded");
         }
         return taken;
     }
 
-    /// <summary>Each transcript's file with its size and times now; null when one is missing or cannot be read.</summary>
-    private static Dictionary<string, string>? Stamps(IEnumerable<string> ids, IReadOnlyDictionary<string, string> transcripts)
+    /// <summary>Each transcript's file with its size and times now (<see cref="Stamp"/>), or, for transcripts that may still
+    /// be written, its creation time and size (<see cref="GrowingStamp"/>); null when one is missing or cannot be read.</summary>
+    private static Dictionary<string, string>? Stamps(IEnumerable<string> ids, IReadOnlyDictionary<string, string> transcripts,
+        bool growing = false)
     {
         var stamps = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         foreach (var id in ids)
         {
             if (!transcripts.TryGetValue(id, out var path)) return null;
-            try { stamps[path] = Stamp(path); }
+            try { stamps[path] = growing ? GrowingStamp(path) : Stamp(path); }
             catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { return null; }
         }
         return stamps;
     }
 
-    /// <summary>Whether every transcript is still as stamped (<see cref="Stamp"/>) and every record still hashes as planned,
-    /// or as this run wrote it (<paramref name="written"/>: another list's record this run advanced).</summary>
+    /// <summary>Whether every transcript is still as stamped (<see cref="Still"/>) and every record still decides as planned
+    /// (<see cref="DecisionHash"/>), or as this run wrote it (<paramref name="written"/>: another list's record this run
+    /// advanced).</summary>
     private static bool Unchanged(IReadOnlyDictionary<string, string>? transcripts, IReadOnlyDictionary<string, string>? records = null,
         IReadOnlyDictionary<string, string>? written = null)
     {
         try
         {
-            return (transcripts ?? new Dictionary<string, string>()).All(pair => Stamp(pair.Key) == pair.Value)
-                && (records ?? new Dictionary<string, string>()).All(pair => File.Exists(pair.Key) && Hash(pair.Key) is var hash
-                    && (hash == pair.Value || written?.GetValueOrDefault(pair.Key) == hash));
+            return (transcripts ?? new Dictionary<string, string>()).All(pair => Still(pair.Key, pair.Value))
+                && (records ?? new Dictionary<string, string>()).All(pair => ReadRecord(pair.Key) is { } record
+                    && DecisionHash(record) is var hash && (hash == pair.Value || written?.GetValueOrDefault(pair.Key) == hash));
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { return false; }
+    }
+
+    /// <summary>The hash of what an advance decides from a record (<see cref="DecisionFields"/>).</summary>
+    private static string DecisionHash(JsonObject record)
+    {
+        var decided = new JsonObject();
+        foreach (var field in DecisionFields)
+            if (record[field] is { } value) decided[field] = value.DeepClone();
+        return Convert.ToHexString(SHA256.HashData(JsonSerializer.SerializeToUtf8Bytes(decided, RecordJson)));
     }
 
     /// <summary>The record of a list holding the latest earlier state of <paramref name="newer"/>'s conversation: the one
@@ -340,11 +384,12 @@ internal sealed class ClaudeSessionShelf
     }
 
     /// <summary>Whether a record of a list may be rewritten to a newer state: an ordinary local session as a source must be
-    /// (<see cref="Ineligible"/>), stored under its own id, holding none of <see cref="HoldingFields"/>, and the newest
-    /// state its list has (no other record there continues it).</summary>
+    /// (<see cref="Ineligible"/>), stored under its own id, holding none of <see cref="HoldingFields"/>, in no worktree of
+    /// its own (an advanced record keeps only <see cref="KeptFields"/>, and the app would lose the worktree it made), and
+    /// the newest state its list has (no other record there continues it).</summary>
     private bool MayAdvance(string file, JsonObject record, Lineage lineage, IReadOnlyDictionary<string, string> transcripts) =>
         Text(record, "sessionId") + ".json" == file && Ineligible(record, transcripts) is null && !HoldsState(record)
-        && lineage.SupersededBy(file, record).Count == 0;
+        && !WorktreeFields.Any(field => record[field] is not null) && lineage.SupersededBy(file, record).Count == 0;
 
     /// <summary>Whether <paramref name="later"/> holds the conversation of <paramref name="earlier"/> further on, as far as
     /// the transcripts show: the conversation went on from the earlier current transcript (see <see cref="Steps"/>) with
@@ -464,23 +509,34 @@ internal sealed class ClaudeSessionShelf
     /// Whether the conversation went on from transcript <paramref name="older"/> in <paramref name="next"/> with nothing
     /// written to the older one since; otherwise that is a branch the user went on with. As in the session plan, both must
     /// be there and dated, the next one created after the older one and by the hand-over (its oldest entry the older one
-    /// does not hold), and the older one's newest entry no later (2 s slack). Remembered per state of the two files.
+    /// does not hold), and the older one's newest entry no later (2 s slack). Remembered per state of the older file and the
+    /// next file's length: once the hand-over is found, what the conversation adds to the next one after it changes
+    /// nothing, so a verdict holds while that file only grows.
     /// </summary>
     private bool WentOn(string older, string next, IReadOnlyDictionary<string, string> transcripts)
     {
         if (!transcripts.TryGetValue(older, out var olderPath) || !transcripts.TryGetValue(next, out var nextPath)) return false;
         string key;
-        try { key = Stamp(olderPath) + "|" + Stamp(nextPath); }
+        long length;
+        try
+        {
+            var onwardFile = new FileInfo(nextPath);
+            key = Stamp(olderPath) + "|" + nextPath + ":" + onwardFile.CreationTimeUtc.Ticks;
+            length = onwardFile.Length;
+        }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { return false; }
-        lock (_handOvers) if (_handOvers.TryGetValue(key, out var known)) return known;
+        lock (_handOvers)
+            if (_handOvers.TryGetValue(key, out var known) && (known.Length == length || known.Settled && known.Length < length))
+                return known.Went;
+        DateTimeOffset? handOver = null;
         var went = ClaudeSessionSync.Transcript(_paths.ProjectsRoot, older) is { LastEntry: { } last, Dated: true } own
             && ClaudeSessionSync.Transcript(_paths.ProjectsRoot, next) is { Dated: true } onward && onward.Created > own.Created
-            && ClaudeSessionSync.HandOver(_paths.ProjectsRoot, older, next) is { } handOver
-            && onward.Created <= handOver + HandOverSlack && last <= handOver + HandOverSlack;
+            && (handOver = ClaudeSessionSync.HandOver(_paths.ProjectsRoot, older, next)) is { } at
+            && onward.Created <= at + HandOverSlack && last <= at + HandOverSlack;
         lock (_handOvers)
         {
             if (_handOvers.Count >= MaxRememberedHandOvers) _handOvers.Clear();
-            _handOvers[key] = went;
+            _handOvers[key] = (went, length, handOver is not null);
         }
         return went;
     }
@@ -489,6 +545,25 @@ internal sealed class ClaudeSessionShelf
     {
         var file = new FileInfo(path);
         return path + ":" + file.Length + ":" + file.CreationTimeUtc.Ticks + ":" + file.LastWriteTimeUtc.Ticks;
+    }
+
+    /// <summary>A transcript that may still be written: the same file (by creation time), and its size then.</summary>
+    private static string GrowingStamp(string path)
+    {
+        var file = new FileInfo(path);
+        return "+" + file.CreationTimeUtc.Ticks.ToString(CultureInfo.InvariantCulture) + ":"
+            + file.Length.ToString(CultureInfo.InvariantCulture);
+    }
+
+    /// <summary>Whether a transcript is as stamped: exactly (<see cref="Stamp"/>), or, stamped as one that may still be
+    /// written (<see cref="GrowingStamp"/>), the same file at least as long.</summary>
+    private static bool Still(string path, string stamp)
+    {
+        if (!stamp.StartsWith('+')) return Stamp(path) == stamp;
+        var file = new FileInfo(path);
+        return stamp[1..].Split(':') is [var created, var length] && file.Exists
+            && file.CreationTimeUtc.Ticks.ToString(CultureInfo.InvariantCulture) == created
+            && long.TryParse(length, NumberStyles.None, CultureInfo.InvariantCulture, out var size) && file.Length >= size;
     }
 
     /// <summary>
@@ -538,10 +613,12 @@ internal sealed class ClaudeSessionShelf
             if (lineage.SupersededBy(entry.File, record) is not [var successor]
                 || lineage.SupersededBy(successor, records[successor]!).Count > 0) continue;
             // The copy's transcript and the next, stamped before the decision reads them: it is archived only while they are
-            // still so.
+            // still so. The next one may still be written (the conversation goes on there).
             var later = records[successor]!;
-            if (Steps(record, later) is not { } steps || Stamps(steps.Take(2), transcripts) is not { } stamps
+            if (Steps(record, later) is not { } steps || Stamps(steps.Take(1), transcripts) is not { } stamps
+                || Stamps(steps.Skip(1).Take(1), transcripts, growing: true) is not { } onward
                 || !WentOnFrom(record, later, transcripts)) continue;
+            foreach (var (path, stamp) in onward) stamps[path] = stamp;
             plan.Retirements.Add(new ClaudeShelfRetirement(target, entry.File, entry.CliSessionId, successor, stamps));
         }
     }
@@ -621,15 +698,16 @@ internal sealed class ClaudeSessionShelf
     /// Only the title fields change; the copy stays as recognisable as before (its ledger hash follows when it was
     /// still exactly as written).
     /// </summary>
-    private int FollowTitles(ClaudeShelfLedger ledger, ClaudeShelfPlan plan, Func<bool> desktopClosed, int created)
+    private int FollowTitles(ClaudeShelfLedger ledger, ClaudeShelfPlan plan, IReadOnlySet<string> writable,
+        Func<string?, bool> mayWrite, int created)
     {
         var retitled = 0;
         foreach (var entry in ledger.Created.Where(entry => !entry.Pending && !entry.Retired).ToArray())
         {
-            // The same holds as for filling: only lists in this run, none held (unknown writers, recovery files,
-            // unreadable records), and no conversation a live CLI is writing.
-            if (!plan.Fingerprints.ContainsKey(entry.Target) || !plan.Fingerprints.ContainsKey(entry.Source)
-                || plan.Held.ContainsKey(entry.Target) || plan.LiveIds.Contains(entry.CliSessionId.ToLowerInvariant())
+            // The same holds as for filling: only lists this run writes, none held (unknown writers, recovery files,
+            // unreadable records), with the original in this run.
+            if (!writable.Contains(entry.Target) || !plan.Fingerprints.ContainsKey(entry.Source)
+                || plan.Held.ContainsKey(entry.Target)
                 || entry.Source.Split('/') is not [var account, var org] || !Guid.TryParse(account, out _) || !Guid.TryParse(org, out _)
                 || !entry.SourceFile.StartsWith("local_", StringComparison.Ordinal) || entry.SourceFile.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0
                 || ClaudeShelfLedger.EntryPath(_paths.SessionsRoot, entry) is not { } path
@@ -660,8 +738,8 @@ internal sealed class ClaudeSessionShelf
             copy["title"] = title;
             if (source["titleSource"] is JsonValue titleSource) copy["titleSource"] = titleSource.DeepClone();
             var after = JsonSerializer.SerializeToUtf8Bytes(copy, RecordJson);
-            if (!desktopClosed()) throw new ClaudeDesktopRunningException(created);
-            if (!Replace(path, before, after, desktopClosed))
+            if (!mayWrite(entry.Target)) throw new ClaudeDesktopRunningException(created);
+            if (!Replace(path, before, after, () => mayWrite(entry.Target)))
             {
                 // The old name is still showing: leave the run unfinished so it is retried, not reported as done.
                 plan.Held[entry.Target] = "retitle_failed";
@@ -675,10 +753,10 @@ internal sealed class ClaudeSessionShelf
     }
 
     /// <summary>Replaces a record with <paramref name="after"/> only if it still holds exactly <paramref name="before"/>
-    /// and Desktop is still closed at the last moment. The swap itself is atomic, but nothing locks the app out between
-    /// that last check and the move: an app started in that instant could still read the old record, or write over the
-    /// new one.</summary>
-    private static bool Replace(string path, byte[] before, byte[] after, Func<bool> desktopClosed)
+    /// and the app still leaves its list alone at the last moment (<paramref name="mayWrite"/>). The swap itself is atomic,
+    /// but nothing locks the app out between that last check and the move: an app that came to the list in that instant
+    /// could still read the old record, or write over the new one.</summary>
+    private static bool Replace(string path, byte[] before, byte[] after, Func<bool> mayWrite)
     {
         var partial = Path.Combine(Path.GetDirectoryName(path)!, "." + Path.GetFileName(path) + PartialSuffix);
         try
@@ -686,7 +764,7 @@ internal sealed class ClaudeSessionShelf
             using (var stream = new FileStream(partial, FileMode.CreateNew, FileAccess.Write, FileShare.None, 4096,
                        FileOptions.WriteThrough))
             { stream.Write(after); stream.Flush(flushToDisk: true); }
-            if (!desktopClosed() || !File.ReadAllBytes(path).AsSpan().SequenceEqual(before)) return false;
+            if (!mayWrite() || !File.ReadAllBytes(path).AsSpan().SequenceEqual(before)) return false;
             File.Move(partial, path, overwrite: true);
             return true;
         }
@@ -697,45 +775,69 @@ internal sealed class ClaudeSessionShelf
     private static long Number(JsonObject record, string field) =>
         record[field] is JsonValue value && value.TryGetValue<long>(out var number) ? number : 0;
 
-    /// <summary>Archives a superseded copy in place, the way the app archives a session; nothing is deleted.</summary>
-    private static bool Archive(string path) => Rewrite(path, record => record["isArchived"] = true);
-
-    /// <summary>Rewrites one record in place through a temporary file, changing only what <paramref name="change"/> sets.</summary>
-    private static bool Rewrite(string path, Action<JsonObject> change)
+    /// <summary>Whether a record to add still has its original as planned and that original's transcript.</summary>
+    private bool StillAsPlanned(ClaudeShelfAction action, IReadOnlyDictionary<string, ClaudeShelfAccount> accounts)
     {
-        if (ReadRecord(path) is not { } record) return false;
-        change(record);
-        var partial = Path.Combine(Path.GetDirectoryName(path)!, "." + Path.GetFileName(path) + PartialSuffix);
+        if (action.SourceHash is null) return true;
+        if (!accounts.TryGetValue(action.Source, out var source) || action.Transcript is null) return false;
         try
         {
-            using (var stream = new FileStream(partial, FileMode.CreateNew, FileAccess.Write, FileShare.None, 4096,
-                       FileOptions.WriteThrough))
-            { stream.Write(JsonSerializer.SerializeToUtf8Bytes(record, RecordJson)); stream.Flush(flushToDisk: true); }
-            File.Move(partial, path, overwrite: true);
-            return true;
+            return ReadRecord(Path.Combine(ShelfDirectory(source), action.SourceFile)) is { } record
+                && DecisionHash(record) == action.SourceHash && File.Exists(action.Transcript);
         }
-        finally { if (File.Exists(partial)) File.Delete(partial); }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { return false; }
     }
 
-    /// <summary>Publishes the plan made immediately before writing. <paramref name="desktopClosed"/> must return
-    /// false when the app's state cannot be determined; it is checked again before every file.</summary>
+    /// <summary>A superseded copy as it is now and archived in place, the way the app archives a session (nothing is
+    /// deleted); null unless it still hashes to <paramref name="fingerprint"/>. It is written through <see cref="Replace"/>.</summary>
+    private static (byte[] Before, byte[] After)? Archived(string path, string? fingerprint)
+    {
+        byte[] before;
+        try { before = File.ReadAllBytes(path); }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { return null; }
+        if (fingerprint is null || Convert.ToHexString(SHA256.HashData(before)) != fingerprint) return null;
+        JsonObject? record;
+        try { record = JsonNode.Parse(before) as JsonObject; }
+        catch (JsonException) { return null; }
+        if (record is null) return null;
+        record["isArchived"] = true;
+        return (before, JsonSerializer.SerializeToUtf8Bytes(record, RecordJson));
+    }
+
+    /// <summary>Publishes the plan made immediately before writing, while Desktop is closed. <paramref name="desktopClosed"/>
+    /// must return false when the app's state cannot be determined; it is checked again before every file.</summary>
     internal ClaudeShelfResult Apply(IReadOnlyList<ClaudeShelfAccount> accounts, Func<bool> desktopClosed,
-        string? appVersion = null)
+        string? appVersion = null) => Apply(accounts, _ => desktopClosed(), appVersion, running: false);
+
+    /// <summary>
+    /// Publishes the plan made immediately before writing to the lists the app leaves alone. While Desktop is closed
+    /// (<paramref name="running"/> false) that is every list, and <paramref name="mayWrite"/> says whether it is still
+    /// closed. While it runs, it is the lists <paramref name="mayWrite"/> allows when the run starts (never one the app
+    /// shows or signs in to); only those are compared and written, and the other lists count toward the plan alone (what
+    /// the list the app shows lacks). <paramref name="mayWrite"/> is asked again before every file with that file's list
+    /// (null: the run as a whole), and must return false when it cannot tell.
+    /// </summary>
+    internal ClaudeShelfResult Apply(IReadOnlyList<ClaudeShelfAccount> accounts, Func<string?, bool> mayWrite,
+        string? appVersion, bool running)
     {
         if (!RunGate.Wait(0)) throw new InvalidOperationException("세션 목록 채우기가 이미 진행 중입니다.");
         try
         {
             using var lease = _acquireLease();
-            if (!desktopClosed()) throw new ClaudeDesktopRunningException();
+            if (!mayWrite(null)) throw new ClaudeDesktopRunningException();
             var ledger = ClaudeShelfLedger.Load(_paths.LedgerDirectory, _paths.SessionsRoot);
             if (ReconcileArchives(ledger)) ledger.Save(_paths.LedgerDirectory);
             var first = Plan(accounts, ledger);
-            if (!desktopClosed()) throw new ClaudeDesktopRunningException();
+            if (!mayWrite(null)) throw new ClaudeDesktopRunningException();
             // Re-plan and publish that final plan: writers or eligibility can change without a shelf change.
             var plan = Plan(accounts, ledger);
-            if (!first.SameShelvesAs(plan)) throw new IOException("세션 목록이 준비 중에 바뀌어 아무것도 쓰지 않았습니다.");
             var targets = accounts.DistinctBy(account => account.Key).ToDictionary(account => account.Key);
-            var prepared = plan.Actions.Select(action =>
+            IReadOnlySet<string> writable = running
+                ? targets.Keys.Where(key => mayWrite(key)).ToHashSet(StringComparer.Ordinal)
+                : targets.Keys.ToHashSet(StringComparer.Ordinal);
+            if (!first.SameShelvesAs(plan, running ? writable : null))
+                throw new IOException("세션 목록이 준비 중에 바뀌어 아무것도 쓰지 않았습니다.");
+            var prepared = plan.Actions.Where(action => writable.Contains(action.Target)).Select(action =>
             {
                 var bytes = JsonSerializer.SerializeToUtf8Bytes(action.Record, RecordJson);
                 var name = action.Record["sessionId"]!.GetValue<string>() + ".json";
@@ -745,7 +847,8 @@ internal sealed class ClaudeSessionShelf
             }).ToArray();
             // Record intent first: after a crash the next load keeps only files whose content matches.
             ledger.Created.AddRange(prepared.Select(item => item.Entry));
-            if (prepared.Length > 0) ledger.Save(_paths.LedgerDirectory);
+            var saved = prepared.Length > 0;
+            if (saved) ledger.Save(_paths.LedgerDirectory);
             var created = 0;
             var advanced = 0;
             List<ClaudeShelfRetirement> retired = [];
@@ -755,7 +858,10 @@ internal sealed class ClaudeSessionShelf
             {
                 foreach (var item in prepared)
                 {
-                    if (!desktopClosed()) throw new ClaudeDesktopRunningException(created);
+                    if (!mayWrite(item.Action.Target)) throw new ClaudeDesktopRunningException(created);
+                    // While the app runs the user may delete or archive the original meanwhile: share only one still as
+                    // planned, with its transcript. The next run plans the rest again.
+                    if (!StillAsPlanned(item.Action, targets)) continue;
                     var directory = ShelfDirectory(targets[item.Action.Target]);
                     Directory.CreateDirectory(directory);
                     RemoveStalePartials(directory);
@@ -775,32 +881,32 @@ internal sealed class ClaudeSessionShelf
                 // Records that did not take their newest state: nothing is retired in their favour.
                 var unadvanced = new HashSet<(string Target, string File)>();
                 var written = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-                foreach (var advance in plan.Advances)
+                foreach (var advance in plan.Advances.Where(advance => writable.Contains(advance.Target)))
                 {
-                    if (!desktopClosed()) throw new ClaudeDesktopRunningException(created + advanced);
-                    if (AdvanceInPlace(ledger, advance, targets[advance.Target], desktopClosed, appVersion, written)) { advanced++; continue; }
+                    if (!mayWrite(advance.Target)) throw new ClaudeDesktopRunningException(created + advanced);
+                    saved = true;
+                    if (AdvanceInPlace(ledger, advance, targets[advance.Target], () => mayWrite(advance.Target), appVersion, written))
+                    { advanced++; continue; }
                     // The older state still shows: leave the run unfinished so it is retried, not reported as done.
                     unadvanced.Add((advance.Target, advance.File));
                     plan.Held[advance.Target] = "advance_failed";
                 }
-                foreach (var retirement in plan.Retirements)
+                foreach (var retirement in plan.Retirements.Where(retirement => writable.Contains(retirement.Target)))
                 {
-                    if (!desktopClosed()) throw new ClaudeDesktopRunningException(created + advanced);
+                    if (!mayWrite(retirement.Target)) throw new ClaudeDesktopRunningException(created + advanced);
                     if (unadvanced.Contains((retirement.Target, retirement.SuccessorFile))) continue;
                     var directory = ShelfDirectory(targets[retirement.Target]);
                     var path = Path.Combine(directory, retirement.File);
                     // The newer record must be there, the copy still exactly as written and the transcripts as the plan read
-                    // them, before it is put away.
-                    if (!File.Exists(Path.Combine(directory, retirement.SuccessorFile)) || !File.Exists(path)
-                        || Hash(path) != plan.Fingerprints[retirement.Target].GetValueOrDefault(retirement.File)
+                    // them, before it is put away, and all of it again at the last moment, with the app still leaving the list alone.
+                    if (!File.Exists(Path.Combine(directory, retirement.SuccessorFile))
+                        || Archived(path, plan.Fingerprints[retirement.Target].GetValueOrDefault(retirement.File)) is not { } archive
                         || !Unchanged(retirement.Transcripts)) continue;
                     // Record the intent first: the next run either confirms the archive from the file or cancels it.
                     ledger.Intend(retirement.Target, retirement.File, retirement.SuccessorFile);
                     ledger.Save(_paths.LedgerDirectory);
-                    bool archived;
-                    try { archived = Archive(path); }
-                    catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { archived = false; }
-                    if (!archived)
+                    saved = true;
+                    if (!Replace(path, archive.Before, archive.After, () => mayWrite(retirement.Target) && Unchanged(retirement.Transcripts)))
                     {
                         // The duplicate is still listed: report the list as held so the run is retried, not done.
                         ledger.CancelIntent(retirement.Target, retirement.File);
@@ -810,42 +916,48 @@ internal sealed class ClaudeSessionShelf
                     ledger.Retire(retirement.Target, retirement.File, _time.GetUtcNow());
                     retired.Add(retirement);
                 }
-                retitled = FollowTitles(ledger, plan, desktopClosed, created + advanced);
-                if (_paths.DesktopConfig is { } config)
+                retitled = FollowTitles(ledger, plan, writable, mayWrite, created + advanced);
+                // The app's own sidebar stores are in use while it runs.
+                if (!running && _paths.DesktopConfig is { } config)
                 {
-                    if (!desktopClosed()) throw new ClaudeDesktopRunningException(created + advanced);
+                    if (!mayWrite(null)) throw new ClaudeDesktopRunningException(created + advanced);
                     var moves = ledger.PendingMoves();
                     ClaudeSidebarPrefs.ISource source = config.EndsWith(".json", StringComparison.OrdinalIgnoreCase)
                         ? new ClaudeSidebarPrefs.SettingsFileSource(config, _paths.LedgerDirectory)
                         : new ClaudeSidebarPrefs.LocalStorageSource(new ClaudeLocalStorage(config), _paths.LedgerDirectory, _time.GetUtcNow);
                     prefs = ClaudeSidebarPrefs.Sync(source, _paths.LedgerDirectory, ClaudeSidebarPrefs.Links(ledger, _paths.SessionsRoot),
                         moves.ToDictionary(entry => ClaudeSidebarPrefs.ListId(entry.File), entry => ClaudeSidebarPrefs.ListId(entry.MovedTo!)),
-                        desktopClosed);
+                        () => mayWrite(null));
                     if (prefs.Complete) foreach (var entry in moves) ledger.FinishMove(entry);
                 }
             }
             finally
             {
                 ledger.SettlePending(_paths.SessionsRoot);
-                ledger.AddRun(_time.GetUtcNow(), "apply", appVersion, created, plan, retired.Count, prefs, retitled, advanced);
-                ledger.Save(_paths.LedgerDirectory);
+                // While the app runs a run comes every minute: one that wrote nothing leaves no trace, and the ledger is
+                // saved only to settle what this run recorded.
+                var wrote = created + advanced + retired.Count + retitled > 0;
+                if (!running || wrote)
+                    ledger.AddRun(_time.GetUtcNow(), running ? "apply-running" : "apply", appVersion, created, plan, retired.Count,
+                        prefs, retitled, advanced);
+                if (!running || wrote || saved) ledger.Save(_paths.LedgerDirectory);
             }
-            return new ClaudeShelfResult(created, plan, retired.Count, prefs, retitled, advanced);
+            return new ClaudeShelfResult(created, plan, retired.Count, prefs, retitled, advanced, writable);
         }
         finally { RunGate.Release(); }
     }
 
     /// <summary>
     /// Writes one planned advance, only while the record still holds exactly the bytes the plan read and, at the last
-    /// moment, Desktop is still closed, everything the decision read is as it read it (a CLI may have resumed a transcript
-    /// and finished since the plan) and no transcript of the lineage has a writer. Otherwise the record is left for the
-    /// next run to plan again. The record as it was is saved beside the ledger and the intent recorded before the record
-    /// is replaced, so the next run settles an interrupted one from the file. The ledger's copies are left as they are:
-    /// an advanced copy no longer holds the transcript the ledger names, so it is no longer this utility's to retitle,
-    /// retire or undo.
+    /// moment, the app still leaves its list alone (<paramref name="mayWrite"/>), everything the decision read is as it read
+    /// it (a CLI may have resumed a transcript and finished since the plan) and no transcript of the lineage before the
+    /// newest one has a writer (the newest one may be in use). Otherwise the record is left for the next run to plan again.
+    /// The record as it was is saved beside the ledger and the intent recorded before the record is replaced, so the next
+    /// run settles an interrupted one from the file. The ledger's copies are left as they are: an advanced copy no longer
+    /// holds the transcript the ledger names, so it is no longer this utility's to retitle, retire or undo.
     /// </summary>
     private bool AdvanceInPlace(ClaudeShelfLedger ledger, ClaudeShelfAdvance advance, ClaudeShelfAccount target,
-        Func<bool> desktopClosed, string? appVersion, Dictionary<string, string> written)
+        Func<bool> mayWrite, string? appVersion, Dictionary<string, string> written)
     {
         var path = Path.Combine(ShelfDirectory(target), advance.File);
         byte[] before;
@@ -860,10 +972,10 @@ internal sealed class ClaudeSessionShelf
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { return false; }
         var intent = ledger.IntendAdvance(advance, afterHash, backup, at, appVersion);
         ledger.Save(_paths.LedgerDirectory);
-        var done = Replace(path, before, after, () => desktopClosed() && Unchanged(advance.Transcripts, advance.Sources, written)
-            && _liveWriters() is { Unknown: false } writers && !advance.Lineage.Any(writers.Ids.Contains));
+        var done = Replace(path, before, after, () => mayWrite() && Unchanged(advance.Transcripts, advance.Sources, written)
+            && _liveWriters() is { Unknown: false } writers && !advance.Lineage.SkipLast(1).Any(writers.Ids.Contains));
         ledger.SettleAdvance(intent, done);
-        if (done) written[path] = afterHash;
+        if (done) written[path] = DecisionHash(advance.Record);
         return done;
     }
 
@@ -897,7 +1009,7 @@ internal sealed class ClaudeSessionShelf
         var cli = Text(record, "cliSessionId");
         if (cli is null || !Guid.TryParse(cli, out _)) return "no_current_id";
         if (RemoteFields.Any(field => record[field] is not null)) return "remote";
-        if (WorktreeFields.Any(field => record[field] is not null)) return "worktree";
+        if (Holds(record["worktreeLazy"])) return "worktree_lazy";
         var cwd = Text(record, "cwd");
         if (string.IsNullOrWhiteSpace(cwd) || !Path.IsPathFullyQualified(cwd)) return "no_cwd";
         // The app deletes a folderless session's scratch folder without checking other accounts.

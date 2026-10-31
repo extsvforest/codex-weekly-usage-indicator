@@ -14,6 +14,10 @@ internal static class ClaudeSessionShelfTests
     {
         TestPlanningAndPublishing();
         TestExclusionsAndHolds();
+        TestWorktreeSessions();
+        TestFillingWhileRunning();
+        TestServiceFillsWhileRunning();
+        TestServiceStartedWhileSignedOut();
         TestWriterAndDesktopRaces();
         TestRecordFields();
         TestUndoAndPendingRecovery();
@@ -72,7 +76,8 @@ internal static class ClaudeSessionShelfTests
         fixture.Record(A, "local_bbbbbbbb-0000-4000-8000-000000000001", fixture.Transcript(), cwd: Path.Combine(fixture.Scratch, "s1"), createCwd: true);
         fixture.Record(A, "local_bbbbbbbb-0000-4000-8000-000000000002", fixture.Transcript(), cwd: Path.Combine(fixture.Root, "gone"), createCwd: false);
         fixture.Record(A, "local_bbbbbbbb-0000-4000-8000-000000000003", fixture.Transcript(), extra: r => r["sshConfig"] = new JsonObject());
-        fixture.Record(A, "local_bbbbbbbb-0000-4000-8000-000000000004", fixture.Transcript(), extra: r => r["worktreePath"] = "C:\\wt");
+        fixture.Record(A, "local_bbbbbbbb-0000-4000-8000-000000000004", fixture.Transcript(),
+            extra: r => r["worktreeLazy"] = new JsonObject { ["baseBranch"] = "main" });
         fixture.Record(A, "local_bbbbbbbb-0000-4000-8000-000000000005", Guid.NewGuid().ToString("D"));
         var deletedCli = fixture.Transcript();
         fixture.Record(A, "local_bbbbbbbb-0000-4000-8000-000000000006", deletedCli);
@@ -81,14 +86,246 @@ internal static class ClaudeSessionShelfTests
         var plan = fixture.Shelf().Plan([A, B]);
         var reasons = plan.Skipped.Values.Single();
         Check(plan.Actions.Count == 0 && reasons["scratch"] == 1 && reasons["missing_cwd"] == 1 && reasons["remote"] == 1
-              && reasons["worktree"] == 1 && reasons["missing_transcript"] == 1 && reasons["deleted_in_target"] == 1,
-            "scratch, missing folders, remote, worktree, missing transcripts and target deletions are excluded");
+              && reasons["worktree_lazy"] == 1 && reasons["missing_transcript"] == 1 && reasons["deleted_in_target"] == 1,
+            "scratch, missing folders, remote, a worktree not made yet, missing transcripts and target deletions are excluded");
 
         File.WriteAllText(Path.Combine(fixture.ShelfPath(B), "local_cccccccc-0000-4000-8000-000000000001.json.tmp"), "{}");
         Check(fixture.Shelf().Plan([A, B]).Held[B.Key] == "recovering", "a pending app recovery holds the target shelf");
         File.Delete(Path.Combine(fixture.ShelfPath(B), "local_cccccccc-0000-4000-8000-000000000001.json.tmp"));
         File.WriteAllText(Path.Combine(fixture.ShelfPath(B), "local_cccccccc-0000-4000-8000-000000000002.json"), "{broken");
         Check(fixture.Shelf().Plan([A, B]).Held[B.Key] == "unreadable", "an unreadable record holds the target shelf");
+    }
+
+    private static void TestWorktreeSessions()
+    {
+        // A session in a worktree is filled as the app's own import does: in its folder, without the worktree, which
+        // stays with the account that made it.
+        using var fixture = new Fixture();
+        var origin = Path.Combine(fixture.Root, "repo");
+        var folder = Path.Combine(origin, ".claude", "worktrees", "feature");
+        fixture.Record(A, "local_babababa-0000-4000-8000-000000000001", fixture.Transcript(), cwd: folder, extra: r =>
+        { r["worktreePath"] = folder; r["worktreeName"] = "feature"; r["branch"] = "claude/feature"; r["originCwd"] = origin; });
+        var result = fixture.Shelf().Apply([A, B], () => true, "test");
+        var copied = Json(fixture.Files(B).Single());
+        Check(result.Created == 1 && copied["cwd"]!.GetValue<string>() == folder && copied["originCwd"]!.GetValue<string>() == origin
+              && copied["worktreePath"] is null && copied["worktreeName"] is null && copied["branch"] is null,
+            "a session in a worktree is filled in its folder, without the worktree the other account owns");
+    }
+
+    private static void TestFillingWhileRunning()
+    {
+        // The app shows A: only the lists it leaves alone are written; what A lacks is counted for when it closes.
+        using var fixture = new Fixture();
+        fixture.Record(A, "local_f0f0f0f0-0000-4000-8000-000000000001", fixture.Transcript());
+        fixture.Record(B, "local_f0f0f0f0-0000-4000-8000-000000000002", fixture.Transcript());
+        var shelf = fixture.Shelf();
+        static bool LeavesA(string? target) => target != A.Key;
+        var result = shelf.Apply([A, B], LeavesA, "test", running: true);
+        Check(result.Created == 1 && fixture.Files(B).Count == 2 && fixture.Files(A).Count == 1
+              && result.Targets!.SetEquals([B.Key]) && result.Plan.PendingFor(A.Key) == 1,
+            "while the app runs, only the lists it leaves alone are written; what the shown one lacks is counted");
+        var ledgerPath = Path.Combine(fixture.Ledger, "ledger.json");
+        Check(Json(ledgerPath)["runs"]!.AsArray()[^1]!["mode"]!.GetValue<string>() == "apply-running",
+            "a run that wrote is kept as one made while the app ran");
+        var kept = File.ReadAllBytes(ledgerPath);
+        Check(shelf.Apply([A, B], LeavesA, "test", running: true).Written == 0 && File.ReadAllBytes(ledgerPath).SequenceEqual(kept),
+            "a pass that writes nothing leaves the ledger as it was: one comes every minute");
+
+        // The app comes to B while its files are written: the rest wait for the next pass.
+        fixture.Record(A, "local_f0f0f0f0-0000-4000-8000-000000000003", fixture.Transcript());
+        fixture.Record(A, "local_f0f0f0f0-0000-4000-8000-000000000004", fixture.Transcript());
+        var askedForB = 0;
+        var cut = MustThrow<ClaudeDesktopRunningException>(() => shelf.Apply([A, B],
+            target => target is null || target == B.Key && ++askedForB <= 2, "test", running: true));
+        Check(cut.Created == 1 && fixture.Files(B).Count == 3 && fixture.Files(A).Count == 3,
+            "the app coming to a list mid-run stops its remaining files, and the list it shows is never written");
+
+        // The list the app shows keeps changing: only the lists written are compared between the two plans.
+        using var busy = new Fixture();
+        busy.Record(A, "local_f1f1f1f1-0000-4000-8000-000000000001", busy.Transcript());
+        var scans = 0;
+        var moving = busy.Shelf(() =>
+        {
+            if (++scans == 1) busy.Record(A, "local_f1f1f1f1-0000-4000-8000-000000000002", busy.Transcript());
+            return new ClaudeLiveSessionScan(new HashSet<string>(), false);
+        });
+        Check(moving.Apply([A, B], target => target != A.Key, "test", running: true).Created == 2,
+            "a change in the list the app shows does not stop the others from being filled");
+
+        // The user deletes a conversation in the list the app shows after the plan: it is not shared. The app may remove
+        // its transcript, as no other list holds it yet.
+        foreach (var removeTranscript in new[] { false, true })
+        {
+            using var deleting = new Fixture();
+            var gone = deleting.Transcript();
+            deleting.Record(A, "local_f2f2f2f2-0000-4000-8000-000000000001", gone);
+            deleting.Record(A, "local_f2f2f2f2-0000-4000-8000-000000000002", deleting.Transcript());
+            var asked = 0;
+            var shared = deleting.Shelf().Apply([A, B], target =>
+            {
+                // The second question for B comes right before its first file.
+                if (target == B.Key && ++asked == 2)
+                {
+                    if (removeTranscript) File.Delete(Path.Combine(deleting.Projects, "E--work", gone + ".jsonl"));
+                    else File.Delete(Path.Combine(deleting.ShelfPath(A), "local_f2f2f2f2-0000-4000-8000-000000000001.json"));
+                }
+                return target != A.Key;
+            }, "test", running: true);
+            Check(shared.Created == 1 && deleting.Files(B).Select(Json).All(record => record["cliSessionId"]!.GetValue<string>() != gone)
+                  && Json(Path.Combine(deleting.Ledger, "ledger.json"))["created"]!.AsArray().Count == 1,
+                removeTranscript ? "a conversation whose transcript went after the plan is not shared"
+                    : "a conversation deleted after the plan is not shared, and the ledger keeps no intent for it");
+        }
+    }
+
+    private static void TestServiceFillsWhileRunning()
+    {
+        using var fixture = new Fixture();
+        // Accounts of their own: the widget's events and mailboxes are per account, and a running widget must not hear this test.
+        var g = new ClaudeShelfAccount("90909090-0000-4000-8000-000000000009", "91919191-0000-4000-8000-000000000009", "G", "p-g");
+        var h = new ClaudeShelfAccount("80808080-0000-4000-8000-000000000008", "81818181-0000-4000-8000-000000000008", "H", "p-h");
+        var logs = Directory.CreateDirectory(Path.Combine(fixture.Root, "logs")).FullName;
+        var main = Path.Combine(logs, "main.log");
+        var start = new DateTime(2026, 10, 1, 2, 0, 0);
+        var second = 0;
+        string Line(string text) => start.AddSeconds(++second).ToString("yyyy-MM-dd HH:mm:ss") + " [info] " + text;
+        string Init(ClaudeShelfAccount account) => Line(
+            $"[LocalSessionManager] Initialization succeeded — accountId={account.AccountUuid}, orgId={account.OrgUuid}, existingSessions=0");
+        string Transition(ClaudeShelfAccount? from, ClaudeShelfAccount? to) => Line(
+            $"[account] Login-state transition (loggedOut: {(from is null ? "true" : "false")} → {(to is null ? "true" : "false")}, "
+            + $"uuid: {from?.AccountUuid ?? "<none>"} → {to?.AccountUuid ?? "<none>"}), clearing oauth cache");
+        var now = DateTimeOffset.Now;
+        var contract = ClaudeDesktopContract.Reviewed;
+        var package = new ClaudeDesktopPackage("Claude_9.9.9.9_x64__pzs8sxrjxfjjc", new Version(9, 9, 9, 9), fixture.Root, "Claude_pzs8sxrjxfjjc");
+        var runtime = new ClaudeDesktopRuntime(ClaudeDesktopRunState.Running, start);
+        var environment = new ClaudeShelfEnvironment(() => runtime, () => package, _ => contract, _ => { }, () => now);
+        var sources = new ClaudeSessionSync.Sources(fixture.Sessions, Path.Combine(fixture.Root, "Local Storage", "leveldb"),
+            Path.Combine(fixture.Root, "IndexedDB", "https_claude.ai_0.indexeddb.leveldb"), fixture.Projects, fixture.Ledger);
+        using var owner = new System.Windows.Forms.Control();
+        using var service = new ClaudeShelfService(owner, () => [], fixture.Shelf(), environment, new ClaudeDesktopLogWatcher(logs), sources);
+        service.SetAccountsForTest([g, h]);
+        // One pass, after the given time and with the given lines added to the app's log.
+        ClaudeShelfStatus After(TimeSpan wait, params string[] lines)
+        {
+            File.AppendAllLines(main, lines);
+            now += wait;
+            service.Accept(service.Work([], service.ActiveReservation()));
+            return service.Status;
+        }
+        var minute = TimeSpan.FromSeconds(60);
+        var moment = TimeSpan.FromSeconds(3);
+
+        fixture.Record(g, "local_9a9a9a9a-0000-4000-8000-000000000001", fixture.Transcript());
+        fixture.Record(h, "local_9a9a9a9a-0000-4000-8000-000000000002", fixture.Transcript());
+        var shown = After(TimeSpan.Zero, Init(g));
+        Check(shown is { AppProfileId: "p-g", PendingForApp: 1 } && fixture.Files(h).Count == 1,
+            "the app shows G: what G lacks is counted, and nothing is written before its log was watched two minutes");
+        After(minute + TimeSpan.FromSeconds(1));
+        Check(fixture.Files(h).Count == 1, "nor a minute later");
+        var filled = After(minute);
+        Check(fixture.Files(h).Count == 2 && fixture.Files(g).Count == 1 && filled.PendingForApp == 1 && filled.LastFillAt == now,
+            "watched two minutes, the list the app leaves alone is filled while it runs; the one it shows waits for it to close");
+
+        // A sign-out fills the lists the app leaves alone at once, before it reads the next account. The account it showed
+        // is still its own until it shows another.
+        fixture.Record(g, "local_9a9a9a9a-0000-4000-8000-000000000003", fixture.Transcript());
+        var signedOut = After(moment, Transition(g, null));
+        Check(signedOut.App.Status == ClaudeDesktopAccountStatus.SignedOut && fixture.Files(h).Count == 3 && fixture.Files(g).Count == 2,
+            "a sign-out fills the other lists at once and leaves the one the app showed");
+        fixture.Record(g, "local_9a9a9a9a-0000-4000-8000-000000000004", fixture.Transcript());
+        var signingIn = After(moment, Transition(null, h));
+        Check(!signingIn.App.Confirmed && fixture.Files(h).Count == 3, "the account the app signs in to is left alone from the first line naming it");
+        var arrived = After(moment, Init(h));
+        Check(arrived is { AppProfileId: "p-h", PendingForApp: 1 } && fixture.Files(g).Count == 3,
+            "the account the app left is left alone: it ends that account's sessions some seconds after showing the next");
+        After(minute + TimeSpan.FromSeconds(1));
+        Check(fixture.Files(g).Count == 3, "still a minute later");
+        After(minute);
+        Check(fixture.Files(g).Count == 4, "two minutes after the app left it, that list is filled while the app runs");
+
+        // An app that cannot be inspected: what it showed meanwhile is not known, so the two minutes start again.
+        fixture.Record(h, "local_9a9a9a9a-0000-4000-8000-000000000005", fixture.Transcript());
+        runtime = new ClaudeDesktopRuntime(ClaudeDesktopRunState.Unknown, null);
+        After(moment);
+        runtime = new ClaudeDesktopRuntime(ClaudeDesktopRunState.Running, start);
+        After(moment);
+        After(minute + TimeSpan.FromSeconds(1));
+        Check(fixture.Files(g).Count == 4, "after an app it could not inspect, nothing is written until it was watched two minutes again");
+        After(minute);
+        Check(fixture.Files(g).Count == 5, "then the list is filled");
+
+        // A version not reviewed yet goes on filling, with the warning; an incompatible one fills nothing.
+        contract = ClaudeDesktopContract.Unreviewed;
+        fixture.Record(h, "local_9a9a9a9a-0000-4000-8000-000000000006", fixture.Transcript());
+        var warned = After(minute);
+        Check(warned is { Unreviewed: "9.9.9.9", Problem: ClaudeShelfProblem.None } && fixture.Files(g).Count == 6,
+            "a version not reviewed yet goes on filling, and is reported for the warning");
+        contract = ClaudeDesktopContract.Incompatible;
+        fixture.Record(h, "local_9a9a9a9a-0000-4000-8000-000000000007", fixture.Transcript());
+        var stopped = After(minute);
+        Check(stopped is { Unreviewed: null, Problem: ClaudeShelfProblem.Incompatible } && fixture.Files(g).Count == 6,
+            "an incompatible version fills nothing");
+
+        // Lost log lines could hide a switch: the two minutes start again.
+        contract = ClaudeDesktopContract.Reviewed;
+        File.Delete(main);
+        After(minute);
+        File.WriteAllLines(main, [Init(h)]);
+        After(minute + TimeSpan.FromSeconds(1));
+        Check(fixture.Files(g).Count == 6, "after lost log lines, nothing is written until the log was watched two minutes again");
+        After(minute);
+        Check(fixture.Files(g).Count == 7, "then the list is filled");
+    }
+
+    private static void TestServiceStartedWhileSignedOut()
+    {
+        // A widget started while the app is signed out: the app still holds the lists of the account it signed out of until
+        // it shows the next one, and the log names that account, so it is left alone however long the app stays signed out.
+        using var fixture = new Fixture();
+        var g = new ClaudeShelfAccount("90909090-0000-4000-8000-00000000000a", "91919191-0000-4000-8000-00000000000a", "G", "p-g2");
+        var h = new ClaudeShelfAccount("80808080-0000-4000-8000-00000000000b", "81818181-0000-4000-8000-00000000000b", "H", "p-h2");
+        var logs = Directory.CreateDirectory(Path.Combine(fixture.Root, "logs")).FullName;
+        var main = Path.Combine(logs, "main.log");
+        var start = new DateTime(2026, 10, 1, 3, 0, 0);
+        var second = 0;
+        string Line(string text) => start.AddSeconds(++second).ToString("yyyy-MM-dd HH:mm:ss") + " [info] " + text;
+        string Init(ClaudeShelfAccount account) => Line(
+            $"[LocalSessionManager] Initialization succeeded — accountId={account.AccountUuid}, orgId={account.OrgUuid}, existingSessions=0");
+        string Transition(ClaudeShelfAccount? from, ClaudeShelfAccount? to) => Line(
+            $"[account] Login-state transition (loggedOut: {(from is null ? "true" : "false")} → {(to is null ? "true" : "false")}, "
+            + $"uuid: {from?.AccountUuid ?? "<none>"} → {to?.AccountUuid ?? "<none>"}), clearing oauth cache");
+        var now = DateTimeOffset.Now;
+        var package = new ClaudeDesktopPackage("Claude_9.9.9.9_x64__pzs8sxrjxfjjc", new Version(9, 9, 9, 9), fixture.Root, "Claude_pzs8sxrjxfjjc");
+        var runtime = new ClaudeDesktopRuntime(ClaudeDesktopRunState.Running, start);
+        var environment = new ClaudeShelfEnvironment(() => runtime, () => package, _ => ClaudeDesktopContract.Reviewed, _ => { }, () => now);
+        var sources = new ClaudeSessionSync.Sources(fixture.Sessions, Path.Combine(fixture.Root, "Local Storage", "leveldb"),
+            Path.Combine(fixture.Root, "IndexedDB", "https_claude.ai_0.indexeddb.leveldb"), fixture.Projects, fixture.Ledger);
+        File.WriteAllLines(main, [Init(g), Transition(g, null)]);
+        fixture.Record(g, "local_9b9b9b9b-0000-4000-8000-000000000001", fixture.Transcript());
+        fixture.Record(h, "local_9b9b9b9b-0000-4000-8000-000000000002", fixture.Transcript());
+        using var owner = new System.Windows.Forms.Control();
+        using var service = new ClaudeShelfService(owner, () => [], fixture.Shelf(), environment, new ClaudeDesktopLogWatcher(logs), sources);
+        service.SetAccountsForTest([g, h]);
+        void After(TimeSpan wait, params string[] lines)
+        {
+            File.AppendAllLines(main, lines);
+            now += wait;
+            service.Accept(service.Work([], service.ActiveReservation()));
+        }
+        var minute = TimeSpan.FromSeconds(60);
+        var moment = TimeSpan.FromSeconds(3);
+        After(TimeSpan.Zero);
+        After(minute);
+        After(minute + TimeSpan.FromSeconds(1));
+        After(minute * 5);
+        Check(fixture.Files(h).Count == 2 && fixture.Files(g).Count == 1,
+            "a widget started while the app is signed out fills the other lists, never the one the app signed out of");
+        After(moment, Transition(null, h));
+        After(moment, Init(h));
+        After(minute + TimeSpan.FromSeconds(1));
+        Check(fixture.Files(g).Count == 1, "nor in the two minutes after the app shows the next account");
+        After(minute);
+        Check(fixture.Files(g).Count == 2, "then that list is filled");
     }
 
     private static void TestWriterAndDesktopRaces()
@@ -101,14 +338,16 @@ internal static class ClaudeSessionShelfTests
         MustThrow<ClaudeDesktopRunningException>(() => fixture.Shelf().Apply([A, B], () => false));
         Check(fixture.Files(B).Count == 0, "nothing is written while Desktop runs");
 
-        // A writer appears between the two plans while the shelves stay identical: publish the final plan.
+        // A writer appears between the two plans: its session is filled all the same, the record pointing at the
+        // transcript as it goes on.
         var calls = 0;
         var shelf = fixture.Shelf(() => new ClaudeLiveSessionScan(
             ++calls >= 2 ? new HashSet<string> { first } : new HashSet<string>(), false));
         var result = shelf.Apply([A, B], () => true);
-        Check(result.Created == 1 && JsonNode.Parse(File.ReadAllText(fixture.Files(B).Single()))!["cliSessionId"]!
-            .GetValue<string>() == second, "a writer that appears just before publishing keeps its session out");
-        Check(result.Plan.HasTransientSkips && !result.Plan.IsComplete, "a writer skip leaves the run incomplete for retry");
+        Check(result.Created == 2 && fixture.Files(B).Select(file => JsonNode.Parse(File.ReadAllText(file))!["cliSessionId"]!
+                  .GetValue<string>()).Order().SequenceEqual(new[] { first, second }.Order()),
+            "a session being written is filled like any other");
+        Check(!result.Plan.HasTransientSkips && result.Plan.IsComplete, "and the run is complete");
 
         using var race = new Fixture();
         race.Record(A, "local_eeeeeeee-0000-4000-8000-000000000001", race.Transcript());
@@ -272,17 +511,30 @@ internal static class ClaudeSessionShelfTests
         Check(state.Status == ClaudeDesktopAccountStatus.Unregistered && !state.Confirmed, "an unregistered account is never shown as a registered one");
         var stale = ClaudeDesktopLogWatcher.Apply(ClaudeDesktopAccountState.Unknown, lines.Take(1), start, registered);
         Check(stale.Status == ClaudeDesktopAccountStatus.Unknown, "a previous run's initialization never describes the current run");
+        // The accounts the app left stay held until it confirms another one.
+        HashSet<string> Held(int count)
+        {
+            var held = new HashSet<string>();
+            ClaudeDesktopLogWatcher.Apply(ClaudeDesktopAccountState.Unknown, lines.Take(count), start, registered, held);
+            return held;
+        }
+        Check(Held(4).SetEquals([AccountA]) && Held(6).SetEquals([AccountA]) && Held(7).Count == 0 && Held(8).SetEquals([AccountB]),
+            "the account signed out of is held through the next sign-in, until the app confirms an account");
 
         using var fixture = new Fixture();
         var logs = Directory.CreateDirectory(Path.Combine(fixture.Root, "logs")).FullName;
         File.WriteAllLines(Path.Combine(logs, "main1.log"), lines.Take(3));
         File.WriteAllLines(Path.Combine(logs, "main.log"), lines.Skip(3).Take(3));
         var watcher = new ClaudeDesktopLogWatcher(logs);
-        Check(watcher.Update(start, registered).Status == ClaudeDesktopAccountStatus.SignedIn,
-            "a new run replays the rotated file and the current file in order");
+        Check(watcher.Update(start, registered).Status == ClaudeDesktopAccountStatus.SignedIn && watcher.Held.SequenceEqual([AccountA]),
+            "a new run replays the rotated file and the current file in order, the account it left included");
         File.AppendAllLines(Path.Combine(logs, "main.log"), [lines[6]]);
-        Check(watcher.Update(start, registered).Confirmed, "later lines are read incrementally");
-        Check(watcher.Update(null, registered).Status == ClaudeDesktopAccountStatus.Closed, "a closed app has no current account");
+        Check(watcher.Update(start, registered).Confirmed && watcher.Held.Count == 0, "later lines are read incrementally");
+        File.AppendAllLines(Path.Combine(logs, "main.log"), [lines[7]]);
+        Check(watcher.Update(start, registered).Status == ClaudeDesktopAccountStatus.Unregistered && watcher.Held.SequenceEqual([AccountB]),
+            "an account left for one not registered is held");
+        Check(watcher.Update(null, registered).Status == ClaudeDesktopAccountStatus.Closed && watcher.Held.Count == 0,
+            "a closed app has no current account and holds none");
     }
 
     // Shapes of the reviewed 2.16120.0.0 bundle. Minified names change between builds; the flows must not.
@@ -325,138 +577,153 @@ internal static class ClaudeSessionShelfTests
     private static void TestContractGuard()
     {
         Check(ClaudeDesktopProbe.IsCompatible(Bundle()), "the reviewed deletion protection is compatible");
+        // Three answers: the stores and log lines the widget follows decide whether it may fill at all; the deletion
+        // protection read differently only warns, and filling goes on.
+        Check(ClaudeDesktopProbe.Contract(Bundle()) == ClaudeDesktopContract.Reviewed, "the reviewed shapes are reviewed");
+        Check(ClaudeDesktopProbe.Contract(Bundle(reap: Reap.Replace("u.has(n)?", "u.has(r)?"))) == ClaudeDesktopContract.Unreviewed
+              && ClaudeDesktopProbe.Contract(Bundle(walk: Walk.Replace("if(!r.isDirectory())continue;",
+                  "if(!r.isDirectory()||r.name!==i().accountId)continue;"))) == ClaudeDesktopContract.Unreviewed,
+            "a deletion protection that reads differently is unreviewed: filling goes on with a warning");
+        var withoutMarker = ClaudeDesktopProbe.ContractMarkers[1].Aggregate(Encoding.UTF8.GetString(Bundle()),
+            (bundle, spelling) => bundle.Replace(spelling, ""));
+        Check(ClaudeDesktopProbe.Contract(Encoding.UTF8.GetBytes(withoutMarker)) == ClaudeDesktopContract.Incompatible
+              && ClaudeDesktopProbe.Contract(Encoding.UTF8.GetBytes(Encoding.UTF8.GetString(Bundle(reap: Reap.Replace("u.has(n)?", "u.has(r)?")))
+                  .Replace(ClaudeDesktopProbe.ContractMarkers[0][0], ""))) == ClaudeDesktopContract.Incompatible,
+            "a store or log line the widget follows that is gone stops filling, whatever the deletion protection reads");
+        Check(ClaudeDesktopProbe.Contract(Path.Combine(Path.GetTempPath(), "gfs-agent", "no-such-" + Guid.NewGuid().ToString("N"), "app.asar"))
+              == ClaudeDesktopContract.Incompatible, "an app package that cannot be read stops filling");
         Check(ClaudeDesktopProbe.IsCompatible(Bundle(collect: CollectIds.Replace("let n ", "let q ").Replace("typeof n", "typeof q")
                 .Replace("WQ(n)", "WQ(q)").Replace("e.add(n)", "z.add(q)").Replace("e.add(t)", "z.add(t)"))),
             "renamed minified variables stay compatible");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(collect: CollectIds.Replace("&&e.add(n);", "&&e.add(o);"))),
-            "claiming something other than the record's current transcript id pauses writes");
+            "claiming something other than the record's current transcript id is not reviewed");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(collect: CollectIds.Replace("e.add(t)}", "void t}"))),
-            "no longer claiming earlier transcript ids pauses writes");
+            "no longer claiming earlier transcript ids is not reviewed");
         Check(ClaudeDesktopProbe.IsCompatible(Bundle(collect: CollectIds26454)), "the reviewed 2.26454 shape is compatible");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(collect: CollectIds26454.Replace("])e.add(t)}", "])void t}"))),
-            "the 2.26454 shape that stops claiming earlier ids pauses writes");
+            "the 2.26454 shape that stops claiming earlier ids is not reviewed");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(collect: CollectIds26454.Replace("n.hn(i.priorCliSessionIds)??[],", ""))),
-            "claiming only remote earlier ids pauses writes");
+            "claiming only remote earlier ids is not reviewed");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(collect: CollectIds26454.Replace("])e.add(t)}", "])o.add(t)}"))),
-            "earlier ids added to another set pause writes");
+            "earlier ids added to another set are not reviewed");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(reap: Reap.Replace("u.has(n)?", "u.has(r)?"))),
-            "a reap check that no longer tests the transcript being deleted pauses writes");
+            "a reap check that no longer tests the transcript being deleted is not reviewed");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(reap: Reap.Replace("\"records_unreadable\"", "\"records_ignored\""))),
-            "a deletion path that no longer fails closed pauses writes");
+            "a deletion path that no longer fails closed is not reviewed");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(release: Release.Replace("?.has(t)", "?.has(n)"))),
-            "a release decision that stops consulting the claims pauses writes");
+            "a release decision that stops consulting the claims is not reviewed");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(release: Release.Replace("await e.claimedOnDisk()", "await g.claimedOnDisk()"))),
-            "a release decision that reads its claims from elsewhere pauses writes");
+            "a release decision that reads its claims from elsewhere is not reviewed");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(release: Release.Replace(":Q0(e,o,s,i,t,q0(n))", ":!0"))),
-            "a session delete that no longer asks the reap decision pauses writes");
+            "a session delete that no longer asks the reap decision is not reviewed");
         Check(ClaudeDesktopProbe.IsCompatible(Bundle(release: Release[..Release.IndexOf("reapIf:", StringComparison.Ordinal)]
                 + "reapIf:async(o,s)=>Q0(e,o,s)}}")),
             "a simpler delete call that still asks the reap decision stays compatible");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(remove: Remove.Replace("if(!p)return;", ""))),
-            "removing transcripts regardless of the reap decision pauses writes");
+            "removing transcripts regardless of the reap decision is not reviewed");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(remove: Remove.Replace("catch(e){t.Bdt.debug(\"desktop-released marker: reap", "catch(e){p=!0;t.Bdt.debug(\"desktop-released marker: reap"))),
-            "a failed reap check that removes anyway pauses writes");
+            "a failed reap check that removes anyway is not reviewed");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(remove: Remove.Replace("err:e});try{a.keptInDoubt", "err:e});p=!0;try{a.keptInDoubt"))),
-            "setting the decision after logging a failed check pauses writes");
+            "setting the decision after logging a failed check is not reviewed");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(remove: Remove.Replace("lastConversationEntryMs()))})}}catch", "lastConversationEntryMs()))});p=!0}}catch"))),
-            "overriding the reap decision after it returns pauses writes");
+            "overriding the reap decision after it returns is not reviewed");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(remove: Remove.Replace("let p=!1;try{", "let p=!1;try{p=!0;"))),
-            "setting the decision before the reap check pauses writes");
+            "setting the decision before the reap check is not reviewed");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(release: Release.Replace("q0(n)),keptInDoubt", "q0(n))||!0,keptInDoubt"))),
-            "changing the reap check's result pauses writes");
+            "changing the reap check's result is not reviewed");
         var keep = Release[Release.IndexOf("?X0(", StringComparison.Ordinal)..(Release.IndexOf("):Q0(e,o,s", StringComparison.Ordinal) + 2)];
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(release: Release.Replace(keep, "?!0:"))),
-            "a guard branch that allows deletion without the reap check pauses writes");
+            "a guard branch that allows deletion without the reap check is not reviewed");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(reap: Reap.Replace("async function Q0(e,n,r,i,a,o){",
-            "async function Q0(e,n,r,i,a,o){" + new string(' ', 4000)))), "protection detached from its function pauses writes");
+            "async function Q0(e,n,r,i,a,o){" + new string(' ', 4000)))), "protection detached from its function is not reviewed");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(reap: Reap.Replace("let u=await e.claimedOnDisk();", "return!0;let u=await e.claimedOnDisk();"))),
-            "allowing deletion before the test on disk pauses writes");
+            "allowing deletion before the test on disk is not reviewed");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(reap: Reap.Replace("await e.claimedOnDisk()", "await o.claimedOnDisk()"))),
-            "a decision that reads its claims from elsewhere pauses writes");
+            "a decision that reads its claims from elsewhere is not reviewed");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(release: Release.Replace(":Q0(e,", ":g7(e,"))),
-            "a session delete that asks another function than the reviewed decision pauses writes");
+            "a session delete that asks another function than the reviewed decision is not reviewed");
         // The session delete hands the checks it made to the removal.
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(call: Call.Replace("=e2(this.reapChecks,", "=e2(this.otherChecks,"))),
-            "checks made from anything but the manager's pause writes");
+            "checks made from anything but the manager's are not reviewed");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(call: Call.Replace("=e2(this.reapChecks,", "=g7(this.reapChecks,"))),
-            "a session delete that makes its checks with another function pauses writes");
+            "a session delete that makes its checks with another function is not reviewed");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(call: Call.Replace("\"delete\",l)", "\"delete\",{})"))),
-            "a removal not given those checks pauses writes");
+            "a removal not given those checks is not reviewed");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(call: Call.Replace("let t=this.transcriptIdClaims", "l={};let t=this.transcriptIdClaims"))),
-            "replacing those checks before the removal pauses writes");
+            "replacing those checks before the removal is not reviewed");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(call: Call.Replace("=UG(this.diskTranscript,", "=g7(this.diskTranscript,"))),
-            "removing through another function than the reviewed removal pauses writes");
+            "removing through another function than the reviewed removal is not reviewed");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(call: Call.Replace("t2(this.reapChecks,l,", "t2(this.reapChecks,{},"))),
-            "an owed delete not given those checks pauses writes");
+            "an owed delete not given those checks is not reviewed");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(call: Call.Replace("t2(this.reapChecks,l,", "g7(this.reapChecks,l,"))),
-            "owing a delete through another function than the reviewed one pauses writes");
+            "owing a delete through another function than the reviewed one is not reviewed");
         // A delete owed to Remote Control sets transcripts aside under those checks and finishes under a second check.
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(aside: Aside.Replace("{...t,nonce", "{nonce"))),
-            "setting aside without the session delete's reap check pauses writes");
+            "setting aside without the session delete's reap check is not reviewed");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(aside: Aside.Replace("&&await t.mayRelease(e)", ""))),
-            "setting aside without the release test on disk pauses writes");
+            "setting aside without the release test on disk is not reviewed");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(aside: Aside.Replace("async e=>!i(e)&&", "async e=>i(e)&&"))),
-            "setting aside what another session holds in memory pauses writes");
+            "setting aside what another session holds in memory is not reviewed");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(aside: Aside.Replace("(r.beforeSetAside(),IG(", "(r.beforeSetAside(),g7("))),
-            "setting aside through another function than the reviewed one pauses writes");
+            "setting aside through another function than the reviewed one is not reviewed");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(aside: Aside.Replace("await e.claimedOnDisk()===null||", ""))),
-            "finishing that no longer keeps on unreadable records pauses writes");
+            "finishing that no longer keeps on unreadable records is not reviewed");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(aside: Aside.Replace("!await t.mayRelease(n)", "await t.mayRelease(n)"))),
-            "finishing that keeps what is free and removes what is claimed pauses writes");
+            "finishing that keeps what is free and removes what is claimed is not reviewed");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(aside: Aside.Replace("=await RG(n,a,", "=await g7(n,a,"))),
-            "finishing through another function than the reviewed one pauses writes");
+            "finishing through another function than the reviewed one is not reviewed");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(setAside: SetAside.Replace("!await r.mayRelease(t)){a=!0;return}", "!await r.mayRelease(t)){return}"))),
-            "a refused release that does not keep the rest pauses writes");
+            "a refused release that does not keep the rest is not reviewed");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(setAside: SetAside.Replace("!await r.reapIf(t,", "!await r.mayRelease(t,"))),
-            "setting aside without the reap decision pauses writes");
+            "setting aside without the reap decision is not reviewed");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(setAside: SetAside.Replace(",!1)))){a=!0;return}", ",!0)))){a=!0;return}"))),
-            "a failed reap check that sets aside anyway pauses writes");
+            "a failed reap check that sets aside anyway is not reviewed");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(setAside: SetAside.Replace("p>r.notWrittenSince||", ""))),
-            "setting aside what was written since the delete began pauses writes");
+            "setting aside what was written since the delete began is not reviewed");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(setAside: SetAside.Replace("let{dirs:s,complete:l}=", "await FG(t,n,r.nonce);let{dirs:s,complete:l}="))),
-            "moving a transcript before the reap decision pauses writes");
+            "moving a transcript before the reap decision is not reviewed");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(setAside: SetAside.Replace("{a=!0;return}for(let{dir:e}", "{a=!0;return}a=!1;for(let{dir:e}"))),
-            "clearing a refusal pauses writes");
+            "clearing a refusal is not reviewed");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(setAside: SetAside.Replace("}catch{a=!0}finally", "}catch{}finally"))),
-            "a failure that does not keep the rest pauses writes");
+            "a failure that does not keep the rest is not reviewed");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(setAside: SetAside.Replace(",!a)return s;", ",!0)return s;"))),
-            "going on after a refusal pauses writes");
+            "going on after a refusal is not reviewed");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(finish: Finish.Replace(".catch((()=>!0)),s=[]", ".catch((()=>!1)),s=[]"))),
-            "a failed finishing check that removes anyway pauses writes");
+            "a failed finishing check that removes anyway is not reviewed");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(finish: Finish.Replace("if(!(!o&&", "if(!(o&&"))),
-            "removing when the finishing check keeps pauses writes");
+            "removing when the finishing check keeps is not reviewed");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(finish: Finish.Replace("if(!(!o&&", "if(!("))),
-            "removing without the finishing check pauses writes");
+            "removing without the finishing check is not reviewed");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(finish: Finish.Replace("i=!0,await DG(r.asidePath,a,r);continue}", "i=!0;continue}"))),
-            "not putting a kept transcript back pauses writes");
+            "not putting a kept transcript back is not reviewed");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(finish: Finish.Replace("await DG(r.asidePath,a,r);continue}", "await DG(r.asidePath,a,r)}"))),
-            "going on to remove a kept transcript pauses writes");
+            "going on to remove a kept transcript is not reviewed");
         Check(!ClaudeDesktopProbe.IsCompatible(Encoding.UTF8.GetBytes(Encoding.UTF8.GetString(Bundle())
                 .Replace("claimedOnDisk:()=>this.cliSessionIdsClaimedOnDisk()", "claimedOnDisk:async()=>new Set"))),
-            "checks that no longer reach the records on disk pause writes");
+            "checks that no longer reach the records on disk are not reviewed");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(walk: Walk.Replace("continue}for(let i of f){", "continue}if(!d)continue;for(let i of f){"))),
-            "a walk narrowed to the current account's folder pauses writes");
+            "a walk narrowed to the current account's folder is not reviewed");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(walk: Walk.Replace("if(!r.isDirectory())continue;", "if(!r.isDirectory()||r.name!==i().accountId)continue;"))),
-            "a walk that leaves other accounts out pauses writes");
+            "a walk that leaves other accounts out is not reviewed");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(walk: Walk.Replace("||d&&a?.skipOwnRecordsOf", "||a?.skipOwnRecordsOf"))),
-            "skipping records in every account's folder pauses writes");
+            "skipping records in every account's folder is not reviewed");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(walk: Walk.Replace("if(!d)e.add(l);else if(a?.foldedSessionStems?.has(l)){e.add(l);continue}",
                 "if(!d)e.add(l);else if(a?.foldedSessionStems?.has(l)){e.add(l);continue}if(!d)continue;"))),
-            "reading ids only from the current account's records pauses writes");
+            "reading ids only from the current account's records is not reviewed");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(walk: Walk.Replace("if(!d)e.add(l);else if(a?.foldedSessionStems?.has(l)){e.add(l);continue}",
                 "if(!d)e.add(l);else if(a?.foldedSessionStems?.has(l)){e.add(l);continue}if(!d&&a?.localOnly)continue;"))),
-            "reading local ids only from the current account's records pauses writes");
+            "reading local ids only from the current account's records is not reviewed");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(walk: Walk.Replace("if(!d)e.add(l);else if(a?.foldedSessionStems?.has(l)){e.add(l);continue}",
                 "if(!d)e.add(l);else if(a?.foldedSessionStems?.has(l)){e.add(l);continue}if(g.name!==h().accountId)continue;"))),
-            "telling accounts apart a new way on the way to the ids pauses writes");
+            "telling accounts apart a new way on the way to the ids is not reviewed");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(walk: Walk.Replace("if(a?.failClosed)throw e;s&&MW(e)&&(s.indexUnreadable=!0,t.Rst.warn(`${t.P9} session index org dir", "s&&MW(e)&&(s.indexUnreadable=!0,t.Rst.warn(`${t.P9} session index org dir"))),
-            "an account folder that cannot be listed no longer failing closed pauses writes");
+            "an account folder that cannot be listed no longer failing closed is not reviewed");
         Check(ClaudeDesktopProbe.IsCompatible(Bundle(remove: Remove.Replace("if(!p)return;let m=u&&d.length===o.length;for(", "if(p)for("))),
             "a removal that loops only when the check allowed stays compatible");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(remove: Remove.Replace("if(!p)return;", "if(p)return;"))),
-            "returning when the check allows pauses writes");
+            "returning when the check allows is not reviewed");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle(remove: Remove.Replace("if(!p)return;", "if(!0)return;"))),
-            "ignoring the check's result pauses writes");
+            "ignoring the check's result is not reviewed");
     }
 
     private static void TestWidgetGate()
@@ -627,7 +894,7 @@ internal static class ClaudeSessionShelfTests
         var state = ClaudeDesktopRunState.Closed;
         var launches = 0; var failLaunch = false;
         var package = new ClaudeDesktopPackage("Claude_9.9.9.9_x64__pzs8sxrjxfjjc", new Version(9, 9, 9, 9), fixture.Root, "Claude_pzs8sxrjxfjjc");
-        var environment = new ClaudeShelfEnvironment(() => new ClaudeDesktopRuntime(state, null), () => package, _ => true,
+        var environment = new ClaudeShelfEnvironment(() => new ClaudeDesktopRuntime(state, null), () => package, _ => ClaudeDesktopContract.Reviewed,
             _ => { if (failLaunch) throw new IOException("launch failed"); launches++; }, () => now);
         using var owner = new System.Windows.Forms.Control();
         using var service = new ClaudeShelfService(owner, () => [], fixture.Shelf(), environment,
@@ -665,17 +932,22 @@ internal static class ClaudeSessionShelfTests
         service.ArmRelaunch(false);
         Check(!service.Status.RelaunchArmed, "a request can be cancelled");
 
-        // An unreviewed version is reported while the app runs, and the report clears once it is reviewed.
-        var compatible = false;
+        // An incompatible version is reported while the app runs, an unreviewed one is told apart, and both clear once a
+        // reviewed one is installed.
+        var contract = ClaudeDesktopContract.Incompatible;
         var guarded = new ClaudeShelfService(owner, () => [], fixture.Shelf(),
-            environment with { Observe = () => new ClaudeDesktopRuntime(ClaudeDesktopRunState.Running, null), IsCompatible = _ => compatible },
+            environment with { Observe = () => new ClaudeDesktopRuntime(ClaudeDesktopRunState.Running, null), Contract = _ => contract },
             new ClaudeDesktopLogWatcher(Path.Combine(fixture.Root, "no-logs")));
         guarded.Accept(guarded.Work([], null));
-        Check(guarded.Status.Problem == ClaudeShelfProblem.Incompatible && guarded.Status.ProblemDetail == "9.9.9.9",
-            "a running app of an unreviewed version is reported before it quits");
-        compatible = true;
+        Check(guarded.Status.Problem == ClaudeShelfProblem.Incompatible && guarded.Status.ProblemDetail == "9.9.9.9"
+              && guarded.Status.Unreviewed is null, "a running app of an incompatible version is reported before it quits");
+        contract = ClaudeDesktopContract.Unreviewed;
         guarded.Accept(guarded.Work([], null));
-        Check(guarded.Status.Problem == ClaudeShelfProblem.None, "a reviewed version clears the report");
+        Check(guarded.Status.Problem == ClaudeShelfProblem.None && guarded.Status.Unreviewed == "9.9.9.9",
+            "an unreviewed version does not stop filling, and is reported for the warning");
+        contract = ClaudeDesktopContract.Reviewed;
+        guarded.Accept(guarded.Work([], null));
+        Check(guarded.Status.Problem == ClaudeShelfProblem.None && guarded.Status.Unreviewed is null, "a reviewed version clears both");
         guarded.Dispose();
         var paused = ClaudeShelfStatus.Initial with
         {
@@ -685,6 +957,14 @@ internal static class ClaudeSessionShelfTests
         var footer = ClaudeAccountPanel.ShelfFooter(paused, "메인", DateTimeOffset.Now);
         Check(footer.Warning && footer.Text == UiText.T("세션 목록 채우기 멈춤 · 이 Claude 버전은 아직 확인되지 않았습니다.")
               && footer.Action == UiText.T("다시 열기 취소"), "a paused fill is said first and never promised, with the reopen still cancellable");
+        var warned = paused with { Problem = ClaudeShelfProblem.None, Unreviewed = "9.9.9.9", RelaunchArmedUntil = null };
+        var warning = ClaudeAccountPanel.ShelfFooter(warned, "메인", DateTimeOffset.Now);
+        Check(warning.Warning && warning.Text == UiText.T("확인 전 Claude 버전 · 세션은 삭제 대신 보관해 주세요.") && warning.Action is null
+              && ClaudeAccountPanel.ShelfFooter(warned with { RelaunchArmedUntil = DateTimeOffset.Now.AddMinutes(10) }, "메인",
+                  DateTimeOffset.Now).Action == UiText.T("다시 열기 취소"),
+            "an unreviewed version warns to archive rather than delete, with the reopen still cancellable");
+        Check(!ClaudeAccountPanel.ShelfFooter(warned with { MappedAccounts = 1 }, "메인", DateTimeOffset.Now).Warning,
+            "with one account nothing is filled, and nothing is warned");
 
         service.ArmRelaunch(true); Quit();
         var pass = Observe();
@@ -723,7 +1003,7 @@ internal static class ClaudeSessionShelfTests
         var now = DateTimeOffset.Now;
         var package = new ClaudeDesktopPackage("Claude_9.9.9.9_x64__pzs8sxrjxfjjc", new Version(9, 9, 9, 9), fixture.Root, "Claude_pzs8sxrjxfjjc");
         var runtime = new ClaudeDesktopRuntime(ClaudeDesktopRunState.Running, start);
-        var environment = new ClaudeShelfEnvironment(() => runtime, () => package, _ => true, _ => { }, () => now);
+        var environment = new ClaudeShelfEnvironment(() => runtime, () => package, _ => ClaudeDesktopContract.Reviewed, _ => { }, () => now);
         // The app's own stores under the fixture, not there at first.
         var storage = Path.Combine(fixture.Root, "Local Storage", "leveldb");
         var indexedDb = Path.Combine(fixture.Root, "IndexedDB", "https_claude.ai_0.indexeddb.leveldb");
@@ -1074,7 +1354,7 @@ internal static class ClaudeSessionShelfTests
     {
         var package = ClaudeDesktopProbe.FindPackage();
         Console.WriteLine($"package: {package?.FullName ?? "(none)"}");
-        if (package is not null) Console.WriteLine($"compatible: {ClaudeDesktopProbe.IsCompatible(package.AsarPath)}");
+        if (package is not null) Console.WriteLine($"contract: {ClaudeDesktopProbe.Contract(package.AsarPath)}");
         var runtime = ClaudeDesktopProbe.Observe();
         Console.WriteLine($"desktop: {runtime.State} host={runtime.HostStartedAt:yyyy-MM-dd HH:mm:ss}");
         var scratch = Path.Combine(Path.GetTempPath(), "gfs-agent", "claude-shelf-probe-" + Guid.NewGuid().ToString("N"));
@@ -1305,9 +1585,10 @@ internal static class ClaudeSessionShelfTests
             { ["dframe-local-slice"] = new JsonObject { ["pinnedOrder"] = new JsonArray("code:" + stale) } } } }.ToJsonString());
         File.Delete(moving.Files(A).Single());
         moving.Record(B, "local_b8b8b8b8-0000-4000-8000-000000000002", two, extra: r => r["priorCliSessionIds"] = new JsonArray(one));
-        // The app reopens after the copy is archived and before the settings are written.
+        // The app reopens after the copy is archived and before the settings are written (the fifth check is the archive's
+        // last one, right before the copy is replaced).
         var checks = 0;
-        MustThrow<ClaudeDesktopRunningException>(() => pinning.Apply([A, B], () => ++checks <= 4));
+        MustThrow<ClaudeDesktopRunningException>(() => pinning.Apply([A, B], () => ++checks <= 5));
         Check(moving.Files(B).Any(path => path.Contains(stale)) && JsonNode.Parse(File.ReadAllText(moving.Files(B).First(path => path.Contains(stale))))!["isArchived"]!.GetValue<bool>(),
             "the copy was archived before the interruption");
         pinning.Apply([A, B], () => true);
@@ -1378,6 +1659,23 @@ internal static class ClaudeSessionShelfTests
         Check(failed.Retired == 0 && !failed.Plan.IsComplete && failed.Plan.Held[B.Key] == "archive_failed"
               && !JsonNode.Parse(File.ReadAllText(stuckCopy))!["isArchived"]!.GetValue<bool>(), "a failed archive leaves the run unfinished");
         Check(stuckShelf.Apply([A, B], () => true).Retired == 1, "the archive succeeds on the retry");
+
+        // While the app runs, it comes to the list at the last moment before an archive: the copy stays as it is.
+        using var late = new Fixture();
+        var (t1, t2) = Two(late);
+        late.Record(A, "local_f4f4f4f4-0000-4000-8000-000000000001", t1);
+        var lateShelf = late.Shelf();
+        lateShelf.Apply([A, B], () => true);
+        var lateCopy = late.Files(B).Single();
+        File.Delete(late.Files(A).Single());
+        late.Record(B, "local_f4f4f4f4-0000-4000-8000-000000000002", t2, extra: r => r["priorCliSessionIds"] = new JsonArray(t1));
+        var before = File.ReadAllBytes(lateCopy);
+        // Asked once the archived copy is staged beside the record: the last check before it replaces it.
+        bool Staged() => Directory.EnumerateFiles(late.ShelfPath(B), ".local_*").Any();
+        var cut = lateShelf.Apply([A, B], target => target != A.Key && !(target == B.Key && Staged()), "test", running: true);
+        Check(cut.Retired == 0 && cut.Plan.Held[B.Key] == "archive_failed" && File.ReadAllBytes(lateCopy).SequenceEqual(before),
+            "an app that comes to the list at the last moment finds the copy as it was, and the run is retried");
+        Check(lateShelf.Apply([A, B], () => true).Retired == 1, "the archive goes ahead once the list is left alone");
 
         // Archived, but the run stopped before the ledger said so; the next run cannot read the copy at first.
         using var locked = new Fixture();
@@ -1621,19 +1919,22 @@ internal static class ClaudeSessionShelfTests
         var cleanLedger = Path.Combine(clean.Ledger, "ledger.json");
         { var l = JsonNode.Parse(File.ReadAllText(cleanLedger))!.AsObject(); foreach (var e in l["created"]!.AsArray()) e!.AsObject().Remove("title"); File.WriteAllText(cleanLedger, l.ToJsonString()); }
         Set(cleanOriginal, r => r["title"] = "원본 새 이름");
-        // Held lists and live writers are left alone.
+        // Held lists are left alone.
         File.WriteAllText(Path.Combine(clean.ShelfPath(B), "local_cccccccc-0000-4000-8000-000000000009.json.tmp"), "{}");
         Check(cleanShelf.Apply([A, B], () => true).Retitled == 0, "a list the app is recovering is not retitled");
         File.Delete(Path.Combine(clean.ShelfPath(B), "local_cccccccc-0000-4000-8000-000000000009.json.tmp"));
         var unknownWriters = clean.Shelf(() => new ClaudeLiveSessionScan(new HashSet<string>(), true));
         Check(unknownWriters.Apply([A, B], () => true).Retitled == 0, "unknown writers hold retitling");
-        var writing = clean.Shelf(() => new ClaudeLiveSessionScan(new HashSet<string> { cleanCli.ToLowerInvariant() }, false));
-        Check(writing.Apply([A, B], () => true).Retitled == 0, "a conversation being written is not retitled");
         ClaudeShelfResult blocked;
         using (new FileStream(cleanCopy, FileMode.Open, FileAccess.Read, FileShare.Read)) blocked = cleanShelf.Apply([A, B], () => true);
         Check(blocked.Retitled == 0 && !blocked.Plan.IsComplete && blocked.Plan.Held[B.Key] == "retitle_failed" && Title(cleanCopy) != "원본 새 이름",
             "a rename that cannot be written leaves the run unfinished");
         Check(cleanShelf.Apply([A, B], () => true).Retitled == 1 && Title(cleanCopy) == "원본 새 이름", "an untouched copy without a recorded title is renamed");
+        // The conversation being written is no reason to wait: the copy in another list is not what is written.
+        var writing = clean.Shelf(() => new ClaudeLiveSessionScan(new HashSet<string> { cleanCli.ToLowerInvariant() }, false));
+        Set(cleanOriginal, r => r["title"] = "쓰는 중에 바꾼 이름");
+        Check(writing.Apply([A, B], () => true).Retitled == 1 && Title(cleanCopy) == "쓰는 중에 바꾼 이름",
+            "a conversation being written is retitled all the same");
         // The ledger owns exactly the bytes written; a later change by the app keeps the copy out of undo.
         Set(cleanCopy, r => r["completedTurns"] = 7);
         Check(cleanShelf.Undo(() => true).Removed == 0 && File.Exists(cleanCopy), "a copy changed after retitling is kept by undo");
@@ -1796,7 +2097,9 @@ internal static class ClaudeSessionShelfTests
                  {
                      ("stagedTranscriptPath", @"C:\staged\import.jsonl"), ("importedFrom", "code1p"), ("interruptedByQuitAt", 5),
                      ("interruptedAwaitingPerson", true), ("unarchivedCliSessionId", Guid.NewGuid().ToString("D")),
-                     ("pendingSystemReminder", "remind"), ("spawnedFrom", new JsonObject { ["sessionId"] = "local_parent" })
+                     ("pendingSystemReminder", "remind"), ("spawnedFrom", new JsonObject { ["sessionId"] = "local_parent" }),
+                     // A worktree the app made for this account's session: an advance would lose it.
+                     ("worktreePath", @"C:\wt\feature"), ("worktreeLazy", new JsonObject { ["baseBranch"] = "main" })
                  })
         {
             using var held = new Fixture();
@@ -1879,6 +2182,23 @@ internal static class ClaudeSessionShelfTests
                 "while the older state's transcript is written, neither an advance nor a copy is made, and the run is retried");
             Check(writing.Shelf().Apply([A, B], () => true).Advanced == 1, "once the writer is gone the older state advances");
         }
+        // The newest transcript may be written meanwhile, and grow before the record is replaced: the older state takes it.
+        using (var growing = new Fixture())
+        {
+            var ids = Conversation(growing, 2);
+            growing.Record(B, Mine, ids[0]);
+            growing.Record(A, Theirs, ids[1], extra: r => r["priorCliSessionIds"] = new JsonArray(ids[0]));
+            var asks = 0;
+            var grown = growing.Shelf(() => new ClaudeLiveSessionScan(new HashSet<string> { ids[1] }, false)).Apply([A, B], () =>
+            {
+                // After the final plan, before the record is replaced.
+                if (++asks == 3) File.AppendAllLines(TranscriptPath(growing, ids[1]), [Entry(DateTime.UtcNow)]);
+                return true;
+            });
+            Check(grown is { Advanced: 1, Created: 0 } && asks >= 3
+                  && Json(Path.Combine(growing.ShelfPath(B), Mine + ".json"))["cliSessionId"]!.GetValue<string>() == ids[1],
+                "the newest transcript being written, and growing, does not stop the advance");
+        }
 
         using var race = new Fixture();
         var raceIds = Conversation(race, 2);
@@ -1903,12 +2223,13 @@ internal static class ClaudeSessionShelfTests
         }).Apply([A, B], () => true);
         Check(changed.Advanced == 0 && Json(path)["lastFocusedAt"]!.GetValue<int>() == 9 && changed.Plan.Held[B.Key] == "advance_failed",
             "a record that changed after the plan is not overwritten");
-        // A writer starts on the conversation after the plan.
+        // A writer starts on the older state's transcript after the plan: the conversation may branch there. (One on the
+        // newest transcript is the conversation going on, and does not stop it.)
         var asked = 0;
-        var started = race.Shelf(() => new ClaudeLiveSessionScan(++asked >= 3 ? new HashSet<string> { raceIds[1] } : new HashSet<string>(), false))
+        var started = race.Shelf(() => new ClaudeLiveSessionScan(++asked >= 3 ? new HashSet<string> { raceIds[0] } : new HashSet<string>(), false))
             .Apply([A, B], () => true);
         Check(started.Advanced == 0 && Json(path)["cliSessionId"]!.GetValue<string>() == raceIds[0] && started.Plan.Held[B.Key] == "advance_failed",
-            "a writer that starts after the plan stops the advance");
+            "a writer that starts on the older state's transcript after the plan stops the advance");
         // The record as it was, and the intent, are in the ledger before the record is replaced.
         var before = File.ReadAllBytes(path);
         hash = ClaudeSessionShelf.Hash(path);
@@ -2017,7 +2338,21 @@ internal static class ClaudeSessionShelfTests
               && late.Files(B).Count == 2 && late.Files(A).Count == 2,
             "planned again, the resumed older state is a branch: the newest state is added beside it, and it reaches A too");
 
-        // The source record the decision read changes after the plan: nothing is written, and the next run plans again.
+        // The source record changes after the plan. What the app keeps updating while it shows the conversation (its title,
+        // its activity) does not stop the advance.
+        using var touched = new Fixture();
+        var (t0, t1) = Two(touched);
+        touched.Record(B, "local_af500000-0000-4000-8000-000000000001", t0);
+        touched.Record(A, "local_af500000-0000-4000-8000-000000000002", t1, extra: r => r["priorCliSessionIds"] = new JsonArray(t0));
+        var shown = Path.Combine(touched.ShelfPath(A), "local_af500000-0000-4000-8000-000000000002.json");
+        var touches = 0;
+        var retitled = touched.Shelf().Apply([A, B], () =>
+        {
+            if (++touches == 3) Change(shown, r => { r["title"] = "바뀐 이름"; r["lastActivityAt"] = 500; });
+            return true;
+        });
+        Check(retitled.Advanced == 1, "a source record the app only retitled or used after the plan does not stop the advance");
+        // What the decision read changes: nothing is written, and the next run plans again.
         using var moved = new Fixture();
         var (m0, m1) = Two(moved);
         moved.Record(B, "local_af400000-0000-4000-8000-000000000001", m0);
@@ -2026,10 +2361,12 @@ internal static class ClaudeSessionShelfTests
         var asked = 0;
         var changed = moved.Shelf().Apply([A, B], () =>
         {
-            if (++asked == 3) Change(source, r => r["title"] = "바뀐 이름");
+            if (++asked == 3) Change(source, r => r["isArchived"] = true);
             return true;
         });
-        Check(changed.Advanced == 0 && changed.Plan.Held[B.Key] == "advance_failed", "a source record changed after the plan stops the advance");
+        Check(changed.Advanced == 0 && changed.Plan.Held[B.Key] == "advance_failed",
+            "a source record whose decision fields changed after the plan stops the advance");
+        Change(source, r => r["isArchived"] = false);
         Check(moved.Shelf().Apply([A, B], () => true).Advanced == 1, "planned again from the record as it is, the advance goes ahead");
     }
 

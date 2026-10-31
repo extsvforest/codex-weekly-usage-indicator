@@ -5,7 +5,9 @@ namespace WeeklyUsageIndicator;
 
 internal enum ClaudeShelfProblem { None, Incompatible, Held, Failed }
 
-/// <summary>A UI-thread snapshot of the Desktop app and the session-list fill.</summary>
+/// <summary>A UI-thread snapshot of the Desktop app and the session-list fill. <see cref="Unreviewed"/> is the installed
+/// app version whose deletion protection reads differently from the reviewed ones (see <see cref="ClaudeDesktopContract"/>):
+/// filling goes on, and the user is told to archive sessions rather than delete them until it is reviewed.</summary>
 internal sealed record ClaudeShelfStatus(
     ClaudeDesktopRunState Desktop,
     ClaudeDesktopAccountState App,
@@ -18,7 +20,8 @@ internal sealed record ClaudeShelfStatus(
     ClaudeShelfProblem Problem,
     string? ProblemDetail,
     DateTimeOffset? RelaunchArmedUntil,
-    DateTime? HostStartedAt = null)
+    DateTime? HostStartedAt = null,
+    string? Unreviewed = null)
 {
     internal static readonly ClaudeShelfStatus Initial = new(ClaudeDesktopRunState.Unknown, ClaudeDesktopAccountState.Unknown,
         null, null, 0, null, 0, true, ClaudeShelfProblem.None, null, null);
@@ -28,10 +31,10 @@ internal sealed record ClaudeShelfStatus(
 
 /// <summary>Seams for tests. Production uses the real probes and ShellExecute.</summary>
 internal sealed record ClaudeShelfEnvironment(Func<ClaudeDesktopRuntime> Observe, Func<ClaudeDesktopPackage?> FindPackage,
-    Func<string, bool> IsCompatible, Action<ClaudeDesktopPackage> Launch, Func<DateTimeOffset> Now)
+    Func<string, ClaudeDesktopContract> Contract, Action<ClaudeDesktopPackage> Launch, Func<DateTimeOffset> Now)
 {
     internal static readonly ClaudeShelfEnvironment Real = new(ClaudeDesktopProbe.Observe, ClaudeDesktopProbe.FindPackage,
-        ClaudeDesktopProbe.IsCompatible, ClaudeDesktopProbe.Launch, () => DateTimeOffset.Now);
+        ClaudeDesktopProbe.Contract, ClaudeDesktopProbe.Launch, () => DateTimeOffset.Now);
 }
 
 /// <summary>What one background pass observed. <see cref="Reservation"/> is the reopen request that the closure
@@ -42,11 +45,12 @@ internal sealed record ClaudeShelfPass(ClaudeShelfStatus Status, Guid? Reservati
 
 /// <summary>
 /// Owned by the widget. Every few seconds it observes Desktop off the UI thread. While Desktop runs it follows the
-/// app's own log to learn the signed-in account and how many sessions that account still lacks. Once Desktop has
-/// been fully closed for a moment it fills every registered account's session list (adding sessions, or bringing an older
-/// state of a conversation continued elsewhere up to date in place). It relaunches Desktop
-/// when the user asked for that, or after a switch to an account that lacked sessions; otherwise a closed app stays
-/// closed.
+/// app's own log to learn the signed-in account and how many sessions that account still lacks, and every minute, and at
+/// once when the app signs out or comes to another account, it fills the lists of the accounts the app has not shown for
+/// a while (<see cref="SettleWindow"/>), all of which it watched. Once Desktop has been fully closed for a moment it fills
+/// every registered account's session list (adding sessions, or bringing an older state of a conversation continued
+/// elsewhere up to date in place). It relaunches Desktop when the user asked for that, or after a switch to an account
+/// that lacked sessions; otherwise a closed app stays closed.
 /// <para>It also keeps what each account changed (<see cref="ClaudeSessionLayout"/>), which the
 /// <c>claude-session-sync</c> plan reads: the mapped accounts and their labels, when the app came to and left each one,
 /// and checkpoints of the account the app comes to and of the account a plan ran in, with what changed there since the
@@ -62,6 +66,10 @@ internal sealed class ClaudeShelfService : IDisposable
     private static readonly TimeSpan RelaunchWindow = TimeSpan.FromMinutes(30);
     // How long the account the app came to is retried for its first checkpoint, while it cannot be read whole.
     private static readonly TimeSpan ArrivalWindow = TimeSpan.FromMinutes(2);
+    // While the app runs, how long after it last showed an account that account's list is left alone: the app ends that
+    // account's Code sessions, and writes their records, some seconds after it shows the next one. The same time must
+    // have been watched, so an account shown before the widget looked is past it too.
+    internal static readonly TimeSpan SettleWindow = TimeSpan.FromMinutes(2);
     private readonly Control _owner;
     private readonly Func<IReadOnlyList<ClaudeProfile>> _profiles;
     private readonly ClaudeSessionShelf _shelf;
@@ -71,8 +79,9 @@ internal sealed class ClaudeShelfService : IDisposable
     // Worker-owned state (only the single in-flight tick touches it).
     private IReadOnlyList<ClaudeShelfAccount> _accounts = [];
     private string _accountsKey = "";
-    private DateTimeOffset _accountsAt = DateTimeOffset.MinValue, _pendingAt = DateTimeOffset.MinValue;
-    private string? _pendingFor;
+    private DateTimeOffset _accountsAt = DateTimeOffset.MinValue, _cycleAt = DateTimeOffset.MinValue;
+    // The app's state the last pass while it runs was made for: a change starts the next one at once.
+    private string? _cycleFor;
     private int? _pending;
     private DateTimeOffset? _closedSince, _retryAt, _closureStarted;
     private bool _closureDone;
@@ -81,7 +90,15 @@ internal sealed class ClaudeShelfService : IDisposable
     private bool _lastComplete = true;
     private ClaudeShelfProblem _problem;
     private string? _problemDetail;
+    // The lists the last fill of each left held.
+    private readonly HashSet<string> _held = new(StringComparer.Ordinal);
+    private string? _unreviewed;
     private string? _confirmedKey;
+    // The accounts the app shows (see NoteShown), when it last did, and since when this widget has seen every line of its
+    // log, or the app closed.
+    private HashSet<string> _shown = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, DateTimeOffset> _shownAt = new(StringComparer.Ordinal);
+    private DateTimeOffset? _watchedSince;
     // Counts the user's reopen choices, so a pass that started before one never overrides it.
     private int _relaunchChoice;
     // What each account changed, kept by this widget alone; null until read or started.
@@ -190,7 +207,12 @@ internal sealed class ClaudeShelfService : IDisposable
     }
 
     internal void SetStatusForTest(ClaudeShelfStatus status) => Publish(status);
-    internal void SetAccountsForTest(IReadOnlyList<ClaudeShelfAccount> accounts) => Volatile.Write(ref _accounts, accounts);
+    /// <summary>For tests: these accounts stay until the next call, however much time passes (no profile resolves to them).</summary>
+    internal void SetAccountsForTest(IReadOnlyList<ClaudeShelfAccount> accounts)
+    {
+        Volatile.Write(ref _accounts, accounts);
+        _accountsKey = ""; _accountsAt = DateTimeOffset.MaxValue;
+    }
 
     private void Publish(ClaudeShelfStatus status)
     {
@@ -215,13 +237,10 @@ internal sealed class ClaudeShelfService : IDisposable
         {
             case ClaudeDesktopRunState.Running:
                 _closedSince = null; _closureDone = false; _retryAt = null; _closureStarted = null;
-                // Report an unreviewed version while the app runs, so nothing promises a fill that will not run.
+                // Report an incompatible version while the app runs, so nothing promises a fill that will not run.
                 package = _environment.FindPackage();
-                if (package is null || !_environment.IsCompatible(package.AsarPath))
-                { _problem = ClaudeShelfProblem.Incompatible; _problemDetail = package?.Version.ToString(); }
-                else if (_problem == ClaudeShelfProblem.Incompatible) { _problem = ClaudeShelfProblem.None; _problemDetail = null; }
-                app = _log.Update(runtime.HostStartedAt, _accounts);
-                if (_log.LostLines) _unwatched = true;
+                var contract = Review(package);
+                app = Watch(runtime, now);
                 if (app.Key is { } confirmed && _accounts.Any(account => account.Key == confirmed))
                 {
                     if (confirmed != _confirmedKey)
@@ -240,18 +259,23 @@ internal sealed class ClaudeShelfService : IDisposable
                 }
                 CheckpointArrival(now);
                 ServePlans(now, app.Key is { } shown && shown == _confirmedKey ? shown : null);
-                if (app.Key is { } key && (key != _pendingFor || now - _pendingAt >= PendingInterval))
+                // Every minute, and at once when the app's account changes (a sign-out first: the account the user goes
+                // to next is filled before the app reads it), fill what may be written and count what the shown list lacks.
+                var cycle = app.Status is ClaudeDesktopAccountStatus.SignedIn or ClaudeDesktopAccountStatus.SignedOut
+                    or ClaudeDesktopAccountStatus.Unregistered ? app.Status + ":" + (app.Key ?? app.AccountUuid) : null;
+                if (cycle is null) { _pending = null; _cycleFor = null; }
+                else if (cycle != _cycleFor || now - _cycleAt >= PendingInterval)
                 {
-                    try { _pending = _shelf.Plan(_accounts).PendingFor(key); }
-                    catch (Exception) { _pending = null; }
-                    _pendingFor = key; _pendingAt = now;
+                    _cycleFor = cycle; _cycleAt = now;
+                    _pending = FillRunning(app, package, contract, now);
                 }
-                else if (app.Key is null) { _pending = null; _pendingFor = null; }
                 break;
             case ClaudeDesktopRunState.Closed:
                 app = _log.Update(null, _accounts);
+                NoteShown(app, now);
+                _watchedSince ??= now;
                 ServePlans(now, null);
-                _pending = null; _pendingFor = null;
+                _pending = null; _cycleFor = null;
                 _closedSince ??= now;
                 _closureStarted ??= now;
                 if (now - _closedSince >= ClosedGrace && (!_closureDone || _retryAt is { } retry && now >= retry))
@@ -263,14 +287,121 @@ internal sealed class ClaudeShelfService : IDisposable
                 }
                 break;
             default:
-                // An uninspectable process: neither write nor claim the app is closed.
+                // An uninspectable process: neither write nor claim the app is closed. What it showed meanwhile is not
+                // seen, so the time watched starts again.
                 app = _log.State.Status == ClaudeDesktopAccountStatus.Closed ? ClaudeDesktopAccountState.Unknown : _log.State;
+                NoteShown(ClaudeDesktopAccountState.Unknown, now);
+                _watchedSince = null;
                 break;
         }
         var profileId = app.Key is { } appKey ? _accounts.FirstOrDefault(account => account.Key == appKey)?.ProfileId : null;
         return new ClaudeShelfPass(new ClaudeShelfStatus(runtime.State, app, profileId, _pending, _accounts.Count, _lastFillAt,
-            _lastCreated, _lastComplete, _problem, _problemDetail, null, runtime.HostStartedAt), accepted,
+            _lastCreated, _lastComplete, _problem, _problemDetail, null, runtime.HostStartedAt, _unreviewed), accepted,
             package ?? _environment.FindPackage(), switchedFrom, choice);
+    }
+
+    /// <summary>Reads the installed app's version against the shelf design: an incompatible one stops filling and is
+    /// reported as a problem; an unreviewed one is reported alongside (<see cref="ClaudeShelfStatus.Unreviewed"/>).</summary>
+    private ClaudeDesktopContract Review(ClaudeDesktopPackage? package)
+    {
+        var contract = package is null ? ClaudeDesktopContract.Incompatible : _environment.Contract(package.AsarPath);
+        if (contract == ClaudeDesktopContract.Incompatible)
+        { _problem = ClaudeShelfProblem.Incompatible; _problemDetail = package?.Version.ToString(); }
+        else if (_problem == ClaudeShelfProblem.Incompatible) { _problem = ClaudeShelfProblem.None; _problemDetail = null; }
+        _unreviewed = contract == ClaudeDesktopContract.Unreviewed ? package!.Version.ToString() : null;
+        return contract;
+    }
+
+    /// <summary>Reads what the app's log says now, and keeps which accounts it shows and since when every line was seen.</summary>
+    private ClaudeDesktopAccountState Watch(ClaudeDesktopRuntime runtime, DateTimeOffset now)
+    {
+        var app = _log.Update(runtime.HostStartedAt, _accounts);
+        // Lines lost could hide a switch: the account left then is not dated, and the time watched starts again.
+        if (_log.LostLines) { _unwatched = true; _watchedSince = now; }
+        else _watchedSince ??= now;
+        NoteShown(app, now);
+        return app;
+    }
+
+    /// <summary>
+    /// Keeps which accounts the app shows: every organization of the account it shows or signs in to, and, until it
+    /// confirms another account, the ones it showed before (signed out, on an account not registered, or in a state it
+    /// cannot tell, it has not let them go: it ends an account's Code sessions only once it shows the next one). Those come
+    /// from its log as well (<see cref="ClaudeDesktopLogWatcher.Held"/>), so a widget started while the app is signed out
+    /// knows them too. An account it stops showing, or closes on, was shown until now.
+    /// </summary>
+    private void NoteShown(ClaudeDesktopAccountState app, DateTimeOffset now)
+    {
+        IEnumerable<string> Mapped(string account) =>
+            _accounts.Where(mapped => string.Equals(mapped.AccountUuid, account, StringComparison.OrdinalIgnoreCase))
+                .Select(mapped => mapped.Key);
+        var showing = (app.Status == ClaudeDesktopAccountStatus.SignedIn && app.AccountUuid is { } account ? Mapped(account) : [])
+            .Concat(app.Status == ClaudeDesktopAccountStatus.Closed ? [] : _log.Held.SelectMany(Mapped));
+        var shown = app.Confirmed || app.Status == ClaudeDesktopAccountStatus.Closed
+            ? showing.ToHashSet(StringComparer.Ordinal)
+            : _shown.Concat(showing).ToHashSet(StringComparer.Ordinal);
+        foreach (var key in shown.Concat(_shown)) _shownAt[key] = now;
+        _shown = shown;
+    }
+
+    /// <summary>
+    /// While the app runs, whether a list may be written (null: any list): an account mapped, not shown now and not for the
+    /// settle window, while the app's account is known (one confirmed, signed out, or one not registered) and every line of
+    /// its log was seen for the settle window.
+    /// </summary>
+    private bool MayWriteWhileRunning(ClaudeDesktopAccountState app, string? target, DateTimeOffset now)
+    {
+        if (_watchedSince is not { } since || now - since < SettleWindow
+            || app.Status is not (ClaudeDesktopAccountStatus.SignedIn or ClaudeDesktopAccountStatus.SignedOut
+                or ClaudeDesktopAccountStatus.Unregistered)) return false;
+        bool Settled(string key) => !_shown.Contains(key) && (!_shownAt.TryGetValue(key, out var at) || now - at >= SettleWindow);
+        return _accounts.Any(account => (target is null || account.Key == target) && Settled(account.Key));
+    }
+
+    /// <summary>Asked before every file a fill writes while the app runs (see <see cref="ClaudeSessionShelf.Apply(IReadOnlyList{ClaudeShelfAccount}, Func{string?, bool}, string?, bool)"/>):
+    /// the app's state is read again, so a list it starts to sign in to is left before the next file.</summary>
+    private bool MayWrite(string? target)
+    {
+        var now = _environment.Now();
+        var runtime = _environment.Observe();
+        return runtime.State == ClaudeDesktopRunState.Running && MayWriteWhileRunning(Watch(runtime, now), target, now);
+    }
+
+    /// <summary>One pass while the app runs: fills the lists that may be written, and returns what the list the app shows
+    /// lacks (null when it shows none or that is not known). That list is filled when the app closes.</summary>
+    private int? FillRunning(ClaudeDesktopAccountState app, ClaudeDesktopPackage? package, ClaudeDesktopContract contract,
+        DateTimeOffset now)
+    {
+        try
+        {
+            if (_accounts.Count < 2 || package is null || contract == ClaudeDesktopContract.Incompatible
+                || !MayWriteWhileRunning(app, null, now))
+                return app.Key is { } key ? _shelf.Plan(_accounts).PendingFor(key) : null;
+            var result = _shelf.Apply(_accounts, MayWrite, package.Version.ToString(), running: true);
+            var targets = result.Targets ?? new HashSet<string>();
+            if (result.Written > 0) { _lastFillAt = now; _lastCreated = result.Created; }
+            if (targets.Count > 0) _lastComplete = result.Plan.IsCompleteFor(targets);
+            foreach (var target in targets)
+                if (result.Plan.Held.ContainsKey(target)) _held.Add(target);
+                else _held.Remove(target);
+            if (_problem is ClaudeShelfProblem.None or ClaudeShelfProblem.Held)
+            {
+                _problem = _held.Count > 0 ? ClaudeShelfProblem.Held : ClaudeShelfProblem.None;
+                _problemDetail = _held.Count > 0 ? result.Plan.Held.Values.FirstOrDefault() ?? _problemDetail : null;
+            }
+            return app.Key is { } shown ? result.Plan.PendingFor(shown) : null;
+        }
+        catch (ClaudeDesktopRunningException exception)
+        {
+            // The app came to a list this pass writes: the next pass plans again.
+            if (exception.Created > 0) { _lastFillAt = now; _lastCreated = exception.Created; _lastComplete = false; }
+            return null;
+        }
+        catch (Exception)
+        {
+            // A list changed while preparing, the installer holds the lease, or anything else: the next pass tries again.
+            return null;
+        }
     }
 
     /// <summary>Keeps <see cref="ClaudeSessionLayout"/>: starts it the first time, keeps the mapped accounts and their
@@ -414,19 +545,17 @@ internal sealed class ClaudeShelfService : IDisposable
         _closureDone = true; _retryAt = null;
         var package = _environment.FindPackage();
         if (_accounts.Count < 2) { _problem = ClaudeShelfProblem.None; _problemDetail = null; return package; }
-        if (package is null || !_environment.IsCompatible(package.AsarPath))
-        {
-            _problem = ClaudeShelfProblem.Incompatible; _problemDetail = package?.Version.ToString();
-            return package;
-        }
+        if (Review(package) == ClaudeDesktopContract.Incompatible) return package;
         try
         {
             var result = _shelf.Apply(_accounts, () => _environment.Observe().State == ClaudeDesktopRunState.Closed,
-                package.Version.ToString());
+                package!.Version.ToString());
             _lastFillAt = now; _lastCreated = result.Created;
             // A sidebar sync that could not finish is retried like a held list.
             _lastComplete = result.Plan.IsComplete && result.Prefs?.Complete != false;
-            _problem = result.Plan.Held.Count > 0 ? ClaudeShelfProblem.Held : ClaudeShelfProblem.None;
+            _held.Clear();
+            _held.UnionWith(result.Plan.Held.Keys);
+            _problem = _held.Count > 0 ? ClaudeShelfProblem.Held : ClaudeShelfProblem.None;
             _problemDetail = result.Plan.Held.Values.FirstOrDefault();
             // Sessions held by a live writer or a pending app recovery clear up on their own.
             if (!_lastComplete) ScheduleRetry(now);

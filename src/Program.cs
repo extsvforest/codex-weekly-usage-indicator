@@ -67,6 +67,8 @@ internal sealed class UsageIndicatorForm : Form
     private readonly ClaudeShelfService? _claudeShelf;
     private readonly ClaudeAppFollower? _claudeFollower;
     private string? _lastAppKey;
+    // The last Claude version not reviewed yet that the user was warned about, so each such version warns once.
+    private string? _lastUnreviewed;
     private string? _claudeAppGate;
     private DateTime? _claudeGateRun;
     private long _claudeGeneration;
@@ -689,6 +691,14 @@ internal sealed class UsageIndicatorForm : Form
                         : UiText.F($"{label} 계정 목록에 채울 세션이 {status.PendingForApp}개 있습니다. Claude를 한 번 종료하면 채워집니다."),
                     status.Problem == ClaudeShelfProblem.Incompatible ? ToolTipIcon.Warning : ToolTipIcon.Info);
             }
+        }
+        if (status.Unreviewed is { } version && version != _lastUnreviewed && status.MappedAccounts >= 2
+            && _accountTray is { Visible: true } warned)
+        {
+            _lastUnreviewed = version;
+            warned.ShowBalloonTip(10000, UiText.T("Claude 세션 목록"),
+                UiText.F($"Claude {version}은 아직 확인 전입니다. 세션 채우기는 계속하지만, 확인될 때까지 세션은 삭제하지 말고 보관해 주세요."),
+                ToolTipIcon.Warning);
         }
         _claudeFollower?.OnStatusChanged();
         UpdateAppMismatch();

@@ -17,6 +17,13 @@ internal sealed record ClaudeDesktopPackage(string FullName, Version Version, st
 
 internal enum ClaudeDesktopRunState { Closed, Running, Unknown }
 
+/// <summary>How the installed app reads against the shelf design. <see cref="Reviewed"/>: everything it relies on is
+/// there. <see cref="Unreviewed"/>: the stores and log lines the widget follows are there, but the deletion protection
+/// reads differently (a version not reviewed yet). Filling goes on: the copies already made rely on that protection
+/// whether or not more are added, so the user is told to archive rather than delete until it is reviewed.
+/// <see cref="Incompatible"/>: a store or log line the widget follows is missing, and nothing is written.</summary>
+internal enum ClaudeDesktopContract { Reviewed, Unreviewed, Incompatible }
+
 /// <summary>Current process generation of the packaged app. The earliest host process start separates app runs.</summary>
 internal sealed record ClaudeDesktopRuntime(ClaudeDesktopRunState State, DateTime? HostStartedAt);
 
@@ -39,7 +46,8 @@ internal static class ClaudeDesktopProbe
     private const string PublisherSuffix = "__pzs8sxrjxfjjc";
     private const int ErrorInvalidParameter = 87;
     // Stable (non-minified) strings the shelf design depends on; each entry lists accepted spellings (bundled
-    // sources may escape non-ASCII punctuation). A missing marker pauses writes.
+    // sources may escape non-ASCII punctuation). A missing marker pauses writes; the windows and flows below only
+    // report a version as unreviewed.
     internal static readonly string[][] ContractMarkers =
     [
         ["\"claude-code-sessions\""],
@@ -119,7 +127,7 @@ internal static class ClaudeDesktopProbe
     ];
     private static readonly string[] SharedGroups = ["link", "maker", "remover", "aside", "setter", "finisher"];
     private static readonly object ContractGate = new();
-    private static (string Key, bool Compatible)? _contract;
+    private static (string Key, ClaudeDesktopContract Contract)? _contract;
 
     internal static string LogDirectory => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Claude", "Logs");
@@ -183,29 +191,39 @@ internal static class ClaudeDesktopProbe
     }
 
     /// <summary>Checks that the installed app still contains the behaviors the shelf design relies on. This is a
-    /// guard against silent drift, not a proof: it pauses writes when an update moves or renames them.</summary>
-    internal static bool IsCompatible(string asarPath)
+    /// guard against silent drift, not a proof: it pauses writes when an update moves or renames the stores and log
+    /// lines the widget follows, and reports a version whose deletion protection reads differently as unreviewed.</summary>
+    internal static ClaudeDesktopContract Contract(string asarPath)
     {
         FileInfo info;
-        try { info = new FileInfo(asarPath); if (!info.Exists) return false; }
-        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { return false; }
+        try { info = new FileInfo(asarPath); if (!info.Exists) return ClaudeDesktopContract.Incompatible; }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { return ClaudeDesktopContract.Incompatible; }
         var key = asarPath + "|" + info.Length + "|" + info.LastWriteTimeUtc.Ticks;
-        lock (ContractGate) if (_contract is { } cached && cached.Key == key) return cached.Compatible;
-        bool compatible;
-        try { compatible = IsCompatible(File.ReadAllBytes(asarPath)); }
-        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { compatible = false; }
-        lock (ContractGate) _contract = (key, compatible);
-        return compatible;
+        lock (ContractGate) if (_contract is { } cached && cached.Key == key) return cached.Contract;
+        ClaudeDesktopContract contract;
+        try { contract = Contract(File.ReadAllBytes(asarPath)); }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { contract = ClaudeDesktopContract.Incompatible; }
+        lock (ContractGate) _contract = (key, contract);
+        return contract;
     }
 
-    internal static bool IsCompatible(ReadOnlySpan<byte> bundle)
+    internal static ClaudeDesktopContract Contract(ReadOnlySpan<byte> bundle)
     {
         foreach (var spellings in ContractMarkers)
         {
             var found = false;
             foreach (var spelling in spellings) found |= bundle.IndexOf(Encoding.UTF8.GetBytes(spelling)) >= 0;
-            if (!found) return false;
+            if (!found) return ClaudeDesktopContract.Incompatible;
         }
+        return Protects(bundle) ? ClaudeDesktopContract.Reviewed : ClaudeDesktopContract.Unreviewed;
+    }
+
+    /// <summary>Whether the bundle reads as reviewed: every marker, connected window and data flow is there.</summary>
+    internal static bool IsCompatible(ReadOnlySpan<byte> bundle) => Contract(bundle) == ClaudeDesktopContract.Reviewed;
+
+    /// <summary>Whether the deletion protection reads as reviewed: the connected windows and data flows below.</summary>
+    private static bool Protects(ReadOnlySpan<byte> bundle)
+    {
         foreach (var (anchor, window, required) in ContractWindows)
         {
             var anchorBytes = Encoding.UTF8.GetBytes(anchor);
@@ -291,20 +309,26 @@ internal sealed class ClaudeDesktopLogWatcher(string? directory = null)
     // name that was just renamed away inherits the old creation time, and the app's rotation does exactly that.
     private string? _file;
     private ClaudeDesktopAccountState _state = ClaudeDesktopAccountState.Closed;
+    private readonly HashSet<string> _held = new(StringComparer.Ordinal);
     internal ClaudeDesktopAccountState State => _state;
     /// <summary>The last update found lines lost (a gap): anything could have happened in them, a switch included.</summary>
     internal bool LostLines { get; private set; }
+    /// <summary>Accounts this run of the app left since it last confirmed one (signed out of, or went from to sign in to
+    /// another): it ends an account's Code sessions only once it shows the next one, so it still holds their lists. They
+    /// come from the log itself, so a replay (a widget started meanwhile, or after a gap) knows them as well.</summary>
+    internal IReadOnlyCollection<string> Held => _held;
 
     internal ClaudeDesktopAccountState Update(DateTime? hostStartedAt, IReadOnlyCollection<ClaudeShelfAccount> registered)
     {
         LostLines = false;
-        if (hostStartedAt is null) { _generation = null; return _state = ClaudeDesktopAccountState.Closed; }
+        if (hostStartedAt is null) { _generation = null; _held.Clear(); return _state = ClaudeDesktopAccountState.Closed; }
         var main = Path.Combine(_directory, "main.log");
         var previous = Path.Combine(_directory, "main1.log");
         List<string> lines = [];
         LogRead result;
         long end = 0; string? file = null;
-        if (_generation != hostStartedAt)
+        var replay = _generation != hostStartedAt;
+        if (replay)
         {
             // A new app run, or a replay after a gap: forget the previous observation and replay this run from both
             // log files. An unfinished last line in main1.log may have been a sign-out or switch, so nothing before
@@ -328,11 +352,14 @@ internal sealed class ClaudeDesktopLogWatcher(string? directory = null)
             return _state = ClaudeDesktopAccountState.Unknown;
         }
         _generation = hostStartedAt; _offset = end; _file = file;
-        return _state = Apply(_state, lines, hostStartedAt.Value, registered);
+        // A replay reads the whole run again, the accounts it left included.
+        if (replay) _held.Clear();
+        return _state = Apply(_state, lines, hostStartedAt.Value, registered, _held);
     }
 
+    /// <param name="held">Collects the accounts the lines leave, until one confirms an account (see <see cref="Held"/>).</param>
     internal static ClaudeDesktopAccountState Apply(ClaudeDesktopAccountState state, IEnumerable<string> lines,
-        DateTime since, IReadOnlyCollection<ClaudeShelfAccount> registered)
+        DateTime since, IReadOnlyCollection<ClaudeShelfAccount> registered, ISet<string>? held = null)
     {
         var accounts = registered.Select(account => account.AccountUuid.ToLowerInvariant()).ToHashSet(StringComparer.Ordinal);
         var pairs = registered.Select(account => account.Key).ToHashSet(StringComparer.Ordinal);
@@ -342,6 +369,10 @@ internal sealed class ClaudeDesktopLogWatcher(string? directory = null)
                     DateTimeStyles.AssumeLocal, out var at) || at < since - ClockSkew) continue;
             if (Transition.Match(line) is { Success: true } transition)
             {
+                // The line names the account left even when what came before it was not read.
+                var left = transition.Groups["from"].Value.ToLowerInvariant();
+                if (left != "<none>") held?.Add(left);
+                if (state.AccountUuid is { } before) held?.Add(before);
                 var target = transition.Groups["to"].Value.ToLowerInvariant();
                 state = target == "<none>" ? new(ClaudeDesktopAccountStatus.SignedOut, ObservedAt: at)
                     : accounts.Contains(target) ? new(ClaudeDesktopAccountStatus.SignedIn, target, ObservedAt: at)
@@ -357,6 +388,8 @@ internal sealed class ClaudeDesktopLogWatcher(string? directory = null)
                     or ClaudeDesktopAccountStatus.Unregistered
                     || state.AccountUuid is { } current && current != account) continue;
                 state = new(ClaudeDesktopAccountStatus.SignedIn, account, org, ObservedAt: at);
+                // The app shows this account now; the ones it left go as their sessions end.
+                held?.Clear();
                 continue;
             }
             if (Loaded.Match(line) is { Success: true } loaded && state.Confirmed

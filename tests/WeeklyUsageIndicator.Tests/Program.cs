@@ -41,7 +41,7 @@ var tests = new (string Name, Func<Task> Run)[]
     ("stable light tooltip hover, placement and focus", UsageTooltipHoverSmoke.RunAsync),
     ("Claude weekly metric, independent expiry and profile cache", ClaudeMetricTests.RunAll),
     ("Claude official profile identity and shared local work", ClaudeProfileTests.RunAsync),
-    ("Claude session shelf: fill by adding and advancing, closed-app writes, account mapping and log observation", ClaudeSessionShelfTests.RunAsync),
+    ("Claude session shelf: fill by adding and advancing, closed- and running-app writes, account mapping and log observation", ClaudeSessionShelfTests.RunAsync),
     ("Claude combined weekly total and session-layout plan", ClaudeSessionSyncTests.RunAsync),
     ("Claude login waits, transient observation and identity invalidation", ClaudeControllerTests.RunAsync),
     ("Claude account menu actions and inactive-profile usage", () => ClaudeAccountMenuSmoke.RunAsync()),

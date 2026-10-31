@@ -74,5 +74,6 @@
   "{0} 계정 목록에 채울 세션이 {1}개 있습니다. Claude를 한 번 종료하면 채워집니다.": "{1} sessions to fill in {0}'s list. Quit Claude once to fill them in.",
   "Claude 앱이 로그아웃 상태입니다.": "The Claude app is signed out.",
   "Claude 앱 계정을 확인하는 중입니다.": "Checking the Claude app's account.",
-  "{0} 계정 목록에 채울 세션이 {1}개 있습니다. Claude를 한 번 종료하면 채운 뒤 다시 엽니다.": "{1} sessions to fill in {0}'s list. Quit Claude once to fill them in; Claude reopens on its own."
+  "{0} 계정 목록에 채울 세션이 {1}개 있습니다. Claude를 한 번 종료하면 채운 뒤 다시 엽니다.": "{1} sessions to fill in {0}'s list. Quit Claude once to fill them in; Claude reopens on its own.",
+  "Claude {0}은 아직 확인 전입니다. 세션 채우기는 계속하지만, 확인될 때까지 세션은 삭제하지 말고 보관해 주세요.": "Claude {0} has not been reviewed yet. Session lists are still filled, but until it is reviewed, archive sessions instead of deleting them."
 }

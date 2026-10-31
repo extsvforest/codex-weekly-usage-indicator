@@ -185,6 +185,12 @@ internal sealed class ClaudeAccountPanel : UserControl
         if (status.Problem == ClaudeShelfProblem.Incompatible && status.MappedAccounts >= 2)
             return (UiText.T("세션 목록 채우기 멈춤 · 이 Claude 버전은 아직 확인되지 않았습니다."), true,
                 status.RelaunchArmed ? UiText.T("다시 열기 취소") : null);
+        // Filling goes on with a version not reviewed yet, but deleting a session there may not spare the conversation
+        // other accounts still list: that warning stays until a reviewed version is installed.
+        if (status.Unreviewed is not null && status.MappedAccounts >= 2)
+            return (UiText.T("확인 전 Claude 버전 · 세션은 삭제 대신 보관해 주세요."), true,
+                status.RelaunchArmed ? UiText.T("다시 열기 취소")
+                : status.AppConfirmed && status.PendingForApp is > 0 ? UiText.T("종료하면 다시 열기") : null);
         if (status.RelaunchArmed)
             return (status.AppConfirmed && status.PendingForApp is > 0 and var waiting
                 ? UiText.F($"채울 세션 {waiting}개 · Claude를 종료하면 채운 뒤 다시 엽니다.")
@@ -199,7 +205,7 @@ internal sealed class ClaudeAccountPanel : UserControl
             return (UiText.T("세션 목록 일부 보류 · 사용 중이거나 복구 중인 세션은 나중에 채웁니다."), false, null);
         if (status.LastFillAt is { } at)
             return (UiText.F($"세션 목록 · 모든 계정 채움 · {AccountUsageText.DateAndTime(at, now)}"), false, null);
-        return (UiText.T("세션 목록 · Claude를 종료하면 모든 계정 목록을 서로 채웁니다."), false, null);
+        return (UiText.T("세션 목록 · 다른 계정은 켠 채로, 지금 계정은 Claude를 종료하면 채웁니다."), false, null);
     }
 
     private void DisplaySummary() => _summary.Display(_controller.Store.ListProfiles().Select(profile =>
