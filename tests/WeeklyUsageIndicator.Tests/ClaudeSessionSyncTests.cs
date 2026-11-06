@@ -64,6 +64,7 @@ internal static class ClaudeSessionSyncTests
         TestLeftFamilyOnDisk();
         TestLeftFamilyBeforeUpgrade();
         TestLeftFamilyChanged();
+        TestLeftFamilyUnclear();
         return Task.CompletedTask;
     }
 
@@ -2354,9 +2355,11 @@ internal static class ClaudeSessionSyncTests
         Check(world.Shows(K2) == world.Shows(K1), "and 계정2 shows what 계정1 shows");
     }
 
-    /// <summary>What the family did since the checkpoint counts too. 프로젝트 was moved, which drops 프롬프트's own filing,
-    /// and pinned; then 프롬프트 was moved out and the app pinned it: its pin and no group are no one's. 곁가지1, filed by
-    /// itself where its family never went, the user took out of every group after moving it out: that is the user's.</summary>
+    /// <summary>What the family did since the checkpoint counts too. 프로젝트 was moved, which drops 프롬프트's own filing;
+    /// 프롬프트 was moved out, then the user pinned 프로젝트 and 프롬프트. Its lack of a group is no one's, its pin the user's:
+    /// had 프로젝트 been pinned first the app would have pinned it, but nothing tells the two apart, and the plan must not
+    /// undo a pin the user made. 곁가지1, filed by itself where its family never went, the user took out of every group
+    /// after moving it out (or its family went away and back, which drops its filing too: the same on disk): the user's.</summary>
     private static void TestLeftFamilyChanged()
     {
         var (world, widget) = SideSessions("left-family-changed");
@@ -2369,8 +2372,8 @@ internal static class ClaudeSessionSyncTests
             "the checkpoint foresees the filings of their own the family hides");
         world.Put(K1, "local_q1", world.GroupId(K1, "보관함"));
         world.Put(K1, "local_e1", null);
-        world.Pin("local_q1");
         Detach(world, "local_e1");
+        world.Pin("local_q1");
         world.Pin("local_e1");
         Detach(world, "local_c1");
         world.Pin("local_c1");
@@ -2378,20 +2381,59 @@ internal static class ClaudeSessionSyncTests
         var plan = widget.Plan(At(0));
         var mine = widget.Layout.Changed[K1];
         Check(mine["local_c1"] is { Group: { Value: null } } c && c.Pinned?.Value != true
-              && mine.GetValueOrDefault("local_e1") is var e && e?.Pinned?.Value != true && e?.Group is null
+              && mine["local_e1"] is { Pinned.Value: true, Group: null }
               && mine["local_q1"] is { Pinned.Value: true, Group.Value: "보관함" },
-            "the pins and the dropped filing the app gave are no one's; taking 곁가지1 out of its group is the user's");
+            "the pin and the dropped filing the app gave are no one's; 프롬프트's pin and taking 곁가지1 out of its group are the user's");
         Check(plan.Moves!.Single() is { Group: "도구" } back && back.Sessions.SequenceEqual(["local_e1"])
-              && plan.Pins!.Single() is { Session: "local_c1", Pinned: false },
-            "in 계정1 the app's pins go and 프롬프트 goes where the others show it");
+              && plan.Pins!.Count == 2 && plan.Pins.Any(pin => pin is { Session: "local_c1", Pinned: false })
+              && plan.Pins.Any(pin => pin is { Session: "local_e1", Pinned: true }),
+            "in 계정1 the app's pin goes and 프롬프트 goes where the others show it, pinned again after the move");
         world.Apply(K1, plan);
         Check(widget.Plan(At(1)) is { Moves.Count: 0, Pins.Count: 0 }, "applied, nothing is left in 계정1");
         widget.Switch(K2, At(10));
         var there = widget.Plan(At(15));
         Check(there.Moves!.Count == 2 && there.Moves.Single(move => move.Group == "보관함").Sessions.SequenceEqual(["local_q2"])
               && there.Moves.Single(move => move.Group is null).Sessions.Order(StringComparer.Ordinal).SequenceEqual(["local_c2", "local_d2"])
-              && there.Pins!.Single() is { Session: "local_q2", Pinned: true },
+              && there.Pins!.Count == 2 && there.Pins.Any(pin => pin is { Session: "local_q2", Pinned: true })
+              && there.Pins.Any(pin => pin is { Session: "local_e2", Pinned: true }),
             "in 계정2 what the user did goes, 곁가지2 with its family, and no pin of the app's");
+        world.Apply(K2, there);
+        widget.Plan(At(16));
+        Check(world.Shows(K2) == world.Shows(K1), "and 계정2 shows what 계정1 shows");
+    }
+
+    /// <summary>Whose a pin is follows the family as it shows now. 곁가지2 sits under 부모 above its archived parent
+    /// 곁가지1; moved out, the app pinned it, as 부모 shows pinned then and now: no one's. 프로젝트 was pinned then, and the
+    /// user unpinned it, moved 프롬프트 out and pinned that: had the app pinned it before 프로젝트 was unpinned, nothing tells
+    /// the two apart, so it is the user's.</summary>
+    private static void TestLeftFamilyUnclear()
+    {
+        var (world, widget) = SideSessions("left-family-unclear");
+        using var _ = world;
+        foreach (var suffix in new[] { "1", "2", "3" }) world.Pin("local_q" + suffix);
+        foreach (var (account, suffix) in new[] { (K1, "1"), (K2, "2"), (K3, "3") }) world.Archive(account, "local_c" + suffix);
+        widget.Start(K2, At(-60)); widget.Switch(K3, At(-50)); widget.Switch(K1, At(-40));
+        Check(widget.Plan(At(-35)) is { Moves.Count: 0, Pins.Count: 0 } && widget.Layout.Checkpoints[K1].Nested is { } foreseen
+              && foreseen["local_d1"] == new Shown(true, true, null) && foreseen["local_e1"] == new Shown(true, true, null),
+            "the checkpoint foresees both pinned, under their pinned families");
+        Detach(world, "local_d1");
+        world.Pin("local_d1");
+        world.Pin("local_q1", false);
+        Detach(world, "local_e1");
+        world.Pin("local_e1");
+        var plan = widget.Plan(At(0));
+        var mine = widget.Layout.Changed[K1];
+        Check(mine.GetValueOrDefault("local_d1")?.Pinned?.Value != true && mine["local_e1"] is { Pinned.Value: true }
+              && mine["local_q1"] is { Pinned.Value: false },
+            "곁가지2's pin is no one's, 프롬프트's the user's");
+        world.Apply(K1, plan);
+        Check(widget.Plan(At(1)) is { Moves.Count: 0, Pins.Count: 0 } && !world.IsPinned("local_d1") && world.IsPinned("local_e1"),
+            "applied in 계정1: 곁가지2 is unpinned, 프롬프트 stays pinned");
+        widget.Switch(K2, At(10));
+        var there = widget.Plan(At(15));
+        Check(there.Moves!.Count == 0 && there.Pins!.Count == 2
+              && there.Pins.Any(pin => pin is { Session: "local_q2", Pinned: false }) && there.Pins.Any(pin => pin is { Session: "local_e2", Pinned: true }),
+            "in 계정2 the user's pins go, no pin of the app's");
         world.Apply(K2, there);
         widget.Plan(At(16));
         Check(world.Shows(K2) == world.Shows(K1), "and 계정2 shows what 계정1 shows");

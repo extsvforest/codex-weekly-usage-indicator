@@ -1623,9 +1623,10 @@ internal static class ClaudeSessionSync
             want.At == DateTimeOffset.MinValue ? null : want.At == DateTimeOffset.MaxValue ? want with { At = at, By = null } : want;
         var nests = state.Layout?.Nested ?? state.Nests;
         var live = state.Records.ToDictionary(record => record.SessionId, StringComparer.Ordinal);
-        // The family a session left, by its top as it shows now; null when that is gone or archived.
+        // The family a session left, by its top as it shows now (above archived sessions, as the app nests); null when no
+        // live session heads it.
         ClaudeSessionLayout.Shown? FamilyOf(Record record) =>
-            record.Former is { } former && live.ContainsKey(former) && live.GetValueOrDefault(nests!.GetValueOrDefault(former) ?? former) is { } top
+            record.Former is { } former && live.GetValueOrDefault(nests!.GetValueOrDefault(former) ?? former) is { } top
                 ? ShownOf(top, state.Layout, state.PinsCount, state.CopyTitles, renamed) : null;
         foreach (var record in state.Records)
         {
@@ -1636,14 +1637,15 @@ internal static class ClaudeSessionSync
             if (before is not null)
             {
                 // What the app gave a session that has left its family since was chosen nowhere (see Left): a pin where its
-                // family showed pinned then or shows it now, its own group, and none where its family moved since (the app
-                // drops the own assignment of a session its family takes along) or the family is not known.
+                // family showed pinned then and shows it now, its own group, and none where its family moved since (the app
+                // drops the own assignment of a session its family takes along). Where that cannot tell the app's doing from
+                // the user's (the family pinned or unpinned since, moved and back, or not known), it is the user's.
                 var left = nests is null || nested ? null : Left(record, checkpoint!);
                 var family = left is null ? null : FamilyOf(record);
-                var appPin = left?.Pinned == true || family?.Pinned == true;
+                var appPin = left?.Pinned == true && family?.Pinned == true;
                 var group = shown.HasGroup && before.HasGroup && shown.Group != before.Group
                     && !(left is not null && (!left.HasGroup || shown.Group == left.Group
-                        || shown.Group is null && (family is not { HasGroup: true } || family.Group != before.Group)));
+                        || shown.Group is null && family is { HasGroup: true } && family.Group != before.Group));
                 // A copy's title the widget wrote since the checkpoint (following the original) was chosen nowhere here.
                 var widget = state.CopyTitles.GetValueOrDefault(record.SessionId) is { } written && written != before.Written
                     && shown.Title == written;
