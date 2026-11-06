@@ -113,8 +113,11 @@ internal sealed class ClaudeSessionLayout
 
     /// <param name="Stay">The stay it was taken in.</param>
     /// <param name="Groups">The groups in sidebar order; null when they were not known.</param>
+    /// <param name="Nested">For each session nested then, what it would show once out of its family: pinned where it or
+    /// its family showed pinned (the app pins one it moves to top level from there), and the group it is filed under
+    /// itself. Null in a checkpoint an earlier widget took.</param>
     internal sealed record Checkpoint(DateTimeOffset At, int Stay, IReadOnlyList<Named>? Groups,
-        IReadOnlyDictionary<string, Shown> Sessions);
+        IReadOnlyDictionary<string, Shown> Sessions, IReadOnlyDictionary<string, Shown>? Nested = null);
 
     /// <summary>A change of an account's group list: the names in sidebar order, and the groups it renamed (old name →
     /// new name) so that what was filed under an old name follows.</summary>
@@ -315,13 +318,21 @@ internal sealed class ClaudeSessionLayout
                 groups.Add(new(id, name));
             }
         }
+        if (ReadSessions(sessions) is not { } shown) return null;
+        Dictionary<string, Shown>? nested = null;
+        if (node["nested"] is { } nestedNode && (nestedNode is not JsonObject entries || (nested = ReadSessions(entries)) is null)) return null;
+        return new(at.Value, stay, groups, shown, nested);
+    }
+
+    private static Dictionary<string, Shown>? ReadSessions(JsonObject sessions)
+    {
         var shown = new Dictionary<string, Shown>(StringComparer.Ordinal);
         foreach (var (id, entry) in sessions)
         {
             if (entry is not JsonObject fields || ReadShown(fields) is not { } read) return null;
             shown[id] = read;
         }
-        return new(at.Value, stay, groups, shown);
+        return shown;
     }
 
     private static Shown? ReadShown(JsonObject entry)
@@ -463,23 +474,29 @@ internal sealed class ClaudeSessionLayout
             };
             if (Checkpoints.TryGetValue(key, out var checkpoint))
             {
-                var sessions = new JsonObject();
-                foreach (var (id, shown) in checkpoint.Sessions.OrderBy(pair => pair.Key, StringComparer.Ordinal))
+                static JsonObject Sessions(IReadOnlyDictionary<string, Shown> shownBy)
                 {
-                    var fields = new JsonObject();
-                    if (shown.Pinned is { } pinned) fields["pinned"] = pinned;
-                    if (shown.HasGroup) fields["group"] = shown.Group;
-                    if (shown.Title is { } title) fields["title"] = title;
-                    if (shown.Written is { } written) fields["written"] = written;
-                    sessions[id] = fields;
+                    var sessions = new JsonObject();
+                    foreach (var (id, shown) in shownBy.OrderBy(pair => pair.Key, StringComparer.Ordinal))
+                    {
+                        var fields = new JsonObject();
+                        if (shown.Pinned is { } pinned) fields["pinned"] = pinned;
+                        if (shown.HasGroup) fields["group"] = shown.Group;
+                        if (shown.Title is { } title) fields["title"] = title;
+                        if (shown.Written is { } written) fields["written"] = written;
+                        sessions[id] = fields;
+                    }
+                    return sessions;
                 }
-                entry["checkpoint"] = new JsonObject
+                var point = new JsonObject
                 {
                     ["at"] = Time(checkpoint.At), ["stay"] = checkpoint.Stay,
                     ["groups"] = checkpoint.Groups is null ? null
                         : new JsonArray(checkpoint.Groups.Select(group => (JsonNode?)new JsonObject { ["id"] = group.Id, ["name"] = group.Name }).ToArray()),
-                    ["sessions"] = sessions
+                    ["sessions"] = Sessions(checkpoint.Sessions)
                 };
+                if (checkpoint.Nested is { } nested) point["nested"] = Sessions(nested);
+                entry["checkpoint"] = point;
             }
             if (GroupsChanged.TryGetValue(key, out var groups)) entry["groupsChanged"] = Write(groups);
             if (Changed.TryGetValue(key, out var changed) && changed.Count > 0)
@@ -718,8 +735,12 @@ internal static class ClaudeSessionSync
     /// <param name="Branch">A fork or a session spawned from another: a conversation of its own, never a newer state.</param>
     /// <param name="Renamed">The app recorded an earlier title (<c>previousTitles</c>): someone renamed it in this list.</param>
     /// <param name="Parent">The session its lineage links it to (see <see cref="ParentOf"/>), under which the app may nest it.</param>
+    /// <param name="Detached">The user moved it to top level (<c>lineageDetached</c>).</param>
+    /// <param name="Written">When its record was last written.</param>
+    /// <param name="Former">The session its lineage links it to even once moved to top level: the family it left.</param>
     internal sealed record Record(string SessionId, string? Title, bool Pinned, string? Cli, IReadOnlyList<string> Prior,
-        long LastActivityAt, bool Branch = false, bool Renamed = false, string? Parent = null);
+        long LastActivityAt, bool Branch = false, bool Renamed = false, string? Parent = null, bool Detached = false,
+        DateTimeOffset? Written = null, string? Former = null);
     internal sealed record Group(string Id, string Name, bool Collapsed = false);
     /// <param name="Groups">In sidebar order.</param>
     /// <param name="Nested">The sessions the app nests under another, each with the session at the top of its family, whose
@@ -827,9 +848,10 @@ internal static class ClaudeSessionSync
     }
 
     /// <summary>An account's sidebar as read now: its records (pins from the pin list), its groups (null when unknown),
-    /// whether its pins count, and the widget's copies there with the title written to each.</summary>
+    /// whether its pins count, and the widget's copies there with the title written to each; its nested sessions when its
+    /// groups do not say (see <see cref="Layout.Nested"/>).</summary>
     internal sealed record State(IReadOnlyList<Record> Records, Layout? Layout, bool PinsCount,
-        IReadOnlyDictionary<string, string?> CopyTitles);
+        IReadOnlyDictionary<string, string?> CopyTitles, IReadOnlyDictionary<string, string>? Nests = null);
 
     internal static bool IsAccountKey(string? key) =>
         key?.Split('/') is [var account, var org] && Guid.TryParse(account, out _) && Guid.TryParse(org, out _);
@@ -1103,7 +1125,7 @@ internal static class ClaudeSessionSync
         // What the plan in progress has not reached yet, or what its moves did on the way, is nobody's choice.
         var since = thisStay ? DateTimeOffset.MaxValue : me?.LeftAt ?? DateTimeOffset.MinValue;
         var observed = copiesKnown
-            ? Observe(new(currentRecords, currentLayout, pinsCount, currentCopyTitles!), checkpoint, since,
+            ? Observe(new(currentRecords, currentLayout, pinsCount, currentCopyTitles!, nests), checkpoint, since,
                 kept.Pendings.GetValueOrDefault(current), kept.Evidences.GetValueOrDefault(current))
             : null;
         var mine = Merge(kept.Changed.GetValueOrDefault(current), observed?.Changes ?? NoChanges());
@@ -1457,7 +1479,7 @@ internal static class ClaudeSessionSync
             var (matches, claimed) = Match(newest, view);
             var nested = Nests(other.Records, other.Archived);
             var observed = copiesKnown && other.CopyTitles is { } copyTitles
-                ? Observe(new(other.Records, other.Layout is { } layout ? layout with { Nested = nested } : null, pinsCount, copyTitles),
+                ? Observe(new(other.Records, other.Layout is { } layout ? layout with { Nested = nested } : null, pinsCount, copyTitles, nested),
                     kept.Checkpoints.GetValueOrDefault(other.Account), other.LeftAt ?? DateTimeOffset.MinValue,
                     kept.Pendings.GetValueOrDefault(other.Account), kept.Evidences.GetValueOrDefault(other.Account))
                 : null;
@@ -1506,9 +1528,15 @@ internal static class ClaudeSessionSync
     /// <summary>A session's group by the name it stands for (see <see cref="Standing"/>); a nested session's is the group of
     /// the session at the top of its family, as the app shows it.</summary>
     private static (bool Known, string? Name) GroupNameOf(Layout layout, string sessionId,
+        IReadOnlyDictionary<string, ClaudeSessionLayout.Moved>? renamed) =>
+        FiledUnder(layout, layout.Nested?.GetValueOrDefault(sessionId) ?? sessionId, renamed);
+
+    /// <summary>The group a session is filed under itself, by the name it stands for: a nested session's own assignment,
+    /// which shows once it is out of its family.</summary>
+    private static (bool Known, string? Name) FiledUnder(Layout layout, string sessionId,
         IReadOnlyDictionary<string, ClaudeSessionLayout.Moved>? renamed)
     {
-        if (!layout.Assignments.TryGetValue(layout.Nested?.GetValueOrDefault(sessionId) ?? sessionId, out var id)) return (true, null);
+        if (!layout.Assignments.TryGetValue(sessionId, out var id)) return (true, null);
         if (layout.Groups.FirstOrDefault(group => group.Id == id) is not { } group) return (false, null);
         return (true, Standing(group, renamed) ?? group.Name);
     }
@@ -1550,6 +1578,15 @@ internal static class ClaudeSessionSync
             OwnTitle(record, copyTitles) ? shown.Title : null);
     }
 
+    /// <summary>What the app gave a session that has left its family since <paramref name="checkpoint"/> — moved to top
+    /// level, or its family archived — as the checkpoint foresaw it (see <see cref="ClaudeSessionLayout.Checkpoint"/>);
+    /// <see cref="Observe"/> adds what its family shows now. A checkpoint an earlier widget took foresaw nothing: a
+    /// session moved to top level since then (its record written after it) may show a pin and any group the app gave it.
+    /// Null for one that has not left a family.</summary>
+    private static ClaudeSessionLayout.Shown? Left(Record record, ClaudeSessionLayout.Checkpoint checkpoint) =>
+        checkpoint.Nested is { } nested ? nested.GetValueOrDefault(record.SessionId)
+        : record.Detached && record.Written > checkpoint.At ? new(Pinned: true) : null;
+
     /// <summary>What an account shows against its checkpoint, and the plan in progress there.</summary>
     /// <param name="Changes">What it changed, dated as asked, and what the plan reached, dated to the change it came from.</param>
     /// <param name="Groups">Its group list where it changed (as asked or as the plan reached it); null otherwise.</param>
@@ -1569,7 +1606,8 @@ internal static class ClaudeSessionSync
     /// wrote there since the checkpoint. A value the plan in progress set out to give is no change of its own: reached,
     /// it counts as the change it came from; not reached yet, or a pin its move undid on the way, it stays in progress;
     /// anything else is a change. A nested session's group is its family's (see <see cref="Nests"/>), never a change of its
-    /// own. The group list is the groups not aside: mid-move (groups aside, and the plan in progress has not made every
+    /// own, nor is what the app gave one that has left its family since (see <see cref="Left"/>). The group list is the
+    /// groups not aside: mid-move (groups aside, and the plan in progress has not made every
     /// group of its list yet, or no plan is known) it is no change; one the plan reached counts as the change it came from;
     /// with groups renamed (same id, new name) the change carries the renaming.
     /// </summary>
@@ -1583,19 +1621,33 @@ internal static class ClaudeSessionSync
         // this stay's own (dated the latest while a plan is made) as of now.
         ClaudeSessionLayout.Stamp<T>? Reached<T>(ClaudeSessionLayout.Stamp<T> want) =>
             want.At == DateTimeOffset.MinValue ? null : want.At == DateTimeOffset.MaxValue ? want with { At = at, By = null } : want;
+        var nests = state.Layout?.Nested ?? state.Nests;
+        var live = state.Records.ToDictionary(record => record.SessionId, StringComparer.Ordinal);
+        // The family a session left, by its top as it shows now; null when that is gone or archived.
+        ClaudeSessionLayout.Shown? FamilyOf(Record record) =>
+            record.Former is { } former && live.ContainsKey(former) && live.GetValueOrDefault(nests!.GetValueOrDefault(former) ?? former) is { } top
+                ? ShownOf(top, state.Layout, state.PinsCount, state.CopyTitles, renamed) : null;
         foreach (var record in state.Records)
         {
-            var nested = state.Layout?.Nested?.ContainsKey(record.SessionId) == true;
+            var nested = nests?.ContainsKey(record.SessionId) == true;
             var shown = ShownOf(record, state.Layout, state.PinsCount, state.CopyTitles, renamed);
             var before = checkpoint?.Sessions.GetValueOrDefault(record.SessionId);
             ClaudeSessionLayout.Shown changed;
             if (before is not null)
             {
-                var group = shown.HasGroup && before.HasGroup && shown.Group != before.Group;
+                // What the app gave a session that has left its family since was chosen nowhere (see Left): a pin where its
+                // family showed pinned then or shows it now, its own group, and none where its family moved since (the app
+                // drops the own assignment of a session its family takes along) or the family is not known.
+                var left = nests is null || nested ? null : Left(record, checkpoint!);
+                var family = left is null ? null : FamilyOf(record);
+                var appPin = left?.Pinned == true || family?.Pinned == true;
+                var group = shown.HasGroup && before.HasGroup && shown.Group != before.Group
+                    && !(left is not null && (!left.HasGroup || shown.Group == left.Group
+                        || shown.Group is null && (family is not { HasGroup: true } || family.Group != before.Group)));
                 // A copy's title the widget wrote since the checkpoint (following the original) was chosen nowhere here.
                 var widget = state.CopyTitles.GetValueOrDefault(record.SessionId) is { } written && written != before.Written
                     && shown.Title == written;
-                changed = new(shown.Pinned is { } pinned && before.Pinned is { } was && pinned != was ? pinned : null,
+                changed = new(shown.Pinned is { } pinned && before.Pinned is { } was && pinned != was && !(pinned && appPin) ? pinned : null,
                     group, group ? shown.Group : null,
                     shown.Title is { } title && title != before.Title && !widget ? title : null);
             }
@@ -1788,7 +1840,17 @@ internal static class ClaudeSessionSync
                 .ToArray();
         }
         else if (observed.GroupsMoving) listed = previous?.Groups;
-        layout.Checkpoints[account] = new(now, stay, listed, sessions);
+        // What each nested session would show once out of its family, so the next look tells what the app gave it then
+        // from what the user chose.
+        var leaving = new Dictionary<string, ClaudeSessionLayout.Shown>(StringComparer.Ordinal);
+        foreach (var (id, top) in groups.Nested!)
+            if (sessions.TryGetValue(id, out var nestedNow))
+            {
+                var own = FiledUnder(groups, id, pending?.Renamed);
+                leaving[id] = new(nestedNow.Pinned is { } self && sessions.GetValueOrDefault(top)?.Pinned is { } family ? self || family : null,
+                    own.Known, own.Name);
+            }
+        layout.Checkpoints[account] = new(now, stay, listed, sessions, leaving);
         // A plan of this stay stays in progress with what it has not reached; of one of an earlier stay only the groups it
         // renamed out of the way, and its list, stay known while groups stand aside. What it did not reach is set out again
         // from the changes.
@@ -2208,10 +2270,12 @@ internal static class ClaudeSessionSync
         foreach (var path in Directory.EnumerateFiles(directory, "local_*.json"))
         {
             JsonObject? record;
+            DateTime written;
             try
             {
                 using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
                 if (stream.Length is <= 0 or > MaxRecordBytes) { whole = false; continue; }
+                written = File.GetLastWriteTimeUtc(stream.SafeFileHandle);
                 record = JsonNode.Parse(stream) as JsonObject;
             }
             catch (Exception exception) when (exception is FileNotFoundException) { continue; }
@@ -2228,7 +2292,9 @@ internal static class ClaudeSessionSync
                 Text(record, "cliSessionId")?.ToLowerInvariant(), prior,
                 record["lastActivityAt"] is JsonValue at && at.TryGetValue<long>(out var activity) ? activity : 0,
                 Branch: !string.IsNullOrEmpty(Text(record, "forkedFromSessionId")) || record["spawnedFrom"] is JsonObject,
-                Renamed: record["previousTitles"] is JsonArray { Count: > 0 }, Parent: ParentOf(record, sessionId)));
+                Renamed: record["previousTitles"] is JsonArray { Count: > 0 }, Parent: ParentOf(record, sessionId),
+                Detached: Flag(record, "lineageDetached"), Written: new DateTimeOffset(written, TimeSpan.Zero),
+                Former: ParentOf(record, sessionId, detachedToo: true)));
         }
         return records;
     }
@@ -2236,10 +2302,11 @@ internal static class ClaudeSessionSync
     /// <summary>The session a record's lineage links it to, as the app reads it (Claude 3.1623): none once the user moved
     /// it to top level (<c>lineageDetached</c>); else the session that started it, when Claude started it as a side
     /// session and it was not forked from another; else the session it was forked from; else the session that started it
-    /// (from a suggestion, say). A link to itself is none. The widget's copies carry no link.</summary>
-    private static string? ParentOf(JsonObject record, string sessionId)
+    /// (from a suggestion, say). A link to itself is none. The widget's copies carry no link. With
+    /// <paramref name="detachedToo"/>, the link it had before the user moved it to top level.</summary>
+    private static string? ParentOf(JsonObject record, string sessionId, bool detachedToo = false)
     {
-        if (Flag(record, "lineageDetached")) return null;
+        if (!detachedToo && Flag(record, "lineageDetached")) return null;
         var spawned = record["spawnedFrom"] as JsonObject;
         var starter = spawned is null ? null : Text(spawned, "sessionId");
         if (string.IsNullOrEmpty(starter) || starter == sessionId) starter = null;

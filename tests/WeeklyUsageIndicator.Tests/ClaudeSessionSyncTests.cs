@@ -61,6 +61,9 @@ internal static class ClaudeSessionSyncTests
         TestNestedLinks();
         TestNestedPlan();
         TestNestedOnDisk();
+        TestLeftFamilyOnDisk();
+        TestLeftFamilyBeforeUpgrade();
+        TestLeftFamilyChanged();
         return Task.CompletedTask;
     }
 
@@ -808,7 +811,7 @@ internal static class ClaudeSessionSyncTests
             {
                 ["local_a"] = new(true, true, "도구", "제목"), ["local_b"] = new(false, true, null, null, "쓴 제목"),
                 ["local_c"] = new(null, false, null, "이름만")
-            });
+            }, new Dictionary<string, Shown> { ["local_b"] = new(true, true, null), ["local_c"] = new(false, true, "티어 2") });
             layout.Checkpoints[ReferenceKey] = new(At(5), 0, null, new Dictionary<string, Shown>());
             layout.Changed[CurrentKey] = new(StringComparer.Ordinal)
             {
@@ -836,6 +839,9 @@ internal static class ClaudeSessionSyncTests
                   && point.Sessions["local_b"] == new Shown(false, true, null, null, "쓴 제목") && point.Sessions["local_c"] == new Shown(null, false, null, "이름만")
                   && loaded.Checkpoints[ReferenceKey] is { Groups: null, Sessions.Count: 0 } empty && empty.At == At(5),
                 "a checkpoint keeps its time, stay, groups by id and name in order (or none known), and each session's pin, group, title and written title");
+            Check(point.Nested is { Count: 2 } nested && nested["local_b"] == new Shown(true, true, null) && nested["local_c"] == new Shown(false, true, "티어 2")
+                  && loaded.Checkpoints[ReferenceKey].Nested is null,
+                "it keeps what each session nested then would show once out of its family; one an earlier widget took knows none");
             Check(loaded.Changed[CurrentKey]["local_a"] == new Changes(new(true, At(1)), new("도구", At(2), ReferenceKey), new("제목", At(3)))
                   && loaded.Changed[CurrentKey]["local_b"] == new Changes(Group: new(null, At(4))) && !loaded.Changed.ContainsKey(ReferenceKey)
                   && loaded.GroupsChanged[CurrentKey] is { Order: ["티어 2", "도구"], By: var listBy } groups && groups.At == At(6)
@@ -2241,6 +2247,154 @@ internal static class ClaudeSessionSyncTests
         var apart = widget.Plan(At(55));
         Check(apart.Moves!.Single() is { Group: "도구" } back && back.Sessions.SequenceEqual(["local_p3"]),
             "in 계정3 the copy keeps the filing 계정2 gave it by itself, and 부모 follows 계정1");
+    }
+
+    /// <summary>11/6: in 계정1 the side sessions of 부모 (pinned, in 보관함) and of 프로젝트 (in 도구) are nested under them,
+    /// their own assignments dropped when their families moved; 계정2 and 계정3 hold copies filed as their families show.
+    /// <paramref name="extra"/> names more side sessions of 프로젝트.</summary>
+    private static (SessionWorld World, Widget Widget) SideSessions(string name, params (string Name, string Title)[] extra)
+    {
+        (string Name, string Title)[] conversations = [("p", "부모"), ("c", "곁가지1"), ("d", "곁가지2"), ("q", "프로젝트"), ("e", "프롬프트"), .. extra];
+        var (world, widget) = Accounts3(name, conversations);
+        for (var index = 0; index < conversations.Length; index++)
+            if (conversations[index].Name is not ("p" or "q") and var side)
+                world.Record(K1, "local_" + side + "1", conversations[index].Title, Cli(index + 1),
+                    extra: record => record["spawnedFrom"] = SideOf(side switch { "c" => "local_p1", "d" => "local_c1", _ => "local_q1" }));
+        foreach (var (account, suffix) in new[] { (K1, "1"), (K2, "2"), (K3, "3") })
+        {
+            var shelf = world.Group(account, "보관함");
+            var tools = world.Group(account, "도구");
+            world.Put(account, "local_p" + suffix, shelf);
+            world.Put(account, "local_q" + suffix, tools);
+            world.Pin("local_p" + suffix);
+            if (account == K1) continue;
+            foreach (var (side, _) in conversations.Where(conversation => conversation.Name is not ("p" or "q")))
+                world.Put(account, "local_" + side + suffix, side is "c" or "d" ? shelf : tools);
+        }
+        return (world, widget);
+    }
+
+    private static JsonObject SideOf(string by) => new() { ["sessionId"] = by, ["taskId"] = "task_1", ["title"] = "일", ["sideSession"] = true };
+
+    /// <summary>The user moves a side session in 계정1 to top level, as the app records it.</summary>
+    private static void Detach(SessionWorld world, string id)
+    {
+        var record = world.Load(K1, id);
+        record["lineageDetached"] = true;
+        File.WriteAllText(world.RecordPath(K1, id), record.ToJsonString());
+    }
+
+    /// <summary>11/6: the user moved side sessions to top level in 계정1. The app pinned those whose family showed pinned and
+    /// showed the others' own (dropped) assignment, which no one chose: the plan there takes them back to what the other
+    /// accounts show, and nothing goes elsewhere. What the user did after moving one is the user's, and goes.</summary>
+    private static void TestLeftFamilyOnDisk()
+    {
+        var (world, widget) = SideSessions("left-family", ("g", "곁가지3"));
+        using var _ = world;
+        widget.Start(K2, At(-60)); widget.Switch(K3, At(-50)); widget.Switch(K1, At(-40));
+        Check(widget.Plan(At(-35)) is { Moves.Count: 0, Pins.Count: 0 }
+              && widget.Layout.Checkpoints[K1].Nested is { } foreseen
+              && foreseen.Keys.Order(StringComparer.Ordinal).SequenceEqual(["local_c1", "local_d1", "local_e1", "local_g1"])
+              && foreseen["local_c1"] == new Shown(true, true, null) && foreseen["local_d1"] == new Shown(true, true, null)
+              && foreseen["local_e1"] == new Shown(false, true, null),
+            "the checkpoint foresees what each nested session would show out of its family: pinned under the pinned 부모, its own group");
+        foreach (var side in new[] { "local_c1", "local_d1", "local_e1", "local_g1" }) Detach(world, side);
+        world.Pin("local_c1"); world.Pin("local_d1");
+        // Then the user files 곁가지3 under 보관함 and pins it.
+        world.Put(K1, "local_g1", world.GroupId(K1, "보관함"));
+        world.Pin("local_g1");
+        var plan = widget.Plan(At(0));
+        Check(plan.Moves!.Count == 2 && plan.Moves[0] is { Group: "보관함" } toShelf
+              && toShelf.Sessions.Order(StringComparer.Ordinal).SequenceEqual(["local_c1", "local_d1"])
+              && plan.Moves[1] is { Group: "도구" } toTools && toTools.Sessions.SequenceEqual(["local_e1"]) && plan.Pins!.Count == 0
+              && widget.Layout.Changed[K1]["local_g1"] is { Pinned.Value: true, Group.Value: "보관함" }
+              && widget.Layout.Changed[K1].GetValueOrDefault("local_c1")?.Pinned?.Value != true,
+            "in 계정1 the plan takes the pins and the dropped group the app gave back to what the others show, and keeps what the user did");
+        world.Apply(K1, plan);
+        Check(widget.Plan(At(1)) is { Moves.Count: 0, Pins.Count: 0 }, "applied, nothing is left in 계정1");
+        widget.Switch(K2, At(10));
+        var there = widget.Plan(At(15));
+        Check(there.Moves!.Single() is { Group: "보관함" } filed && filed.Sessions.SequenceEqual(["local_g2"])
+              && there.Pins!.Single() is { Session: "local_g2", Pinned: true },
+            "in 계정2 only what the user did goes: 곁가지3 filed under 보관함 and pinned, no pin from the app's");
+        world.Apply(K2, there);
+        widget.Plan(At(16));
+        Check(world.Shows(K2) == world.Shows(K1), "and 계정2 shows what 계정1 shows");
+    }
+
+    /// <summary>The same with the checkpoint an earlier widget took, which foresaw nothing: a side session moved to top level
+    /// since (its record written after it) shows what the app gave it; one moved there before keeps what the user does.</summary>
+    private static void TestLeftFamilyBeforeUpgrade()
+    {
+        var (world, widget) = SideSessions("left-family-upgrade", ("f", "옛 곁가지"));
+        using var _ = world;
+        // 옛 곁가지 was moved to top level long before and filed by itself.
+        Detach(world, "local_f1");
+        File.SetLastWriteTimeUtc(world.RecordPath(K1, "local_f1"), At(-100).UtcDateTime);
+        world.Put(K1, "local_f1", world.GroupId(K1, "도구"));
+        widget.Start(K2, At(-60)); widget.Switch(K3, At(-50)); widget.Switch(K1, At(-40));
+        Check(widget.Plan(At(-35)) is { Moves.Count: 0, Pins.Count: 0 }, "nothing to do before");
+        widget.Layout.Checkpoints[K1] = widget.Layout.Checkpoints[K1] with { Nested = null };
+        foreach (var side in new[] { "local_c1", "local_d1", "local_e1" }) Detach(world, side);
+        world.Pin("local_c1"); world.Pin("local_d1");
+        world.Put(K1, "local_f1", world.GroupId(K1, "보관함"));
+        var plan = widget.Plan(At(0));
+        Check(plan.Moves!.Count == 2 && plan.Moves[0] is { Group: "보관함" } toShelf
+              && toShelf.Sessions.Order(StringComparer.Ordinal).SequenceEqual(["local_c1", "local_d1"])
+              && plan.Moves[1] is { Group: "도구" } toTools && toTools.Sessions.SequenceEqual(["local_e1"]) && plan.Pins!.Count == 0
+              && widget.Layout.Changed[K1]["local_f1"].Group?.Value == "보관함" && widget.Layout.Checkpoints[K1].Nested is { Count: 0 },
+            "in 계정1 what the app gave goes back, the move of 옛 곁가지 is the user's, and the new checkpoint foresees again");
+        world.Apply(K1, plan);
+        widget.Switch(K2, At(10));
+        var there = widget.Plan(At(15));
+        Check(there.Moves!.Single() is { Group: "보관함" } filed && filed.Sessions.SequenceEqual(["local_f2"]) && there.Pins!.Count == 0,
+            "in 계정2 only 옛 곁가지's move goes");
+        world.Apply(K2, there);
+        widget.Plan(At(16));
+        Check(world.Shows(K2) == world.Shows(K1), "and 계정2 shows what 계정1 shows");
+    }
+
+    /// <summary>What the family did since the checkpoint counts too. 프로젝트 was moved, which drops 프롬프트's own filing,
+    /// and pinned; then 프롬프트 was moved out and the app pinned it: its pin and no group are no one's. 곁가지1, filed by
+    /// itself where its family never went, the user took out of every group after moving it out: that is the user's.</summary>
+    private static void TestLeftFamilyChanged()
+    {
+        var (world, widget) = SideSessions("left-family-changed");
+        using var _ = world;
+        world.Put(K1, "local_c1", world.GroupId(K1, "도구"));
+        world.Put(K1, "local_e1", world.GroupId(K1, "보관함"));
+        widget.Start(K2, At(-60)); widget.Switch(K3, At(-50)); widget.Switch(K1, At(-40));
+        Check(widget.Plan(At(-35)) is { Moves.Count: 0, Pins.Count: 0 } && widget.Layout.Checkpoints[K1].Nested is { } foreseen
+              && foreseen["local_c1"] == new Shown(true, true, "도구") && foreseen["local_e1"] == new Shown(false, true, "보관함"),
+            "the checkpoint foresees the filings of their own the family hides");
+        world.Put(K1, "local_q1", world.GroupId(K1, "보관함"));
+        world.Put(K1, "local_e1", null);
+        world.Pin("local_q1");
+        Detach(world, "local_e1");
+        world.Pin("local_e1");
+        Detach(world, "local_c1");
+        world.Pin("local_c1");
+        world.Put(K1, "local_c1", null);
+        var plan = widget.Plan(At(0));
+        var mine = widget.Layout.Changed[K1];
+        Check(mine["local_c1"] is { Group: { Value: null } } c && c.Pinned?.Value != true
+              && mine.GetValueOrDefault("local_e1") is var e && e?.Pinned?.Value != true && e?.Group is null
+              && mine["local_q1"] is { Pinned.Value: true, Group.Value: "보관함" },
+            "the pins and the dropped filing the app gave are no one's; taking 곁가지1 out of its group is the user's");
+        Check(plan.Moves!.Single() is { Group: "도구" } back && back.Sessions.SequenceEqual(["local_e1"])
+              && plan.Pins!.Single() is { Session: "local_c1", Pinned: false },
+            "in 계정1 the app's pins go and 프롬프트 goes where the others show it");
+        world.Apply(K1, plan);
+        Check(widget.Plan(At(1)) is { Moves.Count: 0, Pins.Count: 0 }, "applied, nothing is left in 계정1");
+        widget.Switch(K2, At(10));
+        var there = widget.Plan(At(15));
+        Check(there.Moves!.Count == 2 && there.Moves.Single(move => move.Group == "보관함").Sessions.SequenceEqual(["local_q2"])
+              && there.Moves.Single(move => move.Group is null).Sessions.Order(StringComparer.Ordinal).SequenceEqual(["local_c2", "local_d2"])
+              && there.Pins!.Single() is { Session: "local_q2", Pinned: true },
+            "in 계정2 what the user did goes, 곁가지2 with its family, and no pin of the app's");
+        world.Apply(K2, there);
+        widget.Plan(At(16));
+        Check(world.Shows(K2) == world.Shows(K1), "and 계정2 shows what 계정1 shows");
     }
 
     /// <summary>Three accounts the widget maps, each listing the given conversations: 계정1 holds the records the app wrote,
