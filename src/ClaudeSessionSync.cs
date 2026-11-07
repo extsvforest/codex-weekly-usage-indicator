@@ -755,10 +755,11 @@ internal static class ClaudeSessionSync
     internal sealed record Rename(string Session, string Title, string? From, string? By = null);
     /// <summary>A group renamed out of the way before its name is made anew, or before it is deleted.</summary>
     internal sealed record GroupRename(string Id, string From, string To);
-    /// <summary>A group to delete once the moves have emptied it, by the name it then has. <c>Remade</c>: its name is
-    /// made anew elsewhere and every session filed under it moves there, archived ones included, so it goes only once
-    /// nothing is left in it. Otherwise it is a group the list lacks, and <c>Hidden</c> counts the sessions filed under it
-    /// that no list here shows (archived, say): they leave the group, nothing else.</summary>
+    /// <summary>A group to delete once the moves have emptied it of every session a list here shows, by the name it then
+    /// has: it goes once no more than <c>Hidden</c> sessions are left in it. <c>Remade</c>: its name is made anew
+    /// elsewhere, where those sessions go; otherwise it is a group the list lacks. <c>Hidden</c> counts the sessions filed
+    /// under it that no list here shows (archived, say): the app moves no archived session, so they leave the group,
+    /// nothing else.</summary>
     internal sealed record GroupDelete(string Id, string Name, int Hidden = 0, bool Remade = false);
     /// <summary>An older state to archive once <c>Ready</c>: first its newest state must hold the pin and group it keeps
     /// (the plan's moves and pins). A pinned one is unpinned just before archiving, since the app does not archive pinned
@@ -1286,29 +1287,26 @@ internal static class ClaudeSessionSync
                     Place(record.SessionId, head.Group.Name);
                 else Place(record.SessionId, null);
             }
-            // A group out of place steps aside before its name is made anew, and every session filed under it follows to the
-            // group of that name, archived ones too, so remaking a group loses no filing; it goes once nothing is left in
-            // it. A group the list lacks is renamed out of the way too, so one left over shows its mark, and goes once the
-            // moves empty it of every session a list here shows: archived ones filed under it leave the group.
+            // A group out of place steps aside before its name is made anew, and every session filed under it that a list
+            // here shows follows to the group of that name. A group the list lacks is renamed out of the way too, so one
+            // left over shows its mark. Either goes once the moves empty it of every session a list here shows. Archived
+            // sessions filed under it leave the group: the app moves no archived session (Claude 4.23118 refuses the whole
+            // move with "archived sessions aren't shown in the sidebar's groups or pins"), so they are counted, not moved.
             var taken = here.Select(group => group.Name).Concat(order).ToHashSet(StringComparer.Ordinal);
-            var archivedIds = (archived ?? []).Select(record => record.SessionId).ToHashSet(StringComparer.Ordinal);
             foreach (var group in here.Where(group => !keptIds.Contains(group.Id)))
             {
                 // A nested session's own assignment counts for nothing: it leaves with its family.
                 var members = currentLayout!.Assignments.Where(pair => pair.Value == group.Id && !nests.ContainsKey(pair.Key))
                     .Select(pair => pair.Key).ToArray();
-                // Where its sessions go: its own name, or where its renaming leads, when the list has that.
-                var heir = Settle(Stands(group));
-                var remade = heir is not null;
-                var shelved = members.Where(member => !byId.ContainsKey(member) && archivedIds.Contains(member)).ToArray();
-                if (heir is not null) foreach (var member in shelved) Place(member, heir);
-                var emptied = members.Where(member => byId.ContainsKey(member) || remade && shelved.Contains(member)).All(moved.Contains);
+                // Made anew: its own name, or where its renaming leads, is on the list.
+                var remade = Settle(Stands(group)) is not null;
+                var emptied = members.Where(byId.ContainsKey).All(moved.Contains);
                 var marked = Aside(group);
                 if (!emptied && !create.Contains(group.Name)) continue;
                 var mark = marked ? group.Name : MovingName(group.Name, taken);
                 if (mark != group.Name) renameGroups.Add(new(group.Id, group.Name, mark));
                 if (emptied)
-                    deleteGroups.Add(new(group.Id, mark, remade ? 0 : members.Count(member => !byId.ContainsKey(member)), remade));
+                    deleteGroups.Add(new(group.Id, mark, members.Count(member => !byId.ContainsKey(member)), remade));
             }
             moves.AddRange(into.OrderBy(pair => order.IndexOf(pair.Key))
                 .Select(pair => new Move(pair.Key, pair.Value, keep.TryGetValue(pair.Key, out var stays) ? stays.Id : null)));

@@ -65,6 +65,7 @@ internal static class ClaudeSessionSyncTests
         TestLeftFamilyBeforeUpgrade();
         TestLeftFamilyChanged();
         TestLeftFamilyUnclear();
+        TestArchivedInRemadeGroup();
         return Task.CompletedTask;
     }
 
@@ -683,9 +684,9 @@ internal static class ClaudeSessionSyncTests
         var chain = Compute(chainHere, chainLayout, [Other(ReferenceKey, "계정1", [], null, At(10)), Other(ThirdKey, "계정3", [], null, At(20))],
             chainKept, archived: shelved);
         Check(chain.GroupOrder!.SequenceEqual(["I"]) && chain.GroupOrderBy == "계정3" && chain.CreateGroups!.SequenceEqual(["I"])
-              && chain.Moves!.Single() is { Group: "I" } toI && toI.Sessions.Order(StringComparer.Ordinal).SequenceEqual(["local_x", "local_z"])
-              && chain.DeleteGroups!.Single() is { Id: "g", Remade: true, Hidden: 0 },
-            "a group renamed G → H in one account and H → I in another passes what was filed under G to I, archived sessions included");
+              && chain.Moves!.Single() is { Group: "I" } toI && toI.Sessions.SequenceEqual(["local_x"])
+              && chain.DeleteGroups!.Single() is { Id: "g", Remade: true, Hidden: 1 },
+            "a group renamed G → H in one account and H → I in another passes what was filed under G to I; its archived sessions leave the group");
         var dropped = new ClaudeSessionLayout();
         Steady(dropped, CurrentKey, "계정2", chainHere, chainLayout, At(0));
         dropped.GroupsChanged[ThirdKey] = ListChange(["I"], At(20));
@@ -693,16 +694,16 @@ internal static class ClaudeSessionSyncTests
         Check(gone.Moves!.Single() is { Group: null } outOf && outOf.Sessions.SequenceEqual(["local_x"])
               && gone.DeleteGroups!.Single() is { Id: "g", Name: "G (옮기는 중)", Remade: false, Hidden: 1 },
             "a group the newest list lacks goes: its sessions leave for no group, and the archived ones filed there are counted");
-        // Remaking a group for its order moves its archived sessions too.
+        // Remaking a group for its order leaves its archived sessions out: the app moves none.
         var reorder = Groups(["g=G", "h=H"], ("local_x", "g"), ("local_z", "g"));
         var reordered = new ClaudeSessionLayout();
         Steady(reordered, CurrentKey, "계정2", chainHere, reorder, At(0));
         reordered.GroupsChanged[ThirdKey] = ListChange(["H", "G"], At(20));
         var remade = Compute(chainHere, reorder, [Other(ThirdKey, "계정3", [], null, At(20))], reordered, archived: shelved);
         Check(remade.CreateGroups!.SequenceEqual(["G"]) && remade.Moves!.Single() is { Group: "G", GroupId: null } toG
-              && toG.Sessions.Order(StringComparer.Ordinal).SequenceEqual(["local_x", "local_z"])
-              && remade.DeleteGroups!.Single() is { Id: "g", Remade: true, Hidden: 0 },
-            "a group made anew for its order takes every session filed under it, archived ones included");
+              && toG.Sessions.SequenceEqual(["local_x"])
+              && remade.DeleteGroups!.Single() is { Id: "g", Remade: true, Hidden: 1 },
+            "a group made anew for its order takes every session a list shows; the archived ones filed under it are counted");
         // A group this stay filed a session under stays on the list, though the newest list lacks it.
         var filedLayout = Groups(["g=G", "z=Z"], ("local_x", "z"));
         var filedNow = new ClaudeSessionLayout();
@@ -1626,6 +1627,32 @@ internal static class ClaudeSessionSyncTests
             "in a later stay the sorting carries on: P goes to the new B and the old one goes");
         world.Apply(K3, resumed);
         Check(world.Shows(K3) == world.Shows(K1), "and 계정3 shows what 계정1 shows");
+    }
+
+    /// <summary>11/7: Claude 4.23118 moves no archived session. 계정1 put A after B; in 계정3 A is made anew at the end, and
+    /// what the lists show moves there. The archived session filed under the old A stays out of the moves and leaves the
+    /// group as it goes, so nothing is left aside.</summary>
+    private static void TestArchivedInRemadeGroup()
+    {
+        var (world, widget) = Accounts3("archived-remade", ("p", "P"), ("q", "Q"));
+        using var _ = world;
+        foreach (var account in new[] { K1, K3 }) { world.Group(account, "A"); world.Group(account, "B"); }
+        world.Put(K1, "local_p1", world.GroupId(K1, "A"));
+        world.Put(K3, "local_p3", world.GroupId(K3, "A"));
+        world.Put(K3, "local_q3", world.GroupId(K3, "A"));
+        foreach (var (account, suffix) in new[] { (K1, "1"), (K2, "2"), (K3, "3") }) world.Archive(account, "local_q" + suffix);
+        widget.Start(K2, At(-60)); widget.Switch(K3, At(-50)); widget.Switch(K1, At(-40));
+        world.Reorder(K1, "B", "A");
+        widget.Switch(K3, At(0));
+        var plan = widget.Plan(At(5));
+        var oldA = world.GroupId(K3, "A");
+        Check(plan.CreateGroups!.SequenceEqual(["A"]) && plan.Moves!.Single() is { Group: "A" } move && move.Sessions.SequenceEqual(["local_p3"])
+              && plan.DeleteGroups!.Single() is { Remade: true, Hidden: 1 } gone && gone.Id == oldA,
+            "A is made anew after B; P moves, the archived Q is counted, not moved");
+        world.Apply(K3, plan);
+        Check(world.Shows(K3) == world.Shows(K1) && world.Of(K3).Groups.All(group => group.Id != oldA)
+              && widget.Plan(At(6)) is { Moves.Count: 0, DeleteGroups.Count: 0, RenameGroups.Count: 0 },
+            "applied, the old A is gone with nothing left aside, and nothing is left to do");
     }
 
     /// <summary>The user's expectation of 10/20 on disk: 계정3, used last, put its groups in a new order and moved a session;
@@ -2757,6 +2784,11 @@ internal static class ClaudeSessionSyncTests
                 if (move.Sessions.FirstOrDefault(session => nests.TryGetValue(session, out var top) && !move.Sessions.Contains(top)) is { } nested)
                     throw new InvalidOperationException("Session " + nested + " is nested under " + nests[nested]
                         + ", and nested sessions move with their parent. Nothing was moved.");
+                // Claude 4.23118 refuses the whole move when one session in it is archived.
+                if (move.Sessions.FirstOrDefault(session => File.Exists(RecordPath(account, session))
+                        && Load(account, session)["isArchived"] is JsonValue flag && flag.TryGetValue<bool>(out var shelved) && shelved) is { } archived)
+                    throw new InvalidOperationException("Session " + archived
+                        + " is archived: archived sessions aren't shown in the sidebar's groups or pins. Nothing was moved.");
                 var group = move.Group is null ? null : move.GroupId ?? GroupId(account, move.Group);
                 foreach (var session in move.Sessions)
                     if (nests.TryGetValue(session, out var top))
