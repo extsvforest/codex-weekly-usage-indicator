@@ -701,8 +701,9 @@ internal static class ClaudeSidebarPins
 /// (<c>customGroupsByScope</c> and <c>codeSidebarByScope</c>, keyed by account/organization), and the changes from the
 /// widget. A conversation is matched by its current transcript id, or as a continuation of the other side's.
 /// <para>A conversation continued in another account can come back as a second record beside its older state. The plan
-/// lists such older states for archiving (reversible); their changes count for the newest state. Nothing is deleted but
-/// groups left empty; sessions only one side has are otherwise left alone.</para>
+/// lists such older states for archiving (reversible); their changes count for the newest state. A conversation another
+/// account archived after anyone last talked in it is listed for archiving here too. Nothing is deleted but groups left
+/// empty; sessions only one side has are otherwise left alone.</para>
 /// <para>A session the app nests under another (a side session under the session that started it, say) shows the group
 /// of the session at the top of its family and moves only with it (see <see cref="Nests"/>). Its group is therefore that
 /// session's: never a change of its own and never moved by itself. The widget's copies carry no such link, so elsewhere
@@ -761,11 +762,16 @@ internal static class ClaudeSessionSync
     /// under it that no list here shows (archived, say): the app moves no archived session, so they leave the group,
     /// nothing else.</summary>
     internal sealed record GroupDelete(string Id, string Name, int Hidden = 0, bool Remade = false);
-    /// <summary>An older state to archive once <c>Ready</c>: first its newest state must hold the pin and group it keeps
-    /// (the plan's moves and pins). A pinned one is unpinned just before archiving, since the app does not archive pinned
-    /// sessions. <c>LastWritten</c> is its last entry, <c>MovedOn</c> when the conversation went on in a new transcript.</summary>
-    internal sealed record Retire(string Session, string? Title, bool Pinned, string Newest, string? NewestTitle, bool Ready,
-        DateTimeOffset LastWritten, DateTimeOffset MovedOn);
+    /// <summary>A session to archive once <c>Ready</c>, of two kinds. An older state names the newest state that stays
+    /// (<c>Newest</c>), which must first hold the pin and group it keeps (the plan's moves and pins); <c>LastWritten</c> is
+    /// its last entry, <c>MovedOn</c> when the conversation went on in a new transcript. A conversation another account
+    /// archived after anyone last talked in it (see <see cref="Gone"/>) names that account (<c>ArchivedIn</c>) and when
+    /// (<c>ArchivedAt</c>); <c>LastWritten</c> is its last activity, and its older states here go with it. A pinned one is
+    /// unpinned just before archiving, since the app does not archive pinned sessions.</summary>
+    internal sealed record Retire(string Session, string? Title, bool Pinned, string? Newest, string? NewestTitle, bool Ready,
+        DateTimeOffset LastWritten, DateTimeOffset? MovedOn, string? ArchivedIn = null, DateTimeOffset? ArchivedAt = null);
+    /// <summary>Where and when a conversation was last archived in another account, and its last activity anywhere.</summary>
+    internal sealed record Away(string Account, DateTimeOffset At, DateTimeOffset LastActive);
     internal sealed record GroupView(string Name, IReadOnlyList<string> Sessions, bool Collapsed = false);
     /// <summary>A session nested under another, by title: it shows that one's group and moves only with it.</summary>
     internal sealed record NestedView(string Title, string Under);
@@ -1068,8 +1074,9 @@ internal static class ClaudeSessionSync
     /// <summary>
     /// The changes, in the order they must run: rename the groups on their way out, make the groups the list needs in
     /// its order, move sessions (moving a pinned session into a group unpins it, so pins are planned after the moves),
-    /// set pins, rename sessions, delete the groups the moves emptied, and only then archive the older states that are
-    /// ready. Value by value a conversation here takes the newest change any account made to it — this account's own
+    /// set pins, rename sessions, delete the groups the moves emptied, and only then archive what is ready: older states,
+    /// and conversations another account archived after anyone last talked in them, which the plan otherwise leaves
+    /// alone. Value by value a conversation here takes the newest change any account made to it — this account's own
     /// included, and above all what it changed in this stay; a value nobody changed stays. The group list follows the
     /// newest change likewise and is final: the longest start of it already in order stays, the rest is made anew at the
     /// end, a group it lacks goes, and a session filed under a group the list lacks follows that group's renaming or
@@ -1135,6 +1142,12 @@ internal static class ClaudeSessionSync
             .ThenBy(other => other.Account, StringComparer.Ordinal)
             .Select((other, index) => Seen.Of(other, index + 1, kept, newest, lineage, pinsCount, copiesKnown))
             .ToArray();
+        // A conversation archived elsewhere after anyone last talked in it goes, with its older states here; the rest is
+        // planned. A list not read whole could hide where it is still live, so then none goes.
+        var gone = decidable ? Gone(newest, seen, lineage?.Self, currentRecords) : new Dictionary<string, Away>(StringComparer.Ordinal);
+        var staying = newest.Where(record => !gone.ContainsKey(record.SessionId)).ToArray();
+        var leaving = gone.Keys.Concat(retiring.Where(pair => gone.ContainsKey(pair.Value.Newest.SessionId)).Select(pair => pair.Key))
+            .ToHashSet(StringComparer.Ordinal);
         // Groups the plan in progress here renamed out of the way, by id, with the names they stand for.
         var renamedHere = kept.Pendings.GetValueOrDefault(current)?.Renamed ?? new Dictionary<string, ClaudeSessionLayout.Moved>();
         var renames = new List<Rename>();
@@ -1145,7 +1158,7 @@ internal static class ClaudeSessionSync
         // Groups this stay filed sessions under: the group list keeps them.
         var filedHere = new HashSet<string>(StringComparer.Ordinal);
         var onlyHere = new List<Record>();
-        foreach (var record in newest)
+        foreach (var record in staying)
         {
             var found = seen.Where(side => side.Matches.ContainsKey(record.SessionId)).ToArray();
             if (found.Length == 0) onlyHere.Add(record);
@@ -1191,6 +1204,8 @@ internal static class ClaudeSessionSync
         var moved = new HashSet<string>(StringComparer.Ordinal);
         var placed = new Dictionary<string, string?>(StringComparer.Ordinal);
         var filed = new HashSet<string>(StringComparer.Ordinal);
+        // Sessions the plan archives that leave a group it deletes.
+        var dropped = new HashSet<string>(StringComparer.Ordinal);
         var unresolved = false;
         if (groups)
         {
@@ -1269,7 +1284,7 @@ internal static class ClaudeSessionSync
                 moved.Add(session);
             }
             // A nested session moves with the session at the top of its family, never by itself: the app refuses that.
-            foreach (var record in newest.Where(record => !nests.ContainsKey(record.SessionId)))
+            foreach (var record in staying.Where(record => !nests.ContainsKey(record.SessionId)))
             {
                 var (pin, want, from) = targets[record.SessionId];
                 if (!want.Known || GroupNameOf(currentLayout!, record.SessionId, renamedHere) is not { Known: true }) { unresolved = true; continue; }
@@ -1278,7 +1293,8 @@ internal static class ClaudeSessionSync
                 targets[record.SessionId] = (pin, (true, goal), from);
             }
             // An older state follows its group when that is made anew or renamed, and its newest state when its group goes.
-            foreach (var record in currentRecords.Where(record => retiring.ContainsKey(record.SessionId) && !nests.ContainsKey(record.SessionId)))
+            foreach (var record in currentRecords.Where(record => retiring.ContainsKey(record.SessionId) && !leaving.Contains(record.SessionId)
+                         && !nests.ContainsKey(record.SessionId)))
             {
                 if (GroupNameOf(currentLayout!, record.SessionId, renamedHere) is not { Known: true, Name: { } name }
                     || keptIds.Contains(currentLayout!.Assignments[record.SessionId])) continue;
@@ -1291,8 +1307,10 @@ internal static class ClaudeSessionSync
             // here shows follows to the group of that name. A group the list lacks is renamed out of the way too, so one
             // left over shows its mark. Either goes once the moves empty it of every session a list here shows. Archived
             // sessions filed under it leave the group: the app moves no archived session (Claude 4.23118 refuses the whole
-            // move with "archived sessions aren't shown in the sidebar's groups or pins"), so they are counted, not moved.
+            // move with "archived sessions aren't shown in the sidebar's groups or pins"), so they are counted, not moved;
+            // so are the sessions the plan archives, which are not moved either.
             var taken = here.Select(group => group.Name).Concat(order).ToHashSet(StringComparer.Ordinal);
+            bool Stays(string session) => byId.ContainsKey(session) && !leaving.Contains(session);
             foreach (var group in here.Where(group => !keptIds.Contains(group.Id)))
             {
                 // A nested session's own assignment counts for nothing: it leaves with its family.
@@ -1300,13 +1318,14 @@ internal static class ClaudeSessionSync
                     .Select(pair => pair.Key).ToArray();
                 // Made anew: its own name, or where its renaming leads, is on the list.
                 var remade = Settle(Stands(group)) is not null;
-                var emptied = members.Where(byId.ContainsKey).All(moved.Contains);
+                var emptied = members.Where(Stays).All(moved.Contains);
                 var marked = Aside(group);
                 if (!emptied && !create.Contains(group.Name)) continue;
                 var mark = marked ? group.Name : MovingName(group.Name, taken);
                 if (mark != group.Name) renameGroups.Add(new(group.Id, group.Name, mark));
-                if (emptied)
-                    deleteGroups.Add(new(group.Id, mark, members.Count(member => !byId.ContainsKey(member)), remade));
+                if (!emptied) continue;
+                deleteGroups.Add(new(group.Id, mark, members.Count(member => !Stays(member)), remade));
+                dropped.UnionWith(members.Where(leaving.Contains));
             }
             moves.AddRange(into.OrderBy(pair => order.IndexOf(pair.Key))
                 .Select(pair => new Move(pair.Key, pair.Value, keep.TryGetValue(pair.Key, out var stays) ? stays.Id : null)));
@@ -1317,7 +1336,7 @@ internal static class ClaudeSessionSync
         var titles = renames.ToDictionary(rename => rename.Session, rename => rename.Title, StringComparer.Ordinal);
         var pins = new List<Pin>();
         if (pinPlan)
-            foreach (var record in newest)
+            foreach (var record in staying)
             {
                 var target = targets[record.SessionId];
                 var pinned = !filed.Contains(record.SessionId) && record.Pinned;
@@ -1335,11 +1354,20 @@ internal static class ClaudeSessionSync
             && target.Group is { Known: true, Name: var want }
             && GroupNameOf(currentLayout!, head.SessionId, renamedHere) is { Known: true, Name: var have } && want == have
             && target.Pin.Value == head.Pinned && !moved.Contains(head.SessionId) && !pinning.Contains(head.SessionId);
-        var archive = currentRecords.Where(record => retiring.ContainsKey(record.SessionId)).Select(record =>
+        // A conversation archived elsewhere has nothing to hand on: it is ready once its pin can be read.
+        var archive = currentRecords.Where(record => retiring.ContainsKey(record.SessionId) || leaving.Contains(record.SessionId))
+            .Select(record =>
             {
-                var older = retiring[record.SessionId];
-                return new Retire(record.SessionId, record.Title, pinsKnown && record.Pinned, older.Newest.SessionId,
-                    older.Newest.Title, Ready(record, byId[older.Newest.SessionId]), older.LastWritten, older.MovedOn);
+                if (!leaving.Contains(record.SessionId))
+                {
+                    var older = retiring[record.SessionId];
+                    return new Retire(record.SessionId, record.Title, pinsKnown && record.Pinned, older.Newest.SessionId,
+                        older.Newest.Title, Ready(record, byId[older.Newest.SessionId]), older.LastWritten, older.MovedOn);
+                }
+                var own = gone.TryGetValue(record.SessionId, out var itself);
+                var away = own ? itself! : gone[retiring[record.SessionId].Newest.SessionId];
+                return new Retire(record.SessionId, record.Title, pinsKnown && record.Pinned, null, null, pinPlan,
+                    own ? away.LastActive : retiring[record.SessionId].LastWritten, null, Label(away.Account) ?? away.Account, away.At);
             })
             .OrderBy(retire => retire.Title, StringComparer.Ordinal).ToList();
         var sidebars = new List<Sidebar> { View(current, currentLabel, currentRecords, currentLayout, nests, pinsKnown) };
@@ -1354,7 +1382,7 @@ internal static class ClaudeSessionSync
         // time; what its moves do on the way, and the unpinning of an older state before archiving, is nobody's choice.
         var intent = new Dictionary<string, ClaudeSessionLayout.Target>(StringComparer.Ordinal);
         ClaudeSessionLayout.Stamp<T> Stamp<T>(Offer<T> offer) => new(offer.Value, offer.At, offer.By == current ? null : offer.By);
-        foreach (var record in newest)
+        foreach (var record in staying)
         {
             var target = targets[record.SessionId];
             var pin = pinning.Contains(record.SessionId) || filed.Contains(record.SessionId) && record.Pinned ? Stamp(target.Pin) : null;
@@ -1366,14 +1394,16 @@ internal static class ClaudeSessionSync
             if (pin is not null || group is not null || title is not null)
                 intent[record.SessionId] = new(pin, group, title, filed.Contains(record.SessionId));
         }
-        // An older state's move, and its pin undone by the move or before its archiving, are nobody's choice.
-        foreach (var record in currentRecords.Where(record => retiring.ContainsKey(record.SessionId)))
+        // What happens on the way to archiving is nobody's choice: an older state's move, the group a session leaves with a
+        // group deleted, and a pin undone by a move or before archiving.
+        foreach (var record in currentRecords.Where(record => retiring.ContainsKey(record.SessionId) || leaving.Contains(record.SessionId)))
         {
             var moving = moved.Contains(record.SessionId);
-            if (!record.Pinned && !moving) continue;
+            var leaves = dropped.Contains(record.SessionId);
+            if (!record.Pinned && !moving && !leaves) continue;
             intent[record.SessionId] = new(record.Pinned ? new(false, DateTimeOffset.MinValue) : null,
-                moving ? new(placed.GetValueOrDefault(record.SessionId), DateTimeOffset.MinValue) : null, null,
-                filed.Contains(record.SessionId));
+                moving ? new(placed.GetValueOrDefault(record.SessionId), DateTimeOffset.MinValue)
+                : leaves ? new(null, DateTimeOffset.MinValue) : null, null, filed.Contains(record.SessionId));
         }
         var renamedIntent = renameGroups.ToDictionary(rename => rename.Id, rename => new ClaudeSessionLayout.Moved(rename.From, rename.To),
             StringComparer.Ordinal);
@@ -1967,6 +1997,50 @@ internal static class ClaudeSessionSync
         foreach (var key in older.Where(pair => older.ContainsKey(pair.Value.Newest.SessionId)).Select(pair => pair.Key).ToArray())
             older.Remove(key);
         return older;
+    }
+
+    /// <summary>
+    /// The conversations here that another account archived after anyone last talked in them, each with that account (the
+    /// one that archived it last), when, and its last activity. No list there shows the conversation live, and a record
+    /// archived there holds it: the same transcript, or one continued from it (not a branch of it). It was archived when
+    /// that record was last written, since the app keeps no time of archiving; that must come after the conversation's
+    /// last activity in every list that has it, so one talked in since, anywhere, stays. The calling session stays, as does
+    /// a session another one staying here is nested under: archiving it would take the family apart.
+    /// </summary>
+    private static Dictionary<string, Away> Gone(IReadOnlyList<Record> newest, IReadOnlyList<Seen> seen, string? self,
+        IReadOnlyList<Record> records)
+    {
+        var gone = new Dictionary<string, Away>(StringComparer.Ordinal);
+        foreach (var record in newest)
+        {
+            if (record.SessionId == self || record.Cli is not { } cli || record.LastActivityAt <= 0) continue;
+            var lastActive = record.LastActivityAt;
+            (string Account, DateTimeOffset At)? last = null;
+            foreach (var side in seen)
+            {
+                if (side.Matches.TryGetValue(record.SessionId, out var live))
+                {
+                    lastActive = Math.Max(lastActive, live.LastActivityAt);
+                    continue;
+                }
+                foreach (var shelved in side.Other.Archived ?? [])
+                {
+                    if (shelved.Written is not { } at || shelved.Cli != cli && (shelved.Branch || !shelved.Prior.Contains(cli, StringComparer.Ordinal)))
+                        continue;
+                    lastActive = Math.Max(lastActive, shelved.LastActivityAt);
+                    if (last is null || at > last.Value.At) last = (side.Other.Account, at);
+                }
+            }
+            var active = DateTimeOffset.FromUnixTimeMilliseconds(lastActive);
+            if (last is { } away && away.At > active) gone[record.SessionId] = new(away.Account, away.At, active);
+        }
+        for (var held = true; held;)
+        {
+            held = false;
+            foreach (var record in records)
+                if (!gone.ContainsKey(record.SessionId) && record.Parent is { } parent && gone.Remove(parent)) held = true;
+        }
+        return gone;
     }
 
     /// <summary>The transcript a record lists right after <paramref name="cli"/>, its current one last.</summary>

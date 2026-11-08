@@ -66,6 +66,7 @@ internal static class ClaudeSessionSyncTests
         TestLeftFamilyChanged();
         TestLeftFamilyUnclear();
         TestArchivedInRemadeGroup();
+        TestArchivedElsewhere();
         return Task.CompletedTask;
     }
 
@@ -1653,6 +1654,89 @@ internal static class ClaudeSessionSyncTests
         Check(world.Shows(K3) == world.Shows(K1) && world.Of(K3).Groups.All(group => group.Id != oldA)
               && widget.Plan(At(6)) is { Moves.Count: 0, DeleteGroups.Count: 0, RenameGroups.Count: 0 },
             "applied, the old A is gone with nothing left aside, and nothing is left to do");
+    }
+
+    /// <summary>A conversation another account archived after anyone last talked in it goes here too: 「일요일 고성 이동
+    /// 계획」 stayed pinned in 계정3 after 계정2 had archived it (11/8). It is listed for archiving, ready once pins are
+    /// read, and planned no further. One talked in since, one still live where it was archived, an older line of one that
+    /// went on here, a branch, the calling session and a session another one is nested under stay.</summary>
+    private static void TestArchivedElsewhere()
+    {
+        long Ms(double minutes) => At(0).AddMinutes(minutes).ToUnixTimeMilliseconds();
+        Record Shelved(string id, string cli, double active, double archivedAt, string[]? prior = null, bool branch = false) =>
+            R(id, id, false, cli, prior, Ms(active), branch) with { Written = At(0).AddMinutes(archivedAt) };
+        var here = new[]
+        {
+            R("local_x", "고성", true, "x", activity: Ms(10)),
+            R("local_y", "다시 씀", false, "y", activity: Ms(30)),
+            R("local_w", "둘 다", false, "w", activity: Ms(10)),
+            R("local_v", "한쪽만", false, "v", activity: Ms(10)),
+            R("local_c", "여기서 이음", false, "c2", ["c1"], Ms(10)),
+            R("local_d", "거기서 이음", false, "d1", activity: Ms(10)),
+            R("local_e", "곁가지 보관", false, "e1", activity: Ms(10)),
+            R("local_s", "지금", false, "s", activity: Ms(10)),
+            R("local_p", "부모", false, "p", activity: Ms(10)),
+            R("local_n", "곁가지", false, "n", activity: Ms(10)) with { Parent = "local_p" }
+        };
+        OtherAccount[] Others() =>
+        [
+            Other(ReferenceKey, "계정1", [R("local_w1", "둘 다", false, "w", activity: Ms(10)), R("local_v1", "한쪽만", false, "v", activity: Ms(10))],
+                null, At(40), archived:
+                [
+                    Shelved("local_x1", "x", 12, 20), Shelved("local_y1", "y", 5, 20), Shelved("local_w2", "w", 10, 20),
+                    Shelved("local_c1", "c1", 8, 20), Shelved("local_s1", "s", 10, 20), Shelved("local_p1", "p", 10, 20)
+                ]),
+            Other(ThirdKey, "계정3", [], null, At(50), archived:
+                [Shelved("local_v3", "v", 10, 25), Shelved("local_d3", "d2", 15, 25, ["d1"]), Shelved("local_e3", "f", 10, 25, ["e1"], branch: true)])
+        ];
+        var self = new ClaudeSessionSync.Lineage("local_s", _ => null, (_, _) => null);
+        var plan = Compute(here, null, Others(), lineage: self);
+        var items = plan.Archive!.ToDictionary(item => item.Session, StringComparer.Ordinal);
+        Check(items.Keys.Order(StringComparer.Ordinal).SequenceEqual(["local_d", "local_v", "local_x"])
+              && items["local_x"] is { ArchivedIn: "계정1", Newest: null, MovedOn: null, Pinned: true, Ready: true } x
+              && x.ArchivedAt == At(20) && x.LastWritten == At(12)
+              && items["local_d"] is { ArchivedIn: "계정3", Ready: true } d && d.ArchivedAt == At(25) && d.LastWritten == At(15)
+              && items["local_v"] is { ArchivedIn: "계정3", Ready: true },
+            "archived elsewhere after its last activity anywhere, the same transcript or one continued from it, it goes here too, "
+            + "though an account that never archived it still lists it");
+        Check(plan.Pins!.All(pin => pin.Session != "local_x") && plan.OnlyHere is { } onlyHere && !onlyHere.Contains("고성")
+              && !onlyHere.Contains("거기서 이음") && onlyHere.Contains("다시 씀")
+              && plan.Pending!.Sessions["local_x"] is { Pinned: { Value: false } unpin, Group: null } && unpin.At == DateTimeOffset.MinValue,
+            "it is planned no further, and unpinning it before archiving is nobody's choice");
+        Check(Compute(here, null, Others(), lineage: self, pinsKnown: false).Archive!.Single(item => item.Session == "local_x") is { Ready: false, Pinned: false }
+              && Compute(here, null, Others(), lineage: self, listsWhole: false).Archive!.Count == 0,
+            "it waits while pins cannot be read, and none goes while a list cannot be read whole");
+
+        // A group it leaves goes without moving it: it is counted with the archived ones, and leaving is nobody's choice.
+        var grouped = new[] { R("local_x", "고성", false, "x", activity: Ms(10)), R("local_y", "다시 씀", false, "y", activity: Ms(30)) };
+        var groupsHere = Groups(["g=G"], ("local_x", "g"), ("local_y", "g"));
+        var lists = new ClaudeSessionLayout();
+        Steady(lists, CurrentKey, "계정2", grouped, groupsHere, At(0));
+        lists.GroupsChanged[ThirdKey] = ListChange(["I"], At(20));
+        var regroup = Compute(grouped, groupsHere,
+            [Other(ReferenceKey, "계정1", [], null, At(10), archived: [Shelved("local_x1", "x", 12, 20)]), Other(ThirdKey, "계정3", [], null, At(20))], lists);
+        Check(regroup.Moves!.Single() is { Group: null } outOf && outOf.Sessions.SequenceEqual(["local_y"])
+              && regroup.DeleteGroups!.Single() is { Id: "g", Hidden: 1, Remade: false }
+              && regroup.Pending!.Sessions["local_x"] is { Group: { Value: null } left, Pinned: null } && left.At == DateTimeOffset.MinValue
+              && regroup.Archive!.Single() is { Session: "local_x", Ready: true },
+            "the group it leaves is deleted once the others are moved, counting it with the archived ones");
+
+        // Its older state here goes with it.
+        var origin = At(0);
+        ClaudeSessionSync.TranscriptSpan Span(double created, double last) =>
+            new(origin.AddHours(created), origin.AddHours(last), origin.AddHours(last));
+        var spans = new Dictionary<string, ClaudeSessionSync.TranscriptSpan> { ["a1"] = Span(0, 1), ["a2"] = Span(2, 24) };
+        var lineage = new ClaudeSessionSync.Lineage("local_s", cli => spans.TryGetValue(cli, out var span) ? span : null,
+            (_, next) => spans.TryGetValue(next, out var span) ? span.Created : null);
+        var pair = new[] { R("local_old", "대화", true, "a1", [], Ms(60)), R("local_new", "대화", false, "a2", ["a1"], Ms(24 * 60)) };
+        Check(Compute(pair, null, [Other(ReferenceKey, "계정1", [], null, At(40), archived: [Shelved("local_n1", "a2", 24 * 60, 25 * 60, ["a1"])])],
+                  lineage: lineage).Archive is { Count: 2 } both
+              && both.All(item => item is { ArchivedIn: "계정1", Newest: null, Ready: true })
+              && both.Single(item => item.Session == "local_old") is { Pinned: true } old && old.LastWritten == origin.AddHours(1),
+            "its older state here goes with it");
+        Check(Compute(pair, null, [Other(ReferenceKey, "계정1", [], null, At(40))], lineage: lineage).Archive!.Single() is
+                { Session: "local_old", Newest: "local_new", ArchivedIn: null },
+            "without that archiving, the older state is an older state as before");
     }
 
     /// <summary>The user's expectation of 10/20 on disk: 계정3, used last, put its groups in a new order and moved a session;
