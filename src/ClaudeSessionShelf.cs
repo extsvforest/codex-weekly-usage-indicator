@@ -136,7 +136,8 @@ internal sealed class ClaudeSessionShelf
         ["title", "titleSource", "createdAt", "lastActivityAt", "indexedAt", "completedTurns"];
     // The app protects a transcript from deletion per id, so carry every id this session still claims.
     private static readonly string[] LineageFields = ["priorCliSessionIds", "rewindEdges", "transcriptCuts"];
-    private static readonly string[] EffortLevels = ["low", "medium", "high", "xhigh", "max"];
+    // The session plan reads a record's model and effort by the same rules as a copy carries them.
+    internal static readonly string[] EffortLevels = ["low", "medium", "high", "xhigh", "max"];
     private static readonly string[] RemoteFields = ["sshConfig", "wslConfig", "cloudSessionId", "movedToCloud"];
     // A session in a worktree the app made is copied with its folder (cwd) only, as the app's own import makes it: the
     // worktree stays the source account's to keep or remove. One whose worktree is not made yet (lazy) is not copied.
@@ -1226,7 +1227,7 @@ internal sealed class ClaudeSessionShelf
     }
 
     internal static string Hash(string path) => Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(path)));
-    private static bool IsModelCharacter(char character) => char.IsAsciiLetterOrDigit(character) || character is '-' or '.' or '_' or '[' or ']';
+    internal static bool IsModelCharacter(char character) => char.IsAsciiLetterOrDigit(character) || character is '-' or '.' or '_' or '[' or ']';
     private static string? Text(JsonObject record, string field) =>
         record[field] is JsonValue value && value.TryGetValue<string>(out var text) ? text : null;
     private static bool Bool(JsonObject record, string field) =>

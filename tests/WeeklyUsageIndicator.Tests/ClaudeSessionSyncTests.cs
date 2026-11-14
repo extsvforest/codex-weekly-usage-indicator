@@ -67,6 +67,15 @@ internal static class ClaudeSessionSyncTests
         TestLeftFamilyUnclear();
         TestArchivedInRemadeGroup();
         TestArchivedElsewhere();
+        TestSettingsFollowNewest();
+        TestSettingsNoChange();
+        TestSettingsStartingValue();
+        TestSettingsPlanInProgress();
+        TestSettingsScope();
+        TestSettingsCallingSession();
+        TestSettingsLayoutStore();
+        TestSettingsNewRecord();
+        TestSettingsRead();
         return Task.CompletedTask;
     }
 
@@ -88,8 +97,9 @@ internal static class ClaudeSessionSyncTests
         copies.ToDictionary(copy => copy.Id, copy => copy.Written, StringComparer.Ordinal);
 
     private static OtherAccount Other(string account, string? label, IReadOnlyList<Record> records, SyncLayout? layout,
-        DateTimeOffset? leftAt = null, IReadOnlyDictionary<string, string?>? copies = null, IReadOnlyList<Record>? archived = null) =>
-        new(account, label, leftAt, records, layout, copies ?? NoCopies, archived);
+        DateTimeOffset? leftAt = null, IReadOnlyDictionary<string, string?>? copies = null, IReadOnlyList<Record>? archived = null,
+        IReadOnlyDictionary<string, DateTimeOffset>? writes = null) =>
+        new(account, label, leftAt, records, layout, copies ?? NoCopies, archived, writes);
 
     /// <summary>A plan for the current account with the widget's copies known (none unless given) and nothing kept unless
     /// <paramref name="kept"/> holds it. Plans name accounts by the labels the widget keeps.</summary>
@@ -97,24 +107,30 @@ internal static class ClaudeSessionSyncTests
         ClaudeSessionLayout? kept = null, IReadOnlyDictionary<string, string?>? copies = null, bool pinsKnown = true,
         bool groupsKnown = true, ClaudeSessionSync.Lineage? lineage = null, IReadOnlyList<string>? warnings = null,
         string? label = null, bool ledgerKnown = true, bool pinsLost = false, IReadOnlyList<Record>? archived = null,
-        bool listsWhole = true)
+        bool listsWhole = true, IReadOnlyDictionary<string, DateTimeOffset>? writes = null, DateTimeOffset? now = null)
     {
         kept ??= new ClaudeSessionLayout();
         foreach (var other in others)
             if (!kept.Accounts.ContainsKey(other.Account)) kept.Accounts[other.Account] = new(other.Label ?? "");
         return ClaudeSessionSync.Compute(CurrentKey, label, records, layout, others, kept, pinsKnown, lineage, warnings, groupsKnown,
-            ledgerKnown ? copies ?? NoCopies : null, pinsLost, archived, listsWhole);
+            ledgerKnown ? copies ?? NoCopies : null, pinsLost, archived, listsWhole, writes, now ?? Morning);
     }
 
     /// <summary>What a record shows, as a checkpoint keeps it.</summary>
     private static Shown ShownOf(Record record, SyncLayout? layout, string? written = null)
     {
         var title = string.IsNullOrWhiteSpace(record.Title) ? null : record.Title;
-        if (layout is null) return new(record.Pinned, false, null, title, written);
-        if (!layout.Assignments.TryGetValue(record.SessionId, out var id)) return new(record.Pinned, true, null, title, written);
-        return layout.Groups.FirstOrDefault(group => group.Id == id) is { } group
-            ? new(record.Pinned, true, group.Name, title, written) : new(record.Pinned, false, null, title, written);
+        var shown = new Shown(record.Pinned, false, null, title, written, record.Model, record.Effort, record.Mode);
+        if (layout is null) return shown;
+        if (!layout.Assignments.TryGetValue(record.SessionId, out var id)) return shown with { HasGroup = true };
+        return layout.Groups.FirstOrDefault(group => group.Id == id) is { } group ? shown with { HasGroup = true, Group = group.Name } : shown;
     }
+
+    /// <summary>A conversation's record with its model, effort and permission mode (null unknown, empty none), last used
+    /// <paramref name="used"/> minutes into the fixtures' clock.</summary>
+    private static Record S(string id, string title, int cli, int used, string? model = null, string? effort = null, string? mode = null,
+        bool pinned = false) =>
+        new(id, title, pinned, Cli(cli), [], At(used).ToUnixTimeMilliseconds(), Model: model, Effort: effort, Mode: mode);
 
     /// <summary>A checkpoint of what <paramref name="records"/> show in <paramref name="layout"/>.</summary>
     private static ClaudeSessionLayout.Checkpoint PointOf(IReadOnlyList<Record> records, SyncLayout? layout, DateTimeOffset at,
@@ -1432,8 +1448,8 @@ internal static class ClaudeSessionSyncTests
         world.Copied(K1, "local_c", "다");
         Check(Take(At(5)) && layout.Checkpoints[K1] is { Stay: 0 } first && first.At == At(5)
               && first.Groups!.Select(group => group.Name).SequenceEqual(["G"])
-              && layout.Changed[K1]["local_a"] == new Changes(new(true, At(0)), new(null, At(0)), new("가", At(0)))
-              && layout.Changed[K1]["local_b"] == new Changes(new(false, At(0)), new("G", At(0)), new("나", At(0)))
+              && layout.Changed[K1]["local_a"] == new Changes(new(true, At(0)), new(null, At(0)), new("가", At(0)), new("fable", At(0)))
+              && layout.Changed[K1]["local_b"] == new Changes(new(false, At(0)), new("G", At(0)), new("나", At(0)), new("fable", At(0)))
               && !layout.Changed[K1].ContainsKey("local_c") && layout.GroupsChanged[K1] is { Order: ["G"] } seeded && seeded.At == At(0),
             "a first checkpoint seeds what each record gives (a copy only what was chosen there), dated when the app last left the account");
         world.Retitle(K1, "local_a", "가가");
@@ -2563,6 +2579,325 @@ internal static class ClaudeSessionSyncTests
         Check(world.Shows(K2) == world.Shows(K1), "and 계정2 shows what 계정1 shows");
     }
 
+    /// <summary>A model, effort or permission mode another account changed since its checkpoint is planned here with the
+    /// account it came from; this account's own later change stays. Whether a mode raises follows the rank order
+    /// (plan &lt; default &lt; acceptEdits &lt; auto &lt; bypassPermissions, none as default).</summary>
+    private static void TestSettingsFollowNewest()
+    {
+        Record[] Conversations(string prefix, params (string? Model, string? Effort, string? Mode)[] values) =>
+            values.Select((value, index) => S(prefix + (index + 1), "대화" + (index + 1), index + 1, -30 - 10 * index,
+                value.Model, value.Effort, value.Mode)).ToArray();
+        var here = Conversations("local_c", ("m-old", "high", "default"), (null, null, "auto"), (null, null, ""),
+            (null, null, "bypassPermissions"), ("m-mine", null, null), (null, null, ""));
+        var before = Conversations("local_r", ("m-old", "high", "default"), (null, null, "auto"), (null, null, ""),
+            (null, null, "bypassPermissions"), ("m-old", null, null), (null, null, "acceptEdits"));
+        var there = Conversations("local_r", ("m-new", "max", "bypassPermissions"), (null, null, "acceptEdits"), (null, null, "acceptEdits"),
+            (null, null, "auto"), ("m-new", null, null), (null, null, "default"));
+        var kept = new ClaudeSessionLayout();
+        Steady(kept, K1, "계정1", before, null, At(-10));
+        Steady(kept, K2, "계정2", here, null, At(-20));
+        // 계정2 chose its own model for the fifth after 계정1 changed it.
+        Changed(kept, K2, "local_c5", new Changes(Model: new("m-mine", At(-5))));
+        var plan = Compute(here, null, [Other(K1, "계정1", there, null, At(-10))], kept);
+        Check(plan.Models!.Single() is { Session: "local_c1", Title: "대화1", Model: "m-new", From: "m-old", By: "계정1" }
+              && plan.Efforts!.Single() is { Session: "local_c1", Effort: "max", From: "high", By: "계정1" },
+            "a model and an effort another account changed since its checkpoint are planned here with its label; this account's own later change stays");
+        Check(plan.Permissions!.Select(item => (item.Session, item.Mode, item.From, item.Raises, item.By, item.Self)).SequenceEqual([
+                  ("local_c1", "bypassPermissions", "default", true, "계정1", false), ("local_c2", "acceptEdits", "auto", false, "계정1", false),
+                  ("local_c3", "acceptEdits", null, true, "계정1", false), ("local_c4", "auto", "bypassPermissions", false, "계정1", false),
+                  ("local_c6", "default", null, false, "계정1", false)]),
+            "a higher mode raises, a lower one does not, none ranks as default, and default is planned from a recorded change; the most recently used first");
+        Check(plan.Pending!.Sessions["local_c1"] is { Pinned: null, Group: null, Title: null } target
+              && target.Model == new ClaudeSessionLayout.Stamp<string>("m-new", At(-10), K1)
+              && target.Mode == new ClaudeSessionLayout.Stamp<string>("bypassPermissions", At(-10), K1)
+              && !plan.Pending.Sessions.ContainsKey("local_c5"),
+            "each planned value is set out with the time and account of the change it comes from");
+        var json = JsonNode.Parse(ClaudeSessionSync.Serialize(plan))!;
+        Check(json["models"] is JsonArray { Count: 1 } && json["permissions"]![1]!["raises"]!.GetValue<bool>() == false
+              && json["permissions"]![1] is JsonObject item && !item.ContainsKey("self") && item["from"]!.GetValue<string>() == "auto"
+              && json["permissions"]![2] is JsonObject fromNone && !fromNone.ContainsKey("from")
+              && json is JsonObject root && !root.ContainsKey("selfSettings") && !root.ContainsKey("settingsBeyond"),
+            "the plan writes raises always, self only when true, and the calling session's settings and the out-of-scope count only when there is something to say");
+        var nothing = Compute(here, null, [Other(K1, "계정1", before, null, At(-10))], kept);
+        Check(nothing is { Models.Count: 0, Efforts.Count: 0, Permissions.Count: 0 }
+              && JsonNode.Parse(ClaudeSessionSync.Serialize(nothing)) is JsonObject empty && empty["permissions"] is JsonArray { Count: 0 },
+            "with nothing to set the three lists are there and empty");
+        Check(Compute(here, null, [Other(K1, "계정1", there, null, At(-10))], kept, listsWhole: false, warnings: ["list_incomplete"])
+                  is { Models.Count: 0, Efforts.Count: 0, Permissions.Count: 0 },
+            "nothing is planned for them when the plan is not decidable");
+    }
+
+    /// <summary>The app's fill (none to default) is no change, plan mode is neither a change nor planned, and a value going
+    /// to none is no change.</summary>
+    private static void TestSettingsNoChange()
+    {
+        var before = new[]
+        {
+            S("local_f", "채움", 1, -10, mode: ""), S("local_p", "계획", 2, -10, mode: "acceptEdits"),
+            S("local_n", "없음", 3, -10, model: "m", effort: "high")
+        };
+        var now = new[]
+        {
+            S("local_f", "채움", 1, -10, mode: "default"), S("local_p", "계획", 2, -10, mode: null),
+            S("local_n", "없음", 3, -10, model: "", effort: "")
+        };
+        Check(ClaudeSessionSync.Observe(new(now, null, true, NoCopies), PointOf(before, null, At(0)), At(10)).Changes.Count == 0,
+            "none to default is the app's fill, plan mode is unknown, and a value taken away is none: no change");
+        var here = new[]
+        {
+            S("local_a", "가", 1, -10, mode: "acceptEdits"), S("local_b", "나", 2, -10, mode: null), S("local_d", "다", 3, -10, model: "m-here"),
+            S("local_e", "라", 4, -10, mode: "acceptEdits")
+        };
+        var was = new[]
+        {
+            S("local_a1", "가", 1, -10, mode: ""), S("local_b1", "나", 2, -10, mode: "default"), S("local_d1", "다", 3, -10, model: "m"),
+            S("local_e1", "라", 4, -10, mode: "default")
+        };
+        var there = new[]
+        {
+            S("local_a1", "가", 1, -10, mode: "default"), S("local_b1", "나", 2, -10, mode: "auto"), S("local_d1", "다", 3, -10, model: ""),
+            S("local_e1", "라", 4, -10, mode: null)
+        };
+        var kept = new ClaudeSessionLayout();
+        Steady(kept, K1, "계정1", was, null, At(-10));
+        Steady(kept, K2, "계정2", here, null, At(-20));
+        var plan = Compute(here, null, [Other(K1, "계정1", there, null, At(-10))], kept);
+        Check(plan is { Models.Count: 0, Efforts.Count: 0, Permissions.Count: 0 } && plan.Pending!.Sessions.Count == 0,
+            "nothing is planned: not the app's fill, not a mode changed for a session in plan mode here, not a value taken away");
+    }
+
+    /// <summary>Where no account recorded a change, the account that last really used the conversation gives its explicit
+    /// value; a record the widget wrote and nobody used since owns nothing.</summary>
+    private static void TestSettingsStartingValue()
+    {
+        var here = new[]
+        {
+            S("local_a1", "가", 1, -100, "m-here", "low", "default"), S("local_a2", "나", 2, -110, "m-here"),
+            S("local_a3", "다", 3, -120, "m-here", "low", "acceptEdits"), S("local_a4", "라", 4, -130, "m-here")
+        };
+        var there = new[]
+        {
+            S("local_b1", "가", 1, -30, "m-there", "max", "auto"), S("local_b2", "나", 2, -40, "m-there"),
+            S("local_b3", "다", 3, -50, "", "", "default"), S("local_b4", "라", 4, -60, "m-there")
+        };
+        var kept = new ClaudeSessionLayout();
+        Steady(kept, K1, "계정1", there, null, At(-10));
+        Steady(kept, K2, "계정2", here, null, At(-20));
+        Changed(kept, K1, "local_b4", new Changes(Model: new("m-rec", At(-500))));
+        // The widget advanced 계정1's second record after its last use: its activity is the source's.
+        var plan = Compute(here, null, [Other(K1, "계정1", there, null, At(-10), writes: new Dictionary<string, DateTimeOffset> { ["local_b2"] = At(-20) })],
+            kept);
+        Check(plan.Models!.Select(item => (item.Session, item.Model, item.From, item.By)).SequenceEqual([
+                  ("local_a1", "m-there", "m-here", "계정1"), ("local_a4", "m-rec", "m-here", "계정1")])
+              && plan.Efforts!.Single() is { Session: "local_a1", Effort: "max", From: "low", By: "계정1" }
+              && plan.Permissions!.Single() is { Session: "local_a1", Mode: "auto", From: "default", Raises: true, By: "계정1" },
+            "the account that last used a conversation gives its explicit values; one the widget wrote since owns nothing; a recorded change beats any starting value");
+        Check(plan.Pending!.Sessions["local_a1"].Model == new ClaudeSessionLayout.Stamp<string>("m-there", At(-30), K1)
+              && plan.Pending.Sessions["local_a4"].Model == new ClaudeSessionLayout.Stamp<string>("m-rec", At(-500), K1),
+            "a starting value is dated its owner's own activity, by the owner");
+        Check(plan.Permissions.All(item => item.Session != "local_a3") && plan.Efforts.All(item => item.Session != "local_a3")
+              && plan.Models.All(item => item.Session != "local_a3"),
+            "an owner without an explicit value gives nothing, and default is never a starting value");
+        var mine = Compute(here.Select(record => record with { LastActivityAt = At(-1).ToUnixTimeMilliseconds() }).ToArray(), null,
+            [Other(K1, "계정1", there, null, At(-10))], kept);
+        Check(mine.Models!.Single().Session == "local_a4" && mine is { Efforts.Count: 0, Permissions.Count: 0 },
+            "where this account used it last, its values stay");
+    }
+
+    /// <summary>What a plan set out to give: reached, it is recorded with the time and account of the change it came from;
+    /// not reached (an approval declined), it is planned again; changed to something else, it is this account's own.</summary>
+    private static void TestSettingsPlanInProgress()
+    {
+        using var world = new SessionWorld("settings-pending");
+        var widget = new Widget(world);
+        widget.Map(K1, "계정1");
+        widget.Map(K3, "계정3");
+        var used = At(-100).ToUnixTimeMilliseconds();
+        foreach (var (account, suffix) in new[] { (K1, "1"), (K3, "3") })
+        {
+            world.Record(account, "local_p" + suffix, "피", Cli(1), activity: used, extra: record => record["permissionMode"] = "default");
+            world.Record(account, "local_q" + suffix, "큐", Cli(2), activity: used, extra: record => record["permissionMode"] = "default");
+            if (account == K1) continue;
+            world.Copied(account, "local_p" + suffix, "피");
+            world.Copied(account, "local_q" + suffix, "큐");
+        }
+        widget.Start(K1, At(-60)); widget.Switch(K3, At(-50)); widget.Switch(K1, At(-40));
+        world.Set(K1, "local_p1", "permissionMode", "bypassPermissions");
+        world.Set(K1, "local_q1", "effort", "max");
+        widget.Switch(K3, At(10));
+        var plan = widget.Plan(At(15));
+        Check(plan is { Checkpointed: true, Models.Count: 0, Pins.Count: 0, Renames.Count: 0 }
+              && plan.Permissions!.Single() is { Session: "local_p3", Mode: "bypassPermissions", From: "default", Raises: true, By: "계정1" }
+              && plan.Efforts!.Single() is { Session: "local_q3", Effort: "max", From: null, By: "계정1" }
+              && widget.Layout.Pendings[K3].Sessions["local_p3"] is { Pinned: null, Group: null, Title: null } target
+              && target.Mode == new ClaudeSessionLayout.Stamp<string>("bypassPermissions", At(10), K1),
+            "계정3 takes the mode and effort 계정1 changed, kept as in progress though they are its only targets");
+        // The user declines raising the mode; the effort is not set yet either.
+        Check(widget.Plan(At(16)) is { Permissions: [{ Session: "local_p3", By: "계정1" }], Efforts: [{ Session: "local_q3" }] }
+              && widget.Layout.Changed[K3].GetValueOrDefault("local_p3")?.Mode is null,
+            "a value not reached is no change here and is planned again");
+        world.Set(K3, "local_p3", "permissionMode", "bypassPermissions");
+        world.Set(K3, "local_q3", "effort", "low");
+        Check(widget.Plan(At(17)) is { Permissions.Count: 0, Efforts.Count: 0 }
+              && widget.Layout.Changed[K3]["local_p3"].Mode == new ClaudeSessionLayout.Stamp<string>("bypassPermissions", At(10), K1)
+              && widget.Layout.Changed[K3]["local_q3"].Effort == new ClaudeSessionLayout.Stamp<string>("low", At(17)),
+            "reached, a value counts as the change it came from; set to something else, it is this account's own choice");
+        Check(world.Load(K3, "local_p3")["permissionMode"]!.GetValue<string>() == "bypassPermissions" && world.Load(K1, "local_q1")["effort"]!.GetValue<string>() == "max"
+              && !world.Load(K3, "local_q3").ContainsKey("bypassChosenInApp"),
+            "the records hold only what the app set");
+    }
+
+    /// <summary>Only a conversation used within the window or pinned here is planned; the others are counted.</summary>
+    private static void TestSettingsScope()
+    {
+        const int eightDays = -60 * 24 * 8;
+        var here = new[] { S("local_o", "오래됨", 1, eightDays, "m-old"), S("local_k", "고정", 2, eightDays, "m-old", pinned: true) };
+        var before = new[] { S("local_o1", "오래됨", 1, eightDays, "m-old"), S("local_k1", "고정", 2, eightDays, "m-old") };
+        var there = new[] { S("local_o1", "오래됨", 1, eightDays, "m-new"), S("local_k1", "고정", 2, eightDays, "m-new") };
+        var kept = new ClaudeSessionLayout();
+        Steady(kept, K1, "계정1", before, null, At(-10));
+        Steady(kept, K2, "계정2", here, null, At(-20));
+        var plan = Compute(here, null, [Other(K1, "계정1", there, null, At(-10))], kept);
+        Check(plan is { SettingsBeyond: 1 } && plan.Models!.Single().Session == "local_k"
+              && plan.Pending!.Sessions.GetValueOrDefault("local_o")?.Model is null && plan.Pending.Sessions["local_k"].Model is not null
+              && JsonNode.Parse(ClaudeSessionSync.Serialize(plan))!["settingsBeyond"]!.GetValue<int>() == 1,
+            "a conversation not used for a week and not pinned here is counted, not listed and not set out; one pinned here is listed");
+        Check(Compute(here, null, [Other(K1, "계정1", there, null, At(-10))], kept, now: At(eightDays + 60)) is { SettingsBeyond: null } recent
+              && recent.Models!.Count == 2, "used within the week it is planned");
+    }
+
+    /// <summary>The app refuses a session changing its own model or effort: the calling session's go to selfSettings; its
+    /// mode is planned as any other's.</summary>
+    private static void TestSettingsCallingSession()
+    {
+        var here = new[] { S("local_s", "나", 1, -10, "m-old", "high", "default"), S("local_t", "너", 2, -20, "m-old") };
+        var before = new[] { S("local_s1", "나", 1, -10, "m-old", "high", "default"), S("local_t1", "너", 2, -20, "m-old") };
+        var there = new[] { S("local_s1", "나", 1, -10, "m-new", "max", "auto"), S("local_t1", "너", 2, -20, "m-new") };
+        var kept = new ClaudeSessionLayout();
+        Steady(kept, K1, "계정1", before, null, At(-10));
+        Steady(kept, K2, "계정2", here, null, At(-20));
+        var plan = Compute(here, null, [Other(K1, "계정1", there, null, At(-10))], kept,
+            lineage: new ClaudeSessionSync.Lineage("local_s", _ => null, (_, _) => null));
+        Check(plan.SelfSettings == new ClaudeSessionSync.SelfSetting("m-new", "m-old", "계정1", "max", "high", "계정1")
+              && plan.Models!.Single().Session == "local_t" && plan.Efforts!.Count == 0
+              && plan.Permissions!.Single() is { Session: "local_s", Mode: "auto", Raises: true, Self: true }
+              && plan.Pending!.Sessions["local_s"] is { Model: null, Effort: null, Mode.Value: "auto" },
+            "the calling session's model and effort are told, not listed or set out; its mode is listed, marked self");
+        var json = JsonNode.Parse(ClaudeSessionSync.Serialize(plan))!;
+        Check(json["permissions"]![0]!["self"]!.GetValue<bool>() && json["selfSettings"]!["modelBy"]!.GetValue<string>() == "계정1"
+              && json["selfSettings"]!["effortFrom"]!.GetValue<string>() == "high",
+            "the plan writes them as the skill reads them");
+    }
+
+    /// <summary>The layout file keeps the three values in checkpoints, changes and plans in progress; one written before
+    /// them loads with them unknown, and the first checkpoint after it finds no change of them.</summary>
+    private static void TestSettingsLayoutStore()
+    {
+        var root = TempRoot("settings-layout");
+        var layout = new ClaudeSessionLayout();
+        layout.Accounts[K1] = new("계정1", At(0), At(1), 2);
+        layout.Checkpoints[K1] = new(At(2), 2, [], new Dictionary<string, Shown>
+            { ["local_a"] = new(false, true, null, "가", Model: "m", Effort: "", Mode: null) });
+        layout.Changed[K1] = new(StringComparer.Ordinal)
+            { ["local_a"] = new Changes(Model: new("m", At(3)), Effort: new("max", At(4), K2), Mode: new("auto", At(5))) };
+        layout.Pendings[K1] = new(2, new Dictionary<string, Target> { ["local_a"] = new(Mode: new("bypassPermissions", At(6), K2)) }, null,
+            new Dictionary<string, ClaudeSessionLayout.Moved>());
+        layout.Save(root);
+        var (loaded, _) = ClaudeSessionLayout.Load(root);
+        Check(loaded!.Checkpoints[K1].Sessions["local_a"] is { Model: "m", Effort: "", Mode: null }
+              && loaded.Changed[K1]["local_a"] == layout.Changed[K1]["local_a"]
+              && loaded.Pendings[K1].Sessions["local_a"] == layout.Pendings[K1].Sessions["local_a"],
+            "a round trip keeps the three values, none and unknown apart");
+        var text = File.ReadAllText(Path.Combine(root, ClaudeSessionLayout.FileName));
+        File.WriteAllText(Path.Combine(root, ClaudeSessionLayout.FileName), text.Replace("\"model\": \"m\"", "\"model\": 5"));
+        Check(ClaudeSessionLayout.Load(root) is { Layout: null, Exists: true }, "reading stays strict about what a field holds");
+
+        using var world = new SessionWorld("settings-upgrade");
+        world.Record(K1, "local_a", "가", Cli(1), extra: record => { record["effort"] = "high"; record["permissionMode"] = "acceptEdits"; });
+        world.Flush();
+        var earlier = new JsonObject
+        {
+            ["version"] = 2,
+            ["accounts"] = new JsonObject
+            {
+                [K1] = new JsonObject
+                {
+                    ["label"] = "계정1", ["stay"] = 0,
+                    ["checkpoint"] = new JsonObject
+                    {
+                        ["at"] = At(0).ToString("O"), ["stay"] = 0, ["groups"] = new JsonArray(),
+                        ["sessions"] = new JsonObject { ["local_a"] = new JsonObject { ["pinned"] = false, ["group"] = null, ["title"] = "가" } }
+                    }
+                }
+            }
+        };
+        File.WriteAllText(Path.Combine(world.Ledger, ClaudeSessionLayout.FileName), earlier.ToJsonString());
+        var (upgraded, _) = ClaudeSessionLayout.Load(world.Ledger);
+        Check(upgraded!.Checkpoints[K1].Sessions["local_a"] is { Model: null, Effort: null, Mode: null },
+            "a file an earlier widget wrote loads with the values unknown");
+        Check(ClaudeSessionSync.Checkpoint(upgraded, world.Sources, K1, At(5)) && upgraded.Changed[K1].GetValueOrDefault("local_a") is null
+              && upgraded.Checkpoints[K1].Sessions["local_a"] is { Model: "fable", Effort: "high", Mode: "acceptEdits" },
+            "the first checkpoint after it records the values and finds no change of them");
+    }
+
+    /// <summary>A record new since the checkpoint: the account's own gives its explicit values, the widget's copy none.</summary>
+    private static void TestSettingsNewRecord()
+    {
+        var records = new[]
+        {
+            S("local_o", "오", 1, -10, "m", "high", "default"), S("local_m", "엠", 2, -10, "", "", "auto"),
+            S("local_c", "씨", 3, -10, "m", "max", "bypassPermissions")
+        };
+        var state = new ClaudeSessionSync.State(records, null, true, Copies(("local_c", "씨")));
+        foreach (var point in new ClaudeSessionLayout.Checkpoint?[] { new(At(0), 0, null, new Dictionary<string, Shown>()), null })
+        {
+            var observed = ClaudeSessionSync.Observe(state, point, At(10));
+            Check(observed.Changes["local_o"] is { Model.Value: "m", Effort.Value: "high", Mode: null }
+                  && observed.Changes["local_m"] is { Model: null, Effort: null, Mode.Value: "auto" }
+                  && observed.Changes.GetValueOrDefault("local_c") is null or { Model: null, Effort: null, Mode: null },
+                "a record of the account's own gives its explicit values; the widget's copy gives none of the three");
+        }
+    }
+
+    /// <summary>How a record's model, effort and permission mode read, and when the ledger says the widget wrote a record.</summary>
+    private static void TestSettingsRead()
+    {
+        using var world = new SessionWorld("settings-read");
+        void Make(string id, params (string Field, string? Value)[] fields) =>
+            world.Record(K1, id, id, Cli(1), extra: record => { foreach (var (field, value) in fields) record[field] = value; });
+        world.Record(K1, "local_i", "local_i", Cli(1), extra: record => { record["effortInherited"] = true; record["effort"] = "high"; });
+        Make("local_u", ("effort", "ultra"));
+        Make("local_x", ("model", "claude opus"));
+        Make("local_l", ("model", new string('a', 81)));
+        Make("local_v", ("model", "claude-opus-5-5[1m]"), ("effort", "max"), ("permissionMode", "bypassPermissions"));
+        Make("local_p", ("permissionMode", "plan"));
+        Make("local_w", ("permissionMode", "weird"));
+        Make("local_n", ("model", null));
+        var read = world.Records(K1).ToDictionary(record => record.SessionId, StringComparer.Ordinal);
+        Check(read["local_i"].Effort == "" && read["local_u"].Effort == "" && read["local_x"].Model == "" && read["local_l"].Model == ""
+              && read["local_n"].Model == "",
+            "an inherited effort, an unknown effort, a model with other characters or over 80 characters read as none");
+        Check(read["local_v"] is { Model: "claude-opus-5-5[1m]", Effort: "max", Mode: "bypassPermissions" }
+              && read["local_p"].Mode is null && read["local_w"].Mode == "" && read["local_n"].Mode == "",
+            "a familiar model, effort and mode read as they are; plan mode is unknown, and an unfamiliar or missing mode none");
+
+        var ledger = TempRoot("settings-ledger");
+        File.WriteAllText(Path.Combine(ledger, "ledger.json"), new JsonObject
+        {
+            ["created"] = new JsonArray(
+                new JsonObject { ["dst"] = K1, ["file"] = "local_a.json", ["createdAt"] = At(1).ToString("O") },
+                new JsonObject { ["dst"] = K1, ["file"] = "local_r.json", ["createdAt"] = At(1).ToString("O"), ["retiredAt"] = At(2).ToString("O") },
+                new JsonObject { ["dst"] = K1, ["file"] = "local_t.json" },
+                new JsonObject { ["dst"] = K2, ["file"] = "local_o.json", ["createdAt"] = At(1).ToString("O") }),
+            ["advanced"] = new JsonArray(
+                new JsonObject { ["dst"] = K1, ["file"] = "local_b.json", ["state"] = "done", ["at"] = At(3).ToString("O") },
+                new JsonObject { ["dst"] = K1, ["file"] = "local_c.json", ["state"] = "unconfirmed", ["at"] = At(4).ToString("O") })
+        }.ToJsonString());
+        Check(ClaudeSessionSync.LedgerWrites(ledger, K1) is { Count: 3 } writes && writes["local_a"] == At(1) && writes["local_b"] == At(3)
+              && writes["local_t"] == DateTimeOffset.MaxValue,
+            "the widget wrote a copy it made (not archived) when it made it, and a record it advanced when the advance was done; one undated owns nothing");
+    }
+
     /// <summary>Three accounts the widget maps, each listing the given conversations: 계정1 holds the records the app wrote,
     /// 계정2 and 계정3 the widget's copies of them.</summary>
     private static (SessionWorld World, Widget Widget) Accounts3(string name, params (string Name, string Title)[] conversations)
@@ -2694,6 +3029,14 @@ internal static class ClaudeSessionSyncTests
         {
             var record = Load(account, id);
             record["isArchived"] = true;
+            Save(account, id, record);
+        }
+
+        /// <summary>The app sets one field of a record (its model, effort or permission mode, say); null removes it.</summary>
+        internal void Set(string account, string id, string field, string? value)
+        {
+            var record = Load(account, id);
+            if (value is null) record.Remove(field); else record[field] = value;
             Save(account, id, record);
         }
 

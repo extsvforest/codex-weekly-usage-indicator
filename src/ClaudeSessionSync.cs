@@ -91,20 +91,24 @@ internal sealed class ClaudeSessionLayout
     /// <summary>What a conversation showed. A null <c>Pinned</c> is unknown and a null <c>Title</c> none;
     /// <c>HasGroup</c> false is an unknown group, and <c>Group</c> null with it "in no group".</summary>
     /// <param name="Written">For the widget's copy, the title its ledger said the widget had written there.</param>
+    /// <param name="Model">Its model, effort and permission mode as <see cref="ClaudeSessionSync.Record"/> reads them: null
+    /// unknown (a checkpoint an earlier widget took, or a session passing through plan mode), empty none.</param>
     internal sealed record Shown(bool? Pinned = null, bool HasGroup = false, string? Group = null, string? Title = null,
-        string? Written = null);
+        string? Written = null, string? Model = null, string? Effort = null, string? Mode = null);
 
     /// <param name="By">The account the change came from when a plan brought it in; null for the account's own.</param>
     internal sealed record Stamp<T>(T Value, DateTimeOffset At, string? By = null);
 
     /// <summary>The newest change an account made to each value of one conversation; null where it changed nothing.</summary>
-    internal sealed record Changes(Stamp<bool>? Pinned = null, Stamp<string?>? Group = null, Stamp<string>? Title = null)
+    internal sealed record Changes(Stamp<bool>? Pinned = null, Stamp<string?>? Group = null, Stamp<string>? Title = null,
+        Stamp<string>? Model = null, Stamp<string>? Effort = null, Stamp<string>? Mode = null)
     {
-        internal bool IsEmpty => Pinned is null && Group is null && Title is null;
+        internal bool IsEmpty => Pinned is null && Group is null && Title is null && Model is null && Effort is null && Mode is null;
 
         /// <summary>Value by value the later change of this and <paramref name="older"/>, this one on a tie.</summary>
         internal Changes Over(Changes? older) => older is null ? this
-            : new(Later(Pinned, older.Pinned), Later(Group, older.Group), Later(Title, older.Title));
+            : new(Later(Pinned, older.Pinned), Later(Group, older.Group), Later(Title, older.Title), Later(Model, older.Model),
+                Later(Effort, older.Effort), Later(Mode, older.Mode));
 
         private static Stamp<T>? Later<T>(Stamp<T>? mine, Stamp<T>? theirs) =>
             mine is null ? theirs : theirs is null || mine.At >= theirs.At ? mine : theirs;
@@ -128,7 +132,7 @@ internal sealed class ClaudeSessionLayout
     /// <summary>What a plan sets out to give one session, each value with the change it comes from.</summary>
     /// <param name="Filed">The plan moves it into a group, which unpins it until the plan pins it again.</param>
     internal sealed record Target(Stamp<bool>? Pinned = null, Stamp<string?>? Group = null, Stamp<string>? Title = null,
-        bool Filed = false);
+        bool Filed = false, Stamp<string>? Model = null, Stamp<string>? Effort = null, Stamp<string>? Mode = null);
 
     /// <summary>What the last plan in an account set out to change, until a checkpoint finds it done or changed
     /// otherwise: in the meantime neither a value it has not reached yet nor what its moves do on the way is anyone's
@@ -177,7 +181,11 @@ internal sealed class ClaudeSessionLayout
         Stamp<T>? Moved<T>(Stamp<T>? stamp) => stamp is { By: null } && stamp.At <= by ? stamp with { At = to } : stamp;
         if (Changed.TryGetValue(account, out var changed))
             foreach (var id in changed.Keys.ToArray())
-                changed[id] = new(Moved(changed[id].Pinned), Moved(changed[id].Group), Moved(changed[id].Title));
+            {
+                var change = changed[id];
+                changed[id] = new(Moved(change.Pinned), Moved(change.Group), Moved(change.Title), Moved(change.Model),
+                    Moved(change.Effort), Moved(change.Mode));
+            }
         if (GroupsChanged.TryGetValue(account, out var groups) && groups is { By: null } && groups.At <= by)
             GroupsChanged[account] = groups with { At = to };
         if (Renamings.TryGetValue(account, out var renamings))
@@ -339,6 +347,7 @@ internal sealed class ClaudeSessionLayout
     private static Shown? ReadShown(JsonObject entry)
     {
         bool? pinned = null; var hasGroup = false; string? group = null; string? title = null; string? written = null;
+        string? model = null, effort = null, mode = null;
         foreach (var (field, value) in entry)
         {
             if (field == "pinned" && value is JsonValue pin && pin.TryGetValue<bool>(out var isPinned)) pinned = isPinned;
@@ -347,9 +356,12 @@ internal sealed class ClaudeSessionLayout
             { hasGroup = true; group = groupName; }
             else if (field == "title" && value is JsonValue text && text.TryGetValue<string>(out var titleText)) title = titleText;
             else if (field == "written" && value is JsonValue mark && mark.TryGetValue<string>(out var writtenText)) written = writtenText;
+            else if (field == "model" && value is JsonValue modelValue && modelValue.TryGetValue<string>(out var modelText)) model = modelText;
+            else if (field == "effort" && value is JsonValue effortValue && effortValue.TryGetValue<string>(out var effortText)) effort = effortText;
+            else if (field == "mode" && value is JsonValue modeValue && modeValue.TryGetValue<string>(out var modeText)) mode = modeText;
             else return null;
         }
-        return new(pinned, hasGroup, group, title, written);
+        return new(pinned, hasGroup, group, title, written, model, effort, mode);
     }
 
     private static GroupChange? ReadGroupChange(JsonObject node)
@@ -376,16 +388,21 @@ internal sealed class ClaudeSessionLayout
     private static Changes? ReadChanges(JsonObject entry)
     {
         Stamp<bool>? pinned = null; Stamp<string?>? group = null; Stamp<string>? title = null;
+        Stamp<string>? model = null, effort = null, mode = null;
         foreach (var (field, node) in entry)
         {
             if (node is not JsonObject stamp || !ReadStampParts(stamp, out var value, out var at, out var by)) return null;
+            var text = value is JsonValue textValue && textValue.TryGetValue<string>(out var read) ? read : null;
             if (field == "pinned" && value is JsonValue pin && pin.TryGetValue<bool>(out var isPinned)) pinned = new(isPinned, at, by);
             else if (field == "group" && value is null) group = new(null, at, by);
-            else if (field == "group" && value is JsonValue name && name.TryGetValue<string>(out var groupName)) group = new(groupName, at, by);
-            else if (field == "title" && value is JsonValue text && text.TryGetValue<string>(out var titleText)) title = new(titleText, at, by);
+            else if (field == "group" && text is not null) group = new(text, at, by);
+            else if (field == "title" && text is not null) title = new(text, at, by);
+            else if (field == "model" && text is not null) model = new(text, at, by);
+            else if (field == "effort" && text is not null) effort = new(text, at, by);
+            else if (field == "mode" && text is not null) mode = new(text, at, by);
             else return null;
         }
-        return new(pinned, group, title);
+        return new(pinned, group, title, model, effort, mode);
     }
 
     private static Pending? ReadPending(JsonObject node)
@@ -400,7 +417,7 @@ internal sealed class ClaudeSessionLayout
             foreach (var (field, value) in entry)
                 if (field != "filed") fields[field] = value?.DeepClone();
             if (ReadChanges(fields) is not { } read) return null;
-            targets[id] = new(read.Pinned, read.Group, read.Title, filed);
+            targets[id] = new(read.Pinned, read.Group, read.Title, filed, read.Model, read.Effort, read.Mode);
         }
         GroupChange? groups = null;
         if (node["groups"] is { } groupsNode && (groupsNode is not JsonObject groupsObject || (groups = ReadGroupChange(groupsObject)) is null))
@@ -485,6 +502,9 @@ internal sealed class ClaudeSessionLayout
                         if (shown.HasGroup) fields["group"] = shown.Group;
                         if (shown.Title is { } title) fields["title"] = title;
                         if (shown.Written is { } written) fields["written"] = written;
+                        if (shown.Model is { } model) fields["model"] = model;
+                        if (shown.Effort is { } effort) fields["effort"] = effort;
+                        if (shown.Mode is { } mode) fields["mode"] = mode;
                         sessions[id] = fields;
                     }
                     return sessions;
@@ -504,9 +524,7 @@ internal sealed class ClaudeSessionLayout
             {
                 var entries = new JsonObject();
                 foreach (var (id, change) in changed.OrderBy(pair => pair.Key, StringComparer.Ordinal))
-                {
-                    entries[id] = Write(change.Pinned, change.Group, change.Title);
-                }
+                    entries[id] = Write(change);
                 entry["changed"] = entries;
             }
             if (Pendings.TryGetValue(key, out var pending))
@@ -514,7 +532,7 @@ internal sealed class ClaudeSessionLayout
                 var sessions = new JsonObject();
                 foreach (var (id, target) in pending.Sessions.OrderBy(pair => pair.Key, StringComparer.Ordinal))
                 {
-                    var fields = Write(target.Pinned, target.Group, target.Title);
+                    var fields = Write(new Changes(target.Pinned, target.Group, target.Title, target.Model, target.Effort, target.Mode));
                     if (target.Filed) fields["filed"] = true;
                     sessions[id] = fields;
                 }
@@ -552,12 +570,13 @@ internal sealed class ClaudeSessionLayout
         File.Move(partial, path, overwrite: true);
     }
 
-    private static JsonObject Write(Stamp<bool>? pinned, Stamp<string?>? group, Stamp<string>? title)
+    private static JsonObject Write(Changes change)
     {
         var fields = new JsonObject();
-        if (pinned is not null) fields["pinned"] = Write(pinned.Value, pinned.At, pinned.By);
-        if (group is not null) fields["group"] = Write(group.Value, group.At, group.By);
-        if (title is not null) fields["title"] = Write(title.Value, title.At, title.By);
+        if (change.Pinned is { } pinned) fields["pinned"] = Write(pinned.Value, pinned.At, pinned.By);
+        if (change.Group is { } group) fields["group"] = Write(group.Value, group.At, group.By);
+        foreach (var (field, stamp) in new[] { ("title", change.Title), ("model", change.Model), ("effort", change.Effort), ("mode", change.Mode) })
+            if (stamp is not null) fields[field] = Write(stamp.Value, stamp.At, stamp.By);
         return fields;
     }
 
@@ -725,6 +744,9 @@ internal static class ClaudeSessionSync
     // An entry this close after the next transcript began is still the hand-over, not a branch.
     private static readonly TimeSpan HandOverSlack = TimeSpan.FromSeconds(2);
     private const string SidebarKey = "dframe-store";
+    /// <summary>Models, efforts and permission modes are planned only for a conversation used this recently in any account,
+    /// or pinned here: each one the app's tools set is a step the sync takes, and a raised mode asks the user.</summary>
+    internal static readonly TimeSpan SettingsWindow = TimeSpan.FromDays(7);
     /// <summary>Marks a group on its way out while the plan puts the groups in order: the app adds a new group at the
     /// end, so a group out of place is made anew under its name, and the old one, renamed with this mark, is emptied and
     /// deleted, as is a group the list lacks. The plan in progress tells such groups by id; the mark tells them when it
@@ -742,9 +764,11 @@ internal static class ClaudeSessionSync
     /// <param name="Detached">The user moved it to top level (<c>lineageDetached</c>).</param>
     /// <param name="Written">When its record was last written.</param>
     /// <param name="Former">The session its lineage links it to even once moved to top level: the family it left.</param>
+    /// <param name="Model">Its model, effort and permission mode, each null when unknown and empty for none (as
+    /// <c>ReadRecords</c> reads them).</param>
     internal sealed record Record(string SessionId, string? Title, bool Pinned, string? Cli, IReadOnlyList<string> Prior,
         long LastActivityAt, bool Branch = false, bool Renamed = false, string? Parent = null, bool Detached = false,
-        DateTimeOffset? Written = null, string? Former = null);
+        DateTimeOffset? Written = null, string? Former = null, string? Model = null, string? Effort = null, string? Mode = null);
     internal sealed record Group(string Id, string Name, bool Collapsed = false);
     /// <param name="Groups">In sidebar order.</param>
     /// <param name="Nested">The sessions the app nests under another, each with the session at the top of its family, whose
@@ -757,6 +781,17 @@ internal static class ClaudeSessionSync
     /// <param name="By">The account whose change this is; null for this account's own (an older state's, say).</param>
     internal sealed record Pin(string Session, bool Pinned, string? Title, string? By = null);
     internal sealed record Rename(string Session, string Title, string? From, string? By = null);
+    /// <summary>A model, effort or permission mode to set with the app's own tool. <c>From</c> is the value now, null for
+    /// none; <c>By</c> the account the change or starting value came from, null for this account's own.</summary>
+    internal sealed record SettingModel(string Session, string? Title, string Model, string? From, string? By = null);
+    internal sealed record SettingEffort(string Session, string? Title, string Effort, string? From, string? By = null);
+    /// <param name="Raises">The mode ranks above the one now (none as <c>default</c>): the app asks the user first.</param>
+    /// <param name="Self">The calling session's own mode.</param>
+    internal sealed record SettingMode(string Session, string? Title, string Mode, string? From, bool Raises, string? By = null,
+        [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] bool Self = false);
+    /// <summary>The calling session's model and effort, which the app refuses a session to change for itself.</summary>
+    internal sealed record SelfSetting(string? Model = null, string? ModelFrom = null, string? ModelBy = null,
+        string? Effort = null, string? EffortFrom = null, string? EffortBy = null);
     /// <summary>A group renamed out of the way before its name is made anew, or before it is deleted.</summary>
     internal sealed record GroupRename(string Id, string From, string To);
     /// <summary>A group to delete once the moves have emptied it of every session a list here shows, by the name it then
@@ -814,8 +849,11 @@ internal static class ClaudeSessionSync
 
     /// <summary>Another account: its list and groups (null when they cannot be confirmed), when the app last left it, and
     /// the widget's copies in its list with the title last written to each (null when the ledger cannot be read).</summary>
+    /// <param name="Writes">The records of its list the widget wrote, each with when it last did (see
+    /// <see cref="LedgerWrites"/>).</param>
     internal sealed record Other(string Account, string? Label, DateTimeOffset? LeftAt, IReadOnlyList<Record> Records,
-        Layout? Layout, IReadOnlyDictionary<string, string?>? CopyTitles, IReadOnlyList<Record>? Archived = null);
+        Layout? Layout, IReadOnlyDictionary<string, string?>? CopyTitles, IReadOnlyList<Record>? Archived = null,
+        IReadOnlyDictionary<string, DateTimeOffset>? Writes = null);
 
     /// <summary>An account the plan took changes from: how many conversations here it lists, and the titles of those
     /// only it lists.</summary>
@@ -825,14 +863,19 @@ internal static class ClaudeSessionSync
     /// <c>GroupOrder</c> is the group list the plan puts in place and <c>GroupOrderBy</c> the account whose change it
     /// follows (none for this one's own), both only when the plan changes the groups. <c>OnlyHere</c> are the titles of
     /// conversations no other account lists. <c>Checkpointed</c> says whether the widget recorded this account first.
-    /// <c>Pending</c> is what the plan sets out to change, for the widget.</summary>
+    /// <c>Pending</c> is what the plan sets out to change, for the widget. <c>Models</c>, <c>Efforts</c> and
+    /// <c>Permissions</c> are the conversations used within <see cref="SettingsWindow"/> or pinned here whose values it
+    /// changes, the most recently used first; <c>SelfSettings</c> the calling session's model and effort, and
+    /// <c>SettingsBeyond</c> how many conversations out of that scope it would have changed.</summary>
     internal sealed record Plan(string Status, string? Current = null, string? CurrentLabel = null,
         IReadOnlyList<OtherView>? Others = null, IReadOnlyList<Retire>? Archive = null,
         IReadOnlyList<GroupRename>? RenameGroups = null, IReadOnlyList<string>? CreateGroups = null,
         IReadOnlyList<Move>? Moves = null, IReadOnlyList<Pin>? Pins = null, IReadOnlyList<Rename>? Renames = null,
         IReadOnlyList<GroupDelete>? DeleteGroups = null, IReadOnlyList<string>? GroupOrder = null, string? GroupOrderBy = null,
         IReadOnlyList<string>? OnlyHere = null, IReadOnlyList<Sidebar>? Sidebars = null, IReadOnlyList<string>? Warnings = null,
-        bool? Checkpointed = null, [property: JsonIgnore] ClaudeSessionLayout.Pending? Pending = null);
+        bool? Checkpointed = null, [property: JsonIgnore] ClaudeSessionLayout.Pending? Pending = null,
+        IReadOnlyList<SettingModel>? Models = null, IReadOnlyList<SettingEffort>? Efforts = null,
+        IReadOnlyList<SettingMode>? Permissions = null, SelfSetting? SelfSettings = null, int? SettingsBeyond = null);
 
     /// <summary>What a plan reads, once, so a checkpoint and the plan made from it see the same: the pin list, the sidebar
     /// state, and each account's list.</summary>
@@ -841,8 +884,9 @@ internal static class ClaudeSessionSync
     /// <param name="Whole">False when a record there could not be read now.</param>
     /// <param name="CopyTitles">The widget's copies there with the title written to each; null when the ledger cannot be
     /// read.</param>
+    /// <param name="Writes">The records there the widget wrote, with when it last did; null when the ledger cannot be read.</param>
     internal sealed record Listing(string Directory, IReadOnlyList<Record> Records, bool Whole, IReadOnlyList<Record> Archived,
-        IReadOnlyDictionary<string, string?>? CopyTitles);
+        IReadOnlyDictionary<string, string?>? CopyTitles, IReadOnlyDictionary<string, DateTimeOffset>? Writes = null);
 
     /// <summary>Reads what a plan needs, the given accounts' lists included (an account without a list here has none).</summary>
     internal static Snapshot Read(Sources sources, IEnumerable<string> accounts)
@@ -852,8 +896,11 @@ internal static class ClaudeSessionSync
         var lists = new Dictionary<string, Listing>(StringComparer.Ordinal);
         foreach (var account in accounts.Distinct(StringComparer.Ordinal))
             if (AccountDirectory(sources.SessionsRoot, account) is { } directory)
+            {
+                var (copyTitles, writes) = ReadLedger(sources.Ledger, account);
                 lists[account] = new(directory, ReadRecords(directory, pinned, out var whole, out var archived), whole, archived,
-                    CopyTitles(sources.Ledger, account));
+                    copyTitles, writes);
+            }
         return new(pinned, sidebar, lists);
     }
 
@@ -995,7 +1042,7 @@ internal static class ClaudeSessionSync
     /// <summary>The plan for one account against a kept layout, from one snapshot; the widget makes it, to keep what a
     /// plan sets out to change. <paramref name="self"/> is the calling session, which never goes as an older state.</summary>
     internal static Plan BuildFor(Sources sources, string key, ClaudeSessionLayout kept, string? self, Snapshot snapshot,
-        string? only = null)
+        string? only = null, DateTimeOffset? now = null)
     {
         if (!snapshot.Lists.TryGetValue(key, out var mine)) return new("unknown_session");
         string? Label(string account) => kept.Accounts.TryGetValue(account, out var known) ? known.Label : null;
@@ -1023,7 +1070,7 @@ internal static class ClaudeSessionSync
             var layout = LayoutOf(sidebar, account, missingIsEmpty: false);
             if (layout is null && HasScope(sidebar, account)) groupsUnread = true;
             others.Add(new(account, Label(account), kept.Accounts[account].LeftAt, theirs.Records, layout, theirs.CopyTitles,
-                theirs.Archived));
+                theirs.Archived, theirs.Writes));
         }
         if (others.Count == 0) return new("no_other_accounts", key, Label(key));
         if (groupsUnread && currentLayout is not null) warnings.Add("groups_unreadable");
@@ -1033,7 +1080,7 @@ internal static class ClaudeSessionSync
         if (!listsWhole) warnings.Add("list_incomplete");
         return Compute(key, Label(key), mine.Records, currentLayout, others, kept, pinned is not null, lineage, warnings,
             groupsKnown: !groupsUnread, currentCopyTitles: mine.CopyTitles, pinsLost: PinsLost(pinned, kept),
-            archived: mine.Archived, listsWhole: listsWhole);
+            archived: mine.Archived, listsWhole: listsWhole, currentWrites: mine.Writes, now: now);
     }
 
     /// <summary>The app's pin list, one for every account, holds no pin at all where a checkpoint showed some: it was
@@ -1050,29 +1097,63 @@ internal static class ClaudeSessionSync
     /// <summary>The same copies with the title the widget last wrote to each (null when the ledger does not track it).
     /// The app's rename history cannot tell a renamed copy: it records neither a first name nor a change of case or
     /// spacing, so only a title exactly as written proves it untouched.</summary>
-    internal static IReadOnlyDictionary<string, string?>? CopyTitles(string ledgerDirectory, string account)
+    internal static IReadOnlyDictionary<string, string?>? CopyTitles(string ledgerDirectory, string account) =>
+        ReadLedger(ledgerDirectory, account).CopyTitles;
+
+    /// <summary>The records the widget wrote in an account's list, by session id, with when it last wrote each: a copy it
+    /// made (not archived) when it made it, a record it advanced when that advance was done. An advance gives the record
+    /// the source's activity time, earlier than the advance, so only activity after the write is the account's own.</summary>
+    internal static IReadOnlyDictionary<string, DateTimeOffset>? LedgerWrites(string ledgerDirectory, string account) =>
+        ReadLedger(ledgerDirectory, account).Writes;
+
+    /// <summary>The copies with their titles (see <see cref="CopyTitles"/>) and the widget's writes (see
+    /// <see cref="LedgerWrites"/>) from one read of the ledger; both null when it cannot be read whole.</summary>
+    private static (IReadOnlyDictionary<string, string?>? CopyTitles, IReadOnlyDictionary<string, DateTimeOffset>? Writes) ReadLedger(
+        string ledgerDirectory, string account)
     {
         var path = Path.Combine(ledgerDirectory, "ledger.json");
         try
         {
             using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-            if (JsonNode.Parse(stream) is not JsonObject { } root || root["created"] is not JsonArray created) return null;
+            if (JsonNode.Parse(stream) is not JsonObject { } root || root["created"] is not JsonArray created) return (null, null);
             var copies = new Dictionary<string, string?>(StringComparer.Ordinal);
+            var writes = new Dictionary<string, DateTimeOffset>(StringComparer.Ordinal);
+            void Wrote(string id, DateTimeOffset at) { if (!writes.TryGetValue(id, out var known) || at > known) writes[id] = at; }
+            static bool IsRecordFile(string file) =>
+                file.StartsWith("local_", StringComparison.Ordinal) && file.EndsWith(".json", StringComparison.Ordinal);
             foreach (var item in created)
             {
                 if (item is not JsonObject entry || Text(entry, "dst") is not { } target || Text(entry, "file") is not { } file
-                    || !file.StartsWith("local_", StringComparison.Ordinal) || !file.EndsWith(".json", StringComparison.Ordinal))
-                    return null;
-                if (string.Equals(target, account, StringComparison.OrdinalIgnoreCase) && entry["retiredAt"] is null)
-                    copies[file[..^".json".Length]] = Text(entry, "title");
+                    || !IsRecordFile(file)) return (null, null);
+                if (!string.Equals(target, account, StringComparison.OrdinalIgnoreCase) || entry["retiredAt"] is not null) continue;
+                var id = file[..^".json".Length];
+                copies[id] = Text(entry, "title");
+                Wrote(id, WriteTime(Text(entry, "createdAt")));
             }
-            return copies;
+            if (root["advanced"] is { } advancedNode)
+            {
+                if (advancedNode is not JsonArray advanced) return (null, null);
+                foreach (var item in advanced)
+                {
+                    if (item is not JsonObject entry || Text(entry, "dst") is not { } target || Text(entry, "file") is not { } file
+                        || !IsRecordFile(file) || Text(entry, "state") is not { } state) return (null, null);
+                    if (!string.Equals(target, account, StringComparison.OrdinalIgnoreCase)
+                        || !string.Equals(state, "done", StringComparison.OrdinalIgnoreCase)) continue;
+                    Wrote(file[..^".json".Length], WriteTime(Text(entry, "at")));
+                }
+            }
+            return (copies, writes);
         }
         catch (Exception exception) when (exception is FileNotFoundException or DirectoryNotFoundException)
-        { return new Dictionary<string, string?>(StringComparer.Ordinal); }
+        { return (new Dictionary<string, string?>(StringComparer.Ordinal), new Dictionary<string, DateTimeOffset>(StringComparer.Ordinal)); }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or JsonException)
-        { return null; }
+        { return (null, null); }
     }
+
+    /// <summary>When the ledger says the widget wrote: one it does not date is taken as written after any activity, so
+    /// the record owns nothing.</summary>
+    private static DateTimeOffset WriteTime(string? text) =>
+        DateTimeOffset.TryParse(text, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var at) ? at : DateTimeOffset.MaxValue;
 
     /// <summary>
     /// The changes, in the order they must run: rename the groups on their way out, make the groups the list needs in
@@ -1086,20 +1167,27 @@ internal static class ClaudeSessionSync
     /// leaves for no group — unless this stay filed it there, which keeps the group. Groups are planned only when the
     /// pins, every account's groups and this list could be read whole; pins only when the pins could be read; nothing
     /// without the widget's copies. An older state is ready when its newest state already holds what it keeps, so
-    /// stopping part way never loses a pin or a group.
+    /// stopping part way never loses a pin or a group. A conversation's model, effort and permission mode follow the newest
+    /// change likewise, or where nobody recorded one the explicit value of the account that last really used it; only for
+    /// a conversation used within <see cref="SettingsWindow"/> or pinned here, and only as items the app's own tools apply:
+    /// the widget never writes them into a record.
     /// </summary>
     /// <param name="groupsKnown">False when another account's groups are there but cannot be read (that account may hold
     /// the newest) or this list could not be read whole: then no group changes.</param>
     /// <param name="currentCopyTitles">The widget's copies in this account's list, with the titles it wrote. The ledger
     /// that tells them is the one that tells the other accounts' copies.</param>
     /// <param name="pinsLost">The pin list was lost: no pin counts as a change, and the newest changes bring them back.</param>
+    /// <param name="currentWrites">The records here the widget wrote, with when it last did (see <see cref="LedgerWrites"/>).</param>
+    /// <param name="now">What "used within <see cref="SettingsWindow"/>" counts from; the current time when not given.</param>
     internal static Plan Compute(string current, string? currentLabel, IReadOnlyList<Record> currentRecords,
         Layout? currentLayout, IReadOnlyList<Other> others, ClaudeSessionLayout kept, bool pinsKnown = true,
         Lineage? lineage = null, IReadOnlyList<string>? warnings = null, bool groupsKnown = true,
         IReadOnlyDictionary<string, string?>? currentCopyTitles = null, bool pinsLost = false,
-        IReadOnlyList<Record>? archived = null, bool listsWhole = true)
+        IReadOnlyList<Record>? archived = null, bool listsWhole = true,
+        IReadOnlyDictionary<string, DateTimeOffset>? currentWrites = null, DateTimeOffset? now = null)
     {
         var notes = warnings?.ToList() ?? [];
+        var usedSince = ((now ?? DateTimeOffset.UtcNow) - SettingsWindow).ToUnixTimeMilliseconds();
         string? Label(string? account) => account is null ? null
             : account == current ? currentLabel : kept.Accounts.TryGetValue(account, out var known) ? known.Label : null;
         // A nested session shows the group of the session at the top of its family and moves only with it.
@@ -1158,6 +1246,10 @@ internal static class ClaudeSessionSync
         // when it cannot be resolved) with the change it comes from.
         var targets = new Dictionary<string, (Offer<bool> Pin, (bool Known, string? Name) Group, Offer<string?>? GroupFrom)>(StringComparer.Ordinal);
         var titleFrom = new Dictionary<string, Offer<string>>(StringComparer.Ordinal);
+        // The model, effort and mode each session here should have, with the change or starting value each comes from,
+        // its latest activity in any account, and whether it is in scope (used within the window, or pinned here).
+        var settingsFrom = new Dictionary<string, (Offer<string>? Model, Offer<string>? Effort, Offer<string>? Mode, long Used, bool InScope)>(
+            StringComparer.Ordinal);
         // Groups this stay filed sessions under: the group list keeps them.
         var filedHere = new HashSet<string>(StringComparer.Ordinal);
         var onlyHere = new List<Record>();
@@ -1184,9 +1276,26 @@ internal static class ClaudeSessionSync
             // Filed by hand in this stay: that group stays even where the list lacks it.
             if (group is { Value: { } filedUnder, By: var filer, At: var filedAt } && filer == current
                 && (filedAt == DateTimeOffset.MaxValue || filedAt > stayStart)) filedHere.Add(filedUnder);
-            var now = currentLayout is null ? (Known: false, Name: (string?)null) : GroupNameOf(currentLayout, record.SessionId, renamedHere);
+            var groupNow = currentLayout is null ? (Known: false, Name: (string?)null) : GroupNameOf(currentLayout, record.SessionId, renamedHere);
             targets[record.SessionId] = (pin ?? new(record.Pinned, DateTimeOffset.MinValue, null),
-                group is { } chosen ? (true, chosen.Value) : now, group);
+                group is { } chosen ? (true, chosen.Value) : groupNow, group);
+            if (!decidable) continue;
+            // A model, effort and mode follow the newest change too; where nobody recorded one, the account that last
+            // really used the conversation gives its explicit value. Own activity is what a record has after the widget
+            // last wrote it: an advance or a copy carries the source's activity time.
+            var owner = found.Select(side => (Record: side.Matches[record.SessionId], side.Rank, side.Other.Account, side.Other.Writes))
+                .Prepend((Record: record, Rank: 0, Account: current, Writes: currentWrites))
+                .Select(candidate => (candidate.Record, candidate.Rank, candidate.Account, Active: OwnActivity(candidate.Record, candidate.Writes)))
+                .Where(candidate => candidate.Active is not null)
+                .OrderByDescending(candidate => candidate.Active).ThenBy(candidate => candidate.Rank).FirstOrDefault();
+            Offer<string>? Starting(string? value, bool mode = false) =>
+                owner.Record is null || owner.Account == current || value is not { Length: > 0 } || mode && value == DefaultMode ? null
+                : new(value, owner.Active!.Value, owner.Account);
+            var used = found.Select(side => side.Matches[record.SessionId].LastActivityAt).Append(record.LastActivityAt).Max();
+            settingsFrom[record.SessionId] = (Newest(offers, change => change.Model) ?? Starting(owner.Record?.Model),
+                Newest(offers, change => change.Effort) ?? Starting(owner.Record?.Effort),
+                Newest(offers, change => change.Mode) ?? Starting(owner.Record?.Mode, mode: true),
+                used, used >= usedSince || pinsKnown && record.Pinned);
         }
         // The group list follows the newest change too: this account's own in this stay first, else the newest any
         // account made. A list mid-move is nobody's choice; with no change at all the groups here stand as they are.
@@ -1348,6 +1457,44 @@ internal static class ClaudeSessionSync
                         Label(target.Pin.By == current ? null : target.Pin.By)));
             }
         var pinning = pins.Select(pin => pin.Session).ToHashSet(StringComparer.Ordinal);
+        // A model, effort or mode differing from what the record has is set with the app's tools (none differs; unknown,
+        // a session in plan mode, is left alone), the most recently used conversation first. The calling session cannot
+        // change its own model or effort: those it is told instead, and they are not set out as in progress.
+        var models = new List<SettingModel>();
+        var efforts = new List<SettingEffort>();
+        var permissions = new List<SettingMode>();
+        SelfSetting? selfSetting = null;
+        var beyond = 0;
+        var settingTargets = new Dictionary<string, (Offer<string>? Model, Offer<string>? Effort, Offer<string>? Mode)>(StringComparer.Ordinal);
+        static Offer<string>? Differing(Offer<string>? want, string? has) => want is not null && has is not null && want.Value != has ? want : null;
+        static string? From(string? has) => string.IsNullOrEmpty(has) ? null : has;
+        string? By(Offer<string> offer) => Label(offer.By == current ? null : offer.By);
+        var self = lineage?.Self;
+        foreach (var record in staying.Where(record => settingsFrom.ContainsKey(record.SessionId))
+                     .OrderByDescending(record => settingsFrom[record.SessionId].Used))
+        {
+            var (modelFrom, effortFrom, modeFrom, _, inScope) = settingsFrom[record.SessionId];
+            var model = Differing(modelFrom, record.Model);
+            var effort = Differing(effortFrom, record.Effort);
+            var mode = Differing(modeFrom, record.Mode);
+            if (model is null && effort is null && mode is null) continue;
+            if (!inScope) { beyond++; continue; }
+            var title = titles.GetValueOrDefault(record.SessionId) ?? record.Title;
+            var isSelf = record.SessionId == self;
+            if (isSelf)
+            {
+                if (model is not null || effort is not null)
+                    selfSetting = new(model?.Value, model is null ? null : From(record.Model), model is null ? null : By(model),
+                        effort?.Value, effort is null ? null : From(record.Effort), effort is null ? null : By(effort));
+                model = effort = null;
+            }
+            if (model is not null) models.Add(new(record.SessionId, title, model.Value, From(record.Model), By(model)));
+            if (effort is not null) efforts.Add(new(record.SessionId, title, effort.Value, From(record.Effort), By(effort)));
+            if (mode is not null)
+                permissions.Add(new(record.SessionId, title, mode.Value, From(record.Mode), ModeRank(mode.Value) > ModeRank(record.Mode),
+                    By(mode), isSelf));
+            if (model is not null || effort is not null || mode is not null) settingTargets[record.SessionId] = (model, effort, mode);
+        }
         // An older state goes only once what it leaves is known and already in place on its newest state: its own group,
         // the group and pin the newest state should have, and the newest state's own, all read, matching and not about
         // to change.
@@ -1394,8 +1541,10 @@ internal static class ClaudeSessionSync
                     target.GroupFrom?.By is { } by && by != current ? by : null)
                 : null;
             var title = titleFrom.TryGetValue(record.SessionId, out var from) ? Stamp(from) : null;
-            if (pin is not null || group is not null || title is not null)
-                intent[record.SessionId] = new(pin, group, title, filed.Contains(record.SessionId));
+            var (model, effort, mode) = settingTargets.GetValueOrDefault(record.SessionId);
+            if (pin is not null || group is not null || title is not null || model is not null || effort is not null || mode is not null)
+                intent[record.SessionId] = new(pin, group, title, filed.Contains(record.SessionId), model is null ? null : Stamp(model),
+                    effort is null ? null : Stamp(effort), mode is null ? null : Stamp(mode));
         }
         // What happens on the way to archiving is nobody's choice: an older state's move, the group a session leaves with a
         // group deleted, and a pin undone by a move or before archiving.
@@ -1417,7 +1566,17 @@ internal static class ClaudeSessionSync
                 orderBy) : null, renamedIntent);
         return new("ok", current, currentLabel, views, archive, renameGroups, create, moves, pins, renames, deleteGroups,
             regrouped ? order : null, regrouped ? Label(orderBy) : null, onlyHere.Select(Name).Order(StringComparer.Ordinal).ToArray(),
-            sidebars, notes is { Count: > 0 } ? notes : null, Pending: pending);
+            sidebars, notes is { Count: > 0 } ? notes : null, Pending: pending, Models: models, Efforts: efforts,
+            Permissions: permissions, SelfSettings: selfSetting, SettingsBeyond: beyond > 0 ? beyond : null);
+    }
+
+    /// <summary>When a record was last used in its own list: its activity, unless the widget wrote it since (a copy, or an
+    /// advance, carries the source's activity time). Null without activity of its own.</summary>
+    private static DateTimeOffset? OwnActivity(Record record, IReadOnlyDictionary<string, DateTimeOffset>? writes)
+    {
+        if (record.LastActivityAt <= 0) return null;
+        var active = DateTimeOffset.FromUnixTimeMilliseconds(record.LastActivityAt);
+        return writes is not null && writes.TryGetValue(record.SessionId, out var wrote) && active <= wrote ? null : active;
     }
 
     /// <summary>A value one account changed: when, and the account the change came from.</summary>
@@ -1587,7 +1746,8 @@ internal static class ClaudeSessionSync
     {
         var group = layout is null ? (Known: false, Name: (string?)null) : GroupNameOf(layout, record.SessionId, renamed);
         return new(pins ? record.Pinned : null, group.Known, group.Known ? group.Name : null,
-            string.IsNullOrWhiteSpace(record.Title) ? null : record.Title, copyTitles.GetValueOrDefault(record.SessionId));
+            string.IsNullOrWhiteSpace(record.Title) ? null : record.Title, copyTitles.GetValueOrDefault(record.SessionId),
+            record.Model, record.Effort, record.Mode);
     }
 
     /// <summary>Whether a record's title was chosen in its list: always for a record of its own; for the widget's copy
@@ -1596,18 +1756,39 @@ internal static class ClaudeSessionSync
     private static bool OwnTitle(Record record, IReadOnlyDictionary<string, string?> copyTitles) =>
         !copyTitles.TryGetValue(record.SessionId, out var written) || (written is not null ? record.Title != written : record.Renamed);
 
-    /// <summary>What a record gives without a checkpoint to compare with: everything of its own; of the widget's copy
-    /// only what was chosen there — its group once filed, its pin once pinned or filed (filing unpins, so its pin was
-    /// chosen since), its title once its own — and what the first format shows it had received.</summary>
+    /// <summary>What a record gives without a checkpoint to compare with: everything of its own, of its model, effort and
+    /// permission mode only what is explicit (a mode other than <c>default</c>); of the widget's copy only what was chosen
+    /// there — its group once filed, its pin once pinned or filed (filing unpins, so its pin was chosen since), its title
+    /// once its own, none of the three settings (it carries the source's) — and what the first format shows it had
+    /// received.</summary>
     private static ClaudeSessionLayout.Shown Gives(Record record, ClaudeSessionLayout.Shown shown,
         IReadOnlyDictionary<string, string?> copyTitles, ClaudeSessionLayout.Evidence? evidence)
     {
-        if (!copyTitles.ContainsKey(record.SessionId)) return shown;
+        if (!copyTitles.ContainsKey(record.SessionId))
+            return shown with
+            {
+                Model = shown.Model is { Length: > 0 } ? shown.Model : null, Effort = shown.Effort is { Length: > 0 } ? shown.Effort : null,
+                Mode = shown.Mode is { Length: > 0 } and not DefaultMode ? shown.Mode : null
+            };
         var filed = shown is { HasGroup: true, Group: not null };
         var group = filed || evidence?.Group == true && shown.HasGroup;
         return new(shown.Pinned is true || filed || evidence?.Pinned == true ? shown.Pinned : null, group, group ? shown.Group : null,
             OwnTitle(record, copyTitles) ? shown.Title : null);
     }
+
+    /// <summary>A model, effort or mode changed since the checkpoint: known on both sides, different, and not none (the
+    /// app's tools cannot take a value away). The mode the app fills into a record it loads without one (none to
+    /// <c>default</c>) was nobody's choice.</summary>
+    private static string? Setting(string? before, string? now, bool mode = false) =>
+        before is null || now is null || now == before || now.Length == 0 || mode && before.Length == 0 && now == DefaultMode ? null : now;
+
+    private const string DefaultMode = "default";
+
+    /// <summary>A permission mode's rank, for whether a plan raises it: none ranks as <c>default</c>.</summary>
+    private static int ModeRank(string? mode) => mode switch
+    {
+        "plan" => 0, "acceptEdits" => 2, "auto" => 3, "bypassPermissions" => 4, _ => 1
+    };
 
     /// <summary>What the app gave a session that has left its family since <paramref name="checkpoint"/> — moved to top
     /// level, or its family archived — as the checkpoint foresaw it (see <see cref="ClaudeSessionLayout.Checkpoint"/>);
@@ -1640,7 +1821,9 @@ internal static class ClaudeSessionSync
     /// own, nor is what the app gave one that has left its family since (see <see cref="Left"/>). The group list is the
     /// groups not aside: mid-move (groups aside, and the plan in progress has not made every
     /// group of its list yet, or no plan is known) it is no change; one the plan reached counts as the change it came from;
-    /// with groups renamed (same id, new name) the change carries the renaming.
+    /// with groups renamed (same id, new name) the change carries the renaming. A model, effort or permission mode changes
+    /// only from one known value to another that is not none (see <see cref="Setting"/>), and is settled against the plan
+    /// in progress as a title is.
     /// </summary>
     internal static Observation Observe(State state, ClaudeSessionLayout.Checkpoint? checkpoint, DateTimeOffset at,
         ClaudeSessionLayout.Pending? pending = null, IReadOnlyDictionary<string, ClaudeSessionLayout.Evidence>? evidence = null)
@@ -1682,12 +1865,17 @@ internal static class ClaudeSessionSync
                     && shown.Title == written;
                 changed = new(shown.Pinned is { } pinned && before.Pinned is { } was && pinned != was && !(pinned && appPin) ? pinned : null,
                     group, group ? shown.Group : null,
-                    shown.Title is { } title && title != before.Title && !widget ? title : null);
+                    shown.Title is { } title && title != before.Title && !widget ? title : null,
+                    Model: Setting(before.Model, shown.Model), Effort: Setting(before.Effort, shown.Effort),
+                    Mode: Setting(before.Mode, shown.Mode, mode: true));
             }
             else changed = Gives(record, shown, state.CopyTitles, checkpoint is null ? evidence?.GetValueOrDefault(record.SessionId) : null);
             ClaudeSessionLayout.Stamp<bool>? pin = changed.Pinned is { } pinnedNow ? new(pinnedNow, at) : null;
             ClaudeSessionLayout.Stamp<string?>? filing = changed.HasGroup && !nested ? new(changed.Group, at) : null;
             ClaudeSessionLayout.Stamp<string>? naming = changed.Title is { } titleNow ? new(titleNow, at) : null;
+            ClaudeSessionLayout.Stamp<string>? model = changed.Model is { Length: > 0 } modelNow ? new(modelNow, at) : null;
+            ClaudeSessionLayout.Stamp<string>? effort = changed.Effort is { Length: > 0 } effortNow ? new(effortNow, at) : null;
+            ClaudeSessionLayout.Stamp<string>? mode = changed.Mode is { Length: > 0 } modeNow ? new(modeNow, at) : null;
             if (pending?.Sessions.GetValueOrDefault(record.SessionId) is { } target)
             {
                 // Reached: the change it came from (an operational one, dated the earliest, is none). Not reached yet, or a
@@ -1712,10 +1900,24 @@ internal static class ClaudeSessionSync
                     if (hasTitle == wantTitle.Value) naming = Reached(wantTitle);
                     else if (before?.Title == hasTitle) { naming = null; openTitle = wantTitle; }
                 }
-                if (openPin is not null || openGroup is not null || openTitle is not null)
-                    open[record.SessionId] = new(openPin, openGroup, openTitle, target.Filed);
+                // A model, effort or mode as for titles: one still as in the checkpoint (an approval declined, say) stays
+                // in progress; one passing through plan mode is unknown and leaves the target as it was.
+                ClaudeSessionLayout.Stamp<string>? Settle(ClaudeSessionLayout.Stamp<string>? want, string? has, string? was,
+                    ref ClaudeSessionLayout.Stamp<string>? stamp)
+                {
+                    if (want is null || has is null) return null;
+                    if (has == want.Value) { stamp = Reached(want); return null; }
+                    if (was == has) { stamp = null; return want; }
+                    return null;
+                }
+                var openModel = Settle(target.Model, shown.Model, before?.Model, ref model);
+                var openEffort = Settle(target.Effort, shown.Effort, before?.Effort, ref effort);
+                var openMode = Settle(target.Mode, shown.Mode, before?.Mode, ref mode);
+                if (openPin is not null || openGroup is not null || openTitle is not null || openModel is not null
+                    || openEffort is not null || openMode is not null)
+                    open[record.SessionId] = new(openPin, openGroup, openTitle, target.Filed, openModel, openEffort, openMode);
             }
-            var stamped = new ClaudeSessionLayout.Changes(pin, filing, naming);
+            var stamped = new ClaudeSessionLayout.Changes(pin, filing, naming, model, effort, mode);
             if (!stamped.IsEmpty) changes[record.SessionId] = stamped;
         }
         // The group list: mid-move it is nobody's choice; reached it counts as the change it came from.
@@ -1913,7 +2115,7 @@ internal static class ClaudeSessionSync
     {
         var snapshot = Read(sources, layout.Accounts.Keys.Prepend(account));
         var checkpointed = active && Checkpoint(layout, snapshot, account, now);
-        var plan = BuildFor(sources, account, layout, self, snapshot);
+        var plan = BuildFor(sources, account, layout, self, snapshot, now: now);
         if (!checkpointed || plan is not { Status: "ok", Pending: { } pending }) return plan with { Checkpointed = false };
         layout.Pendings[account] = pending;
         return plan with { Checkpointed = true };
@@ -2420,10 +2622,28 @@ internal static class ClaudeSessionSync
                 Branch: !string.IsNullOrEmpty(Text(record, "forkedFromSessionId")) || record["spawnedFrom"] is JsonObject,
                 Renamed: record["previousTitles"] is JsonArray { Count: > 0 }, Parent: ParentOf(record, sessionId),
                 Detached: Flag(record, "lineageDetached"), Written: new DateTimeOffset(written, TimeSpan.Zero),
-                Former: ParentOf(record, sessionId, detachedToo: true)));
+                Former: ParentOf(record, sessionId, detachedToo: true), Model: ModelOf(record), Effort: EffortOf(record),
+                Mode: ModeOf(record)));
         }
         return records;
     }
+
+    /// <summary>A record's model as a copy carries it (see <see cref="ClaudeSessionShelf.IsModelCharacter"/>); none
+    /// otherwise.</summary>
+    private static string ModelOf(JsonObject record) =>
+        Text(record, "model") is { Length: > 0 and <= 80 } model && model.All(ClaudeSessionShelf.IsModelCharacter) ? model : "";
+
+    /// <summary>A record's own effort level; none when it is the default's (<c>effortInherited</c>) or unfamiliar.</summary>
+    private static string EffortOf(JsonObject record) =>
+        !Flag(record, "effortInherited") && Text(record, "effort") is { } effort && ClaudeSessionShelf.EffortLevels.Contains(effort) ? effort : "";
+
+    /// <summary>A record's permission mode: unknown while it passes through plan mode, none when absent or unfamiliar.</summary>
+    private static string? ModeOf(JsonObject record) => Text(record, "permissionMode") switch
+    {
+        "plan" => null,
+        { } mode when mode is DefaultMode or "acceptEdits" or "auto" or "bypassPermissions" => mode,
+        _ => ""
+    };
 
     /// <summary>The session a record's lineage links it to, as the app reads it (Claude 3.1623): none once the user moved
     /// it to top level (<c>lineageDetached</c>); else the session that started it, when Claude started it as a side
