@@ -291,7 +291,11 @@ internal sealed class ClaudeCodeUsageSource : IClaudeUsageSource
 
 internal sealed class ClaudeCodeProcessRunner : IClaudeCommandRunner
 {
-    internal static readonly TimeSpan CommandTimeout = TimeSpan.FromSeconds(20);
+    // Claude Code 2.1.321 computes "What's contributing to your usage?" from this machine's
+    // transcripts alongside the limits fetch and answers only when both finish. Observed
+    // 2026-11-14: 27 s and 50 s for one week of shared transcripts, so 20 s timed out the
+    // usual read. The ten-minute interval spaces requests, not this wait.
+    internal static readonly TimeSpan CommandTimeout = TimeSpan.FromMinutes(2);
     private const int MaximumOutputCharacters = 128 * 1024;
     private readonly string? _configDirectory;
     private readonly Action<ProcessStartInfo>? _configureProcess;
@@ -311,6 +315,9 @@ internal sealed class ClaudeCodeProcessRunner : IClaudeCommandRunner
         try
         {
             if (!process.Start()) throw new IOException("Claude Code could not be started.");
+            // The prompt is an argument. Close stdin so a print-mode CLI never waits for piped input.
+            try { process.StandardInput.Close(); }
+            catch (IOException) { /* An early exit already closed the pipe; its result follows. */ }
         }
         catch (Win32Exception exception)
         {
@@ -349,6 +356,7 @@ internal sealed class ClaudeCodeProcessRunner : IClaudeCommandRunner
             FileName = executablePath,
             UseShellExecute = false,
             CreateNoWindow = true,
+            RedirectStandardInput = true,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             StandardOutputEncoding = System.Text.Encoding.UTF8,

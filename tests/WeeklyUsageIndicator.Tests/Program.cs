@@ -70,6 +70,7 @@ var tests = new (string Name, Func<Task> Run)[]
     ("model turns and costs are rejected", TestNoModelTurnGuardAsync),
     ("authentication and malformed output are hard failures", TestSourceHardFailuresAsync),
     ("Claude process invocation is shell-free and session-free", TestProcessArgumentsAsync),
+    ("slow current /usage report parses and a timed-out retry names its cause", TestSlowUsageReportAsync),
     ("ten-minute cache prevents duplicate commands", TestFreshCacheAsync),
     ("transient command failures keep cached usage and back off", TestTransientRecoveryAsync),
     ("persisted usage protects a transient cold start", TestPersistedColdStartAsync),
@@ -80,6 +81,22 @@ var tests = new (string Name, Func<Task> Run)[]
     ("temporary errors expose the next attempt", TestRetryErrorTextAsync),
     ("stale tooltip reports last success and next retry", TestStaleTooltipAsync)
 };
+
+if (args.Contains("--claude-usage-tests"))
+{
+    // Window-free Claude usage checks: parsing, invocation, client cache/backoff, metric and controller.
+    var first = Array.FindIndex(tests, test => test.Name == "official Claude /usage output is parsed");
+    foreach (var test in new (string Name, Func<Task> Run)[]
+             {
+                 ("Claude weekly metric, independent expiry and profile cache", ClaudeMetricTests.RunAll),
+                 ("Claude login waits, transient observation and identity invalidation", ClaudeControllerTests.RunAsync)
+             }.Concat(tests[first..]))
+    {
+        await test.Run();
+        Console.WriteLine($"PASS: {test.Name}");
+    }
+    return;
+}
 
 foreach (var test in tests)
 {
@@ -316,6 +333,70 @@ static Task TestProcessArgumentsAsync()
         "the command contract should remain exact and reviewable");
     Assert(UsageIndicatorForm.ClaudeRefreshTimeout > ClaudeCodeProcessRunner.CommandTimeout,
         "the UI timeout must leave the process runner time to classify a slow command as transient");
+    Assert(UsageIndicatorForm.ClaudeRefreshTimeout - ClaudeCodeProcessRunner.CommandTimeout >= TimeSpan.FromSeconds(30),
+        "the UI timeout must also cover the identity check that precedes the read");
+    // Observed 2026-11-14 with Claude Code 2.1.321: /usage answered after 27 s and 50 s.
+    Assert(ClaudeCodeProcessRunner.CommandTimeout >= TimeSpan.FromMinutes(2),
+        "the read must outlast the official CLI's local usage analysis");
+    Assert(startInfo.RedirectStandardInput, "print mode must not wait on an inherited or open stdin");
+    return Task.CompletedTask;
+}
+
+static Task TestSlowUsageReportAsync()
+{
+    // Shape of Claude Code 2.1.321 output (2026-11-14): no five-hour line while that window is
+    // idle, structured limits beside the text, and the local analysis after the limits.
+    var now = new DateTimeOffset(2026, 11, 14, 6, 30, 0, TimeSpan.Zero);
+    var text = """
+        You are currently using your subscription to power your Claude Code usage
+
+        Current week (all models): 87% used · resets Nov 14, 6pm (Asia/Seoul)
+        Current week (Fable): 82% used · resets Nov 14, 6pm (Asia/Seoul)
+
+        What's contributing to your usage?
+        Approximate · sessions on this machine only · shares overlap
+
+        Last 24h · 5000 requests · 20 sessions
+          95%  Start fresh when you switch tasks · run /clear
+        """;
+    var raw = JsonSerializer.Serialize(new object[]
+    {
+        new { type = "system", subtype = "init" },
+        new
+        {
+            type = "assistant",
+            usage_report = new
+            {
+                session = new { total_cost_usd = 0, total_duration_ms = 49518 },
+                rate_limits = new
+                {
+                    limits = new object[]
+                    {
+                        new { kind = "weekly_all", group = "weekly", percent = 87, resets_at = "2026-11-14T09:00:00.410151+00:00", scope = (object?)null, is_active = true },
+                        new { kind = "weekly_scoped", group = "weekly", percent = 82, resets_at = "2026-11-14T09:00:00.410262+00:00", scope = new { model = new { display_name = "Fable" } }, is_active = false }
+                    },
+                    extra_usage = new { is_enabled = false }
+                }
+            }
+        },
+        new { type = "result", subtype = "success", is_error = false, num_turns = 0, total_cost_usd = 0,
+            duration_ms = 48587, local_command = "usage", result = text }
+    });
+    var snapshot = ClaudeCodeUsageSource.ParseEnvelope(raw, now);
+    Assert(snapshot.FiveHour is null && snapshot.Weekly?.UsedPercent == 87 && snapshot.Fable?.UsedPercent == 82,
+        "the current report parses its weekly windows and leaves the idle session window absent");
+    Assert(snapshot.Weekly?.ResetsAt == new DateTimeOffset(2026, 11, 14, 18, 0, 0, TimeSpan.FromHours(9)),
+        "the hour-only reset keeps its reported time zone");
+
+    var waited = new TimeoutException("Claude Code /usage timed out.");
+    var retry = DateTimeOffset.Now.AddMinutes(10);
+    var shown = UsageIndicatorForm.FriendlyClaudeError(new ClaudeUsageTemporarilyUnavailableException(retry,
+        new ClaudeUsageTemporarilyUnavailableException(retry, waited)));
+    Assert(shown.StartsWith(UiText.T("Claude 응답 시간이 초과되었습니다."), StringComparison.Ordinal),
+        "a retry wait that follows a timed-out read names the timeout");
+    shown = UsageIndicatorForm.FriendlyClaudeError(new ClaudeUsageTemporarilyUnavailableException(retry));
+    Assert(shown == UiText.T("Claude 사용량 조회가 지연되었습니다. 다음 시도: {0}", shown[(shown.LastIndexOf(": ", StringComparison.Ordinal) + 2)..]),
+        "a plain interval wait keeps the general text");
     return Task.CompletedTask;
 }
 
