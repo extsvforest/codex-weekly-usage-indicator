@@ -1507,6 +1507,12 @@ internal static class ClaudeSessionShelfTests
                 foreach (var group in plan.DeleteGroups ?? [])
                     Console.WriteLine($"  delete group {group.Name}" + (group.Remade ? " (made anew)" : "") + (group.Hidden > 0 ? $" ({group.Hidden} archived leave it)" : ""));
                 if (plan.GroupOrder is { } order) Console.WriteLine($"  group order [{string.Join(", ", order)}] from {plan.GroupOrderBy ?? "this account"}");
+                foreach (var item in plan.Models ?? []) Console.WriteLine($"  model {item.Title}: {item.From ?? "(none)"} -> {item.Model} (by {item.By})");
+                foreach (var item in plan.Efforts ?? []) Console.WriteLine($"  effort {item.Title}: {item.From ?? "(none)"} -> {item.Effort} (by {item.By})");
+                foreach (var item in plan.Permissions ?? [])
+                    Console.WriteLine($"  mode {item.Title}: {item.From ?? "(none)"} -> {item.Mode}{(item.Raises ? ", asks" : "")} (by {item.By})");
+                if (plan.SelfSettings is { } own) Console.WriteLine($"  the calling session's own: model {own.Model} effort {own.Effort}");
+                if (plan.SettingsBeyond is { } beyond) Console.WriteLine($"  {beyond} conversations out of scope keep their model, effort and mode");
             }
         }
         finally { Directory.Delete(scratch, true); }

@@ -76,6 +76,8 @@ internal static class ClaudeSessionSyncTests
         TestSettingsLayoutStore();
         TestSettingsNewRecord();
         TestSettingsRead();
+        TestSettingsScheduledRun();
+        TestSettingsFirstLook();
         return Task.CompletedTask;
     }
 
@@ -2898,6 +2900,102 @@ internal static class ClaudeSessionSyncTests
             "the widget wrote a copy it made (not archived) when it made it, and a record it advanced when the advance was done; one undated owns nothing");
     }
 
+    /// <summary>A run a scheduled task started keeps what the task set: nothing is planned for it or counted, here or
+    /// where it ran; once the user goes on with it, it is planned.</summary>
+    private static void TestSettingsScheduledRun()
+    {
+        const int eightDays = -60 * 24 * 8;
+        var here = new[] { S("local_c", "예약", 1, -100, "m-here", mode: ""), S("local_o", "옛 예약", 2, eightDays, "m-here") };
+        var ran = new[]
+        {
+            S("local_r", "예약", 1, -30, "m-task", mode: "bypassPermissions") with { Scheduled = true },
+            S("local_q", "옛 예약", 2, eightDays, "m-task") with { Scheduled = true }
+        };
+        var kept = new ClaudeSessionLayout();
+        Steady(kept, K1, "계정1", ran, null, At(-10));
+        Steady(kept, K2, "계정2", here, null, At(-20));
+        Changed(kept, K1, "local_q", new Changes(Model: new("m-task", At(-15))));
+        var copies = Copies(("local_c", "예약"), ("local_o", "옛 예약"));
+        var plan = Compute(here, null, [Other(K1, "계정1", ran, null, At(-10))], kept, copies);
+        Check(plan is { Models.Count: 0, Efforts.Count: 0, Permissions.Count: 0, SettingsBeyond: null, SelfSettings: null }
+              && !plan.Pending!.Sessions.ContainsKey("local_c") && !plan.Pending.Sessions.ContainsKey("local_o"),
+            "a scheduled run in another account, its copy here without a mode, is neither planned nor counted");
+        var mine = Compute(here.Select(record => record with { Scheduled = true }).ToArray(), null,
+            [Other(K1, "계정1", ran.Select(record => record with { Scheduled = false }).ToArray(), null, At(-10))], kept, copies,
+            lineage: new ClaudeSessionSync.Lineage("local_c", _ => null, (_, _) => null));
+        Check(mine is { Models.Count: 0, Permissions.Count: 0, SettingsBeyond: null, SelfSettings: null },
+            "nor one whose record here is the scheduled run, the calling session included");
+        var continued = Compute(here, null, [Other(K1, "계정1", ran.Select(record => record with { Scheduled = false }).ToArray(), null, At(-10))],
+            kept, copies);
+        Check(continued.Models!.Single() is { Session: "local_c", Model: "m-task", From: "m-here", By: "계정1" }
+              && continued.Permissions!.Single() is { Session: "local_c", Mode: "bypassPermissions", From: null, Raises: true }
+              && continued.SettingsBeyond == 1,
+            "a run the user went on with is planned, and counted when out of scope");
+
+        using var world = new SessionWorld("settings-scheduled");
+        world.Record(K1, "local_s", "s", Cli(1), extra: record => record["scheduledTaskId"] = "daily-brief");
+        world.Record(K1, "local_g", "g", Cli(2), extra: record => { record["scheduledTaskId"] = "daily-brief"; record["scheduledRunContinued"] = true; });
+        world.Record(K1, "local_e", "e", Cli(3), extra: record => record["scheduledTaskId"] = "");
+        var read = world.Records(K1).ToDictionary(record => record.SessionId, StringComparer.Ordinal);
+        Check(read["local_s"].Scheduled && !read["local_g"].Scheduled && !read["local_e"].Scheduled,
+            "a record with a scheduled task's id is a scheduled run until the user goes on with it");
+    }
+
+    /// <summary>The first look at this stay's models, efforts and modes, after a checkpoint that held none: a record the app
+    /// wrote since it came to the account, and the widget did not, shows this stay's choices.</summary>
+    private static void TestSettingsFirstLook()
+    {
+        using var world = new SessionWorld("settings-first-look");
+        var mineActive = At(-200).ToUnixTimeMilliseconds();
+        var theirsActive = At(5).ToUnixTimeMilliseconds();
+        void Pair(string name, string title, int cli, (string Field, string Value)[] here)
+        {
+            world.Record(K2, "local_" + name + "2", title, Cli(cli), activity: mineActive,
+                extra: record => { foreach (var (field, value) in here) record[field] = value; });
+            world.Record(K1, "local_" + name + "1", title, Cli(cli), activity: theirsActive,
+                extra: record => { record["model"] = "m-there"; record["effort"] = "low"; record["permissionMode"] = "acceptEdits"; });
+        }
+        Pair("a", "가", 1, [("model", "m-mine"), ("effort", "max"), ("permissionMode", "auto")]);
+        Pair("b", "나", 2, [("model", "m-mine")]);
+        Pair("c", "다", 3, [("model", "m-mine")]);
+        Pair("d", "라", 4, [("model", ""), ("permissionMode", "default")]);
+        // The widget made 다 here and wrote it again after the app came.
+        world.Copied(K2, "local_c2", "다", At(20));
+        void Written(string account, string id, int minutes) => File.SetLastWriteTimeUtc(world.RecordPath(account, id), At(minutes).UtcDateTime);
+        foreach (var id in new[] { "local_a2", "local_c2", "local_d2" }) Written(K2, id, 10);
+        Written(K2, "local_b2", -10);
+        foreach (var id in new[] { "local_a1", "local_b1", "local_c1", "local_d1" }) Written(K1, id, 10);
+        world.Flush();
+        // A checkpoint each from before the upgrade: titles, pins and groups, no model, effort or mode. The app came to
+        // 계정2 at 0 and is there; 계정1 was arrived at and left before.
+        var layout = new ClaudeSessionLayout { Active = K2 };
+        layout.Accounts[K2] = new("계정2", At(-100), At(0), 1);
+        layout.Accounts[K1] = new("계정1", At(-50), At(-60), 1);
+        ClaudeSessionLayout.Checkpoint Earlier(string suffix, int minutes) => new(At(minutes), 1, [],
+            new[] { ("a", "가"), ("b", "나"), ("c", "다"), ("d", "라") }.ToDictionary(pair => "local_" + pair.Item1 + suffix,
+                pair => new Shown(false, true, null, pair.Item2), StringComparer.Ordinal));
+        layout.Checkpoints[K2] = Earlier("2", 1);
+        layout.Checkpoints[K1] = Earlier("1", -55);
+        var view = ClaudeSessionSync.Serve(layout, world.Sources, K2, null, active: false, At(25));
+        Check(view is { Status: "ok", Checkpointed: false } && view.Models!.All(item => item.Session != "local_a2")
+              && view.Efforts!.All(item => item.Session != "local_a2") && view.Permissions!.All(item => item.Session != "local_a2"),
+            "a plan for viewing already takes what this stay chose over another account's starting value");
+        Check(view.Models!.Any(item => item.Session == "local_b2") && view.Pending!.Sessions["local_b2"].Model
+                  == new ClaudeSessionLayout.Stamp<string>("m-there", At(5), K1),
+            "a record not written since the arrival gives nothing, and another account's first look finds no change: the starting value applies");
+        Check(ClaudeSessionSync.Checkpoint(layout, world.Sources, K2, At(30))
+              && layout.Changed[K2].GetValueOrDefault("local_a2") is { Model: { Value: "m-mine" } model, Effort.Value: "max", Mode.Value: "auto" } && model.At == At(30)
+              && layout.Changed[K2].GetValueOrDefault("local_b2")?.Model is null && layout.Changed[K2].GetValueOrDefault("local_c2")?.Model is null
+              && layout.Changed[K2].GetValueOrDefault("local_d2") is null or { Model: null, Mode: null },
+            "the checkpoint takes a record written since the arrival as this stay's choice; not one the widget wrote since, nor default or none");
+        Check(ClaudeSessionSync.Serve(layout, world.Sources, K2, null, active: true, At(31)) is { Checkpointed: true } plan
+              && plan.Models!.All(item => item.Session != "local_a2") && plan.Models.Any(item => item.Session == "local_b2"),
+            "this stay's choices win over another account's starting value");
+        Written(K2, "local_b2", 40);
+        Check(ClaudeSessionSync.Checkpoint(layout, world.Sources, K2, At(41)) && layout.Changed[K2].GetValueOrDefault("local_b2")?.Model is null,
+            "a second look, the checkpoint holding the values, finds no change in a value that stayed");
+    }
+
     /// <summary>Three accounts the widget maps, each listing the given conversations: 계정1 holds the records the app wrote,
     /// 계정2 and 계정3 the widget's copies of them.</summary>
     private static (SessionWorld World, Widget Widget) Accounts3(string name, params (string Name, string Title)[] conversations)
@@ -3052,10 +3150,11 @@ internal static class ClaudeSessionSyncTests
 
         /// <summary>The widget copied a session into <paramref name="account"/>'s list, writing <paramref name="written"/> as its
         /// title (null: a ledger entry from before titles were kept).</summary>
-        internal void Copied(string account, string id, string? written)
+        internal void Copied(string account, string id, string? written, DateTimeOffset? createdAt = null)
         {
             var entry = new JsonObject { ["dst"] = account, ["file"] = id + ".json" };
             if (written is not null) entry["title"] = written;
+            if (createdAt is { } at) entry["createdAt"] = at.ToString("O");
             _created.Add(entry);
             WriteLedger();
         }
