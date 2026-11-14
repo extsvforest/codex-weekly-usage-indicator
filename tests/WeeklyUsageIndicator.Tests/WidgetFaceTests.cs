@@ -84,7 +84,7 @@ internal static class WidgetFaceTests
             new(new(72), new WidgetGauge(41), Hovered: true),
             new(new(38), null),
             new(new(55), new WidgetGauge(41, Stale: true)),
-            new(new(null), new WidgetGauge(null), Refreshing: true),
+            new(new(null, Loading: true), new WidgetGauge(null, Loading: true)),
             new(new(100), new WidgetGauge(100)),
         ];
         foreach (var (name, ground, behind) in new[]
@@ -158,6 +158,9 @@ internal static class WidgetFaceTests
                 using (var graphics = Graphics.FromImage(shot)) graphics.CopyFromScreen(widget.Left - 60, widget.Top - 40, 0, 0, shot.Size);
                 shot.Save(output, ImageFormat.Png);
                 Console.WriteLine($"ground: {Field("_ground").GetValue(widget)}, bounds: {widget.Bounds}");
+                // Read from the window manager without moving the pointer: where the window would take it.
+                bool Takes(int x, int y) => WindowFromPoint(new Point(widget.Left + x, widget.Top + y)) == widget.Handle;
+                Console.WriteLine($"takes the pointer: middle {Takes(136, 32)}, left edge {Takes(3, 32)}, top strip {Takes(136, 2)}, bottom strip {Takes(136, 61)}, corner {Takes(0, 0)}");
                 widget.Close();
                 completion.SetResult();
             }
@@ -174,6 +177,9 @@ internal static class WidgetFaceTests
             while (Environment.TickCount64 < until) { Application.DoEvents(); Thread.Sleep(15); }
         }
     }
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern IntPtr WindowFromPoint(Point point);
 
     private static bool Near(Color pixel, Color colour) =>
         pixel.A > 200 && Math.Abs(pixel.R - colour.R) < 12 && Math.Abs(pixel.G - colour.G) < 12 && Math.Abs(pixel.B - colour.B) < 12;

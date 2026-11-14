@@ -672,7 +672,11 @@ internal sealed class UsageIndicatorForm : Form
     private async Task RefreshClaudeAndShowAsync()
     {
         await RefreshClaudeAsync();
-        if (!IsDisposed) { UpdateToolTip(); Invalidate(); }
+        // Shown from the message loop, once this read has ended and is in the caller's hand: the face reads a read
+        // that has not ended as under way.
+        if (IsHandleCreated && !IsDisposed) BeginInvoke((Action)Shown);
+        else Shown();
+        void Shown() { if (!IsDisposed) { UpdateToolTip(); Invalidate(); } }
     }
 
     private async Task RefreshClaudeAsync()
@@ -781,15 +785,18 @@ internal sealed class UsageIndicatorForm : Form
     /// unknown or withheld, and a share kept through a transient failure marked stale.</summary>
     private WidgetFaceState FaceState()
     {
-        var codex = new WidgetGauge(UsagePercentage.Remaining(_codexError is null ? (double?)_codexSnapshot?.UsedPercent : null));
+        var codex = new WidgetGauge(UsagePercentage.Remaining(_codexError is null ? (double?)_codexSnapshot?.UsedPercent : null),
+            Loading: _isRefreshing);
         WidgetGauge? claude = null;
         if (_showClaude)
         {
             var (usage, error) = ClaudeDisplay();
             var used = error is null ? _claudeMetric.SelectUsedPercent(usage?.Snapshot, DateTimeOffset.UtcNow) : null;
-            claude = new WidgetGauge(UsagePercentage.Remaining(used), usage is { IsStale: true });
+            // A Claude read runs beside the Codex poll and outlasts it (see CommandTimeout).
+            claude = new WidgetGauge(UsagePercentage.Remaining(used), usage is { IsStale: true },
+                Loading: _isRefreshing || _claudeRefresh is { IsCompleted: false });
         }
-        return new WidgetFaceState(codex, claude, _isRefreshing, _isHovered, _ground);
+        return new WidgetFaceState(codex, claude, _isHovered, _ground);
     }
 
     /// <summary>Puts the face on screen. A layered window shows the picture it was last given and nothing before the

@@ -11,11 +11,12 @@ namespace WeeklyUsageIndicator;
 internal enum WidgetGround { Floating, DarkTaskbar, LightTaskbar }
 
 /// <summary>One provider's gauge: the share of its weekly window that remains, or none while that is unknown. A stale
-/// share (the last observation, kept through a transient failure) is drawn fainter.</summary>
-internal readonly record struct WidgetGauge(int? Remaining, bool Stale = false);
+/// share (the last observation, kept through a transient failure) is drawn fainter. <c>Loading</c>: a read is under way,
+/// which shows only while there is no share to show.</summary>
+internal readonly record struct WidgetGauge(int? Remaining, bool Stale = false, bool Loading = false);
 
 /// <summary>Everything the face shows. <c>Claude</c> is null while its half is switched off.</summary>
-internal sealed record WidgetFaceState(WidgetGauge Codex, WidgetGauge? Claude, bool Refreshing = false, bool Hovered = false,
+internal sealed record WidgetFaceState(WidgetGauge Codex, WidgetGauge? Claude, bool Hovered = false,
     WidgetGround Ground = WidgetGround.Floating);
 
 /// <summary>Draws the widget: per provider a ring that fills clockwise with what remains, in the provider's colour, and
@@ -123,7 +124,7 @@ internal static class WidgetFace
             : new[] { (state.Codex, palette.Codex) };
         var family = AccountFonts.Family();
         // Each number keeps the room of its digit count, so the face does not shift as a value changes within it.
-        var rooms = gauges.Select(gauge => NumberRoom(family, gauge.Item1, state.Refreshing)).ToArray();
+        var rooms = gauges.Select(gauge => NumberRoom(family, gauge.Item1)).ToArray();
         var total = rooms.Sum(room => Ring + RingToNumber + room) + Between * (gauges.Length - 1);
         var x = (float)Math.Round((Width - total) / 2f);
         var baseline = Baseline(family);
@@ -131,7 +132,7 @@ internal static class WidgetFace
         {
             var (gauge, accent) = gauges[index];
             DrawRing(graphics, palette, gauge, accent, x + Ring / 2f, Height / 2f);
-            DrawNumber(graphics, palette, family, gauge, state.Refreshing, x + Ring + RingToNumber, baseline);
+            DrawNumber(graphics, palette, family, gauge, x + Ring + RingToNumber, baseline);
             x += Ring + RingToNumber + rooms[index] + Between;
         }
     }
@@ -177,12 +178,12 @@ internal static class WidgetFace
         else graphics.DrawArc(pen, arc, -90f, Math.Max(1f, sweep));
     }
 
-    private static void DrawNumber(Graphics graphics, Palette palette, FontFamily family, WidgetGauge gauge, bool refreshing,
+    private static void DrawNumber(Graphics graphics, Palette palette, FontFamily family, WidgetGauge gauge,
         float left, float baseline)
     {
         if (gauge.Remaining is not { } remaining)
         {
-            using var mark = Outline(refreshing ? "…" : "—", family, Em * 0.9f, baseline);
+            using var mark = Outline(gauge.Loading ? "…" : "—", family, Em * 0.9f, baseline);
             MoveInkTo(mark, left);
             using var missing = new SolidBrush(palette.Missing);
             graphics.FillPath(missing, mark);
@@ -203,11 +204,11 @@ internal static class WidgetFace
 
     /// <summary>The width a number is given: that of zeros of its digit count with the percent sign, or of the mark that
     /// stands in for a missing value.</summary>
-    private static float NumberRoom(FontFamily family, WidgetGauge gauge, bool refreshing)
+    private static float NumberRoom(FontFamily family, WidgetGauge gauge)
     {
         if (gauge.Remaining is not { } remaining)
         {
-            using var mark = Outline(refreshing ? "…" : "—", family, Em * 0.9f, 0);
+            using var mark = Outline(gauge.Loading ? "…" : "—", family, Em * 0.9f, 0);
             return mark.GetBounds().Width;
         }
         using var digits = Outline(new string('0', remaining.ToString().Length), family, Em, 0);
