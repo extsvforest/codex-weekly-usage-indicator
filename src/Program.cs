@@ -59,8 +59,8 @@ internal sealed class UsageIndicatorForm : Form
     internal static readonly TimeSpan ClaudeRefreshTimeout =
         ClaudeCodeProcessRunner.CommandTimeout + TimeSpan.FromSeconds(35);
 
-    private const int WidgetWidth = 272;
-    private const int WidgetHeight = 64;
+    private const int WidgetWidth = WidgetFace.Width;
+    private const int WidgetHeight = WidgetFace.Height;
 
     private readonly AppServerClient _codexClient = new();
     private readonly ClaudeUsageClient? _claudeClient;
@@ -82,8 +82,9 @@ internal sealed class UsageIndicatorForm : Form
         InitialDelay = 350
     };
     private readonly ContextMenuStrip _contextMenu = new();
-    private readonly Font _valueFont = new("Segoe UI", 13f, FontStyle.Bold);
     private readonly bool _previewMode;
+    // What the widget stands on: a taskbar's own surface while it sits inside one, its own otherwise.
+    private WidgetGround _ground;
 
     private UsageSnapshot? _codexSnapshot;
     private ClaudeUsageResult? _claudeUsage;
@@ -162,13 +163,15 @@ internal sealed class UsageIndicatorForm : Form
         StartPosition = FormStartPosition.Manual;
         Text = UiText.T("Codex 및 Claude 사용량");
         AccessibleName = UiText.T("Codex 및 Claude 사용량 인디케이터");
-        Opacity = 0;
 
         BuildContextMenu();
         _contextMenu.Opening += (_, _) => { if (_languageMenu is not null) _languageMenu.Enabled = CanChangeLanguage; };
         _accountTray = new NotifyIcon { Icon = SystemIcons.Application, Text = UiText.T("Codex 사용량 · 계정 관리"), ContextMenuStrip = _contextMenu, Visible = !previewMode };
         _accountTray.DoubleClick += (_, _) => ShowAccountManager();
-        ApplyRoundedRegion();
+        // The window is layered and never gets a paint message for what it shows: every request to repaint is answered
+        // by composing the face again.
+        Invalidated += (_, _) => { if (IsHandleCreated) Present(); };
+        LocationChanged += (_, _) => UpdateGround();
         _toolTip.SetHoverText(UiText.T("Codex 및 Claude 사용량을 불러오는 중…"));
         _toolTip.TrackHover(this);
 
@@ -177,13 +180,15 @@ internal sealed class UsageIndicatorForm : Form
         {
             if (_openAccountsSignal.WaitOne(0)) ShowAccountManager();
             SyncCodexVisibility();
+            // A taskbar that hides, shows or changes its mode moves no window of ours.
+            UpdateGround();
         };
         Shown += (_, _) =>
         {
             if (_previewMode)
             {
                 EnsurePositionInitialized();
-                Opacity = 1;
+                Present();
                 _ = RefreshUsageAsync(force: true);
                 return;
             }
@@ -206,7 +211,6 @@ internal sealed class UsageIndicatorForm : Form
         MouseMove += HandleMouseMove;
         MouseUp += HandleMouseUp;
         DoubleClick += async (_, _) => await RefreshUsageAsync(force: true);
-        Resize += (_, _) => ApplyRoundedRegion();
         FormClosing += (_, e) =>
         {
             if (_accountManager is { IsOperationInProgress: true })
@@ -227,7 +231,6 @@ internal sealed class UsageIndicatorForm : Form
             _claudeAccounts?.Dispose();
             _toolTip.Dispose();
             _contextMenu.Dispose();
-            _valueFont.Dispose();
             _accountTray?.Dispose();
             _openAccountsSignal.Dispose();
             _accountManager?.Close();
@@ -243,8 +246,12 @@ internal sealed class UsageIndicatorForm : Form
             const int WsExToolWindow = 0x00000080;
             const int WsExNoActivate = 0x08000000;
             const int WsExTopMost = 0x00000008;
+            const int WsExLayered = 0x00080000;
             var parameters = base.CreateParams;
-            parameters.ExStyle |= WsExToolWindow | WsExNoActivate;
+            // Layered, with its picture set whole (Present): the face has soft edges and, on a taskbar, no surface at
+            // all. Form.Opacity and TransparencyKey must stay untouched, since they claim the layered window for the
+            // other, single-alpha way of drawing it.
+            parameters.ExStyle |= WsExToolWindow | WsExNoActivate | WsExLayered;
             // Form.TopMost makes WinForms focus the form when it becomes visible,
             // even with ShowWithoutActivation. Keep z-order in native styles instead.
             if (_keepOnTop) parameters.ExStyle |= WsExTopMost;
@@ -413,9 +420,25 @@ internal sealed class UsageIndicatorForm : Form
 
         var savedPosition = IndicatorSettingsStore.LoadPosition();
         if (savedPosition is { } position && TryRestorePosition(position))
+        {
+            SettleIntoTaskbar();
             return;
+        }
 
         PlaceNearTaskbar();
+    }
+
+    /// <summary>Inside a taskbar the widget settles on the bar's middle line, where the bar keeps its own items: there
+    /// it has no surface of its own, and a gauge a few pixels off that line shows.</summary>
+    private void SettleIntoTaskbar()
+    {
+        foreach (var taskbar in NativeWindow.Taskbars())
+        {
+            if (!taskbar.Contains(Bounds) || taskbar.Width <= taskbar.Height) continue;
+            var top = taskbar.Top + (taskbar.Height - Height) / 2;
+            if (top != Top) Location = new Point(Left, top);
+            return;
+        }
     }
 
     private bool TryRestorePosition(Point position)
@@ -450,7 +473,6 @@ internal sealed class UsageIndicatorForm : Form
             }
 
             _codexWasRunning = false;
-            Opacity = 0;
             if (Visible) Hide();
             return;
         }
@@ -466,7 +488,6 @@ internal sealed class UsageIndicatorForm : Form
 
         if (NativeWindow.IsForegroundWindowFullscreen(Handle))
         {
-            Opacity = 0;
             if (Visible) Hide();
             return;
         }
@@ -476,8 +497,8 @@ internal sealed class UsageIndicatorForm : Form
 
     internal void MaintainVisiblePresentation()
     {
-        if (!Visible) Show();
-        if (Opacity != 1) Opacity = 1;
+        // Composed before it shows, so the window never appears empty.
+        if (!Visible) { UpdateGround(); Present(); Show(); }
         if (_keepOnTop)
         {
             // The WinForms TopMost setter can activate this form even when it
@@ -756,94 +777,44 @@ internal sealed class UsageIndicatorForm : Form
         if (_showClaude && !IsDisposed) await (_claudeRefresh = RefreshClaudeAndShowAsync());
     }
 
-    protected override void OnPaint(PaintEventArgs e)
+    /// <summary>What the face shows now: per provider the remaining share of the selected window, none while it is
+    /// unknown or withheld, and a share kept through a transient failure marked stale.</summary>
+    private WidgetFaceState FaceState()
     {
-        base.OnPaint(e);
-        var graphics = e.Graphics;
-        graphics.SmoothingMode = SmoothingMode.AntiAlias;
-        graphics.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
-
-        var background = _isHovered
-            ? Color.FromArgb(36, 36, 42)
-            : Color.FromArgb(29, 29, 34);
-        graphics.Clear(background);
-
-        using var borderPen = new Pen(Color.FromArgb(58, 58, 68), 1f);
-        using var borderPath = RoundedRectangle(new RectangleF(0.5f, 0.5f, Width - 1f, Height - 1f), 15f);
-        graphics.DrawPath(borderPen, borderPath);
-
-        var codexUsed = _codexError is null ? (double?)_codexSnapshot?.UsedPercent : null;
-        var (claudeUsage, claudeError) = ClaudeDisplay();
-        var claudeUsed = claudeError is null
-            ? _claudeMetric.SelectUsedPercent(claudeUsage?.Snapshot, DateTimeOffset.UtcNow)
-            : null;
-        var codexAccent = Color.FromArgb(124, 156, 255);
-
+        var codex = new WidgetGauge(UsagePercentage.Remaining(_codexError is null ? (double?)_codexSnapshot?.UsedPercent : null));
+        WidgetGauge? claude = null;
         if (_showClaude)
-            DrawDualProviders(graphics, codexUsed, claudeUsed);
-        else
-            DrawProvider(graphics, new RectangleF(0, 0, Width, Height), codexUsed, codexAccent);
-    }
-
-    private void DrawDualProviders(Graphics graphics, double? codexUsed, double? claudeUsed)
-    {
-        var panelWidth = Width / 2f;
-        DrawProvider(
-            graphics,
-            new RectangleF(0, 0, panelWidth, Height),
-            codexUsed,
-            Color.FromArgb(124, 156, 255));
-        DrawProvider(
-            graphics,
-            new RectangleF(panelWidth, 0, Width - panelWidth, Height),
-            claudeUsed,
-            Color.FromArgb(217, 119, 87));
-
-        using var dividerPen = new Pen(Color.FromArgb(54, 54, 63), 1f);
-        graphics.DrawLine(dividerPen, panelWidth, 9, panelWidth, Height - 9);
-    }
-
-    private void DrawProvider(
-        Graphics graphics,
-        RectangleF panel,
-        double? usedPercent,
-        Color accent)
-    {
-        var remaining = UsagePercentage.Remaining(usedPercent);
-
-        using var valueBrush = new SolidBrush(Color.FromArgb(244, 244, 247));
-        using var unavailableBrush = new SolidBrush(Color.FromArgb(151, 151, 162));
-        using var accentBrush = new SolidBrush(accent);
-        using var trackBrush = new SolidBrush(Color.FromArgb(54, 54, 64));
-
-        var valueText = remaining is { } percent
-            ? $"{percent}%"
-            : _isRefreshing ? "…" : "—";
-        var valueSize = graphics.MeasureString(valueText, _valueFont);
-        graphics.DrawString(
-            valueText,
-            _valueFont,
-            remaining is null ? unavailableBrush : valueBrush,
-            panel.Left + (panel.Width - valueSize.Width) / 2f,
-            5);
-
-        var horizontalPadding = panel.Width > WidgetWidth / 2f ? 20f : 12f;
-        var trackX = panel.Left + horizontalPadding;
-        const float trackY = 45;
-        var trackWidth = panel.Width - horizontalPadding * 2f;
-        const float trackHeight = 7;
-        using var trackPath = RoundedRectangle(new RectangleF(trackX, trackY, trackWidth, trackHeight), 4f);
-        graphics.FillPath(trackBrush, trackPath);
-
-        var fillWidth = remaining is null or <= 0
-            ? 0
-            : Math.Max(trackHeight, trackWidth * remaining.Value / 100f);
-        if (fillWidth > 0)
         {
-            using var fillPath = RoundedRectangle(new RectangleF(trackX, trackY, fillWidth, trackHeight), 4f);
-            graphics.FillPath(accentBrush, fillPath);
+            var (usage, error) = ClaudeDisplay();
+            var used = error is null ? _claudeMetric.SelectUsedPercent(usage?.Snapshot, DateTimeOffset.UtcNow) : null;
+            claude = new WidgetGauge(UsagePercentage.Remaining(used), usage is { IsStale: true });
         }
+        return new WidgetFaceState(codex, claude, _isRefreshing, _isHovered, _ground);
     }
+
+    /// <summary>Puts the face on screen. A layered window shows the picture it was last given and nothing before the
+    /// first one, so presenting before <c>Show</c> is what keeps an empty window from flashing.</summary>
+    private void Present()
+    {
+        if (IsDisposed) return;
+        using var face = WidgetFace.Render(FaceState());
+        _ = NativeWindow.SetLayeredPicture(Handle, face);
+    }
+
+    private void UpdateGround()
+    {
+        // Needs no window yet: the ground is known from the place alone, so the first picture is already the right one.
+        if (IsDisposed) return;
+        var ground = WidgetGrounds.At(Bounds);
+        if (ground == _ground) return;
+        _ground = ground;
+        Invalidate();
+    }
+
+    // Reached only through WM_PRINT (DrawToBitmap): the screen is fed by Present.
+    protected override void OnPaintBackground(PaintEventArgs e) { }
+
+    protected override void OnPaint(PaintEventArgs e) => WidgetFace.Draw(e.Graphics, FaceState());
 
     internal static string BuildTooltipText(UsageSnapshot? codex, ClaudeUsageResult? claude,
         string? codexError, string? claudeError, bool showClaude, CombinedUsageSnapshot? combined = null,
@@ -1026,27 +997,10 @@ internal sealed class UsageIndicatorForm : Form
         if (e.Button != MouseButtons.Left) return;
         _isDragging = false;
         Capture = false;
+        SettleIntoTaskbar();
         IndicatorSettingsStore.SavePosition(Location);
     }
 
-    private void ApplyRoundedRegion()
-    {
-        using var path = RoundedRectangle(new RectangleF(0, 0, Width, Height), 16f);
-        Region?.Dispose();
-        Region = new Region(path);
-    }
-
-    private static GraphicsPath RoundedRectangle(RectangleF rectangle, float radius)
-    {
-        var diameter = radius * 2;
-        var path = new GraphicsPath();
-        path.AddArc(rectangle.Left, rectangle.Top, diameter, diameter, 180, 90);
-        path.AddArc(rectangle.Right - diameter, rectangle.Top, diameter, diameter, 270, 90);
-        path.AddArc(rectangle.Right - diameter, rectangle.Bottom - diameter, diameter, diameter, 0, 90);
-        path.AddArc(rectangle.Left, rectangle.Bottom - diameter, diameter, diameter, 90, 90);
-        path.CloseFigure();
-        return path;
-    }
 }
 
 internal sealed record IndicatorSettings(int? X, int? Y, bool? ShowClaude, string? Language = null, string? ClaudeMetric = null);
@@ -1170,6 +1124,45 @@ internal static class NativeWindow
             SwpNoSize | SwpNoMove | SwpNoActivate | SwpShowWindow);
     }
 
+    /// <summary>The screen bounds of every taskbar that is showing: the main one and those on other monitors.</summary>
+    public static IEnumerable<Rectangle> Taskbars()
+    {
+        foreach (var className in new[] { "Shell_TrayWnd", "Shell_SecondaryTrayWnd" })
+        {
+            var window = IntPtr.Zero;
+            while ((window = FindWindowEx(IntPtr.Zero, window, className, null)) != IntPtr.Zero)
+                if (IsWindowVisible(window) && GetWindowRect(window, out var bounds))
+                    yield return Rectangle.FromLTRB(bounds.Left, bounds.Top, bounds.Right, bounds.Bottom);
+        }
+    }
+
+    /// <summary>Gives a layered window its picture, per-pixel alpha included, at the window's place and the picture's
+    /// size. The picture is premultiplied, as <see cref="System.Drawing.Imaging.PixelFormat.Format32bppPArgb"/> is.</summary>
+    public static bool SetLayeredPicture(IntPtr windowHandle, Bitmap picture)
+    {
+        const int UlwAlpha = 0x00000002;
+        var screen = GetDC(IntPtr.Zero);
+        var memory = CreateCompatibleDC(screen);
+        var bitmap = IntPtr.Zero;
+        var previous = IntPtr.Zero;
+        try
+        {
+            bitmap = picture.GetHbitmap(Color.FromArgb(0));
+            previous = SelectObject(memory, bitmap);
+            var size = new NativeSize { Width = picture.Width, Height = picture.Height };
+            var origin = new NativePoint();
+            var blend = new BlendFunction { SourceConstantAlpha = 255, AlphaFormat = 1 };
+            return UpdateLayeredWindow(windowHandle, screen, IntPtr.Zero, ref size, memory, ref origin, 0, ref blend, UlwAlpha);
+        }
+        finally
+        {
+            if (previous != IntPtr.Zero) SelectObject(memory, previous);
+            if (bitmap != IntPtr.Zero) DeleteObject(bitmap);
+            DeleteDC(memory);
+            ReleaseDC(IntPtr.Zero, screen);
+        }
+    }
+
     public static bool IsForegroundWindowFullscreen(IntPtr ignoredWindowHandle)
     {
         var foregroundWindow = GetForegroundWindow();
@@ -1223,6 +1216,23 @@ internal static class NativeWindow
     }
 
     [StructLayout(LayoutKind.Sequential)]
+    private struct NativeSize
+    {
+        public int Width;
+        public int Height;
+    }
+
+    // BLENDFUNCTION: source over, the whole window at full strength, alpha taken from each pixel.
+    [StructLayout(LayoutKind.Sequential, Pack = 1)]
+    private struct BlendFunction
+    {
+        public byte BlendOp;
+        public byte BlendFlags;
+        public byte SourceConstantAlpha;
+        public byte AlphaFormat;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
     private struct NativeRect
     {
         public int Left;
@@ -1253,6 +1263,34 @@ internal static class NativeWindow
 
     [DllImport("user32.dll")]
     private static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern IntPtr FindWindowEx(IntPtr parent, IntPtr after, string className, string? title);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool UpdateLayeredWindow(IntPtr windowHandle, IntPtr destination, IntPtr position, ref NativeSize size,
+        IntPtr source, ref NativePoint sourceOrigin, int colorKey, ref BlendFunction blend, int flags);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetDC(IntPtr windowHandle);
+
+    [DllImport("user32.dll")]
+    private static extern int ReleaseDC(IntPtr windowHandle, IntPtr deviceContext);
+
+    [DllImport("gdi32.dll")]
+    private static extern IntPtr CreateCompatibleDC(IntPtr deviceContext);
+
+    [DllImport("gdi32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool DeleteDC(IntPtr deviceContext);
+
+    [DllImport("gdi32.dll")]
+    private static extern IntPtr SelectObject(IntPtr deviceContext, IntPtr graphicsObject);
+
+    [DllImport("gdi32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool DeleteObject(IntPtr graphicsObject);
 
     [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]

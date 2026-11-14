@@ -4,7 +4,7 @@ See how much weekly usage you have left, then choose the account for your next s
 
 **Windows · 한국어 / English · Manual account switching**
 
-<img src="docs/design/2026-09-28/100/widget.png" alt="Compact widget showing Codex and Claude weekly remaining percentages" width="272">
+<img src="docs/design/2026-11-14/widget.png" alt="Compact widget showing Codex and Claude weekly remaining percentages as two ring gauges" width="272">
 
 Blue is Codex; orange is Claude. Choose **all-model weekly** or **Fable weekly** for the Claude number from the right-click menu.
 

@@ -10,6 +10,9 @@ if (args.Contains("--claude-sidebar-store-shape")) { ClaudeSessionShelfTests.Sid
 if (args.Contains("--claude-layout-diff")) { ClaudeSessionShelfTests.LayoutDiff(args[Array.IndexOf(args, "--claude-layout-diff") + 1], args[Array.IndexOf(args, "--claude-layout-diff") + 2]); return; }
 if (args.Contains("--claude-shelf-tests")) { await ClaudeSessionShelfTests.RunAsync(); Console.WriteLine("PASS: Claude session shelf"); return; }
 if (args.Contains("--claude-sync-tests")) { await ClaudeSessionSyncTests.RunAsync(); Console.WriteLine("PASS: Claude session sync"); return; }
+if (args.Contains("--widget-face-preview")) { WidgetFaceTests.Preview(args); return; }
+if (args.Contains("--widget-native-preview")) { await WidgetFaceTests.NativePreview(args); return; }
+if (args.Contains("--widget-face-tests")) { await WidgetFaceTests.RunAsync(); Console.WriteLine("PASS: widget face"); return; }
 if (args.Contains("--claude-menu-smoke")) { await ClaudeAccountMenuSmoke.RunAsync(); return; }
 if (args.Contains("--live-claude-menu-smoke")) { await ClaudeAccountMenuSmoke.RunAsync(live: true); return; }
 if (args.Contains("--language-ui-smoke")) { await LanguageUiSmoke.RunAsync(); return; }
@@ -40,6 +43,7 @@ var tests = new (string Name, Func<Task> Run)[]
     // Run the brief cursor-driven check first so a local user can resume using the
     // mouse while the slower credential and lifecycle fixtures continue.
     ("stable light tooltip hover, placement and focus", UsageTooltipHoverSmoke.RunAsync),
+    ("widget face: gauges, grounds and states", WidgetFaceTests.RunAsync),
     ("Claude weekly metric, independent expiry and profile cache", ClaudeMetricTests.RunAll),
     ("Claude official profile identity and shared local work", ClaudeProfileTests.RunAsync),
     ("Claude session shelf: fill by adding and advancing, closed- and running-app writes, account mapping and log observation", ClaudeSessionShelfTests.RunAsync),
