@@ -229,24 +229,28 @@ internal sealed class ClaudeShelfService : IDisposable
         if (changed && !_disposed) StatusChanged?.Invoke(this, EventArgs.Empty);
     }
 
-    // What a pass may allocate before the collector is asked to give it back at once.
-    private const long HeavyPassBytes = 96L * 1024 * 1024;
+    // What the process may allocate before the collector is asked to give it back at once, and the count at the last time.
+    private const long ReleaseAfterBytes = 128L * 1024 * 1024;
+    private long _allocatedAtRelease;
 
-    /// <summary>One background pass, then a collection where the pass was a heavy one. A pass that reads the lists whole
-    /// (the first one, the plan a fill publishes, a plan made for the session sync) leaves a few hundred megabytes of
-    /// large arrays behind at once. So little is allocated between such passes that the collector does not come for
+    /// <summary>One background pass, then a collection once enough was allocated since the last one. A pass that reads
+    /// the lists whole (the first one, the plan a fill publishes, a plan made for the session sync) leaves a few hundred
+    /// megabytes of large arrays behind at once. So little is allocated otherwise that the collector does not come for
     /// them for many minutes, and each left the process a step higher: 0.3 GB after start, 1.4 GB a quarter of an hour
-    /// later (measured 2026-11-14). One compacting collection right after such a pass gives the memory back.</summary>
+    /// later (measured 2026-11-14). A compacting collection after every 128 MB allocated, which is right after such a
+    /// pass and some ten minutes apart otherwise, gives the memory back.</summary>
     private ClaudeShelfPass WorkAndRelease(IReadOnlyList<ClaudeProfile> profiles, Guid? reservation)
     {
-        var before = GC.GetTotalAllocatedBytes(false);
         try { return Work(profiles, reservation); }
         finally
         {
-            if (GC.GetTotalAllocatedBytes(false) - before > HeavyPassBytes)
+            // Counted since the last such collection, not per pass: records read again a few at a time (their kept
+            // reads running out) leave as much behind over ten minutes as one heavy pass does at once.
+            if (GC.GetTotalAllocatedBytes(false) - _allocatedAtRelease > ReleaseAfterBytes)
             {
                 System.Runtime.GCSettings.LargeObjectHeapCompactionMode = System.Runtime.GCLargeObjectHeapCompactionMode.CompactOnce;
                 GC.Collect(GC.MaxGeneration, GCCollectionMode.Aggressive, blocking: true, compacting: true);
+                _allocatedAtRelease = GC.GetTotalAllocatedBytes(false);
             }
         }
     }
