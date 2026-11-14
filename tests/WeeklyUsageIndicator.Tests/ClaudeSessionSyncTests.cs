@@ -2959,12 +2959,16 @@ internal static class ClaudeSessionSyncTests
         Pair("b", "나", 2, [("model", "m-mine")]);
         Pair("c", "다", 3, [("model", "m-mine")]);
         Pair("d", "라", 4, [("model", ""), ("permissionMode", "default")]);
-        // The widget made 다 here and wrote it again after the app came.
+        Pair("e", "마", 5, [("model", "m-mine"), ("permissionMode", "default")]);
+        // The widget made 다 here and wrote it again after the app came. It made 가 and 마 long before: 가's mode was raised
+        // here since, 마's is the one the app fills in.
         world.Copied(K2, "local_c2", "다", At(20));
+        world.Copied(K2, "local_a2", "가", At(-150));
+        world.Copied(K2, "local_e2", "마", At(-150));
         void Written(string account, string id, int minutes) => File.SetLastWriteTimeUtc(world.RecordPath(account, id), At(minutes).UtcDateTime);
-        foreach (var id in new[] { "local_a2", "local_c2", "local_d2" }) Written(K2, id, 10);
+        foreach (var id in new[] { "local_a2", "local_c2", "local_d2", "local_e2" }) Written(K2, id, 10);
         Written(K2, "local_b2", -10);
-        foreach (var id in new[] { "local_a1", "local_b1", "local_c1", "local_d1" }) Written(K1, id, 10);
+        foreach (var id in new[] { "local_a1", "local_b1", "local_c1", "local_d1", "local_e1" }) Written(K1, id, 10);
         world.Flush();
         // A checkpoint each from before the upgrade: titles, pins and groups, no model, effort or mode. The app came to
         // 계정2 at 0 and is there; 계정1 was arrived at and left before.
@@ -2972,7 +2976,7 @@ internal static class ClaudeSessionSyncTests
         layout.Accounts[K2] = new("계정2", At(-100), At(0), 1);
         layout.Accounts[K1] = new("계정1", At(-50), At(-60), 1);
         ClaudeSessionLayout.Checkpoint Earlier(string suffix, int minutes) => new(At(minutes), 1, [],
-            new[] { ("a", "가"), ("b", "나"), ("c", "다"), ("d", "라") }.ToDictionary(pair => "local_" + pair.Item1 + suffix,
+            new[] { ("a", "가"), ("b", "나"), ("c", "다"), ("d", "라"), ("e", "마") }.ToDictionary(pair => "local_" + pair.Item1 + suffix,
                 pair => new Shown(false, true, null, pair.Item2), StringComparer.Ordinal));
         layout.Checkpoints[K2] = Earlier("2", 1);
         layout.Checkpoints[K1] = Earlier("1", -55);
@@ -2988,6 +2992,8 @@ internal static class ClaudeSessionSyncTests
               && layout.Changed[K2].GetValueOrDefault("local_b2")?.Model is null && layout.Changed[K2].GetValueOrDefault("local_c2")?.Model is null
               && layout.Changed[K2].GetValueOrDefault("local_d2") is null or { Model: null, Mode: null },
             "the checkpoint takes a record written since the arrival as this stay's choice; not one the widget wrote since, nor default or none");
+        Check(view.Models!.Any(item => item is { Session: "local_e2", Model: "m-there" }) && layout.Changed[K2].GetValueOrDefault("local_e2")?.Model is null,
+            "the widget's copy whose mode nobody raised here shows what came with the copy, though the app wrote it since: the starting value applies");
         Check(ClaudeSessionSync.Serve(layout, world.Sources, K2, null, active: true, At(31)) is { Checkpointed: true } plan
               && plan.Models!.All(item => item.Session != "local_a2") && plan.Models.Any(item => item.Session == "local_b2"),
             "this stay's choices win over another account's starting value");

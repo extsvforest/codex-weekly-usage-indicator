@@ -1834,7 +1834,7 @@ internal static class ClaudeSessionSync
     /// only from one known value to another that is not none (see <see cref="Setting"/>), and is settled against the plan
     /// in progress as a title is. With <paramref name="writtenSince"/> (when the app came to the account, for the stay it
     /// is in), a value the checkpoint does not know yet is this stay's choice where it is explicit and the app wrote the
-    /// record since then and the widget did not.
+    /// record since then and the widget did not; the widget's copy only once its mode was raised there.
     /// </summary>
     internal static Observation Observe(State state, ClaudeSessionLayout.Checkpoint? checkpoint, DateTimeOffset at,
         ClaudeSessionLayout.Pending? pending = null, IReadOnlyDictionary<string, ClaudeSessionLayout.Evidence>? evidence = null,
@@ -1877,9 +1877,12 @@ internal static class ClaudeSessionSync
                     && shown.Title == written;
                 // The first look at this stay's models, efforts and modes (a checkpoint taken before it held none): a record the
                 // app wrote since it came to the account, and the widget has not written since, shows this stay's choices; a
-                // tool that sets one leaves lastActivityAt as it was, so nothing else would tell them.
+                // tool that sets one leaves lastActivityAt as it was, so nothing else would tell them. Not the widget's copy
+                // whose mode nobody raised here: the app writes such a record too, filling its mode as it loads the list, and
+                // what it shows came with the copy.
                 var fresh = writtenSince is { } arrived && record.Written > arrived
-                    && !(state.Writes is not null && state.Writes.TryGetValue(record.SessionId, out var wrote) && wrote > arrived);
+                    && !(state.Writes is not null && state.Writes.TryGetValue(record.SessionId, out var wrote) && wrote > arrived)
+                    && (!state.CopyTitles.ContainsKey(record.SessionId) || shown.Mode is { Length: > 0 } and not DefaultMode);
                 string? Chosen(string? was, string? now, bool mode = false) =>
                     was is null && fresh && now is { Length: > 0 } && !(mode && now == DefaultMode) ? now : Setting(was, now, mode);
                 changed = new(shown.Pinned is { } pinned && before.Pinned is { } was && pinned != was && !(pinned && appPin) ? pinned : null,
