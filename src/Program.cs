@@ -55,8 +55,9 @@ internal sealed record UsageWindow(int UsedPercent, DateTimeOffset? ResetsAt, lo
 
 internal sealed class UsageIndicatorForm : Form
 {
+    // The identity check before each read is bounded separately (30 s); keep room for it.
     internal static readonly TimeSpan ClaudeRefreshTimeout =
-        ClaudeCodeProcessRunner.CommandTimeout + TimeSpan.FromSeconds(5);
+        ClaudeCodeProcessRunner.CommandTimeout + TimeSpan.FromSeconds(35);
 
     private const int WidgetWidth = 272;
     private const int WidgetHeight = 64;
@@ -72,6 +73,7 @@ internal sealed class UsageIndicatorForm : Form
     private string? _claudeAppGate;
     private DateTime? _claudeGateRun;
     private long _claudeGeneration;
+    private Task? _claudeRefresh;
     private readonly CodexDesktopStateReader _codexStateReader = new();
     private readonly System.Windows.Forms.Timer _pollTimer = new() { Interval = 60_000 };
     private readonly System.Windows.Forms.Timer _codexStateTimer = new() { Interval = 1_000 };
@@ -505,10 +507,11 @@ internal sealed class UsageIndicatorForm : Form
 
         try
         {
-            var refreshTasks = new List<Task> { RefreshCodexAsync() };
             if (_showClaude)
             {
-                refreshTasks.Add(RefreshClaudeAsync());
+                // A Claude read can take a minute or more (see CommandTimeout). It runs beside the
+                // Codex polls instead of holding them, and a read in flight is not started twice.
+                if (_claudeRefresh is not { IsCompleted: false }) _claudeRefresh = RefreshClaudeAndShowAsync();
             }
             else
             {
@@ -516,7 +519,7 @@ internal sealed class UsageIndicatorForm : Form
                 _claudeError = null; _claudeFailure = null;
             }
 
-            await Task.WhenAll(refreshTasks);
+            await RefreshCodexAsync();
             UpdateToolTip();
         }
         finally
@@ -645,6 +648,12 @@ internal sealed class UsageIndicatorForm : Form
         Invalidate();
     }
 
+    private async Task RefreshClaudeAndShowAsync()
+    {
+        await RefreshClaudeAsync();
+        if (!IsDisposed) { UpdateToolTip(); Invalidate(); }
+    }
+
     private async Task RefreshClaudeAsync()
     {
         var generation = _claudeGeneration;
@@ -744,7 +753,7 @@ internal sealed class UsageIndicatorForm : Form
         _claudeGeneration++;
         _claudeUsage = null; _claudeError = null; _claudeFailure = null;
         UpdateToolTip(); Invalidate();
-        if (_showClaude && !IsDisposed) { await RefreshClaudeAsync(); if (!IsDisposed) { UpdateToolTip(); Invalidate(); } }
+        if (_showClaude && !IsDisposed) await (_claudeRefresh = RefreshClaudeAndShowAsync());
     }
 
     protected override void OnPaint(PaintEventArgs e)
@@ -965,6 +974,10 @@ internal sealed class UsageIndicatorForm : Form
             return TruncateError(UiText.Message(exception.Message));
         if (exception is ClaudeUsageTemporarilyUnavailableException unavailable)
         {
+            // Say why when it is known: the waits behind a retry time otherwise look alike.
+            for (var cause = exception.InnerException; cause is not null; cause = cause.InnerException)
+                if (cause is TimeoutException)
+                    return UiText.F($"Claude 응답 시간이 초과되었습니다. 다음 시도: {FormatResetTime(unavailable.RetryAfter)}");
             return UiText.F($"Claude 사용량 조회가 지연되었습니다. 다음 시도: {FormatResetTime(unavailable.RetryAfter)}");
         }
         if (exception is FileNotFoundException ||
