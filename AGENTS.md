@@ -65,6 +65,8 @@ Run:
 .\scripts\build.ps1
 ```
 
+On a PC someone is using, run `.\scripts\build-hidden.ps1` instead: the same build and tests on a Windows desktop that is never shown, so no test window takes the screen or the keyboard focus. The pointer-driven hover check cannot run there and is skipped; say so when reporting.
+
 Keep regression coverage for:
 
 1. Settings migration, metric selection without a query, independent window expiry, consistent rounding, per-account request spacing across duplicate profiles and profile-bound recovery values.
