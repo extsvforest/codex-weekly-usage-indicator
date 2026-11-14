@@ -187,6 +187,9 @@ internal sealed class ClaudeSessionShelf
     // Plans repeat every minute while the app runs and a hand-over reads two transcripts whole: remember each verdict per
     // state of the earlier file and the later file's length (see WentOn).
     private readonly Dictionary<string, (bool Went, long Length, bool Settled)> _handOvers = new(StringComparer.Ordinal);
+    // The records of the lists as last read, by file, with the file's size and times then (see ScanRecord).
+    private readonly Dictionary<string, ((long Length, long Created, long Written) Stamp, JsonObject Record, string Fingerprint)>
+        _scanned = new(StringComparer.OrdinalIgnoreCase);
     internal ClaudeShelfPaths Paths => _paths;
 
     internal ClaudeSessionShelf(ClaudeShelfPaths? paths = null, Func<ClaudeLiveSessionScan>? liveWriters = null,
@@ -702,16 +705,9 @@ internal sealed class ClaudeSessionShelf
         Func<string?, bool> mayWrite, int created)
     {
         var retitled = 0;
-        foreach (var entry in ledger.Created.Where(entry => !entry.Pending && !entry.Retired).ToArray())
+        foreach (var (entry, path, sourcePath) in TitleCandidates(ledger, plan, writable))
         {
-            // The same holds as for filling: only lists this run writes, none held (unknown writers, recovery files,
-            // unreadable records), with the original in this run.
-            if (!writable.Contains(entry.Target) || !plan.Fingerprints.ContainsKey(entry.Source)
-                || plan.Held.ContainsKey(entry.Target)
-                || entry.Source.Split('/') is not [var account, var org] || !Guid.TryParse(account, out _) || !Guid.TryParse(org, out _)
-                || !entry.SourceFile.StartsWith("local_", StringComparison.Ordinal) || entry.SourceFile.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0
-                || ClaudeShelfLedger.EntryPath(_paths.SessionsRoot, entry) is not { } path
-                || ReadRecord(Path.Combine(_paths.SessionsRoot, account, org, entry.SourceFile)) is not { } source) continue;
+            if (ReadRecord(sourcePath) is not { } source) continue;
             byte[] before;
             try { before = File.ReadAllBytes(path); }
             catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { continue; }
@@ -721,20 +717,10 @@ internal sealed class ClaudeSessionShelf
             if (copy is null) continue;
             var current = Text(copy, "title");
             var untouched = Convert.ToHexString(SHA256.HashData(before)) == entry.Sha256;
-            if (Bool(copy, "isArchived")
-                || !string.Equals(Text(copy, "cliSessionId"), entry.CliSessionId, StringComparison.OrdinalIgnoreCase)
-                || Number(copy, "lastActivityAt") > Number(source, "lastActivityAt")) continue;
+            var step = TitleStep(entry, source, copy, untouched);
+            if (step == TitleAction.Track) { ledger.Retitle(entry, current!, entry.Sha256); continue; }
+            if (step != TitleAction.Write) continue;
             var title = Text(source, "title");
-            if (entry.Title is null)
-            {
-                // An older entry starts tracking once the copy shows the original's title. Until then only a copy still
-                // exactly as written proves its name was never changed there; the app's rename history cannot, as it
-                // records neither a first name nor a change of case or spacing.
-                if (current is not null && current == title) { ledger.Retitle(entry, current, entry.Sha256); continue; }
-                if (!untouched) continue;
-            }
-            else if (current != entry.Title) continue;
-            if (string.IsNullOrWhiteSpace(title) || title == current) continue;
             copy["title"] = title;
             if (source["titleSource"] is JsonValue titleSource) copy["titleSource"] = titleSource.DeepClone();
             var after = JsonSerializer.SerializeToUtf8Bytes(copy, RecordJson);
@@ -746,10 +732,68 @@ internal sealed class ClaudeSessionShelf
                 continue;
             }
             // Only the bytes written here become this utility's; a copy the app had changed stays changed.
-            ledger.Retitle(entry, title, untouched ? Convert.ToHexString(SHA256.HashData(after)) : entry.Sha256);
+            ledger.Retitle(entry, title!, untouched ? Convert.ToHexString(SHA256.HashData(after)) : entry.Sha256);
             retitled++;
         }
         return retitled;
+    }
+
+    /// <summary>The copies whose title following may do something, with the copy's and its original's files, checked one
+    /// at a time as they are taken (a list a failed write holds is passed over from then on). A first look at the records
+    /// as the plan read them (see <see cref="ScanRecord"/>) passes over the copies with nothing to do, nearly all of them,
+    /// without reading them again; the caller decides the rest again from the files.</summary>
+    internal IEnumerable<(ClaudeShelfLedger.Entry Entry, string Path, string SourcePath)> TitleCandidates(
+        ClaudeShelfLedger ledger, ClaudeShelfPlan plan, IReadOnlySet<string> writable)
+    {
+        foreach (var entry in ledger.Created.Where(entry => !entry.Pending && !entry.Retired).ToArray())
+        {
+            // The same holds as for filling: only lists this run writes, none held (unknown writers, recovery files,
+            // unreadable records), with the original in this run.
+            if (!writable.Contains(entry.Target) || !plan.Fingerprints.ContainsKey(entry.Source)
+                || plan.Held.ContainsKey(entry.Target)
+                || entry.Source.Split('/') is not [var account, var org] || !Guid.TryParse(account, out _) || !Guid.TryParse(org, out _)
+                || !entry.SourceFile.StartsWith("local_", StringComparison.Ordinal) || entry.SourceFile.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0
+                || ClaudeShelfLedger.EntryPath(_paths.SessionsRoot, entry) is not { } path) continue;
+            var sourcePath = Path.Combine(_paths.SessionsRoot, account, org, entry.SourceFile);
+            if (!Scanned(sourcePath, out var source, out _) || !Scanned(path, out var copy, out var fingerprint)
+                || TitleStep(entry, source, copy, fingerprint == entry.Sha256) == TitleAction.None) continue;
+            yield return (entry, path, sourcePath);
+        }
+    }
+
+    private enum TitleAction { None, Track, Write }
+
+    /// <summary>What following its original's title does to a copy: nothing, start tracking its title (the ledger only),
+    /// or write the original's title. <paramref name="untouched"/>: the copy is still exactly as written.</summary>
+    private static TitleAction TitleStep(ClaudeShelfLedger.Entry entry, JsonObject source, JsonObject copy, bool untouched)
+    {
+        var current = Text(copy, "title");
+        if (Bool(copy, "isArchived")
+            || !string.Equals(Text(copy, "cliSessionId"), entry.CliSessionId, StringComparison.OrdinalIgnoreCase)
+            || Number(copy, "lastActivityAt") > Number(source, "lastActivityAt")) return TitleAction.None;
+        var title = Text(source, "title");
+        if (entry.Title is null)
+        {
+            // An older entry starts tracking once the copy shows the original's title. Until then only a copy still
+            // exactly as written proves its name was never changed there; the app's rename history cannot, as it
+            // records neither a first name nor a change of case or spacing.
+            if (current is not null && current == title) return TitleAction.Track;
+            if (!untouched) return TitleAction.None;
+        }
+        else if (current != entry.Title) return TitleAction.None;
+        return string.IsNullOrWhiteSpace(title) || title == current ? TitleAction.None : TitleAction.Write;
+    }
+
+    /// <summary>A record as the plan's read of its list holds it (see <see cref="ScanRecord"/>); false when it cannot be
+    /// read or parsed. What it returns is shared with the plan and must not be changed.</summary>
+    private bool Scanned(string path, out JsonObject record, out string fingerprint)
+    {
+        JsonObject? read;
+        try { (read, fingerprint) = ScanRecord(path, null); }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        { read = null; fingerprint = ""; }
+        record = read!;
+        return read is not null;
     }
 
     /// <summary>Replaces a record with <paramref name="after"/> only if it still holds exactly <paramref name="before"/>
@@ -1048,6 +1092,7 @@ internal sealed class ClaudeSessionShelf
     {
         var shelf = new Shelf();
         if (!Directory.Exists(directory)) return shelf;
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var path in Directory.EnumerateFiles(directory).Order(StringComparer.Ordinal))
         {
             var name = Path.GetFileName(path);
@@ -1055,11 +1100,48 @@ internal sealed class ClaudeSessionShelf
                 shelf.Temporaries.Add(name);
             else if (name.StartsWith("deleted_", StringComparison.Ordinal)) shelf.Deleted.Add(name);
             else if (name.StartsWith("local_", StringComparison.Ordinal) && name.EndsWith(".json", StringComparison.Ordinal))
-                shelf.Records[name] = ReadRecord(path);
+            {
+                var (record, fingerprint) = ScanRecord(path, seen);
+                shelf.Records[name] = record;
+                shelf.Fingerprint[name] = fingerprint;
+                continue;
+            }
             else continue;
             shelf.Fingerprint[name] = Hash(path);
         }
+        lock (_scanned)
+            foreach (var path in _scanned.Keys.Where(path => !seen.Contains(path)
+                         && string.Equals(Path.GetDirectoryName(path), directory, StringComparison.OrdinalIgnoreCase)).ToArray())
+                _scanned.Remove(path);
         return shelf;
+    }
+
+    /// <summary>
+    /// A record of a list and the fingerprint of its bytes, as read now. Plans come every minute while the app runs, and
+    /// records reach hundreds of kilobytes (each parsed record also keeps a copy of its bytes), so a list read whole each
+    /// time is hundreds of megabytes of garbage a minute. A record whose file is the same size with the same creation and
+    /// write times as at its last read is taken from that read: the stamp comes from the handle the bytes are read
+    /// through, so it always belongs to them. This only feeds plans; every write checks the bytes again at the last moment
+    /// (<see cref="Replace"/>, <see cref="AdvanceInPlace"/>, <see cref="StillAsPlanned"/>, <see cref="Unchanged"/>), and a
+    /// fingerprint from an earlier read can only fail such a check, never pass one the file now would not. A record that
+    /// does not parse is never kept: it may be one being written.
+    /// </summary>
+    private (JsonObject? Record, string Fingerprint) ScanRecord(string path, HashSet<string>? seen)
+    {
+        seen?.Add(path);
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        var stamp = (stream.Length, File.GetCreationTimeUtc(stream.SafeFileHandle).Ticks,
+            File.GetLastWriteTimeUtc(stream.SafeFileHandle).Ticks);
+        lock (_scanned)
+            if (_scanned.TryGetValue(path, out var known) && known.Stamp == stamp) return (known.Record, known.Fingerprint);
+        var bytes = new byte[stream.Length];
+        stream.ReadExactly(bytes);
+        var record = ParseRecord(bytes);
+        var fingerprint = Convert.ToHexString(SHA256.HashData(bytes));
+        lock (_scanned)
+            if (record is not null) _scanned[path] = (stamp, record, fingerprint);
+            else _scanned.Remove(path);
+        return (record, fingerprint);
     }
 
     private static JsonObject? ReadRecord(string path)
@@ -1071,6 +1153,13 @@ internal sealed class ClaudeSessionShelf
         }
         catch (Exception exception) when (exception is JsonException or IOException or UnauthorizedAccessException)
         { return null; }
+    }
+
+    private static JsonObject? ParseRecord(byte[] bytes)
+    {
+        if (bytes.Length == 0 || bytes.Length > MaxRecordBytes) return null;
+        try { return JsonNode.Parse(bytes) as JsonObject; }
+        catch (JsonException) { return null; }
     }
 
     /// <summary>Every transcript by id, at the first project folder holding it (where the session plan finds it too).</summary>

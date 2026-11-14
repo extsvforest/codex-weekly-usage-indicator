@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Globalization;
 using System.IO.MemoryMappedFiles;
 using System.Text;
@@ -716,6 +717,8 @@ internal static class ClaudeSessionSync
     private const long MaxRecordBytes = 10 * 1024 * 1024;
     private const int TranscriptTailBytes = 4 * 1024 * 1024;
     private const long MaxTranscriptBytes = 512L * 1024 * 1024;
+    // What a whole transcript is read through; it grows only for a longer line.
+    private const int TranscriptChunkBytes = 1024 * 1024;
     private const int MaxSettleSeconds = 120;
     // How long a plan waits for the widget to checkpoint the account before it is made.
     private static readonly TimeSpan CheckpointWait = TimeSpan.FromSeconds(30);
@@ -2188,11 +2191,17 @@ internal static class ClaudeSessionSync
             var created = new DateTimeOffset(File.GetCreationTimeUtc(path));
             var written = new DateTimeOffset(File.GetLastWriteTimeUtc(path));
             using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-            var tail = new byte[(int)Math.Min(stream.Length, TranscriptTailBytes)];
-            stream.Seek(-tail.Length, SeekOrigin.End);
-            stream.ReadExactly(tail);
-            if (Entries(tail, partialStart: tail.Length < stream.Length) is not { } entries) return null;
-            return new(created, written, entries.Count == 0 ? null : entries.Max(entry => entry.At));
+            var length = (int)Math.Min(stream.Length, TranscriptTailBytes);
+            // Pooled: every plan pass reads many tails, and a fresh 4 MB array each time is garbage the GC must collect.
+            var tail = ArrayPool<byte>.Shared.Rent(length);
+            try
+            {
+                stream.Seek(-length, SeekOrigin.End);
+                stream.ReadExactly(tail, 0, length);
+                if (Entries(tail.AsSpan(0, length), partialStart: length < stream.Length) is not { } entries) return null;
+                return new(created, written, entries.Count == 0 ? null : entries.Max(entry => entry.At));
+            }
+            finally { ArrayPool<byte>.Shared.Return(tail); }
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { return null; }
     }
@@ -2208,10 +2217,16 @@ internal static class ClaudeSessionSync
         if (Locate(projectsRoot, older) is not { } olderPath || Locate(projectsRoot, next) is not { } nextPath) return null;
         try
         {
-            if (Entries(ReadWhole(olderPath), partialStart: false, skipLost: true) is not { } earlier
-                || Entries(ReadWhole(nextPath), partialStart: false) is not { } later) return null;
-            var known = earlier.Select(entry => entry.Id).OfType<string>().ToHashSet(StringComparer.Ordinal);
-            return later.Where(entry => entry.Id is { } id && !known.Contains(id)).Select(entry => (DateTimeOffset?)entry.At).Min();
+            // Streamed: transcripts reach hundreds of megabytes, and only the earlier one's ids and the later one's oldest
+            // new entry are needed.
+            var known = new HashSet<string>(StringComparer.Ordinal);
+            if (!EachEntry(olderPath, skipLost: true, entry => { if (entry.Id is { } id) known.Add(id); })) return null;
+            DateTimeOffset? first = null;
+            if (!EachEntry(nextPath, skipLost: false, entry =>
+                {
+                    if (entry.Id is { } id && !known.Contains(id) && (first is null || entry.At < first)) first = entry.At;
+                })) return null;
+            return first;
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidDataException)
         { return null; }
@@ -2221,29 +2236,66 @@ internal static class ClaudeSessionSync
         !Guid.TryParse(cli, out _) || !Directory.Exists(projectsRoot) ? null
         : Directory.EnumerateDirectories(projectsRoot).Select(project => Path.Combine(project, cli + ".jsonl")).FirstOrDefault(File.Exists);
 
-    private static byte[] ReadWhole(string path)
+    /// <summary>Hands each entry of a whole transcript, as it was long when opened, to <paramref name="found"/> (see
+    /// <see cref="Entries"/>, which reads the same lines from memory); false when a line is broken. It reads through a
+    /// bounded buffer that grows only to the longest line.</summary>
+    private static bool EachEntry(string path, bool skipLost, Action<(string? Id, DateTimeOffset At)> found)
     {
-        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, 1,
+            FileOptions.SequentialScan);
         if (stream.Length > MaxTranscriptBytes) throw new InvalidDataException("Transcript too large to compare.");
-        var bytes = new byte[stream.Length];
-        stream.ReadExactly(bytes);
-        return bytes;
+        var remaining = stream.Length;
+        var pooled = ArrayPool<byte>.Shared.Rent(TranscriptChunkBytes);
+        var buffer = pooled;
+        try
+        {
+            var filled = 0;
+            while (true)
+            {
+                var read = remaining == 0 ? 0 : stream.Read(buffer, filled, (int)Math.Min(buffer.Length - filled, remaining));
+                // The file shrank since it was opened.
+                if (read == 0 && remaining > 0) throw new EndOfStreamException();
+                remaining -= read;
+                filled += read;
+                var start = 0;
+                for (int end; (end = buffer.AsSpan(start, filled - start).IndexOf((byte)'\n')) >= 0; start += end + 1)
+                    if (!Line(buffer.AsSpan(start, end))) return false;
+                if (remaining == 0) return start == filled || Line(buffer.AsSpan(start, filled - start));
+                // Keep the unfinished line; a line longer than the buffer grows it (only for this read).
+                filled -= start;
+                if (filled == buffer.Length)
+                {
+                    var larger = new byte[buffer.Length * 2L > Array.MaxLength ? Array.MaxLength : buffer.Length * 2];
+                    buffer.AsSpan(0, filled).CopyTo(larger);
+                    buffer = larger;
+                }
+                else buffer.AsSpan(start, filled).CopyTo(buffer);
+            }
+        }
+        finally { ArrayPool<byte>.Shared.Return(pooled); }
+
+        bool Line(ReadOnlySpan<byte> line)
+        {
+            if (skipLost && line.Trim(" \t\r\0"u8).IsEmpty) return true;
+            if (!TryEntry(line, out var entry)) return false;
+            if (entry is { } value) found(value);
+            return true;
+        }
     }
 
     /// <summary>Each line's own id and time (top-level <c>uuid</c> and <c>timestamp</c>; nested values do not count).
     /// Blank lines and complete lines without a time are skipped; any other line that is not one complete JSON object
     /// makes the whole read null. Only the fragment a tail read cuts off at the start (<paramref name="partialStart"/>)
     /// is dropped unread, and with <paramref name="skipLost"/> a line of nothing but NUL bytes.</summary>
-    private static List<(string? Id, DateTimeOffset At)>? Entries(byte[] data, bool partialStart, bool skipLost = false)
+    private static List<(string? Id, DateTimeOffset At)>? Entries(ReadOnlySpan<byte> data, bool partialStart, bool skipLost = false)
     {
         var entries = new List<(string? Id, DateTimeOffset At)>();
         var start = 0;
-        if (partialStart) start = Array.IndexOf(data, (byte)'\n') is var first and >= 0 ? first + 1 : data.Length;
+        if (partialStart) start = data.IndexOf((byte)'\n') is var first and >= 0 ? first + 1 : data.Length;
         while (start < data.Length)
         {
-            var end = Array.IndexOf(data, (byte)'\n', start);
-            if (end < 0) end = data.Length;
-            var line = data.AsSpan(start, end - start);
+            var end = data[start..].IndexOf((byte)'\n') is var at and >= 0 ? start + at : data.Length;
+            var line = data[start..end];
             start = end + 1;
             if (skipLost && line.Trim(" \t\r\0"u8).IsEmpty) continue;
             if (!TryEntry(line, out var entry)) return null;

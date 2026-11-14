@@ -1101,6 +1101,19 @@ internal static class ClaudeSessionSyncTests
             ]);
             Check(ClaudeSessionSync.HandOver(root, noted, goneOn) == DateTimeOffset.Parse("2026-10-02T06:00:00Z"),
                 "the hand-over is dated by the later transcript's first turn of its own");
+            // Whole transcripts are streamed: lines longer than the read buffer, and lines across its edges, read the same.
+            var bulk = "{\"type\":\"attachment\",\"data\":\"" + new string('x', 3 * 1024 * 1024) + "\"}\n";
+            var filler = string.Concat(Enumerable.Range(0, 40000).Select(index =>
+                "{\"type\":\"progress\",\"n\":" + index.ToString(System.Globalization.CultureInfo.InvariantCulture) + "}\n"));
+            File.WriteAllText(path, Kept + bulk + filler + Later);
+            File.WriteAllText(Path.Combine(project, next + ".jsonl"), Kept + filler + bulk + Later + filler + New + bulk);
+            Check(ClaudeSessionSync.HandOver(root, id, next) == DateTimeOffset.Parse("2026-10-02T05:07:07Z"),
+                "a hand-over is dated the same across lines longer than the read buffer");
+            File.WriteAllText(Path.Combine(project, next + ".jsonl"), Kept + filler + bulk[..^2] + "\n" + New);
+            Check(ClaudeSessionSync.HandOver(root, id, next) is null, "a broken long line still dates no hand-over");
+            File.WriteAllText(Path.Combine(project, next + ".jsonl"), Kept + bulk + New.TrimEnd('\n'));
+            Check(ClaudeSessionSync.HandOver(root, id, next) == DateTimeOffset.Parse("2026-10-02T05:07:07Z"),
+                "a last line without a line end is read too");
         }
         finally { Directory.Delete(root, true); }
     }
