@@ -5,6 +5,7 @@ if (args.Contains("--english")) UiText.SetLanguage("en");
 if (args.Contains("--live-environment-smoke")) { await LiveEnvironmentSmoke.RunAsync(); return; }
 if (args.Contains("--claude-shelf-live-probe")) { ClaudeSessionShelfTests.LiveProbe(); return; }
 if (args.Contains("--claude-shelf-memory-probe")) { ClaudeShelfMemoryProbe.Run(args); return; }
+if (args.Contains("--account-manager-memory-probe")) { await AccountManagerMemoryProbe.RunAsync(args); return; }
 if (args.Contains("--claude-layout-dry-run")) { ClaudeSessionShelfTests.LayoutDryRun(); return; }
 if (args.Contains("--claude-sidebar-store-shape")) { ClaudeSessionShelfTests.SidebarStoreShape(); return; }
 if (args.Contains("--claude-layout-diff")) { ClaudeSessionShelfTests.LayoutDiff(args[Array.IndexOf(args, "--claude-layout-diff") + 1], args[Array.IndexOf(args, "--claude-layout-diff") + 2]); return; }

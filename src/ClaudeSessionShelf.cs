@@ -196,7 +196,8 @@ internal sealed class ClaudeSessionShelf
     // ScanRecord).
     private readonly Dictionary<string, ((long Length, long Created, long Written) Stamp, long ReadAt, JsonObject Record,
         string Fingerprint)> _scanned = new(StringComparer.OrdinalIgnoreCase);
-    // A read this soon after the file's write time is not kept for the next plan, and none is kept longer than MaxScanAge.
+    // A read this soon after the file's write time is not kept for the next plan, and none is kept longer than MaxScanAge
+    // to twice that.
     private static readonly TimeSpan RacyScanWindow = TimeSpan.FromSeconds(2), MaxScanAge = TimeSpan.FromMinutes(10);
     internal ClaudeShelfPaths Paths => _paths;
 
@@ -1148,7 +1149,7 @@ internal sealed class ClaudeSessionShelf
     /// the clock share a write time, and a file replaced under its name keeps the creation time (NTFS tunnelling;
     /// reproduced 2026-11-14 with replacements of equal length). So a read made within <see cref="RacyScanWindow"/> of
     /// the file's write time is not taken again (a later write then has a later time), none is taken after
-    /// <see cref="MaxScanAge"/> (whatever the clock did meanwhile), and <paramref name="fresh"/> takes none at all: the
+    /// <see cref="MaxScanAge"/> to twice that (whatever the clock did meanwhile), and <paramref name="fresh"/> takes none at all: the
     /// plan that is published is read whole from the files (see <see cref="Apply"/>). What is kept only spares the plans
     /// in between, which publish nothing; every write also checks the bytes again at the last moment
     /// (<see cref="Replace"/>, <see cref="AdvanceInPlace"/>, <see cref="StillAsPlanned"/>, <see cref="Unchanged"/>). A
@@ -1162,11 +1163,15 @@ internal sealed class ClaudeSessionShelf
         var stamp = (stream.Length, File.GetCreationTimeUtc(stream.SafeFileHandle).Ticks, written);
         // The clock that stamps files, not the injected one: the two are compared.
         var now = DateTime.UtcNow.Ticks;
+        // Each file keeps its read for the least age and up to as long again, by its name, so the reads of a list do
+        // not all run out in the same minute: read together again they would be a list read whole.
+        var keep = MaxScanAge.Ticks + (uint)StringComparer.OrdinalIgnoreCase.GetHashCode(path) % (uint)MaxScanAge.TotalSeconds
+            * TimeSpan.TicksPerSecond;
         if (!fresh)
             lock (_scanned)
                 if (_scanned.TryGetValue(path, out var known) && known.Stamp == stamp
                     && known.ReadAt - written >= RacyScanWindow.Ticks && now - known.ReadAt is var age && age >= 0
-                    && age < MaxScanAge.Ticks) return (known.Record, known.Fingerprint);
+                    && age < keep) return (known.Record, known.Fingerprint);
         var bytes = new byte[stream.Length];
         stream.ReadExactly(bytes);
         var record = ParseRecord(bytes);

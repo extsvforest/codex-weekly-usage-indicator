@@ -159,7 +159,7 @@ internal sealed class ClaudeShelfService : IDisposable
         try { profiles = _profiles(); }
         catch (Exception) { profiles = []; }
         var reservation = ActiveReservation();
-        _ = Task.Run(() => Work(profiles, reservation)).ContinueWith(task =>
+        _ = Task.Run(() => WorkAndRelease(profiles, reservation)).ContinueWith(task =>
         {
             if (_disposed) return;
             try
@@ -227,6 +227,28 @@ internal sealed class ClaudeShelfService : IDisposable
         var changed = status != Status;
         Status = status;
         if (changed && !_disposed) StatusChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    // What a pass may allocate before the collector is asked to give it back at once.
+    private const long HeavyPassBytes = 96L * 1024 * 1024;
+
+    /// <summary>One background pass, then a collection where the pass was a heavy one. A pass that reads the lists whole
+    /// (the first one, the plan a fill publishes, a plan made for the session sync) leaves a few hundred megabytes of
+    /// large arrays behind at once. So little is allocated between such passes that the collector does not come for
+    /// them for many minutes, and each left the process a step higher: 0.3 GB after start, 1.4 GB a quarter of an hour
+    /// later (measured 2026-11-14). One compacting collection right after such a pass gives the memory back.</summary>
+    private ClaudeShelfPass WorkAndRelease(IReadOnlyList<ClaudeProfile> profiles, Guid? reservation)
+    {
+        var before = GC.GetTotalAllocatedBytes(false);
+        try { return Work(profiles, reservation); }
+        finally
+        {
+            if (GC.GetTotalAllocatedBytes(false) - before > HeavyPassBytes)
+            {
+                System.Runtime.GCSettings.LargeObjectHeapCompactionMode = System.Runtime.GCLargeObjectHeapCompactionMode.CompactOnce;
+                GC.Collect(GC.MaxGeneration, GCCollectionMode.Aggressive, blocking: true, compacting: true);
+            }
+        }
     }
 
     /// <summary>Background pass. Only one runs at a time; it owns the worker state below.</summary>
