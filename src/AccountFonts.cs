@@ -30,6 +30,10 @@ internal static class AccountFonts
         // after all forms, labels and native font handles have finished using them.
     }
 
+    /// <summary>The family itself, for text drawn as outlines rather than through a <see cref="Font"/>.</summary>
+    internal static FontFamily Family(bool semibold = false) =>
+        Families.Families.Single(family => family.Name == (semibold ? "Pretendard SemiBold" : "Pretendard"));
+
     internal static Font Create(float size, bool bold = false, bool semibold = false)
     {
         var name = semibold ? "Pretendard SemiBold" : "Pretendard";
