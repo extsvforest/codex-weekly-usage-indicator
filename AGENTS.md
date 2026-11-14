@@ -56,6 +56,7 @@ This repository contains a small Windows WinForms utility with optional WSL Code
 - Launch `--supervise` through the per-user interactive, least-privilege scheduled task, never directly from Codex. The supervisor retries abnormal exits/start failures only; normal Close ends supervision. Do not replace this loop with Task Scheduler RestartOnFailure.
 - Disable/stop the task before upgrade or uninstall; filter processes by the current user's exact installed EXE path. Coordinate lifecycle scripts with in-progress account operations.
 - Check the install directory's final handle path before stopping tasks or processes: packaged shells can redirect AppData without reporting package identity. Package `install-environment.ps1` with both lifecycle scripts.
+- From a shell inside a packaged app, install with `.\scripts\install-outside.ps1`: it runs `install.ps1` through a one-off scheduled task of the current user, with no window, waits for it and compares the installed hash with the built one.
 
 ## Validation
 
