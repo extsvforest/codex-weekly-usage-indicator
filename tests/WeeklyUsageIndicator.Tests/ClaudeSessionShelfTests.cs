@@ -82,13 +82,16 @@ internal static class ClaudeSessionShelfTests
         fixture.Record(A, "local_bbbbbbbb-0000-4000-8000-000000000005", Guid.NewGuid().ToString("D"));
         var deletedCli = fixture.Transcript();
         fixture.Record(A, "local_bbbbbbbb-0000-4000-8000-000000000006", deletedCli);
+        fixture.Record(A, "local_bbbbbbbb-0000-4000-8000-000000000007", fixture.Transcript(),
+            extra: r => r["overflowCliSessionIds"] = new JsonArray(Guid.NewGuid().ToString("D")));
         Directory.CreateDirectory(fixture.ShelfPath(B));
         File.WriteAllText(Path.Combine(fixture.ShelfPath(B), "deleted_" + deletedCli), "");
         var plan = fixture.Shelf().Plan([A, B]);
         var reasons = plan.Skipped.Values.Single();
         Check(plan.Actions.Count == 0 && reasons["scratch"] == 1 && reasons["missing_cwd"] == 1 && reasons["remote"] == 1
-              && reasons["worktree_lazy"] == 1 && reasons["missing_transcript"] == 1 && reasons["deleted_in_target"] == 1,
-            "scratch, missing folders, remote, a worktree not made yet, missing transcripts and target deletions are excluded");
+              && reasons["worktree_lazy"] == 1 && reasons["missing_transcript"] == 1 && reasons["deleted_in_target"] == 1
+              && reasons["overflow_lineage"] == 1,
+            "scratch, missing folders, remote, a worktree not made yet, missing transcripts, target deletions and a lineage past what a copy carries are excluded");
 
         File.WriteAllText(Path.Combine(fixture.ShelfPath(B), "local_cccccccc-0000-4000-8000-000000000001.json.tmp"), "{}");
         Check(fixture.Shelf().Plan([A, B]).Held[B.Key] == "recovering", "a pending app recovery holds the target shelf");
@@ -105,21 +108,47 @@ internal static class ClaudeSessionShelfTests
         var path = Path.Combine(fixture.ShelfPath(A), Id + ".json");
         fixture.Record(A, Id, fixture.Transcript(), extra: r => r["title"] = "aaaa");
         var shelf = fixture.Shelf();
-        Check(shelf.Plan([A, B]).Actions.Single().Record["title"]!.GetValue<string>() == "aaaa", "a record is planned");
-        var written = File.GetLastWriteTimeUtc(path);
-        File.WriteAllText(path, File.ReadAllText(path).Replace("aaaa", "bbbb"));
-        File.SetLastWriteTimeUtc(path, written.AddSeconds(1));
-        Check(shelf.Plan([A, B]).Actions.Single().Record["title"]!.GetValue<string>() == "bbbb",
-            "a record written again with the same size is read again");
+        // The file's stamp: its size and its creation and write times. Long unwritten, a read of it is kept.
+        var old = DateTime.UtcNow.AddHours(-1);
+        void Stamp(DateTime written) { File.SetCreationTimeUtc(path, old); File.SetLastWriteTimeUtc(path, written); }
+        void Rewrite(string from, string to) => File.WriteAllText(path, File.ReadAllText(path).Replace(from, to));
+        string Planned() => shelf.Plan([A, B]).Actions.Single().Record["title"]!.GetValue<string>();
+        Stamp(old);
+        Check(Planned() == "aaaa", "a record is planned");
+        Rewrite("aaaa", "bbbb"); Stamp(old.AddSeconds(1));
+        Check(Planned() == "bbbb", "a record written again with the same size is read again");
+        // Two writes within one tick of the clock share a write time. A read made right after the file was written is
+        // therefore not kept, so the second of them is seen.
+        var recent = DateTime.UtcNow;
+        Rewrite("bbbb", "cccc"); Stamp(recent);
+        Check(Planned() == "cccc", "a record just written is read");
+        Rewrite("cccc", "dddd"); Stamp(recent);
+        Check(Planned() == "dddd", "a read made right after the write is not kept: the same stamp is read again");
+        // Kept, a read answers for any file with its stamp, which does not name the content.
+        Stamp(old.AddSeconds(2));
+        Check(Planned() == "dddd", "a record long unwritten is read once");
+        Rewrite("dddd", "eeee"); Stamp(old.AddSeconds(2));
+        Check(Planned() == "dddd", "a file with the stamp of a kept read is taken from that read");
+        var valid = File.ReadAllText(path);
         var archived = Json(path);
         archived["isArchived"] = true;
         archived["note"] = "x";
-        File.WriteAllText(path, archived.ToJsonString());
-        File.SetLastWriteTimeUtc(path, written.AddSeconds(1));
+        File.WriteAllText(path, archived.ToJsonString()); Stamp(old.AddSeconds(2));
         Check(shelf.Plan([A, B]).Actions.Count == 0, "a record of another size is read again, whatever its times");
         File.WriteAllText(path, "{broken");
         Check(shelf.Plan([A, B]).Held.GetValueOrDefault(A.Key) == "unreadable",
             "a record that no longer parses is not taken from an earlier read");
+        // The plans in between may rest on a kept read; the plan that is published reads every record from its file.
+        File.WriteAllText(path, valid); Stamp(old.AddSeconds(3));
+        Check(Planned() == "eeee", "the record is planned again");
+        Rewrite("eeee", "ffff"); Stamp(old.AddSeconds(3));
+        Check(Planned() == "eeee", "the kept read still answers");
+        MustThrow<IOException>(() => shelf.Apply([A, B], () => true, "test"));
+        Check(!Directory.Exists(fixture.ShelfPath(B)) || fixture.Files(B).Count == 0,
+            "a list that is not as an earlier read had it publishes nothing");
+        Check(shelf.Apply([A, B], () => true, "test").Created == 1
+              && Json(fixture.Files(B).Single())["title"]!.GetValue<string>() == "ffff",
+            "the next run starts from what was read then, and publishes the record as its file has it");
     }
 
     private static void TestWorktreeSessions()
@@ -279,6 +308,16 @@ internal static class ClaudeSessionShelfTests
         Check(fixture.Files(g).Count == 4, "after an app it could not inspect, nothing is written until it was watched two minutes again");
         After(minute);
         Check(fixture.Files(g).Count == 5, "then the list is filled");
+
+        // A record that does not parse may count for nothing with the app's delete protection: reported once it has
+        // stayed two minutes, and no longer once the list reads again.
+        var broken = Path.Combine(fixture.ShelfPath(g), "local_9a9a9a9a-0000-4000-8000-0000000000ff.json");
+        File.WriteAllText(broken, "{\"sessionId\":\"local_9a9a");
+        Check(After(minute + moment).Damaged is null && After(minute + moment).Damaged is null,
+            "a record that does not parse may be one being written");
+        Check(After(minute + moment).Damaged == "G", "one that stays two minutes is reported with its account");
+        File.Delete(broken);
+        Check(After(minute + moment) is { Damaged: null, Problem: ClaudeShelfProblem.None }, "and no longer once the list reads again");
 
         // A version not reviewed yet goes on filling, with the warning; an incompatible one fills nothing.
         contract = ClaudeDesktopContract.Unreviewed;
@@ -801,6 +840,21 @@ internal static class ClaudeSessionShelfTests
             "an export that names another function than the reviewed removal is not reviewed");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle5(exports: Exports5.Replace("exports.f=Ze,", ""))),
             "a removal the chunk does not export is not reviewed");
+        // The reviewed function may stay in place while the name that is called comes to mean another.
+        Check(!ClaudeDesktopProbe.IsCompatible(Bundle5(exports: Exports5 + "exports.f=Qe;"))
+              && !ClaudeDesktopProbe.IsCompatible(Bundle5(exports: Exports5.Replace("exports.f=Ze,", "exports.f=Ze,exports.f=async(e,n)=>{},")))
+              && !ClaudeDesktopProbe.IsCompatible(Bundle5(exports: "exports.f=void 0;" + Exports5)),
+            "an export set a second time, after or before the reviewed function, is not reviewed");
+        Check(!ClaudeDesktopProbe.IsCompatible(Bundle5(exports: Exports5 + "Object.defineProperty(exports,\"f\",{get:function(){return Qe}});"))
+              && !ClaudeDesktopProbe.IsCompatible(Bundle5(exports: Exports5 + "module.exports={f:Qe};")),
+            "nor one redefined as a property or replaced with the exports whole");
+        Check(!ClaudeDesktopProbe.IsCompatible(Bundle5(header: Header5 + "Gt.f=Kt.f;"))
+              && !ClaudeDesktopProbe.IsCompatible(Bundle5(call: "Gt.d = Kt.f;" + Call5)),
+            "an import the calling file assigns to is not reviewed");
+        Check(!ClaudeDesktopProbe.IsCompatible(Bundle5(header: Header5 + "var Gt=require(\"./index.chunk-BNMstLw_.js\");")),
+            "nor a name the file binds to two required files");
+        Check(ClaudeDesktopProbe.IsCompatible(Bundle5(header: Header5 + "if(Gt.f==null)throw Error();let xGt={};xGt.f=1;e.Gt.f=2;")),
+            "a comparison, a longer name and another object's member are no assignment to the import");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle5(aside: Aside5.Replace("Gt.d(r.resolver", "Gt.c(r.resolver"))),
             "setting aside through another export than the reviewed one is not reviewed");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle5(aside: Aside5.Replace("await Gt.f(r.resolver", "await Kt.f(r.resolver"))),

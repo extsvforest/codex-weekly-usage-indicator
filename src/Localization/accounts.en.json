@@ -173,6 +173,7 @@
   "세션 목록 · 모든 계정 채움 · {0}": "Session lists · All accounts filled · {0}",
   "세션 목록 · 다른 계정은 켠 채로, 지금 계정은 Claude를 종료하면 채웁니다.": "Session lists · Other accounts are filled while Claude runs; the current one when Claude quits.",
   "확인 전 Claude 버전 · 세션은 삭제 대신 보관해 주세요.": "Claude version not reviewed yet · Archive sessions instead of deleting them.",
+  "{0} 목록에 읽을 수 없는 세션 기록이 있습니다. 고쳐질 때까지 세션은 삭제 대신 보관해 주세요.": "The {0} list holds a session record that cannot be read. Archive sessions instead of deleting them until it reads again.",
   "이 계정의 사용량 조회 로그인이 필요합니다.": "This account needs a usage sign-in.",
   "Claude 앱이 지금 이 계정으로 로그인되어 있습니다.": "The Claude app is signed in to this account now.",
   "다시 열기 예약됨 · Claude를 종료하면 세션 목록을 채운 뒤 다시 엽니다.": "Reopen scheduled · When Claude quits, session lists are filled and Claude reopens."

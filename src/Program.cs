@@ -70,6 +70,8 @@ internal sealed class UsageIndicatorForm : Form
     private string? _lastAppKey;
     // The last Claude version not reviewed yet that the user was warned about, so each such version warns once.
     private string? _lastUnreviewed;
+    // The accounts last reported for a session record that cannot be read, so each such state warns once.
+    private string? _lastDamaged;
     private string? _claudeAppGate;
     private DateTime? _claudeGateRun;
     private long _claudeGeneration;
@@ -733,6 +735,14 @@ internal sealed class UsageIndicatorForm : Form
             warned.ShowBalloonTip(10000, UiText.T("Claude 세션 목록"),
                 UiText.F($"Claude {version}은 아직 확인 전입니다. 세션 채우기는 계속하지만, 확인될 때까지 세션은 삭제하지 말고 보관해 주세요."),
                 ToolTipIcon.Warning);
+        }
+        if (status.Damaged != _lastDamaged)
+        {
+            _lastDamaged = status.Damaged;
+            if (status.Damaged is { } damaged && status.MappedAccounts >= 2 && _accountTray is { Visible: true } alarmed)
+                alarmed.ShowBalloonTip(10000, UiText.T("Claude 세션 목록"),
+                    UiText.F($"{damaged} 목록에 읽을 수 없는 세션 기록이 있습니다. 고쳐질 때까지 세션은 삭제 대신 보관해 주세요."),
+                    ToolTipIcon.Warning);
         }
         _claudeFollower?.OnStatusChanged();
         UpdateAppMismatch();

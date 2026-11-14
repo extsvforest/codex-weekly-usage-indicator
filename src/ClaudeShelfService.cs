@@ -7,7 +7,9 @@ internal enum ClaudeShelfProblem { None, Incompatible, Held, Failed }
 
 /// <summary>A UI-thread snapshot of the Desktop app and the session-list fill. <see cref="Unreviewed"/> is the installed
 /// app version whose deletion protection reads differently from the reviewed ones (see <see cref="ClaudeDesktopContract"/>):
-/// filling goes on, and the user is told to archive sessions rather than delete them until it is reviewed.</summary>
+/// filling goes on, and the user is told to archive sessions rather than delete them until it is reviewed.
+/// <see cref="Damaged"/> names the accounts whose list has held a record that does not parse for a while: the app may
+/// count nothing for such a record, so the same advice holds until it reads again.</summary>
 internal sealed record ClaudeShelfStatus(
     ClaudeDesktopRunState Desktop,
     ClaudeDesktopAccountState App,
@@ -21,7 +23,8 @@ internal sealed record ClaudeShelfStatus(
     string? ProblemDetail,
     DateTimeOffset? RelaunchArmedUntil,
     DateTime? HostStartedAt = null,
-    string? Unreviewed = null)
+    string? Unreviewed = null,
+    string? Damaged = null)
 {
     internal static readonly ClaudeShelfStatus Initial = new(ClaudeDesktopRunState.Unknown, ClaudeDesktopAccountState.Unknown,
         null, null, 0, null, 0, true, ClaudeShelfProblem.None, null, null);
@@ -92,6 +95,11 @@ internal sealed class ClaudeShelfService : IDisposable
     private string? _problemDetail;
     // The lists the last fill of each left held.
     private readonly HashSet<string> _held = new(StringComparer.Ordinal);
+    // The lists holding a record that does not parse, since when, and the labels of those that have for a while
+    // (see NoteUnreadable).
+    private readonly Dictionary<string, DateTimeOffset> _unreadable = new(StringComparer.Ordinal);
+    private static readonly TimeSpan UnreadableGrace = TimeSpan.FromMinutes(2);
+    private string? _damaged;
     private string? _unreviewed;
     private string? _confirmedKey;
     // The accounts the app shows (see NoteShown), when it last did, and since when this widget has seen every line of its
@@ -296,7 +304,7 @@ internal sealed class ClaudeShelfService : IDisposable
         }
         var profileId = app.Key is { } appKey ? _accounts.FirstOrDefault(account => account.Key == appKey)?.ProfileId : null;
         return new ClaudeShelfPass(new ClaudeShelfStatus(runtime.State, app, profileId, _pending, _accounts.Count, _lastFillAt,
-            _lastCreated, _lastComplete, _problem, _problemDetail, null, runtime.HostStartedAt, _unreviewed), accepted,
+            _lastCreated, _lastComplete, _problem, _problemDetail, null, runtime.HostStartedAt, _unreviewed, _damaged), accepted,
             package ?? _environment.FindPackage(), switchedFrom, choice);
     }
 
@@ -376,8 +384,14 @@ internal sealed class ClaudeShelfService : IDisposable
         {
             if (_accounts.Count < 2 || package is null || contract == ClaudeDesktopContract.Incompatible
                 || !MayWriteWhileRunning(app, null, now))
-                return app.Key is { } key ? _shelf.Plan(_accounts).PendingFor(key) : null;
+            {
+                if (app.Key is not { } key) return null;
+                var seen = _shelf.Plan(_accounts);
+                NoteUnreadable(seen, now);
+                return seen.PendingFor(key);
+            }
             var result = _shelf.Apply(_accounts, MayWrite, package.Version.ToString(), running: true);
+            NoteUnreadable(result.Plan, now);
             var targets = result.Targets ?? new HashSet<string>();
             if (result.Written > 0) { _lastFillAt = now; _lastCreated = result.Created; }
             if (targets.Count > 0) _lastComplete = result.Plan.IsCompleteFor(targets);
@@ -402,6 +416,21 @@ internal sealed class ClaudeShelfService : IDisposable
             // A list changed while preparing, the installer holds the lease, or anything else: the next pass tries again.
             return null;
         }
+    }
+
+    /// <summary>Keeps which lists hold a record that does not parse. The app counts the transcripts of such a record only
+    /// as far as a text scan still finds their ids (Claude 5.11492), so one that is empty or cut short may claim nothing,
+    /// and a delete of the same conversation in another account would then take its transcripts. A record being written
+    /// passes within moments; one that stays is reported, so the user archives rather than deletes until it reads again.</summary>
+    private void NoteUnreadable(ClaudeShelfPlan plan, DateTimeOffset now)
+    {
+        foreach (var key in _unreadable.Keys.Where(key => plan.Held.GetValueOrDefault(key) != "unreadable").ToArray())
+            _unreadable.Remove(key);
+        foreach (var (key, reason) in plan.Held)
+            if (reason == "unreadable") _unreadable.TryAdd(key, now);
+        var labels = _accounts.Where(account => _unreadable.TryGetValue(account.Key, out var since) && now - since >= UnreadableGrace)
+            .Select(account => account.Label).ToArray();
+        _damaged = labels.Length > 0 ? string.Join(", ", labels) : null;
     }
 
     /// <summary>Keeps <see cref="ClaudeSessionLayout"/>: starts it the first time, keeps the mapped accounts and their
@@ -550,6 +579,7 @@ internal sealed class ClaudeShelfService : IDisposable
         {
             var result = _shelf.Apply(_accounts, () => _environment.Observe().State == ClaudeDesktopRunState.Closed,
                 package!.Version.ToString());
+            NoteUnreadable(result.Plan, now);
             _lastFillAt = now; _lastCreated = result.Created;
             // A sidebar sync that could not finish is retried like a held list.
             _lastComplete = result.Plan.IsComplete && result.Prefs?.Complete != false;

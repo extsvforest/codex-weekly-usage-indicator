@@ -299,23 +299,30 @@ internal static class ClaudeDesktopProbe
     /// still have to name one function (since 5.11492 the transcript removal lives in a chunk of its own). Each bundled
     /// file ends with its source map comment, which names the file. An import (<c>Gt.f</c>) is the export of the file
     /// the caller's file requires under that name in its header; a function its own file exports at the end is that
-    /// export; any other name is that file's local function (itself, in a bundle not split into files). Null when an
-    /// import cannot be resolved.</summary>
+    /// export; any other name is that file's local function (itself, in a bundle not split into files). An export stands
+    /// for the function a flow read only while its file sets it exactly once and by assignment, and an import only while
+    /// its file binds the name to one required file and never assigns to the member: set again later, the name would
+    /// call something no flow read. Null when a name cannot be resolved to one function.</summary>
     private static string? Function(ReadOnlySpan<byte> bundle, string name, int at)
     {
+        var previous = bundle[..at].LastIndexOf(SourceMapTrailer);
+        var fileStart = previous < 0 ? 0 : previous + SourceMapTrailer.Length;
+        var trailer = bundle[at..].IndexOf(SourceMapTrailer);
+        var fileEnd = trailer < 0 ? bundle.Length : at + trailer;
         var dot = name.IndexOf('.');
         if (dot >= 0)
         {
-            var previous = bundle[..at].LastIndexOf(SourceMapTrailer);
-            var fileStart = previous < 0 ? 0 : previous + SourceMapTrailer.Length;
             var header = Encoding.UTF8.GetString(bundle.Slice(fileStart, Math.Min(HeaderBytes, at - fileStart)));
-            var required = Regex.Match(header, @"(?<![\w$.])" + Regex.Escape(name[..dot])
+            var required = Regex.Matches(header, @"(?<![\w$.])" + Regex.Escape(name[..dot])
                 + @"=require\(""\./(?<file>[\w.-]+\.js)""\)", RegexOptions.CultureInvariant);
-            return required.Success ? required.Groups["file"].Value + "#" + name[(dot + 1)..] : null;
+            if (required.Count != 1) return null;
+            var target = required[0].Groups["file"].Value;
+            var member = name[(dot + 1)..];
+            if (Sets(bundle[fileStart..fileEnd], name, ownName: true) != 0 || FileNamed(bundle, target) is not { } span
+                || !ExportedOnce(bundle[span], member)) return null;
+            return target + "#" + member;
         }
-        var trailer = bundle[at..].IndexOf(SourceMapTrailer);
         if (trailer < 0) return name;
-        var fileEnd = at + trailer;
         var after = bundle[(fileEnd + SourceMapTrailer.Length)..];
         var mapEnd = after.IndexOf(".map"u8);
         if (mapEnd < 0) return name;
@@ -323,7 +330,46 @@ internal static class ClaudeDesktopProbe
         var tailStart = Math.Max(at, fileEnd - ExportTailBytes);
         var exported = Regex.Match(Encoding.UTF8.GetString(bundle[tailStart..fileEnd]),
             @"(?<![\w$.])exports\.(?<export>[\w$]+)=" + Regex.Escape(name) + "(?![\\w$])", RegexOptions.CultureInvariant);
-        return exported.Success ? file + "#" + exported.Groups["export"].Value : file + ":" + name;
+        if (!exported.Success) return file + ":" + name;
+        return ExportedOnce(bundle[fileStart..fileEnd], exported.Groups["export"].Value)
+            ? file + "#" + exported.Groups["export"].Value : null;
+    }
+
+    /// <summary>The bundled file of this name, without its source map comment: null unless exactly one ends with it.</summary>
+    private static Range? FileNamed(ReadOnlySpan<byte> bundle, string file)
+    {
+        var ending = Encoding.UTF8.GetBytes("//# sourceMappingURL=" + file + ".map");
+        var end = bundle.IndexOf(ending);
+        if (end < 0 || bundle[(end + ending.Length)..].IndexOf(ending) >= 0) return null;
+        var previous = bundle[..end].LastIndexOf(SourceMapTrailer);
+        return (previous < 0 ? 0 : previous + SourceMapTrailer.Length)..end;
+    }
+
+    /// <summary>Whether the file sets this export exactly once, by a plain assignment: not a second time, not as a
+    /// defined property, and not by replacing its exports whole.</summary>
+    private static bool ExportedOnce(ReadOnlySpan<byte> file, string export) =>
+        Sets(file, "exports." + export, ownName: false) == 1
+        && file.IndexOf(Encoding.UTF8.GetBytes("exports,\"" + export + "\"")) < 0
+        && Sets(file, "module.exports", ownName: false) == 0;
+
+    /// <summary>How often the file assigns to this name (<c>=</c>, not a comparison). With <paramref name="ownName"/>
+    /// the name must stand on its own, not end a longer name or be another object's member.</summary>
+    private static int Sets(ReadOnlySpan<byte> file, string name, bool ownName)
+    {
+        var count = 0;
+        foreach (var spelling in new[] { name + "=", name + " =" })
+        {
+            var needle = Encoding.UTF8.GetBytes(spelling);
+            for (int offset = 0, found; (found = file[offset..].IndexOf(needle)) >= 0; offset += found + needle.Length)
+            {
+                int start = offset + found, end = start + needle.Length;
+                if (end < file.Length && file[end] == (byte)'=') continue;
+                if (ownName && start > 0 && file[start - 1] is var before
+                    && (char.IsAsciiLetterOrDigit((char)before) || before is (byte)'_' or (byte)'$' or (byte)'.')) continue;
+                count++;
+            }
+        }
+        return count;
     }
 
     internal static void Launch(ClaudeDesktopPackage package) =>

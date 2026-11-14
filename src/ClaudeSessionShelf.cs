@@ -71,6 +71,10 @@ internal sealed class ClaudeShelfPlan
     /// <summary>Entries the next fill adds to a list or brings up to date there.</summary>
     internal int PendingFor(string targetKey) =>
         Actions.Count(action => action.Target == targetKey) + Advances.Count(advance => advance.Target == targetKey);
+    /// <summary>Whether the plan adds, advances or retires anything in these lists.</summary>
+    internal bool WritesTo(IReadOnlySet<string> targets) => Actions.Any(action => targets.Contains(action.Target))
+        || Advances.Any(advance => targets.Contains(advance.Target))
+        || Retirements.Any(retirement => targets.Contains(retirement.Target));
     internal bool HasTransientSkips => Skipped.Values.Any(reasons => TransientReasons.Any(reasons.ContainsKey));
     internal bool IsComplete => Held.Count == 0 && !HasTransientSkips;
 
@@ -154,6 +158,7 @@ internal sealed class ClaudeSessionShelf
     private static readonly string[] HoldingFields =
     [
         "stagedTranscriptPath", "unarchivedCliSessionId", "historyOnlyCliSessionId", "priorRemoteCliSessionIds",
+        "overflowCliSessionIds", "overflowRemoteCliSessionIds",
         "sshRemoteTranscriptPath", "forkedFromSessionId", "spawnedFrom", "scheduledTaskId", "dispatchParentId",
         "dispatchParentOrigin", "remoteControlSpawn", "violinBow", "branch", "folderWorktrees", "worktreePinned",
         "keptDirtyWorktree", "keptWorktreeLeftover", "pendingFirstStart", "pendingSystemReminder", "queuedSideSessionNotes",
@@ -187,9 +192,12 @@ internal sealed class ClaudeSessionShelf
     // Plans repeat every minute while the app runs and a hand-over reads two transcripts whole: remember each verdict per
     // state of the earlier file and the later file's length (see WentOn).
     private readonly Dictionary<string, (bool Went, long Length, bool Settled)> _handOvers = new(StringComparer.Ordinal);
-    // The records of the lists as last read, by file, with the file's size and times then (see ScanRecord).
-    private readonly Dictionary<string, ((long Length, long Created, long Written) Stamp, JsonObject Record, string Fingerprint)>
-        _scanned = new(StringComparer.OrdinalIgnoreCase);
+    // The records of the lists as last read, by file, with the file's size and times then and when that read was (see
+    // ScanRecord).
+    private readonly Dictionary<string, ((long Length, long Created, long Written) Stamp, long ReadAt, JsonObject Record,
+        string Fingerprint)> _scanned = new(StringComparer.OrdinalIgnoreCase);
+    // A read this soon after the file's write time is not kept for the next plan, and none is kept longer than MaxScanAge.
+    private static readonly TimeSpan RacyScanWindow = TimeSpan.FromSeconds(2), MaxScanAge = TimeSpan.FromMinutes(10);
     internal ClaudeShelfPaths Paths => _paths;
 
     internal ClaudeSessionShelf(ClaudeShelfPaths? paths = null, Func<ClaudeLiveSessionScan>? liveWriters = null,
@@ -208,11 +216,18 @@ internal sealed class ClaudeSessionShelf
     internal ClaudeShelfPlan Plan(IReadOnlyList<ClaudeShelfAccount> accounts) =>
         Plan(accounts, ClaudeShelfLedger.Load(_paths.LedgerDirectory, _paths.SessionsRoot));
 
-    private ClaudeShelfPlan Plan(IReadOnlyList<ClaudeShelfAccount> accounts, ClaudeShelfLedger ledger)
+    /// <param name="fresh">Read every record from its file, taking none from an earlier read (see ScanRecord): the plan
+    /// that is published.</param>
+    private ClaudeShelfPlan Plan(IReadOnlyList<ClaudeShelfAccount> accounts, ClaudeShelfLedger ledger, bool fresh = false)
     {
         var plan = new ClaudeShelfPlan();
         var distinct = accounts.DistinctBy(account => account.Key).ToArray();
-        var shelves = distinct.ToDictionary(account => account.Key, account => ScanShelf(ShelfDirectory(account)));
+        var shelves = distinct.ToDictionary(account => account.Key, account => ScanShelf(ShelfDirectory(account), fresh));
+        // What was read of a list no longer planned (a profile removed) goes.
+        var directories = distinct.Select(ShelfDirectory).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        lock (_scanned)
+            foreach (var path in _scanned.Keys.Where(path => !directories.Contains(Path.GetDirectoryName(path) ?? "")).ToArray())
+                _scanned.Remove(path);
         foreach (var (key, shelf) in shelves) plan.Fingerprints[key] = shelf.Fingerprint;
         if (distinct.Length < 2) return plan;
         var live = _liveWriters();
@@ -873,13 +888,17 @@ internal sealed class ClaudeSessionShelf
             if (ReconcileArchives(ledger)) ledger.Save(_paths.LedgerDirectory);
             var first = Plan(accounts, ledger);
             if (!mayWrite(null)) throw new ClaudeDesktopRunningException();
-            // Re-plan and publish that final plan: writers or eligibility can change without a shelf change.
-            var plan = Plan(accounts, ledger);
             var targets = accounts.DistinctBy(account => account.Key).ToDictionary(account => account.Key);
             IReadOnlySet<string> writable = running
                 ? targets.Keys.Where(key => mayWrite(key)).ToHashSet(StringComparer.Ordinal)
                 : targets.Keys.ToHashSet(StringComparer.Ordinal);
-            if (!first.SameShelvesAs(plan, running ? writable : null))
+            // Re-plan and publish that final plan: writers or eligibility can change without a shelf change. The first
+            // plan may rest on records as last read (see ScanRecord), which is enough to tell that there is nothing to
+            // publish; the plan that is published reads every record from its file again, so no list is judged by what
+            // it held earlier. Where the two differ, a list changed meanwhile or an earlier read had gone stale: nothing
+            // is written, and the next run starts from what was read now. (Title following decides from the files.)
+            var plan = first.WritesTo(writable) ? Plan(accounts, ledger, fresh: true) : first;
+            if (!ReferenceEquals(plan, first) && !first.SameShelvesAs(plan, running ? writable : null))
                 throw new IOException("세션 목록이 준비 중에 바뀌어 아무것도 쓰지 않았습니다.");
             var prepared = plan.Actions.Where(action => writable.Contains(action.Target)).Select(action =>
             {
@@ -1052,6 +1071,10 @@ internal sealed class ClaudeSessionShelf
         if (Bool(record, "isArchived")) return "archived";
         var cli = Text(record, "cliSessionId");
         if (cli is null || !Guid.TryParse(cli, out _)) return "no_current_id";
+        // Past 1,700 earlier transcripts the app moves the oldest ids here and still counts them for the delete
+        // protection (Claude 5.11492). A copy carries only the lineage fields above, so those transcripts would go with
+        // the original's delete: such a conversation is left out rather than copied in part.
+        if (record["overflowCliSessionIds"] is JsonArray { Count: > 0 }) return "overflow_lineage";
         if (RemoteFields.Any(field => record[field] is not null)) return "remote";
         if (Holds(record["worktreeLazy"])) return "worktree_lazy";
         var cwd = Text(record, "cwd");
@@ -1088,7 +1111,7 @@ internal sealed class ClaudeSessionShelf
         return record;
     }
 
-    private Shelf ScanShelf(string directory)
+    private Shelf ScanShelf(string directory, bool fresh = false)
     {
         var shelf = new Shelf();
         if (!Directory.Exists(directory)) return shelf;
@@ -1101,7 +1124,7 @@ internal sealed class ClaudeSessionShelf
             else if (name.StartsWith("deleted_", StringComparison.Ordinal)) shelf.Deleted.Add(name);
             else if (name.StartsWith("local_", StringComparison.Ordinal) && name.EndsWith(".json", StringComparison.Ordinal))
             {
-                var (record, fingerprint) = ScanRecord(path, seen);
+                var (record, fingerprint) = ScanRecord(path, seen, fresh);
                 shelf.Records[name] = record;
                 shelf.Fingerprint[name] = fingerprint;
                 continue;
@@ -1121,25 +1144,35 @@ internal sealed class ClaudeSessionShelf
     /// records reach hundreds of kilobytes (each parsed record also keeps a copy of its bytes), so a list read whole each
     /// time is hundreds of megabytes of garbage a minute. A record whose file is the same size with the same creation and
     /// write times as at its last read is taken from that read: the stamp comes from the handle the bytes are read
-    /// through, so it always belongs to them. This only feeds plans; every write checks the bytes again at the last moment
-    /// (<see cref="Replace"/>, <see cref="AdvanceInPlace"/>, <see cref="StillAsPlanned"/>, <see cref="Unchanged"/>), and a
-    /// fingerprint from an earlier read can only fail such a check, never pass one the file now would not. A record that
-    /// does not parse is never kept: it may be one being written.
+    /// through, so it always belongs to them. The stamp does not name the content, though: two writes within one tick of
+    /// the clock share a write time, and a file replaced under its name keeps the creation time (NTFS tunnelling;
+    /// reproduced 2026-11-14 with replacements of equal length). So a read made within <see cref="RacyScanWindow"/> of
+    /// the file's write time is not taken again (a later write then has a later time), none is taken after
+    /// <see cref="MaxScanAge"/> (whatever the clock did meanwhile), and <paramref name="fresh"/> takes none at all: the
+    /// plan that is published is read whole from the files (see <see cref="Apply"/>). What is kept only spares the plans
+    /// in between, which publish nothing; every write also checks the bytes again at the last moment
+    /// (<see cref="Replace"/>, <see cref="AdvanceInPlace"/>, <see cref="StillAsPlanned"/>, <see cref="Unchanged"/>). A
+    /// record that does not parse is never kept: it may be one being written.
     /// </summary>
-    private (JsonObject? Record, string Fingerprint) ScanRecord(string path, HashSet<string>? seen)
+    private (JsonObject? Record, string Fingerprint) ScanRecord(string path, HashSet<string>? seen, bool fresh = false)
     {
         seen?.Add(path);
         using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-        var stamp = (stream.Length, File.GetCreationTimeUtc(stream.SafeFileHandle).Ticks,
-            File.GetLastWriteTimeUtc(stream.SafeFileHandle).Ticks);
-        lock (_scanned)
-            if (_scanned.TryGetValue(path, out var known) && known.Stamp == stamp) return (known.Record, known.Fingerprint);
+        var written = File.GetLastWriteTimeUtc(stream.SafeFileHandle).Ticks;
+        var stamp = (stream.Length, File.GetCreationTimeUtc(stream.SafeFileHandle).Ticks, written);
+        // The clock that stamps files, not the injected one: the two are compared.
+        var now = DateTime.UtcNow.Ticks;
+        if (!fresh)
+            lock (_scanned)
+                if (_scanned.TryGetValue(path, out var known) && known.Stamp == stamp
+                    && known.ReadAt - written >= RacyScanWindow.Ticks && now - known.ReadAt is var age && age >= 0
+                    && age < MaxScanAge.Ticks) return (known.Record, known.Fingerprint);
         var bytes = new byte[stream.Length];
         stream.ReadExactly(bytes);
         var record = ParseRecord(bytes);
         var fingerprint = Convert.ToHexString(SHA256.HashData(bytes));
         lock (_scanned)
-            if (record is not null) _scanned[path] = (stamp, record, fingerprint);
+            if (record is not null) _scanned[path] = (stamp, now, record, fingerprint);
             else _scanned.Remove(path);
         return (record, fingerprint);
     }

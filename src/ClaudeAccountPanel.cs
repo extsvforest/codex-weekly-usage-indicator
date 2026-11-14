@@ -185,6 +185,11 @@ internal sealed class ClaudeAccountPanel : UserControl
         if (status.Problem == ClaudeShelfProblem.Incompatible && status.MappedAccounts >= 2)
             return (UiText.T("세션 목록 채우기 멈춤 · 이 Claude 버전은 아직 확인되지 않았습니다."), true,
                 status.RelaunchArmed ? UiText.T("다시 열기 취소") : null);
+        // A record that does not parse may count for nothing with the app, so a delete in another account could take
+        // its conversation: that warning stays until the record reads again.
+        if (status.Damaged is { } damaged && status.MappedAccounts >= 2)
+            return (UiText.F($"{damaged} 목록에 읽을 수 없는 세션 기록이 있습니다. 고쳐질 때까지 세션은 삭제 대신 보관해 주세요."), true,
+                status.RelaunchArmed ? UiText.T("다시 열기 취소") : null);
         // Filling goes on with a version not reviewed yet, but deleting a session there may not spare the conversation
         // other accounts still list: that warning stays until a reviewed version is installed.
         if (status.Unreviewed is not null && status.MappedAccounts >= 2)
