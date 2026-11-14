@@ -2,8 +2,8 @@
 
 The user asked for a prettier widget inside the same 272 × 64 window, which they
 keep inside the taskbar. This face was applied on 2026-11-14 as the agent's
-recommendation. The user's verdict on the installed widget is still to come, so
-nothing here is an accepted taste yet.
+recommendation, and the user accepted it the same day after using the installed
+widget ("지금 디자인 안 훌륭하네"). It is the decided face.
 
 ![The face on a dark taskbar, in its states](face-dark-taskbar.png)
 
@@ -72,5 +72,5 @@ Synthetic values, drawn by the production painter (`--widget-face-preview`):
 `WidgetFaceTests` reads the composed picture: grounds, the pointer's sheet,
 provider sides and colours, clockwise growth, missing and stale shares, and that
 a new value of as many digits shifts nothing. The layered window itself was
-looked at on the real taskbar and floating (`--widget-native-preview`). Hover and
-drag on the installed widget are the user's to try.
+looked at on the real taskbar and floating (`--widget-native-preview`). The user
+dragged the installed widget into place on the taskbar and accepted the face.
