@@ -82,9 +82,10 @@ internal static class ClaudeDesktopProbe
     // claiming its own stem, (7) a delete owed to Remote Control sets transcripts aside under those same checks and later
     // finishes under a check that keeps on anything claimed or unreadable, (8) setting aside moves nothing until the
     // release test and the reap decision allow it, and any refusal or failure keeps them all, (9) finishing removes only
-    // when its check allowed it, a failed check keeping, and puts the transcript back otherwise. A shared group (see
-    // SharedGroups) names one function in every flow it appears in. What the keep call returns is not checked; this is
-    // a drift guard, not a proof.
+    // when its check allowed it, a failed check keeping, and puts the transcript back otherwise, (10) the claims never
+    // narrow that walk to the current organization. A shared group (see SharedGroups) names one function in every flow
+    // it appears in, across bundled files too (see Function). What the keep call returns is not checked; this is a
+    // drift guard, not a proof.
     internal static readonly (string Anchor, int Before, int After, Regex Flow)[] ContractFlows =
     [
         // (1) Earlier ids are iterated directly (2.16120–2.19675) or spread first into an array that may add more ids,
@@ -97,32 +98,42 @@ internal static class ClaudeDesktopProbe
             @"async function (?<link>[\w$]+)\((?<c>[\w$]+),(?<id>[\w$]+),(?:(?!return!0).){0,1000}?let (?<l>[\w$]+)=await \k<c>\.claimedOnDisk\(\);return \k<l>===null\?[\w$]+\(""records_unreadable""[^)]*\):\k<l>\.has\(\k<id>\)\?[\w$]+\(""claimed_elsewhere""",
             RegexOptions.CultureInvariant | RegexOptions.Singleline)),
         // (3) Inline in the session delete until 4.29; since 4.4212 a function given the manager's checks makes them.
+        // Since 5.11492 the checks also carry the session's own process exit (`reapAfter`) for the removal to wait on
+        // first; the reap check still refuses on its own when that exit is not confirmed.
         ("mayRelease:async ", 200, 600, new Regex(
-            @"function (?<maker>[\w$]+)\((?<c>[\w$]+),[^()]*\)\{(?:let [^;{}]{0,120};)?return\{mayRelease:async (?<e>[\w$]+)=>!\(\(await \k<c>\.claimedOnDisk\(\)\)\?\.has\(\k<e>\)(?:\?\?![01])?\),reapIf:async\((?<t>[\w$]+),(?<r>[\w$]+)\)=>(?:[^;{}?:]{1,200}\?[\w$]+\(\k<t>,""[\w-]+"",""[^""\\]*"",[^;{}?:()]{0,60}\):)?(?<link>[\w$]+)\(\k<c>,\k<t>,\k<r>(?:,(?:[\w$.]+|[\w$]+\([\w$]*\)))*\)(?:,[\w$]+:|\})",
+            @"function (?<maker>[\w$]+)\((?<c>[\w$]+),[^()]*\)\{(?:let [^;{}]{0,120};)?return\{mayRelease:async (?<e>[\w$]+)=>!\(\(await \k<c>\.claimedOnDisk\(\)\)\?\.has\(\k<e>\)(?:\?\?![01])?\),(?:reapAfter:[\w$]+,)?reapIf:async\((?<t>[\w$]+),(?<r>[\w$]+)\)=>(?:[^;{}?:]{1,200}\?[\w$]+\(\k<t>,""[\w-]+"",""[^""\\]*"",[^;{}?:()]{0,60}\):)?(?<link>[\w$]+)\(\k<c>,\k<t>,\k<r>(?:,(?:[\w$.]+|[\w$]+\([\w$]*(?:,[\w$]+)*\)))*\)(?:,[\w$]+:|\})",
             RegexOptions.CultureInvariant)),
-        // (4)
+        // (4) Since 5.11492 the removal and the setting aside are imports from the chunk that holds them (`Gt.f`).
         ("(this.reapChecks,", 60, 2400, new Regex(
-            @"let (?<v>[\w$]+)=(?<maker>[\w$]+)\(this\.reapChecks,[^;]{0,400}?(?<aside>[\w$]+)\(this\.reapChecks,\k<v>,(?:(?!(?<![\w$.])\k<v>=(?!=)).){0,2300}?(?<remover>[\w$]+)\(this\.diskTranscript,[^;]{0,120},""delete"",\k<v>\)",
+            @"let (?<v>[\w$]+)=(?<maker>[\w$]+)\(this\.reapChecks,[^;]{0,400}?(?<![\w$.])(?<aside>[\w$]+)\(this\.reapChecks,\k<v>,(?:(?!(?<![\w$.])\k<v>=(?!=)).){0,2300}?(?<![\w$.])(?<remover>(?:[\w$]+\.)?[\w$]+)\(this\.diskTranscript,[^;]{0,120},""delete"",\k<v>\)",
             RegexOptions.CultureInvariant | RegexOptions.Singleline)),
-        // (5)
+        // (5) Since 5.11492 the removal first waits, out of the shared limit of removals at once, for the checks'
+        // `reapAfter` (a wait that swallows its failure and returns nothing), then asks the reap check as before.
         ("desktop-released marker: reap check failed", 1600, 200, new Regex(
-            @"async function (?<remover>[\w$]+)\([^()]*\)\{.{0,160}?if\((?<m>[\w$]+)\.mayRelease&&!await \k<m>\.mayRelease\((?<c>[\w$]+)\)\)return\}catch\{return\}.{0,900}?if\([\w$]+===null\|\|![\w$]+\|\|!\k<m>\.reapIf\)return;let (?<d>[\w$]+)=!1;try\{(?:(?!(?<![\w$.])\k<d>=(?!=)).){0,700}?(?<![\w$.])\k<d>=await \k<m>\.reapIf\(\k<c>,\{[^{}]*\}\)\}+catch\([\w$]+\)\{[\w$.]+\.debug\(""desktop-released marker: reap check failed"",\{[^{}]*\}\);try\{\k<m>\.keptInDoubt\?\.\(\k<c>\)\}catch\{\}\}(?:if\(\k<d>\)for\(|if\(!\k<d>\)return;)",
+            @"async function (?<remover>[\w$]+)\([^()]*\)\{[^{}]{0,160}?async(?:\(\)| (?<w>[\w$]+))=>\{try\{if\((?<m>[\w$]+)\.mayRelease&&!await \k<m>\.mayRelease\((?<c>[\w$]+)\)\)return\}catch\{return\}.{0,900}?if\([\w$]+===null\|\|![\w$]+\|\|!\k<m>\.reapIf\)return;(?:await \k<w>\(\k<m>\.reapAfter\);)?let (?<d>[\w$]+)=!1;try\{(?:(?!(?<![\w$.])\k<d>=(?!=)).){0,700}?(?<![\w$.])\k<d>=await \k<m>\.reapIf\(\k<c>,\{[^{}]*\}\)\}+catch\([\w$]+\)\{[\w$.]+\.debug\(""desktop-released marker: reap check failed"",\{[^{}]*\}\);try\{\k<m>\.keptInDoubt\?\.\(\k<c>\)\}catch\{\}\}(?:if\(\k<d>\)for\(|if\(!\k<d>\)return;)",
             RegexOptions.CultureInvariant | RegexOptions.Singleline)),
-        // (6)
+        // (6) Since 5.11492 the walk can also be asked for the current organization only (`currentOrgOnly`, for the
+        // recovery index); flow (10) checks that the claims never ask it.
         ("skipOwnRecordsOf?.has(", 1500, 1300, new Regex(
-            @"for\(let (?<a>[\w$]+) of [\w$]+\)\{if\(!\k<a>\.isDirectory\(\)\)continue;let (?<ad>[\w$]+)=\(0,[\w$]+\.join\)\([\w$]+,\k<a>\.name\),(?<os>[\w$]+);try\{\k<os>=await [\w$.]+\.readdir\(\k<ad>,\{withFileTypes:!0\}\)\}catch\([\w$]+\)\{if\([\w$]+\?\.failClosed\)throw [\w$]+;.{0,200}?continue\}for\(let (?<o>[\w$]+) of \k<os>\)\{if\(!\k<o>\.isDirectory\(\)\)continue;let (?<od>[\w$]+)=\(0,[\w$]+\.join\)\(\k<ad>,\k<o>\.name\),(?<own>[\w$]+)=[\w$]+===void 0&&\k<a>\.name===[\w$]+\(\)\.accountId&&\k<o>\.name===[\w$]+\(\)\.orgId,(?<fs>[\w$]+);try\{\k<fs>=await [\w$.]+\.readdir\(\k<od>,\{withFileTypes:!0\}\)\}catch\([\w$]+\)\{if\([\w$]+\?\.failClosed\)throw [\w$]+;.{0,200}?continue\}for\(let [\w$]+ of \k<fs>\)\{(?:(?!(?<![\w$.])\k<own>(?![\w$])|accountId).){0,700}?\|\|\k<own>&&[\w$]+\?\.skipOwnRecordsOf\?\.has\([^;]{0,60}\)continue;let (?<s>[\w$]+)=[^;]{0,60};if\(!\k<own>\)[\w$]+\.add\(\k<s>\);else if\((?:(?<=,)\k<own>,|(?<=if\()\k<own>&&[\w$]+\.add\(\k<s>\),|(?!(?<![\w$.])\k<own>(?![\w$])|accountId).){0,1200}?for\(let [\w$]+ of\[[\w$]+\.cliSessionId,",
+            @"for\(let (?<a>[\w$]+) of [\w$]+\)\{if\(!\k<a>\.isDirectory\(\)(?:\|\|(?<only>[\w$]+)\?\.currentOrgOnly&&\k<a>\.name!==[\w$]+\(\)\.accountId)?\)continue;let (?<ad>[\w$]+)=\(0,[\w$]+\.join\)\([\w$]+,\k<a>\.name\),(?<os>[\w$]+);try\{\k<os>=await [\w$.]+\.readdir\(\k<ad>,\{withFileTypes:!0\}\)\}catch\([\w$]+\)\{if\([\w$]+\?\.failClosed\)throw [\w$]+;.{0,200}?continue\}for\(let (?<o>[\w$]+) of \k<os>\)\{if\(!\k<o>\.isDirectory\(\)\)continue;let (?<od>[\w$]+)=\(0,[\w$]+\.join\)\(\k<ad>,\k<o>\.name\),(?<own>[\w$]+)=[\w$]+===void 0&&\k<a>\.name===[\w$]+\(\)\.accountId&&\k<o>\.name===[\w$]+\(\)\.orgId(?:,|;if\(\k<only>\?\.currentOrgOnly&&!\k<own>\)continue;let )(?<fs>[\w$]+);try\{\k<fs>=await [\w$.]+\.readdir\(\k<od>,\{withFileTypes:!0\}\)\}catch\([\w$]+\)\{if\([\w$]+\?\.failClosed\)throw [\w$]+;.{0,200}?continue\}for\(let [\w$]+ of \k<fs>\)\{(?:(?!(?<![\w$.])\k<own>(?![\w$])|accountId).){0,700}?\|\|\k<own>&&[\w$]+\?\.skipOwnRecordsOf\?\.has\([^;]{0,60}\)continue;let (?<s>[\w$]+)=[^;]{0,60};if\(!\k<own>\)[\w$]+\.add\(\k<s>\);else if\((?:(?<=,)\k<own>,|(?<=if\()\k<own>&&[\w$]+\.add\(\k<s>\),|(?!(?<![\w$.])\k<own>(?![\w$])|accountId).){0,1200}?for\(let [\w$]+ of\[[\w$]+\.cliSessionId,",
             RegexOptions.CultureInvariant | RegexOptions.Singleline)),
-        // (7) Since 4.4212.
-        ("setAside:(", 200, 500, new Regex(
-            @"function (?<aside>[\w$]+)\((?<c>[\w$]+),(?<l>[\w$]+),(?<s>[\w$]+),(?<o>[\w$]+)\)\{let (?<x>[\w$]+)=(?<y>[\w$]+)=>\k<c>\.claims\(\)\.localIdsClaimedByOthers\(\k<s>,\{adopting:!0\}\)\.has\(\k<y>\);return\{setAside:\((?<a>[\w$]+),(?<b>[\w$]+)\)=>\(\k<o>\.beforeSetAside\(\),(?<setter>[\w$]+)\(\k<o>\.resolver,\k<o>\.ids,\k<o>\.hints,\{\.\.\.\k<l>,nonce:\k<a>,notWrittenSince:\k<b>,mayRelease:async (?<m>[\w$]+)=>!\k<x>\(\k<m>\)&&await \k<l>\.mayRelease\(\k<m>\)\}\)\),finish:async\((?<p>[\w$]+),(?<q>[\w$]+)\)=>\{let [\w$]+=await (?<finisher>[\w$]+)\(\k<p>,\k<q>,\(async (?<z>[\w$]+)=>\k<x>\(\k<z>\)\|\|await \k<c>\.claimedOnDisk\(\)===null\|\|!await \k<l>\.mayRelease\(\k<z>\)\)\);",
+        // (7) Since 4.4212. The removal after finishing is given only the release test, no reap check, so it only
+        // writes markers: a transcript kept is back under its name by then.
+        ("setAside:(", 200, 700, new Regex(
+            @"function (?<aside>[\w$]+)\((?<c>[\w$]+),(?<l>[\w$]+),(?<s>[\w$]+),(?<o>[\w$]+)\)\{let (?<x>[\w$]+)=(?<y>[\w$]+)=>\k<c>\.claims\(\)\.localIdsClaimedByOthers\(\k<s>,\{adopting:!0\}\)\.has\(\k<y>\);return\{setAside:\((?<a>[\w$]+),(?<b>[\w$]+)\)=>\(\k<o>\.beforeSetAside\(\),(?<setter>(?:[\w$]+\.)?[\w$]+)\(\k<o>\.resolver,\k<o>\.ids,\k<o>\.hints,\{\.\.\.\k<l>,nonce:\k<a>,notWrittenSince:\k<b>,mayRelease:async (?<m>[\w$]+)=>!\k<x>\(\k<m>\)&&await \k<l>\.mayRelease\(\k<m>\)\}\)\),finish:async\((?<p>[\w$]+),(?<q>[\w$]+)\)=>\{let (?<k>[\w$]+)=await (?<finisher>(?:[\w$]+\.)?[\w$]+)\(\k<p>,\k<q>,\(async (?<z>[\w$]+)=>\k<x>\(\k<z>\)\|\|await \k<c>\.claimedOnDisk\(\)===null\|\|!await \k<l>\.mayRelease\(\k<z>\)\)\)(?:,[\w$]+=\k<c>\.claims\(\)\.localIdsClaimedByOthers\(\k<s>,\{adopting:!0\}\))?;return await (?<remover>(?:[\w$]+\.)?[\w$]+)\(\k<o>\.resolver,\k<o>\.ids\.filter\([^;]{0,60}?\),\k<o>\.hints,""delete"",\{mayRelease:\k<l>\.mayRelease\}\),\k<k>\}",
             RegexOptions.CultureInvariant)),
         // (8) Since 4.4212. A moved transcript is named by the nonce, so nothing before the decision may use it.
         (".notWrittenSince||", 1200, 900, new Regex(
-            @"async function (?<setter>[\w$]+)\([^()]*\)\{.{0,240}?try\{if\(![\w$]+\((?<t>[\w$]+)\)\|\|!await (?<r>[\w$]+)\.mayRelease\(\k<t>\)\)\{(?<a>[\w$]+)=!0;return\}(?:(?!\k<r>\.nonce|(?<![\w$.])\k<a>=!1).){0,900}?if\([\w$]+>\k<r>\.notWrittenSince\|\|!await \k<r>\.reapIf\(\k<t>,\{.{0,240}?\}\)\.catch\(\(\(\)=>\(\k<r>\.keptInDoubt\?\.\(\k<t>\),!1\)\)\)\)\{\k<a>=!0;return\}(?:(?!(?<![\w$.])\k<a>=!1).){0,400}?\}catch\{\k<a>=!0\}finally\{[^{}]{0,60}\}.{0,40}?,!\k<a>\)return [\w$]+;",
+            @"async function (?<setter>[\w$]+)\([^()]*\)\{.{0,240}?try\{if\(![\w$]+\((?<t>[\w$]+)\)\|\|!await (?<r>[\w$]+)\.mayRelease\(\k<t>\)\)\{(?<a>[\w$]+)=!0;return\}(?:(?!\k<r>\.nonce|(?<![\w$.])\k<a>=!1).){0,900}?if\([\w$]+>\k<r>\.notWrittenSince\|\|!await \k<r>\.reapIf\(\k<t>,\{.{0,240}?\}\)\.catch\((?:\(\(\)=>\(\k<r>\.keptInDoubt\?\.\(\k<t>\),!1\)\)|\(\)=>\(\k<r>\.keptInDoubt\?\.\(\k<t>\),!1\))\)\)\{\k<a>=!0;return\}(?:(?!(?<![\w$.])\k<a>=!1).){0,400}?\}catch\{\k<a>=!0\}finally\{[^{}]{0,60}\}.{0,40}?,!\k<a>\)return [\w$]+;",
             RegexOptions.CultureInvariant | RegexOptions.Singleline)),
-        // (9) Since 4.4212.
+        // (9) Since 4.4212. 5.11492 writes arrow arguments without the extra parentheses.
         (".asidePath", 500, 600, new Regex(
-            @"async function (?<finisher>[\w$]+)\([\w$]+,[\w$]+,(?<r>[\w$]+)\)\{let (?<i>[\w$]+)=!1,.{0,200}?let (?<o>[\w$]+)=await \k<r>\([\w$]+\)\.catch\(\(\(\)=>!0\)\),.{0,160}?if\(!\(!\k<o>&&[^{}]{0,300}\)\)\{\k<i>=!0,await [\w$]+\([\w$]+\.asidePath,[^;{}]{0,40}\);continue\}(?:(?!(?<![\w$.])\k<o>(?![\w$])).){0,300}?\.rm\([\w$]+\.asidePath,",
+            @"async function (?<finisher>[\w$]+)\([\w$]+,[\w$]+,(?<r>[\w$]+)\)\{let (?<i>[\w$]+)=!1,.{0,200}?let (?<o>[\w$]+)=await \k<r>\([\w$]+\)\.catch\((?:\(\(\)=>!0\)|\(\)=>!0)\),.{0,160}?if\(!\(!\k<o>&&[^{}]{0,300}\)\)\{\k<i>=!0,await [\w$]+\([\w$]+\.asidePath,[^;{}]{0,40}\);continue\}(?:(?!(?<![\w$.])\k<o>(?![\w$])).){0,300}?\.rm\([\w$]+\.asidePath,",
+            RegexOptions.CultureInvariant | RegexOptions.Singleline)),
+        // (10) The claims ask the walk with a literal of their own options, and nothing in them narrows it to the
+        // current organization (5.11492's `currentOrgOnly`).
+        ("cliSessionIdsClaimedOnDisk(){", 0, 1600, new Regex(
+            @"^cliSessionIdsClaimedOnDisk\(\)\{(?!.*currentOrgOnly).{0,400}?let [\w$]+=\{failClosed:!0,localOnly:!0,recordsOnly:!0(?:,skipOwnRecordsOf:new Set(?:\([^;]{0,200}?\))?)?\}[,;]",
             RegexOptions.CultureInvariant | RegexOptions.Singleline))
     ];
     private static readonly string[] SharedGroups = ["link", "maker", "remover", "aside", "setter", "finisher"];
@@ -222,10 +233,16 @@ internal static class ClaudeDesktopProbe
     internal static bool IsCompatible(ReadOnlySpan<byte> bundle) => Contract(bundle) == ClaudeDesktopContract.Reviewed;
 
     /// <summary>Whether the deletion protection reads as reviewed: the connected windows and data flows below.</summary>
-    private static bool Protects(ReadOnlySpan<byte> bundle)
+    private static bool Protects(ReadOnlySpan<byte> bundle) => Unmatched(bundle, firstOnly: true).Count == 0;
+
+    /// <summary>Which connected windows and data flows do not read as reviewed (by index, a flow's number in the
+    /// comment above being its index plus one), so the next review starts where the shape moved. Read-only.</summary>
+    internal static IReadOnlyList<string> Unmatched(ReadOnlySpan<byte> bundle, bool firstOnly = false)
     {
-        foreach (var (anchor, window, required) in ContractWindows)
+        var failed = new List<string>();
+        for (var index = 0; index < ContractWindows.Length; index++)
         {
+            var (anchor, window, required) = ContractWindows[index];
             var anchorBytes = Encoding.UTF8.GetBytes(anchor);
             var satisfied = false;
             for (int offset = 0, found; !satisfied && (found = bundle[offset..].IndexOf(anchorBytes)) >= 0;
@@ -237,28 +254,76 @@ internal static class ClaudeDesktopProbe
                 foreach (var text in required)
                     if (region.IndexOf(Encoding.UTF8.GetBytes(text)) < 0) { satisfied = false; break; }
             }
-            if (!satisfied) return false;
+            if (!satisfied) { failed.Add($"window {index} ({anchor})"); if (firstOnly) return failed; }
         }
         var shared = new Dictionary<string, string>(StringComparer.Ordinal);
-        foreach (var (anchor, before, after, flow) in ContractFlows)
+        for (var index = 0; index < ContractFlows.Length; index++)
         {
+            var (anchor, before, after, flow) = ContractFlows[index];
             var anchorBytes = Encoding.UTF8.GetBytes(anchor);
             var satisfied = false;
+            string? conflict = null;
             for (int offset = 0, found; !satisfied && (found = bundle[offset..].IndexOf(anchorBytes)) >= 0;
                  offset += found + anchorBytes.Length)
             {
                 var start = Math.Max(0, offset + found - before);
                 var end = Math.Min(bundle.Length, offset + found + after);
-                var match = flow.Match(Encoding.UTF8.GetString(bundle[start..end]));
+                var text = Encoding.UTF8.GetString(bundle[start..end]);
+                var match = flow.Match(text);
                 satisfied = match.Success;
                 if (!satisfied) continue;
                 foreach (var name in SharedGroups)
-                    if (match.Groups[name] is { Success: true } named && !shared.TryAdd(name, named.Value)
-                        && shared[name] != named.Value) return false;
+                {
+                    if (match.Groups[name] is not { Success: true } named) continue;
+                    var at = start + Encoding.UTF8.GetByteCount(text.AsSpan(0, named.Index));
+                    // A name that cannot be resolved to one function links nothing.
+                    if (Function(bundle, named.Value, at) is not { } function
+                        || !shared.TryAdd(name, function) && shared[name] != function) conflict ??= name;
+                }
+                // A matching place that names another function than an earlier flow fails the flow outright.
+                if (conflict is not null) break;
             }
-            if (!satisfied) return false;
+            if (!satisfied || conflict is not null)
+            {
+                failed.Add($"flow {index}" + (conflict is null ? $" ({anchor})" : $" (shared {conflict})"));
+                if (firstOnly) return failed;
+            }
         }
-        return true;
+        return failed;
+    }
+
+    private static readonly byte[] SourceMapTrailer = "//# sourceMappingURL="u8.ToArray();
+    private const int HeaderBytes = 65536, ExportTailBytes = 8192;
+
+    /// <summary>The function a shared name at <paramref name="at"/> stands for, so flows in different bundled files
+    /// still have to name one function (since 5.11492 the transcript removal lives in a chunk of its own). Each bundled
+    /// file ends with its source map comment, which names the file. An import (<c>Gt.f</c>) is the export of the file
+    /// the caller's file requires under that name in its header; a function its own file exports at the end is that
+    /// export; any other name is that file's local function (itself, in a bundle not split into files). Null when an
+    /// import cannot be resolved.</summary>
+    private static string? Function(ReadOnlySpan<byte> bundle, string name, int at)
+    {
+        var dot = name.IndexOf('.');
+        if (dot >= 0)
+        {
+            var previous = bundle[..at].LastIndexOf(SourceMapTrailer);
+            var fileStart = previous < 0 ? 0 : previous + SourceMapTrailer.Length;
+            var header = Encoding.UTF8.GetString(bundle.Slice(fileStart, Math.Min(HeaderBytes, at - fileStart)));
+            var required = Regex.Match(header, @"(?<![\w$.])" + Regex.Escape(name[..dot])
+                + @"=require\(""\./(?<file>[\w.-]+\.js)""\)", RegexOptions.CultureInvariant);
+            return required.Success ? required.Groups["file"].Value + "#" + name[(dot + 1)..] : null;
+        }
+        var trailer = bundle[at..].IndexOf(SourceMapTrailer);
+        if (trailer < 0) return name;
+        var fileEnd = at + trailer;
+        var after = bundle[(fileEnd + SourceMapTrailer.Length)..];
+        var mapEnd = after.IndexOf(".map"u8);
+        if (mapEnd < 0) return name;
+        var file = Encoding.UTF8.GetString(after[..mapEnd]);
+        var tailStart = Math.Max(at, fileEnd - ExportTailBytes);
+        var exported = Regex.Match(Encoding.UTF8.GetString(bundle[tailStart..fileEnd]),
+            @"(?<![\w$.])exports\.(?<export>[\w$]+)=" + Regex.Escape(name) + "(?![\\w$])", RegexOptions.CultureInvariant);
+        return exported.Success ? file + "#" + exported.Groups["export"].Value : file + ":" + name;
     }
 
     internal static void Launch(ClaudeDesktopPackage package) =>
