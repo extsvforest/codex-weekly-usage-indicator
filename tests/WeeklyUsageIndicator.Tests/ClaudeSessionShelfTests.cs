@@ -1554,19 +1554,17 @@ internal static class ClaudeSessionShelfTests
                 var moved = plan.Retirements.ToDictionary(r => ClaudeSidebarPrefs.ListId(r.File), r => ClaudeSidebarPrefs.ListId(r.SuccessorFile));
                 var outcome = ClaudeSidebarPrefs.Sync(copy, scratch, links, moved, () => true);
                 Console.WriteLine($"sidebar dry run (settings mirror): links={links.Count} {outcome}");
-                // The real store, on a copy kept for an independent reader to check.
+                // The real store, on a copy inside this probe's scratch folder (removed when the probe ends).
                 var real = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Claude", "Local Storage", "leveldb");
-                var trial = Path.Combine(Path.GetTempPath(), "gfs-agent", "260930_claude-acct-switch", "ls-trial");
-                if (Directory.Exists(trial)) Directory.Delete(trial, recursive: true);
+                var trial = Path.Combine(scratch, "ls-trial");
                 Directory.CreateDirectory(trial);
                 foreach (var file in Directory.EnumerateFiles(real))
                     if (!Path.GetFileName(file).Equals("LOCK", StringComparison.OrdinalIgnoreCase)) File.Copy(file, Path.Combine(trial, Path.GetFileName(file)));
                 File.WriteAllText(Path.Combine(trial, "LOCK"), "");
                 var trialState = trial + "-state";
-                if (Directory.Exists(trialState)) Directory.Delete(trialState, recursive: true);
                 var trialOutcome = ClaudeSidebarPrefs.Sync(new ClaudeSidebarPrefs.LocalStorageSource(new ClaudeLocalStorage(trial), trialState, () => DateTimeOffset.UtcNow),
                     trialState, links, moved, () => true);
-                Console.WriteLine($"sidebar trial on a copy of the real store: {trialOutcome} at {trial}");
+                Console.WriteLine($"sidebar trial on a copy of the real store: {trialOutcome}");
             }
         }
         finally { if (Directory.Exists(scratch)) Directory.Delete(scratch, recursive: true); }
