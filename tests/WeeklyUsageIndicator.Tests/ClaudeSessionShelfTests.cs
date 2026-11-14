@@ -14,6 +14,7 @@ internal static class ClaudeSessionShelfTests
     {
         TestPlanningAndPublishing();
         TestExclusionsAndHolds();
+        TestScansFollowChangedRecords();
         TestWorktreeSessions();
         TestFillingWhileRunning();
         TestServiceFillsWhileRunning();
@@ -94,6 +95,31 @@ internal static class ClaudeSessionShelfTests
         File.Delete(Path.Combine(fixture.ShelfPath(B), "local_cccccccc-0000-4000-8000-000000000001.json.tmp"));
         File.WriteAllText(Path.Combine(fixture.ShelfPath(B), "local_cccccccc-0000-4000-8000-000000000002.json"), "{broken");
         Check(fixture.Shelf().Plan([A, B]).Held[B.Key] == "unreadable", "an unreadable record holds the target shelf");
+    }
+
+    private static void TestScansFollowChangedRecords()
+    {
+        // One shelf plans every minute and keeps what it read of a record while its file stays as it was.
+        using var fixture = new Fixture();
+        const string Id = "local_c4c4c4c4-0000-4000-8000-000000000001";
+        var path = Path.Combine(fixture.ShelfPath(A), Id + ".json");
+        fixture.Record(A, Id, fixture.Transcript(), extra: r => r["title"] = "aaaa");
+        var shelf = fixture.Shelf();
+        Check(shelf.Plan([A, B]).Actions.Single().Record["title"]!.GetValue<string>() == "aaaa", "a record is planned");
+        var written = File.GetLastWriteTimeUtc(path);
+        File.WriteAllText(path, File.ReadAllText(path).Replace("aaaa", "bbbb"));
+        File.SetLastWriteTimeUtc(path, written.AddSeconds(1));
+        Check(shelf.Plan([A, B]).Actions.Single().Record["title"]!.GetValue<string>() == "bbbb",
+            "a record written again with the same size is read again");
+        var archived = Json(path);
+        archived["isArchived"] = true;
+        archived["note"] = "x";
+        File.WriteAllText(path, archived.ToJsonString());
+        File.SetLastWriteTimeUtc(path, written.AddSeconds(1));
+        Check(shelf.Plan([A, B]).Actions.Count == 0, "a record of another size is read again, whatever its times");
+        File.WriteAllText(path, "{broken");
+        Check(shelf.Plan([A, B]).Held.GetValueOrDefault(A.Key) == "unreadable",
+            "a record that no longer parses is not taken from an earlier read");
     }
 
     private static void TestWorktreeSessions()
