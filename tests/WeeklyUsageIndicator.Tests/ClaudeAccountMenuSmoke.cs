@@ -143,7 +143,7 @@ internal static class ClaudeAccountMenuSmoke
                 {
                     Desktop = ClaudeDesktopRunState.Running, AppProfileId = second.Id, PendingForApp = 2, MappedAccounts = 2,
                     App = new ClaudeDesktopAccountState(ClaudeDesktopAccountStatus.SignedIn,
-                        "46411433-0040-4598-a1bd-a5444a5eb7b4", "a8f42351-0c23-4928-87ef-ecb3e3bf2b10")
+                        "4a4a4a4a-0000-4000-8000-00000000004a", "4b4b4b4b-0000-4000-8000-00000000004b")
                 });
                 Application.DoEvents();
                 var badge = Find<Button>(panel, "ClaudeSelect-" + second.Id);
@@ -188,7 +188,7 @@ internal static class ClaudeAccountMenuSmoke
         using var form = new Form { ClientSize = new(960, 650), Text = "Claude session layout check" };
         AccountUiTheme.SetForm(form);
         using var shelf = new ClaudeShelfService(form, () => store.ListProfiles(), new ClaudeSessionShelf(paths));
-        const string account = "46411433-0040-4598-a1bd-a5444a5eb7b4", org = "a8f42351-0c23-4928-87ef-ecb3e3bf2b10";
+        const string account = "4a4a4a4a-0000-4000-8000-00000000004a", org = "4b4b4b4b-0000-4000-8000-00000000004b";
         shelf.SetAccountsForTest([new ClaudeShelfAccount(account, org, second.Label, second.Id)]);
         using var panel = new ClaudeAccountPanel(controller, shelf) { Dock = DockStyle.Fill };
         form.Controls.Add(panel); form.Show(); Application.DoEvents();

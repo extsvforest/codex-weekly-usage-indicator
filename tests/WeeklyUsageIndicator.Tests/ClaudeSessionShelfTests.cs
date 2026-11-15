@@ -6,8 +6,8 @@ using WeeklyUsageIndicator;
 
 internal static class ClaudeSessionShelfTests
 {
-    private const string AccountA = "0998b264-7315-4fdb-8634-fc7f3f827316", OrgA = "7f98dbbd-af39-46bf-9609-cfd3972b3633";
-    private const string AccountB = "46411433-0040-4598-a1bd-a5444a5eb7b4", OrgB = "a8f42351-0c23-4928-87ef-ecb3e3bf2b10";
+    private const string AccountA = "1a1a1a1a-0000-4000-8000-00000000001a", OrgA = "1b1b1b1b-0000-4000-8000-00000000001b";
+    private const string AccountB = "4a4a4a4a-0000-4000-8000-00000000004a", OrgB = "4b4b4b4b-0000-4000-8000-00000000004b";
     private static readonly ClaudeShelfAccount A = new(AccountA, OrgA, "Main"), B = new(AccountB, OrgB, "Sub");
 
     internal static async Task RunAsync()

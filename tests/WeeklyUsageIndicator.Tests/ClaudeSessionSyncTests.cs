@@ -12,8 +12,8 @@ using Target = WeeklyUsageIndicator.ClaudeSessionLayout.Target;
 
 internal static class ClaudeSessionSyncTests
 {
-    private const string CurrentAccount = "46411433-0040-4598-a1bd-a5444a5eb7b4", CurrentOrg = "a8f42351-0c23-4928-87ef-ecb3e3bf2b10";
-    private const string ReferenceAccount = "0998b264-7315-4fdb-8634-fc7f3f827316", ReferenceOrg = "7f98dbbd-af39-46bf-9609-cfd3972b3633";
+    private const string CurrentAccount = "4a4a4a4a-0000-4000-8000-00000000004a", CurrentOrg = "4b4b4b4b-0000-4000-8000-00000000004b";
+    private const string ReferenceAccount = "1a1a1a1a-0000-4000-8000-00000000001a", ReferenceOrg = "1b1b1b1b-0000-4000-8000-00000000001b";
     private static string CurrentKey => CurrentAccount + "/" + CurrentOrg;
     private static string ReferenceKey => ReferenceAccount + "/" + ReferenceOrg;
     private const string ThirdAccount = "7a7a7a7a-0000-4000-8000-00000000007a", ThirdOrg = "7b7b7b7b-0000-4000-8000-00000000007b";
@@ -603,7 +603,7 @@ internal static class ClaudeSessionSyncTests
     private static void TestGroupOrder()
     {
         // 계정3's sidebar, whose group list is the newest, and 계정2 here with the same groups in another order.
-        string[] tiers = ["티어 2", "티어 3 (보관)", "스킬 생태계", "태림 오리지널 콘텐츠", "도구"];
+        string[] tiers = ["티어 2", "티어 3 (보관)", "스킬 생태계", "오리지널 콘텐츠", "도구"];
         var origin = DateTimeOffset.Parse("2026-10-01T00:00:00Z");
         var spans = new Dictionary<string, ClaudeSessionSync.TranscriptSpan>
         {
@@ -617,7 +617,7 @@ internal static class ClaudeSessionSyncTests
             R("local_s1", "하나", false, "c1"), R("local_s2", "둘", true, "c2"), R("local_s3", "셋", false, "c3", ["c3-old"], 20),
             R("local_s3_old", "셋", false, "c3-old", [], 10), R("local_s4", "넷", false, "c4"), R("local_s5", "다섯", false, "c5")
         };
-        var hereLayout = Groups(["g-t2=티어 2", "g-tool=도구", "g-skill=스킬 생태계", "g-t3=티어 3 (보관)", "g-orig=태림 오리지널 콘텐츠"],
+        var hereLayout = Groups(["g-t2=티어 2", "g-tool=도구", "g-skill=스킬 생태계", "g-t3=티어 3 (보관)", "g-orig=오리지널 콘텐츠"],
             ("local_s1", "g-t2"), ("local_s2", "g-tool"), ("local_s3", "g-skill"), ("local_s3_old", "g-skill"), ("local_s4", "g-t3"),
             ("local_s5", "g-t2"));
         var third = new[]
@@ -625,7 +625,7 @@ internal static class ClaudeSessionSyncTests
             R("local_t1", "하나", false, "c1"), R("local_t2", "둘", true, "c2"), R("local_t3", "셋", false, "c3"), R("local_t4", "넷", false, "c4"),
             R("local_t5", "다섯", false, "c5")
         };
-        var thirdLayout = Groups(["h-t2=티어 2", "h-t3=티어 3 (보관)", "h-skill=스킬 생태계", "h-orig=태림 오리지널 콘텐츠", "h-tool=도구"],
+        var thirdLayout = Groups(["h-t2=티어 2", "h-t3=티어 3 (보관)", "h-skill=스킬 생태계", "h-orig=오리지널 콘텐츠", "h-tool=도구"],
             ("local_t1", "h-t2"), ("local_t2", "h-tool"), ("local_t3", "h-skill"), ("local_t4", "h-t3"), ("local_t5", "h-t3"));
         var kept = new ClaudeSessionLayout();
         Steady(kept, CurrentKey, "계정2", here, hereLayout, At(0));
@@ -635,13 +635,13 @@ internal static class ClaudeSessionSyncTests
         OtherAccount[] others = [Other(ThirdKey, "계정3", third, thirdLayout, At(50))];
         var plan = Compute(here, hereLayout, others, kept, lineage: lineage, label: "계정2");
         Check(plan.GroupOrder!.SequenceEqual(tiers) && plan.GroupOrderBy == "계정3"
-              && plan.CreateGroups!.SequenceEqual(["스킬 생태계", "태림 오리지널 콘텐츠", "도구"]),
+              && plan.CreateGroups!.SequenceEqual(["스킬 생태계", "오리지널 콘텐츠", "도구"]),
             "the start of the newest list already in order here stays (티어 2, 티어 3 (보관)); the rest is made anew at the end, in order");
         Check(plan.RenameGroups!.Select(rename => (rename.Id, rename.From, rename.To)).SequenceEqual(
                   [("g-tool", "도구", "도구 (옮기는 중)"), ("g-skill", "스킬 생태계", "스킬 생태계 (옮기는 중)"),
-                   ("g-orig", "태림 오리지널 콘텐츠", "태림 오리지널 콘텐츠 (옮기는 중)")])
+                   ("g-orig", "오리지널 콘텐츠", "오리지널 콘텐츠 (옮기는 중)")])
               && plan.DeleteGroups!.Select(group => (group.Id, group.Name, group.Remade)).SequenceEqual(
-                  [("g-tool", "도구 (옮기는 중)", true), ("g-skill", "스킬 생태계 (옮기는 중)", true), ("g-orig", "태림 오리지널 콘텐츠 (옮기는 중)", true)]),
+                  [("g-tool", "도구 (옮기는 중)", true), ("g-skill", "스킬 생태계 (옮기는 중)", true), ("g-orig", "오리지널 콘텐츠 (옮기는 중)", true)]),
             "a group out of place steps aside under the moving mark before its name is made anew, and goes once the moves empty it");
         Check(plan.Moves!.Select(move => (move.Group, move.GroupId, string.Join(",", move.Sessions))).SequenceEqual(
                   [("티어 3 (보관)", "g-t3", "local_s5"), ("스킬 생태계", null, "local_s3,local_s3_old"), ("도구", null, "local_s2")]),
@@ -1776,8 +1776,8 @@ internal static class ClaudeSessionSyncTests
     {
         using var world = new SessionWorld("sorting");
         var widget = new Widget(world);
-        string[] tiers = ["티어 2", "티어 3 (보관)", "스킬 생태계", "태림 오리지널 콘텐츠", "도구"];
-        string[] before = ["티어 2", "도구", "스킬 생태계", "티어 3 (보관)", "태림 오리지널 콘텐츠"];
+        string[] tiers = ["티어 2", "티어 3 (보관)", "스킬 생태계", "오리지널 콘텐츠", "도구"];
+        string[] before = ["티어 2", "도구", "스킬 생태계", "티어 3 (보관)", "오리지널 콘텐츠"];
         string[] titles = ["하나", "둘", "셋", "넷", "다섯"];
         string[] homes = ["티어 2", "도구", "스킬 생태계", "티어 3 (보관)", "티어 2"];
         foreach (var (account, label, prefix) in new[] { (K2, "계정2", "local_c"), (K3, "계정3", "local_t") })
