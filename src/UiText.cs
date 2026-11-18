@@ -40,10 +40,7 @@ internal static class UiText
         if (exact != message) return exact;
         foreach (var pattern in Patterns.Value)
         {
-            if (pattern.Language != Language) continue;
-            var match = pattern.Regex.Match(message);
-            if (!match.Success) continue;
-            var values = Enumerable.Range(0, pattern.ArgumentCount).Select(i => (object)match.Groups["p" + i].Value).ToArray();
+            if (pattern.Language != Language || pattern.Match(message) is not { } values) continue;
             return string.Format(Culture, pattern.Target, values);
         }
         // Cleanup summaries carry one known category and an unchanged error code.
@@ -52,6 +49,7 @@ internal static class UiText
         return message;
     }
     internal static IReadOnlyDictionary<string, string> Catalog(string language) => language == "en" ? English : Korean;
+    internal static IReadOnlyList<TranslationPattern> Templates => Patterns.Value;
     private static Dictionary<string, string> ReadCatalog(string language)
     {
         var result = new Dictionary<string, string>(StringComparer.Ordinal);
@@ -80,16 +78,49 @@ internal static class UiText
         { foreach (var pair in map) AddOne(pair.Key, pair.Value, language); }
         void AddOne(string source, string target, string language)
         {
-            var matches = Placeholder.Matches(source); var pattern = new StringBuilder(@"\A"); var start = 0; var count = 0;
-            foreach (Match match in matches)
+            var literals = new List<string>(); var indices = new List<int>(); var start = 0; var count = 0;
+            foreach (Match match in Placeholder.Matches(source))
             {
-                pattern.Append(Regex.Escape(source[start..match.Index]));
+                literals.Add(source[start..match.Index]);
                 var index = int.Parse(match.Groups[1].Value, CultureInfo.InvariantCulture); count = Math.Max(count, index + 1);
-                pattern.Append("(?<p" + index + ">.*?)"); start = match.Index + match.Length;
+                indices.Add(index); start = match.Index + match.Length;
             }
-            pattern.Append(Regex.Escape(source[start..])).Append(@"\z");
-            result.Add(new(language, new Regex(pattern.ToString(), RegexOptions.Singleline | RegexOptions.CultureInvariant | RegexOptions.NonBacktracking), target, count));
+            literals.Add(source[start..]);
+            result.Add(new(language, literals.ToArray(), indices.ToArray(), target, count));
         }
     }
-    private sealed record TranslationPattern(string Language, Regex Regex, string Target, int ArgumentCount);
+
+    /// <summary>
+    /// A known template as its literal parts in order, a value between each two (<see cref="Indices"/> says which). It is
+    /// matched by plain ordinal search, not a regular expression: a thousand compiled patterns held the widget near a
+    /// gigabyte once the first unknown message came. The matches are those of the pattern
+    /// <c>\A part (?&lt;p0&gt;.*?) part … part \z</c> (single-line): the whole message, each value as short as the parts
+    /// after it allow, which is each next part at its earliest place. A value repeated keeps its last place; one the
+    /// template lacks is empty.
+    /// </summary>
+    internal sealed record TranslationPattern(string Language, string[] Literals, int[] Indices, string Target, int ArgumentCount)
+    {
+        internal object[]? Match(string message)
+        {
+            if (Indices.Length == 0) return message == Literals[0] ? [] : null;
+            string first = Literals[0], last = Literals[^1];
+            if (message.Length < first.Length + last.Length || !message.StartsWith(first, StringComparison.Ordinal)
+                || !message.EndsWith(last, StringComparison.Ordinal)) return null;
+            var values = new object[ArgumentCount];
+            Array.Fill(values, "");
+            int position = first.Length, end = message.Length - last.Length;
+            for (var i = 0; i < Indices.Length; i++)
+            {
+                var next = end;
+                if (i + 1 < Indices.Length)
+                {
+                    next = message.IndexOf(Literals[i + 1], position, end - position, StringComparison.Ordinal);
+                    if (next < 0) return null;
+                }
+                values[Indices[i]] = message[position..next];
+                position = next + Literals[i + 1].Length;
+            }
+            return values;
+        }
+    }
 }
