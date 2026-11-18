@@ -38,6 +38,8 @@ internal static class ClaudeSessionSyncTests
         TestLayoutStore();
         TestPinList();
         TestTranscript();
+        TestTranscriptCopies();
+        TestHandOverRemembered();
         TestBuildFromDisk();
         TestGroupsFromLocalStorage();
         TestObserve();
@@ -51,6 +53,8 @@ internal static class ClaudeSessionSyncTests
         TestFirstFormatEvidence();
         TestOlderStateFollowsRename();
         TestReopenedOlderState();
+        TestOlderStateInTwoFolders();
+        TestUndecided();
         TestRenamedWhileAside();
         TestEditedWhileAside();
         TestDeletedAsPlanned();
@@ -1136,6 +1140,169 @@ internal static class ClaudeSessionSyncTests
         finally { Directory.Delete(root, true); }
     }
 
+    /// <summary>A transcript id in several project folders: the app copies a transcript along when a session resumes in
+    /// another folder and goes on in the copy. The copy the conversation is in is the one; none when that cannot be told.</summary>
+    private static void TestTranscriptCopies()
+    {
+        var root = TempRoot("transcript-copies");
+        try
+        {
+            static string U(int n) => "50000000-0000-4000-8000-" + n.ToString("x12", CultureInfo.InvariantCulture);
+            static string Id() => Guid.NewGuid().ToString("D");
+            static DateTimeOffset T(string at) => DateTimeOffset.Parse(at, CultureInfo.InvariantCulture);
+            string[] begun = [U(1) + "@2026-10-01T00:00:10Z", U(2) + "@2026-10-01T05:00:00Z"];
+
+            // Begun in the first folder, it stopped there at 10/01 05:00; copied to the second a day later, it went on there.
+            var moved = Id();
+            Copy(root, "A--first", moved, "2026-10-01T00:00:00Z", "2026-10-01T05:00:00Z", begun);
+            string[] wentOn = [.. begun, U(3) + "@2026-10-02T00:00:00.5Z", U(4) + "@2026-10-03T00:00:00Z"];
+            Copy(root, "B--second", moved, "2026-10-02T00:00:00Z", "2026-10-03T00:00:00Z", wentOn);
+            Check(ClaudeSessionSync.Transcript(root, moved) is { Dated: true } span && span.Created == T("2026-10-02T00:00:00Z")
+                  && span.LastEntry == T("2026-10-03T00:00:00Z"),
+                "a copy that stopped before the other was made is passed over, though its folder sorts first");
+            var next = Id();
+            Copy(root, "B--second", next, "2026-10-03T12:00:00Z", "2026-10-03T12:00:01Z", [.. wentOn, U(5) + "@2026-10-03T12:00:00.5Z"]);
+            // From the first folder's copy the hand-over was the first entry it lacks, 10/02 00:00:00.5, long before the next
+            // transcript was made: the older state stayed.
+            Check(ClaudeSessionSync.HandOver(root, moved, next) == T("2026-10-03T12:00:00.5Z"),
+                "the hand-over is dated from the copy the conversation is in");
+
+            // A copy nothing was added to since it was made holds no turn the original lacks, whichever folder sorts first.
+            foreach (var (copied, original) in new[] { ("A--first", "B--second"), ("B--second", "A--first") })
+            {
+                var id = Id();
+                Copy(root, original, id, "2026-10-01T00:00:00Z", "2026-10-04T00:00:00Z", [.. begun, U(3) + "@2026-10-04T00:00:00Z"]);
+                Copy(root, copied, id, "2026-10-02T00:00:00Z", "2026-10-02T00:00:00Z", begun);
+                Check(ClaudeSessionSync.Transcript(root, id) is { } found && found.Created == T("2026-10-01T00:00:00Z")
+                      && found.LastEntry == T("2026-10-04T00:00:00Z"),
+                    "the original that went on is the one beside a copy nothing was added to, the copy in " + copied);
+            }
+
+            // The same newest turn everywhere: a copy whose creation dates it first, then the earliest made.
+            var same = Id();
+            Copy(root, "A--first", same, "2026-10-01T12:00:00Z", "2026-10-01T11:00:00Z", begun);
+            Copy(root, "B--second", same, "2026-10-03T00:00:00Z", "2026-10-03T00:00:00Z", begun);
+            Copy(root, "C--third", same, "2026-10-02T00:00:00Z", "2026-10-02T00:00:00Z", begun);
+            Check(ClaudeSessionSync.Transcript(root, same) is { Dated: true } tied && tied.Created == T("2026-10-02T00:00:00Z"),
+                "among copies with the same newest turn, the dated one made earliest");
+
+            // Each written to after the other was made: the conversation went two ways under one id.
+            var split = Id();
+            string[] here = [.. begun, U(6) + "@2026-10-05T00:00:00Z"];
+            Copy(root, "A--first", split, "2026-10-01T00:00:00Z", "2026-10-05T00:00:00Z", here);
+            Copy(root, "B--second", split, "2026-10-02T00:00:00Z", "2026-10-04T00:00:00Z", [.. begun, U(7) + "@2026-10-04T00:00:00Z"]);
+            var onward = Id();
+            Copy(root, "A--first", onward, "2026-10-06T00:00:00Z", "2026-10-06T00:00:01Z", [.. here, U(8) + "@2026-10-06T00:00:00.5Z"]);
+            Check(ClaudeSessionSync.Transcript(root, split) is null && ClaudeSessionSync.HandOver(root, split, onward) is null,
+                "copies that went two ways leave the transcript undated and no hand-over");
+
+            // A copy with no turn near its end, or one whose last line is torn, could hold a turn the other lacks.
+            var bare = Id();
+            Copy(root, "A--first", bare, "2026-10-01T00:00:00Z", "2026-10-01T05:00:00Z", begun);
+            Copy(root, "B--second", bare, "2026-10-02T00:00:00Z", "2026-10-02T00:00:00Z", "{\"type\":\"cost-state\"}");
+            var torn = Id();
+            Copy(root, "A--first", torn, "2026-10-01T00:00:00Z", "2026-10-01T05:00:00Z", begun);
+            Copy(root, "B--second", torn, "2026-10-02T00:00:00Z", "2026-10-03T00:00:00Z",
+                [.. begun, U(3) + "@2026-10-03T00:00:00Z", "{\"type\":\"user\",\"uuid\":\"" + U(9) + "\",\"timestamp\":\"2026-10-0"]);
+            Check(ClaudeSessionSync.Transcript(root, bare) is null && ClaudeSessionSync.Transcript(root, torn) is null,
+                "a copy with no turn near its end, or a torn last line, leaves the transcript undated");
+
+            // Three copies: one nothing was added to, one with the same newest turn made later, and the one.
+            var three = Id();
+            string[] last = [.. begun, U(3) + "@2026-10-03T05:00:00Z"];
+            Copy(root, "A--first", three, "2026-10-02T00:00:00Z", "2026-10-02T00:00:00Z", begun);
+            Copy(root, "B--second", three, "2026-10-04T00:00:00Z", "2026-10-04T00:00:00Z", last);
+            Copy(root, "C--third", three, "2026-10-03T00:00:00Z", "2026-10-03T05:00:00Z", last);
+            Check(ClaudeSessionSync.Transcript(root, three) is { } kept && kept.Created == T("2026-10-03T00:00:00Z"),
+                "with every other copy holding nothing it lacks, the third folder's copy is the one");
+            // The first one written to after it was made and after the one was made, with an older turn than its newest.
+            Copy(root, "A--first", three, "2026-10-02T00:00:00Z", "2026-10-03T02:00:00Z", [.. begun, U(10) + "@2026-10-03T02:00:00Z"]);
+            Check(ClaudeSessionSync.Transcript(root, three) is null, "one copy that could hold a turn the newest lacks leaves none");
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    /// <summary>A hand-over is read from both transcripts whole and remembered for the two files as they were: the earlier
+    /// one exactly, the later one while it only grows once a hand-over was found. No test builds a transcript over the
+    /// 512 MB the comparison once refused (a real 763 MB one left its older state undated): it would write half a
+    /// gigabyte on every run.</summary>
+    private static void TestHandOverRemembered()
+    {
+        var root = TempRoot("hand-over-remembered");
+        try
+        {
+            static string U(int n) => "60000000-0000-4000-8000-" + n.ToString("x12", CultureInfo.InvariantCulture);
+            static string Id() => Guid.NewGuid().ToString("D");
+            static DateTimeOffset T(string at) => DateTimeOffset.Parse(at, CultureInfo.InvariantCulture);
+            static void Append(string path, params string[] entries) => File.AppendAllLines(path, entries.Select(Line));
+            string[] begun = [U(1) + "@2026-10-01T00:00:10Z", U(2) + "@2026-10-01T01:00:00Z"];
+            var firstNew = U(3) + "@2026-10-02T00:00:00.5Z";
+
+            var older = Id(); var next = Id();
+            var olderPath = Copy(root, "E--work", older, "2026-10-01T00:00:00Z", "2026-10-01T01:00:00Z", begun);
+            var nextPath = Copy(root, "E--work", next, "2026-10-02T00:00:00Z", "2026-10-02T01:00:00Z",
+                [.. begun, firstNew, U(4) + "@2026-10-02T01:00:00Z"]);
+            Check(ClaudeSessionSync.HandOver(root, older, next) == T("2026-10-02T00:00:00.5Z"), "the hand-over is dated");
+            // The earlier one changes: read again, the first new entry is the next one it lacks.
+            Append(olderPath, firstNew);
+            Check(ClaudeSessionSync.HandOver(root, older, next) == T("2026-10-02T01:00:00Z"),
+                "a changed earlier transcript is read again");
+            // The later one only grows: what a conversation adds is newer, so it is not read again. An entry with a new id
+            // and an earlier time (no conversation writes one) shows it was not.
+            Append(nextPath, U(20) + "@2026-10-01T12:00:00Z");
+            Check(ClaudeSessionSync.HandOver(root, older, next) == T("2026-10-02T01:00:00Z"),
+                "once dated, the hand-over holds while the later transcript only grows");
+
+            // Nothing new in the later one yet: no hand-over, until it has a new entry.
+            var quiet = Id(); var copied = Id();
+            Copy(root, "E--work", quiet, "2026-10-01T00:00:00Z", "2026-10-01T01:00:00Z", begun);
+            var copiedPath = Copy(root, "E--work", copied, "2026-10-02T00:00:00Z", "2026-10-02T00:00:00Z", begun);
+            Check(ClaudeSessionSync.HandOver(root, quiet, copied) is null, "a later transcript with nothing new dates no hand-over");
+            Append(copiedPath, firstNew);
+            Check(ClaudeSessionSync.HandOver(root, quiet, copied) == T("2026-10-02T00:00:00.5Z"),
+                "one that grows from nothing new is read again and dated");
+
+            // A torn line in the earlier one: nothing dates it until that file changes.
+            var broken = Id(); var after = Id();
+            var tornLine = "{\"type\":\"user\",\"uuid\":\"" + U(9) + "\",\"timestamp\":\"2026-10-0";
+            var brokenPath = Copy(root, "E--work", broken, "2026-10-01T00:00:00Z", "2026-10-01T01:00:00Z", [.. begun, tornLine]);
+            var afterPath = Copy(root, "E--work", after, "2026-10-02T00:00:00Z", "2026-10-02T00:00:01Z", [.. begun, firstNew]);
+            Check(ClaudeSessionSync.HandOver(root, broken, after) is null, "a torn line in the earlier transcript dates no hand-over");
+            Append(afterPath, U(4) + "@2026-10-02T01:00:00Z");
+            Check(ClaudeSessionSync.HandOver(root, broken, after) is null, "nor once the later one grows");
+            Copy(root, "E--work", broken, "2026-10-01T00:00:00Z", "2026-10-01T01:00:00Z", begun);
+            Check(brokenPath == Path.Combine(root, "E--work", broken + ".jsonl")
+                  && ClaudeSessionSync.HandOver(root, broken, after) == T("2026-10-02T00:00:00.5Z"),
+                "made whole, the earlier transcript is read again and dates the hand-over");
+
+            // The later one replaced by a shorter file under its name and creation time: read again.
+            var from = Id(); var replaced = Id();
+            Copy(root, "E--work", from, "2026-10-01T00:00:00Z", "2026-10-01T01:00:00Z", begun);
+            Copy(root, "E--work", replaced, "2026-10-02T00:00:00Z", "2026-10-02T01:00:00Z", [.. begun, firstNew, U(4) + "@2026-10-02T01:00:00Z"]);
+            Check(ClaudeSessionSync.HandOver(root, from, replaced) == T("2026-10-02T00:00:00.5Z"), "dated before the later one is replaced");
+            Copy(root, "E--work", replaced, "2026-10-02T00:00:00Z", "2026-10-02T02:00:01Z", [.. begun, U(30) + "@2026-10-02T02:00:00Z"]);
+            Check(ClaudeSessionSync.HandOver(root, from, replaced) == T("2026-10-02T02:00:00Z"),
+                "a later transcript that shrank is read again");
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    /// <summary>A transcript file in a project folder, created and last written when given: lines given as "uuid@time" (a
+    /// message the user wrote; others as they are).</summary>
+    private static string Copy(string projects, string folder, string id, string created, string written, params string[] entries)
+    {
+        var path = Path.Combine(Directory.CreateDirectory(Path.Combine(projects, folder)).FullName, id + ".jsonl");
+        File.WriteAllLines(path, entries.Select(Line));
+        File.SetCreationTimeUtc(path, Utc(created));
+        File.SetLastWriteTimeUtc(path, Utc(written));
+        return path;
+    }
+
+    private static string Line(string entry) => entry.Split('@') is [var uuid, var at]
+        ? "{\"type\":\"user\",\"uuid\":\"" + uuid + "\",\"timestamp\":\"" + at + "\"}" : entry;
+
+    private static DateTime Utc(string at) => DateTime.Parse(at, CultureInfo.InvariantCulture, DateTimeStyles.AdjustToUniversal);
+
     private static void TestBuildFromDisk()
     {
         var root = TempRoot("build");
@@ -1910,6 +2077,127 @@ internal static class ClaudeSessionSyncTests
         File.AppendAllLines(Path.Combine(world.Projects, "E--work", r + ".jsonl"),
             ["{\"type\":\"user\",\"uuid\":\"40000000-0000-0000-0000-000000000005\",\"timestamp\":\"2026-10-03T00:10:00Z\"}"]);
         Check(ClaudeSessionSync.Build(world.Sources, "local_n").Archive!.Count == 0, "one the user went on with is a branch and stays");
+    }
+
+    /// <summary>An older state whose transcript is in two project folders: begun in one whose name sorts first, copied to
+    /// the other when resumed there, gone on with in the copy and then in the next transcript. It goes, dated from the copy
+    /// the conversation is in; with the copies gone two ways it stays, and the plan names it.</summary>
+    private static void TestOlderStateInTwoFolders()
+    {
+        using var world = new SessionWorld("older-two-folders");
+        static string U(int n) => "70000000-0000-4000-8000-" + n.ToString("x12", CultureInfo.InvariantCulture);
+        var r = Guid.NewGuid().ToString("D"); var n = Guid.NewGuid().ToString("D");
+        var stale = Copy(world.Projects, "A--elsewhere", r, "2026-10-01T00:00:00Z", "2026-10-01T00:00:10Z", U(1) + "@2026-10-01T00:00:10Z");
+        string[] wentOn = [U(1) + "@2026-10-01T00:00:10Z", U(2) + "@2026-10-01T01:05:00Z"];
+        Copy(world.Projects, "E--work", r, "2026-10-01T01:00:00Z", "2026-10-01T01:05:00Z", wentOn);
+        Copy(world.Projects, "E--work", n, "2026-10-01T02:00:00Z", "2026-10-01T02:00:01Z", [.. wentOn, U(3) + "@2026-10-01T02:00:00.5Z"]);
+        world.Record(K2, "local_r", "가", r, activity: 10);
+        world.Record(K2, "local_n", "나", n, [r], activity: 20);
+        world.Record(K1, "local_k", "다", Cli(9));
+        world.Flush();
+        Keep(world.Ledger, (K2, "계정2", null), (K1, "계정1", At(0)));
+        // From the first folder's copy the hand-over was 01:05, the entry that copy lacks, and the next transcript was
+        // made after it: the older state stayed beside its newest.
+        var plan = ClaudeSessionSync.Build(world.Sources, "local_n");
+        Check(plan.Archive is [{ Session: "local_r", Newest: "local_n" } item]
+              && item.MovedOn == DateTimeOffset.Parse("2026-10-01T02:00:00.5Z", CultureInfo.InvariantCulture)
+              && item.LastWritten == DateTimeOffset.Parse("2026-10-01T01:05:00Z", CultureInfo.InvariantCulture) && plan.Undecided is null,
+            "an older state whose transcript has a stale copy in a folder sorting first goes, dated from the copy it went on in");
+        // The first folder's copy written to after the other was made: the conversation went two ways under one id.
+        File.AppendAllLines(stale, [Line(U(4) + "@2026-10-01T03:00:00Z")]);
+        plan = ClaudeSessionSync.Build(world.Sources, "local_n");
+        Check(plan.Archive!.Count == 0
+              && plan.Undecided is [{ Session: "local_r", Title: "가", ContinuedBy: "나", Why: ClaudeSessionSync.Stays.OwnTranscript }],
+            "with its copies gone two ways it stays, and the plan names it with the record continuing it");
+    }
+
+    /// <summary>Why a record another one continues stays (<see cref="ClaudeSessionSync.Stays"/>), and the plan's list of those
+    /// it could not tell: live records here, other than branches the user went on with and the calling session.</summary>
+    private static void TestUndecided()
+    {
+        var origin = DateTimeOffset.Parse("2026-10-01T00:00:00Z", CultureInfo.InvariantCulture);
+        // Each transcript: when its file was created, and its last entry (hours after origin).
+        ClaudeSessionSync.TranscriptSpan S(double createdHours, double lastHours) =>
+            new(origin.AddHours(createdHours), origin.AddHours(lastHours), origin.AddHours(lastHours));
+        var spans = new Dictionary<string, ClaudeSessionSync.TranscriptSpan>
+        {
+            // w1 was written at 5h, after the conversation went on in w2 at 2h: a branch.
+            ["w1"] = S(0, 5), ["w2"] = S(2, 24),
+            // l1 went on in l2, which is missing.
+            ["l1"] = S(0, 1),
+            // m2's first entry m1 lacks is at 2h, but m2 was made at 6h.
+            ["m1"] = S(0, 1), ["m2"] = S(6, 24),
+            // e1 is continued in e2 by one record and in e3 by another.
+            ["e1"] = S(0, 1), ["e2"] = S(2, 24), ["e3"] = S(3, 24),
+            // p1 went on in p2, p2 in p3 and p3 in p1: p1 reaches p3 as its newest, which is itself taken for an older state.
+            ["p3"] = S(0, 1), ["p1"] = S(2, 3), ["p2"] = S(4, 5),
+            // The calling session's own transcript is missing: it would stay whatever it was. So are z1's and o1's.
+            ["s2"] = S(2, 24), ["z2"] = S(2, 24), ["o2"] = S(2, 24)
+        };
+        var handOvers = new Dictionary<(string, string), DateTimeOffset> { [("m1", "m2")] = origin.AddHours(2) };
+        var lineage = new ClaudeSessionSync.Lineage("local_self", cli => spans.TryGetValue(cli, out var span) ? span : null,
+            (earlier, next) => handOvers.TryGetValue((earlier, next), out var at) ? at : spans.TryGetValue(next, out var span) ? span.Created : null);
+        var records = new[]
+        {
+            R("local_w", "다", false, "w1"), R("local_w2", "다 이음", false, "w2", ["w1"]),
+            R("local_l", "라", false, "l1"), R("local_l2", "라 이음", false, "l2", ["l1"]),
+            R("local_m", "마", false, "m1"), R("local_m2", "마 이음", false, "m2", ["m1"]),
+            R("local_e", "바", false, "e1"), R("local_e2", "바 하나", false, "e2", ["e1"]), R("local_e3", "바 둘", false, "e3", ["e1"]),
+            R("local_p1", "사", false, "p1", ["p3"]), R("local_p2", "사 둘", false, "p2", ["p1"]), R("local_p3", "사 셋", false, "p3", ["p2"]),
+            R("local_self", "나", false, "s1"), R("local_self2", "나 이음", false, "s2", ["s1"])
+        };
+        var told = new Dictionary<string, string>(StringComparer.Ordinal);
+        ClaudeSessionSync.OlderStates(records, lineage, stays: (record, why) => told.Add(record.SessionId, why));
+        Check(told.GetValueOrDefault("local_w") == ClaudeSessionSync.Stays.WrittenSince
+              && told.GetValueOrDefault("local_l") == ClaudeSessionSync.Stays.LaterTranscript
+              && told.GetValueOrDefault("local_m") == ClaudeSessionSync.Stays.NextMadeLater
+              && told.GetValueOrDefault("local_e") == ClaudeSessionSync.Stays.NextUnclear
+              && told.GetValueOrDefault("local_p1") == ClaudeSessionSync.Stays.Loop
+              && told.GetValueOrDefault("local_p2") == ClaudeSessionSync.Stays.NextUnclear && !told.ContainsKey("local_self"),
+            "each record another one continues that stays is told why; the calling session is not: "
+            + string.Join(", ", told.Select(pair => pair.Key + "=" + pair.Value)));
+
+        // A torn first new entry deep in the next transcript, beyond the tail its span reads: both are dated, the hand-over
+        // cannot be.
+        var root = TempRoot("undecided");
+        try
+        {
+            static string U(int n) => "80000000-0000-4000-8000-" + n.ToString("x12", CultureInfo.InvariantCulture);
+            var h1 = Guid.NewGuid().ToString("D"); var h2 = Guid.NewGuid().ToString("D");
+            Copy(root, "E--work", h1, "2026-10-01T00:00:00Z", "2026-10-01T00:00:10Z", U(1) + "@2026-10-01T00:00:10Z");
+            Copy(root, "E--work", h2, "2026-10-02T00:00:00Z", "2026-10-02T01:00:01Z", U(1) + "@2026-10-01T00:00:10Z",
+                "{\"type\":\"user\",\"uuid\":\"" + U(2) + "\",\"timestamp\":\"2026-10-02T00:00:00.5Z\"",
+                "{\"type\":\"attachment\",\"data\":\"" + new string('x', 5 * 1024 * 1024) + "\"}", U(3) + "@2026-10-02T01:00:00Z");
+            var disk = new ClaudeSessionSync.Lineage(null, cli => ClaudeSessionSync.Transcript(root, cli),
+                (earlier, next) => ClaudeSessionSync.HandOver(root, earlier, next));
+            var unread = new List<string>();
+            ClaudeSessionSync.OlderStates([R("local_h", "아", false, h1), R("local_h2", "아 이음", false, h2, [h1])], disk,
+                stays: (record, why) => unread.Add(record.SessionId + "=" + why));
+            Check(ClaudeSessionSync.Transcript(root, h2) is { Dated: true }
+                  && unread.SequenceEqual(["local_h=" + ClaudeSessionSync.Stays.HandOverUnread]),
+                "a hand-over that cannot be read whole is told as unread: " + string.Join(", ", unread));
+        }
+        finally { Directory.Delete(root, true); }
+
+        // The plan lists the live records here it could not tell, by title, with the record continuing each.
+        var none = Groups([]);
+        var here = new[]
+        {
+            R("local_self", "자기", false, "s1"), R("local_self2", "자기 이음", false, "s2", ["s1"]),
+            R("local_z", "나", false, "z1"), R("local_z2", "나 이음", false, "z2", ["z1"], 20),
+            R("local_y", "가", false, "l1"), R("local_y2", "가 이음", false, "l2", ["l1"], 20),
+            R("local_w", "다", false, "w1"), R("local_w2", "다 이음", false, "w2", ["w1"], 20),
+            R("local_o2", "라 이음", false, "o2", ["o1"], 20)
+        };
+        var plan = Compute(here, none, [], lineage: lineage, archived: [R("local_o", "라", false, "o1")]);
+        Check(plan.Undecided is { Count: 2 } listed
+              && listed[0] is { Session: "local_y", Title: "가", ContinuedBy: "가 이음", Why: ClaudeSessionSync.Stays.LaterTranscript }
+              && listed[1] is { Session: "local_z", Title: "나", ContinuedBy: "나 이음", Why: ClaudeSessionSync.Stays.OwnTranscript },
+            "the plan names the live records it could not tell, ordered by title; not a branch, the calling session or an archived one");
+        Check(JsonNode.Parse(ClaudeSessionSync.Serialize(plan))!["undecided"] is JsonArray { Count: 2 } json
+              && (string?)json[0]!["why"] == ClaudeSessionSync.Stays.LaterTranscript && (string?)json[0]!["continuedBy"] == "가 이음"
+              && !JsonNode.Parse(ClaudeSessionSync.Serialize(Compute(here[6..8], none, [], lineage: lineage)))!.AsObject().ContainsKey("undecided"),
+            "the plan's JSON has undecided only when there is one");
     }
 
     /// <summary>R5: a plan set G and K aside to make them anew in order; only K was set aside when the user renamed the

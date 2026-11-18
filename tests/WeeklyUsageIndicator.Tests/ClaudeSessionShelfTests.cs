@@ -38,6 +38,7 @@ internal static class ClaudeSessionShelfTests
         TestAdvancingOlderStates();
         TestAdvanceHoldsAndRecovery();
         TestVerifiedContinuation();
+        TestTranscriptInTwoFolders();
     }
 
     private static void TestPlanningAndPublishing()
@@ -2547,6 +2548,45 @@ internal static class ClaudeSessionShelfTests
             "a source record whose decision fields changed after the plan stops the advance");
         Change(source, r => r["isArchived"] = false);
         Check(moved.Shelf().Apply([A, B], () => true).Advanced == 1, "planned again from the record as it is, the advance goes ahead");
+    }
+
+    /// <summary>B holds an older state whose transcript the app has in two project folders: begun in one whose name sorts
+    /// first, copied to E--work when resumed there two hours later and gone on with in that copy, then in the next
+    /// transcript a day later, which A holds. Judged from the copy the conversation is in, B's record takes the newest state
+    /// in place (judged from the first folder's, the hand-over came before the next transcript was made, and the newest
+    /// state was added beside it). With the copies gone two ways it is added beside, and the transcript still counts as
+    /// there.</summary>
+    private static void TestTranscriptInTwoFolders()
+    {
+        const string Mine = "local_ad600000-0000-4000-8000-000000000001", Theirs = "local_ad600000-0000-4000-8000-000000000002";
+        foreach (var twoWays in new[] { false, true })
+        {
+            using var fixture = new Fixture();
+            var start = DateTime.UtcNow.Date.AddDays(-20);
+            var older = Guid.NewGuid().ToString("D");
+            var first = Entry(start.AddMilliseconds(500));
+            var stale = Path.Combine(Directory.CreateDirectory(Path.Combine(fixture.Projects, "A--elsewhere")).FullName, older + ".jsonl");
+            File.WriteAllLines(stale, [first]);
+            File.SetCreationTimeUtc(stale, start);
+            File.WriteAllLines(TranscriptPath(fixture, older), [first, Entry(start.AddHours(3))]);
+            File.SetCreationTimeUtc(TranscriptPath(fixture, older), start.AddHours(2));
+            var next = GoOn(fixture, older, start.AddDays(1));
+            // Written to after the other copy was made.
+            if (twoWays) File.AppendAllLines(stale, [Entry(start.AddHours(5))]);
+            fixture.Record(B, Mine, older);
+            fixture.Record(A, Theirs, next, extra: r => r["priorCliSessionIds"] = new JsonArray(older));
+            var path = Path.Combine(fixture.ShelfPath(B), Mine + ".json");
+            var hash = ClaudeSessionShelf.Hash(path);
+            var result = fixture.Shelf().Apply([A, B], () => true);
+            if (!twoWays)
+                Check(result is { Advanced: 1, Created: 0 } && Json(path)["cliSessionId"]!.GetValue<string>() == next && fixture.Files(B).Count == 1,
+                    "an older state whose transcript has a stale copy in a folder sorting first takes the newest state in place");
+            else
+                Check(result is { Advanced: 0, Created: 2 } && ClaudeSessionShelf.Hash(path) == hash && fixture.Files(B).Count == 2
+                      && result.Plan.Skipped.Values.All(reasons => !reasons.ContainsKey("missing_transcript")),
+                    "with its copies gone two ways it is not advanced: the newest state is added beside it, and the conversation "
+                    + "still counts as there");
+        }
     }
 
     private static string TranscriptPath(Fixture fixture, string id) => Path.Combine(fixture.Projects, "E--work", id + ".jsonl");
