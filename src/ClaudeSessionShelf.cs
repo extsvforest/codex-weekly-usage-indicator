@@ -1201,7 +1201,6 @@ internal sealed class ClaudeSessionShelf
         catch (JsonException) { return null; }
     }
 
-    /// <summary>Every transcript by id, at the first project folder holding it (where the session plan finds it too).</summary>
     /// <summary>Each transcript's file by id. One the app has in several project folders (see
     /// <see cref="ClaudeSessionSync.Current"/>) is the copy the conversation is in, the file the hand-overs are dated from;
     /// where that cannot be told, any copy still shows the transcript is there.</summary>
