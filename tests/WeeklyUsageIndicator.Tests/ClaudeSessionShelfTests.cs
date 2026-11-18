@@ -1513,6 +1513,11 @@ internal static class ClaudeSessionShelfTests
                     Console.WriteLine($"  mode {item.Title}: {item.From ?? "(none)"} -> {item.Mode}{(item.Raises ? ", asks" : "")} (by {item.By})");
                 if (plan.SelfSettings is { } own) Console.WriteLine($"  the calling session's own: model {own.Model} effort {own.Effort}");
                 if (plan.SettingsBeyond is { } beyond) Console.WriteLine($"  {beyond} conversations out of scope keep their model, effort and mode");
+                foreach (var item in plan.Archive ?? [])
+                    Console.WriteLine($"  archive {item.Title}{(item.Ready ? "" : " (not ready)")}: "
+                        + (item.ArchivedIn is { } elsewhere ? $"archived in {elsewhere}" : $"older state of {item.NewestTitle}, went on {item.MovedOn?.ToLocalTime():MM-dd HH:mm}"));
+                foreach (var item in plan.Undecided ?? [])
+                    Console.WriteLine($"  undecided {item.Title}: continued by {item.ContinuedBy}, {item.Why}");
             }
         }
         finally { Directory.Delete(scratch, true); }

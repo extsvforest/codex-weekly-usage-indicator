@@ -735,9 +735,9 @@ internal static class ClaudeSessionSync
     internal const string CommandFlag = "--claude-session-plan";
     private const long MaxRecordBytes = 10 * 1024 * 1024;
     private const int TranscriptTailBytes = 4 * 1024 * 1024;
-    private const long MaxTranscriptBytes = 512L * 1024 * 1024;
     // What a whole transcript is read through; it grows only for a longer line.
     private const int TranscriptChunkBytes = 1024 * 1024;
+    private const int MaxRememberedHandOvers = 512;
     private const int MaxSettleSeconds = 120;
     // How long a plan waits for the widget to checkpoint the account before it is made.
     private static readonly TimeSpan CheckpointWait = TimeSpan.FromSeconds(30);
@@ -869,7 +869,8 @@ internal static class ClaudeSessionSync
     /// <c>Pending</c> is what the plan sets out to change, for the widget. <c>Models</c>, <c>Efforts</c> and
     /// <c>Permissions</c> are the conversations used within <see cref="SettingsWindow"/> or pinned here whose values it
     /// changes, the most recently used first; <c>SelfSettings</c> the calling session's model and effort, and
-    /// <c>SettingsBeyond</c> how many conversations out of that scope it would have changed.</summary>
+    /// <c>SettingsBeyond</c> how many conversations out of that scope it would have changed. <c>Undecided</c> are the
+    /// records here another one continues that stay because what would tell them for older states could not be read.</summary>
     internal sealed record Plan(string Status, string? Current = null, string? CurrentLabel = null,
         IReadOnlyList<OtherView>? Others = null, IReadOnlyList<Retire>? Archive = null,
         IReadOnlyList<GroupRename>? RenameGroups = null, IReadOnlyList<string>? CreateGroups = null,
@@ -878,7 +879,14 @@ internal static class ClaudeSessionSync
         IReadOnlyList<string>? OnlyHere = null, IReadOnlyList<Sidebar>? Sidebars = null, IReadOnlyList<string>? Warnings = null,
         bool? Checkpointed = null, [property: JsonIgnore] ClaudeSessionLayout.Pending? Pending = null,
         IReadOnlyList<SettingModel>? Models = null, IReadOnlyList<SettingEffort>? Efforts = null,
-        IReadOnlyList<SettingMode>? Permissions = null, SelfSetting? SelfSettings = null, int? SettingsBeyond = null);
+        IReadOnlyList<SettingMode>? Permissions = null, SelfSetting? SelfSettings = null, int? SettingsBeyond = null,
+        IReadOnlyList<Undecided>? Undecided = null);
+
+    /// <summary>A record here that another one continues (<c>ContinuedBy</c>, by title) and that is neither taken for an
+    /// older state nor known for a branch the user went on with: what would tell could not be read (<c>Why</c>, one of
+    /// <see cref="Stays"/> other than <see cref="Stays.WrittenSince"/>). It stays, and the list shows the conversation
+    /// twice, so the plan says so.</summary>
+    internal sealed record Undecided(string Session, string? Title, string? ContinuedBy, string Why);
 
     /// <summary>What a plan reads, once, so a checkpoint and the plan made from it see the same: the pin list, the sidebar
     /// state, and each account's list.</summary>
@@ -1202,8 +1210,17 @@ internal static class ClaudeSessionSync
         // This account's older states are archived and the others' are seen through: either way what was changed on
         // them counts for the newest state of the conversation, as does what was changed on an older state already
         // archived — found again here, so an archived branch never counts for another conversation.
-        var older = lineage is null ? new Dictionary<string, Older>(StringComparer.Ordinal) : OlderStates(currentRecords, lineage, archived);
+        var unsettled = new List<(Record Record, string Why)>();
+        var older = lineage is null ? new Dictionary<string, Older>(StringComparer.Ordinal)
+            : OlderStates(currentRecords, lineage, archived, (record, why) => unsettled.Add((record, why)));
         var byId = currentRecords.ToDictionary(record => record.SessionId, StringComparer.Ordinal);
+        // A live record another one continues that could not be told for an older state: it stays, and the plan names it.
+        var undecided = unsettled.Where(item => item.Why != Stays.WrittenSince && byId.ContainsKey(item.Record.SessionId))
+            .Select(item => new Undecided(item.Record.SessionId, item.Record.Title,
+                currentRecords.Where(other => !other.Branch && other.SessionId != item.Record.SessionId
+                        && other.Prior.Contains(item.Record.Cli!, StringComparer.Ordinal))
+                    .MaxBy(other => other.LastActivityAt)?.Title, item.Why))
+            .OrderBy(item => item.Title, StringComparer.Ordinal).ThenBy(item => item.Session, StringComparer.Ordinal).ToArray();
         var retiring = older.Where(pair => byId.ContainsKey(pair.Key)).ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.Ordinal);
         var activity = currentRecords.Concat(archived ?? []).ToDictionary(record => record.SessionId, record => record.LastActivityAt, StringComparer.Ordinal);
         var ownOlderOf = older.OrderByDescending(pair => activity.GetValueOrDefault(pair.Key))
@@ -1576,7 +1593,8 @@ internal static class ClaudeSessionSync
         return new("ok", current, currentLabel, views, archive, renameGroups, create, moves, pins, renames, deleteGroups,
             regrouped ? order : null, regrouped ? Label(orderBy) : null, onlyHere.Select(Name).Order(StringComparer.Ordinal).ToArray(),
             sidebars, notes is { Count: > 0 } ? notes : null, Pending: pending, Models: models, Efforts: efforts,
-            Permissions: permissions, SelfSettings: selfSetting, SettingsBeyond: beyond > 0 ? beyond : null);
+            Permissions: permissions, SelfSettings: selfSetting, SettingsBeyond: beyond > 0 ? beyond : null,
+            Undecided: undecided.Length > 0 ? undecided : null);
     }
 
     /// <summary>When a record was last used in its own list: its activity, unless the widget wrote it since (a copy, or an
@@ -2192,8 +2210,10 @@ internal static class ClaudeSessionSync
     /// there and dated. An open session may go: archiving stops its process, and the app refuses one that is working.
     /// </summary>
     /// <param name="archived">Archived records, each found as an older state the same way; never taken to continue one.</param>
+    /// <param name="stays">Told each record another one continues that is not taken for an older state, and why (the words
+    /// in <see cref="Stays"/>): for diagnosis.</param>
     internal static Dictionary<string, Older> OlderStates(IReadOnlyList<Record> records, Lineage lineage,
-        IReadOnlyList<Record>? archived = null)
+        IReadOnlyList<Record>? archived = null, Action<Record, string>? stays = null)
     {
         var listers = records.Where(record => !record.Branch)
             .SelectMany(record => record.Prior.Distinct(StringComparer.Ordinal).Select(prior => (Prior: prior, Record: record)))
@@ -2204,28 +2224,55 @@ internal static class ClaudeSessionSync
         var spans = new Dictionary<string, TranscriptSpan?>(StringComparer.Ordinal);
         TranscriptSpan? Span(string cli) => spans.TryGetValue(cli, out var span) ? span : spans[cli] = lineage.Transcript(cli);
         var older = new Dictionary<string, Older>(StringComparer.Ordinal);
+        var byId = stays is null ? null : records.Concat(archived ?? []).ToLookup(record => record.SessionId, StringComparer.Ordinal);
         foreach (var record in records.Concat(archived ?? []))
         {
-            if (record.SessionId == lineage.Self || record.Cli is not { } cli || Continuations(record) is not { Count: > 0 } next
-                || Span(cli) is not { LastEntry: { } lastWritten, Dated: true } own) continue;
+            if (record.SessionId == lineage.Self || record.Cli is not { } cli || Continuations(record) is not { Count: > 0 } next) continue;
+            if (Span(cli) is not { LastEntry: { } lastWritten, Dated: true } own) { stays?.Invoke(record, Stays.OwnTranscript); continue; }
             var onward = next.SelectMany(other => other.Prior.Append(other.Cli)).OfType<string>()
                 .Where(id => id != cli).Distinct(StringComparer.Ordinal).ToDictionary(id => id, Span, StringComparer.Ordinal);
-            if (onward.Values.Any(span => span is not { Dated: true })) continue;
+            if (onward.Values.Any(span => span is not { Dated: true })) { stays?.Invoke(record, Stays.LaterTranscript); continue; }
             var listedNext = next.Select(other => NextAfter(other, cli)).Distinct(StringComparer.Ordinal).ToArray();
             var createdNext = onward.Where(pair => pair.Value!.Created > own.Created).OrderBy(pair => pair.Value!.Created)
                 .Select(pair => pair.Key).FirstOrDefault();
-            if (listedNext is not [{ } nextId] || createdNext != nextId || lineage.HandOver(cli, nextId) is not { } handOver
-                || onward[nextId]!.Created > handOver + HandOverSlack || lastWritten > handOver + HandOverSlack) continue;
+            if (listedNext is not [{ } nextId] || createdNext != nextId) { stays?.Invoke(record, Stays.NextUnclear); continue; }
+            if (lineage.HandOver(cli, nextId) is not { } handOver) { stays?.Invoke(record, Stays.HandOverUnread); continue; }
+            if (onward[nextId]!.Created > handOver + HandOverSlack) { stays?.Invoke(record, Stays.NextMadeLater); continue; }
+            if (lastWritten > handOver + HandOverSlack) { stays?.Invoke(record, Stays.WrittenSince); continue; }
             var newest = next.MaxBy(other => other.LastActivityAt)!;
             var seen = new HashSet<string>(StringComparer.Ordinal) { record.SessionId, newest.SessionId };
             while (Continuations(newest).MaxBy(other => other.LastActivityAt) is { } step && seen.Add(step.SessionId)) newest = step;
-            if (newest.Cli is not { } newestCli || Span(newestCli) is not { Dated: true }) continue;
+            if (newest.Cli is not { } newestCli || Span(newestCli) is not { Dated: true }) { stays?.Invoke(record, Stays.LaterTranscript); continue; }
             older[record.SessionId] = new(newest, lastWritten, handOver);
         }
         // Lineage that loops has no newest state to keep: none of it goes.
         foreach (var key in older.Where(pair => older.ContainsKey(pair.Value.Newest.SessionId)).Select(pair => pair.Key).ToArray())
+        {
             older.Remove(key);
+            if (byId?[key].FirstOrDefault() is { } looped) stays!(looped, Stays.Loop);
+        }
         return older;
+    }
+
+    /// <summary>Why a record another one continues is not taken for an older state (see <see cref="OlderStates"/>). Only
+    /// <see cref="WrittenSince"/> says what it is, a branch the user went on with; the rest could not be told.</summary>
+    internal static class Stays
+    {
+        /// <summary>Its own transcript is missing, unreadable, undated, without a turn near its end, or there in several
+        /// folders none of which can be told to hold the conversation (see <c>Locate</c>).</summary>
+        internal const string OwnTranscript = "own_transcript";
+        /// <summary>A transcript of the continuing lineage, or of the newest state, is missing or undated.</summary>
+        internal const string LaterTranscript = "later_transcript";
+        /// <summary>The continuing records disagree on the transcript that follows, or it is not the first created after.</summary>
+        internal const string NextUnclear = "next_unclear";
+        /// <summary>The hand-over cannot be dated: a transcript cannot be read whole, or the next one holds nothing new.</summary>
+        internal const string HandOverUnread = "hand_over_unread";
+        /// <summary>The next transcript was created after its first entry this one does not hold.</summary>
+        internal const string NextMadeLater = "next_made_later";
+        /// <summary>It was written to after the conversation went on: a branch.</summary>
+        internal const string WrittenSince = "written_since";
+        /// <summary>Its lineage loops.</summary>
+        internal const string Loop = "loop";
     }
 
     /// <summary>
@@ -2409,9 +2456,11 @@ internal static class ClaudeSessionSync
 
     /// <summary>When a transcript was created and last written, and its newest entry (read near its end); null when the
     /// transcript is missing or unreadable, or a line there is broken: a lost line could be the newest entry.</summary>
-    internal static TranscriptSpan? Transcript(string projectsRoot, string cli)
+    internal static TranscriptSpan? Transcript(string projectsRoot, string cli) =>
+        Locate(projectsRoot, cli) is { } path ? Span(path) : null;
+
+    private static TranscriptSpan? Span(string path)
     {
-        if (Locate(projectsRoot, cli) is not { } path) return null;
         try
         {
             var created = new DateTimeOffset(File.GetCreationTimeUtc(path));
@@ -2437,30 +2486,75 @@ internal static class ClaudeSessionSync
     /// line, or the later one holds nothing new. A line of nothing but NUL bytes in the earlier one (what a crash leaves)
     /// is not broken: what it held is lost to the app too, it was written before the lines after it, whose time
     /// <see cref="Transcript"/> dates, and an entry of it the later one holds only makes the hand-over earlier, which
-    /// keeps the older state. In the later one such a line could be the first new entry, so it stays broken.</summary>
+    /// keeps the older state. In the later one such a line could be the first new entry, so it stays broken. Both are
+    /// read whole, whatever their size (long conversations pass a gigabyte, and one that could not be dated left its
+    /// older state beside the newest in every list), so what was found is remembered for the two files as they were: the
+    /// earlier one exactly, the later one while it only grows once its first new entry is found, since what the
+    /// conversation adds after that is newer.</summary>
     internal static DateTimeOffset? HandOver(string projectsRoot, string older, string next)
     {
         if (Locate(projectsRoot, older) is not { } olderPath || Locate(projectsRoot, next) is not { } nextPath) return null;
         try
         {
-            // Streamed: transcripts reach hundreds of megabytes, and only the earlier one's ids and the later one's oldest
-            // new entry are needed.
+            var olderFile = new FileInfo(olderPath);
+            var nextFile = new FileInfo(nextPath);
+            var key = string.Join('|', olderPath, olderFile.Length, olderFile.CreationTimeUtc.Ticks, olderFile.LastWriteTimeUtc.Ticks,
+                nextPath, nextFile.CreationTimeUtc.Ticks);
+            var nextLength = nextFile.Length;
+            lock (HandOvers)
+                if (HandOvers.TryGetValue(key, out var kept)
+                    && (kept.OlderBroken || kept.NextLength == nextLength || kept.At is not null && kept.NextLength < nextLength))
+                    return kept.At;
+            // Streamed: only the earlier one's ids and the later one's oldest new entry are needed.
             var known = new HashSet<string>(StringComparer.Ordinal);
-            if (!EachEntry(olderPath, skipLost: true, entry => { if (entry.Id is { } id) known.Add(id); })) return null;
+            var olderBroken = !EachEntry(olderPath, skipLost: true, entry => { if (entry.Id is { } id) known.Add(id); });
             DateTimeOffset? first = null;
-            if (!EachEntry(nextPath, skipLost: false, entry =>
+            if (!olderBroken && !EachEntry(nextPath, skipLost: false, entry =>
                 {
                     if (entry.Id is { } id && !known.Contains(id) && (first is null || entry.At < first)) first = entry.At;
-                })) return null;
+                })) first = null;
+            lock (HandOvers)
+            {
+                if (HandOvers.Count >= MaxRememberedHandOvers) HandOvers.Clear();
+                HandOvers[key] = (first, nextLength, olderBroken);
+            }
             return first;
         }
-        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidDataException)
-        { return null; }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { return null; }
     }
 
-    private static string? Locate(string projectsRoot, string cli) =>
-        !Guid.TryParse(cli, out _) || !Directory.Exists(projectsRoot) ? null
-        : Directory.EnumerateDirectories(projectsRoot).Select(project => Path.Combine(project, cli + ".jsonl")).FirstOrDefault(File.Exists);
+    private static readonly Dictionary<string, (DateTimeOffset? At, long NextLength, bool OlderBroken)> HandOvers =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>The file holding a transcript. The app keeps a transcript in the project folder of its session's folder
+    /// and, when a session resumes whose transcript is in another one (a worktree session another account moved, say),
+    /// copies it over and goes on in the copy: a transcript can be in several folders, the earlier copies left as they
+    /// were. Then it is the copy the conversation is in (see <see cref="Current"/>), and none when that cannot be told,
+    /// like a transcript that is missing.</summary>
+    private static string? Locate(string projectsRoot, string cli)
+    {
+        if (!Guid.TryParse(cli, out _) || !Directory.Exists(projectsRoot)) return null;
+        var copies = Directory.EnumerateDirectories(projectsRoot).Select(project => Path.Combine(project, cli + ".jsonl"))
+            .Where(File.Exists).ToArray();
+        return copies.Length <= 1 ? copies.FirstOrDefault() : Current(copies);
+    }
+
+    /// <summary>Of a transcript's copies in several project folders, the one the conversation is in: the one with the
+    /// newest turn, when no other copy can hold a turn it lacks. Another copy holds none when its newest turn is the
+    /// same; when nothing was added to it since it was made (a copy holds what its source held then); or when it had
+    /// stopped by the time the newest one was made. Among copies with the same newest turn, one whose creation time dates
+    /// it, the earliest. Null when a copy cannot be read, has no turn near its end, or was written to after the newest
+    /// one was made: the conversation then went two ways under one id, and neither file stands for it.</summary>
+    internal static string? Current(IReadOnlyList<string> copies)
+    {
+        var spans = copies.Select(path => (Path: path, Span: Span(path))).ToArray();
+        if (spans.Any(copy => copy.Span?.LastEntry is null)) return null;
+        var (current, span) = spans.OrderByDescending(copy => copy.Span!.LastEntry).ThenByDescending(copy => copy.Span!.Dated)
+            .ThenBy(copy => copy.Span!.Created).First();
+        return spans.All(copy => copy.Path == current || copy.Span!.LastEntry == span!.LastEntry
+            || copy.Span.LastEntry <= copy.Span.Created + HandOverSlack || copy.Span.LastEntry <= span.Created + HandOverSlack)
+            ? current : null;
+    }
 
     /// <summary>Hands each entry of a whole transcript, as it was long when opened, to <paramref name="found"/> (see
     /// <see cref="Entries"/>, which reads the same lines from memory); false when a line is broken. It reads through a
@@ -2469,7 +2563,6 @@ internal static class ClaudeSessionSync
     {
         using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, 1,
             FileOptions.SequentialScan);
-        if (stream.Length > MaxTranscriptBytes) throw new InvalidDataException("Transcript too large to compare.");
         var remaining = stream.Length;
         var pooled = ArrayPool<byte>.Shared.Rent(TranscriptChunkBytes);
         var buffer = pooled;

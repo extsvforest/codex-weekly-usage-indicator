@@ -1202,14 +1202,22 @@ internal sealed class ClaudeSessionShelf
     }
 
     /// <summary>Every transcript by id, at the first project folder holding it (where the session plan finds it too).</summary>
+    /// <summary>Each transcript's file by id. One the app has in several project folders (see
+    /// <see cref="ClaudeSessionSync.Current"/>) is the copy the conversation is in, the file the hand-overs are dated from;
+    /// where that cannot be told, any copy still shows the transcript is there.</summary>
     private IReadOnlyDictionary<string, string> TranscriptIds()
     {
-        var ids = new Dictionary<string, string>(StringComparer.Ordinal);
-        if (!Directory.Exists(_paths.ProjectsRoot)) return ids;
-        foreach (var project in Directory.EnumerateDirectories(_paths.ProjectsRoot))
-            foreach (var file in Directory.EnumerateFiles(project, "*.jsonl"))
-                ids.TryAdd(Path.GetFileNameWithoutExtension(file).ToLowerInvariant(), file);
-        return ids;
+        var copies = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+        if (Directory.Exists(_paths.ProjectsRoot))
+            foreach (var project in Directory.EnumerateDirectories(_paths.ProjectsRoot))
+                foreach (var file in Directory.EnumerateFiles(project, "*.jsonl"))
+                {
+                    var id = Path.GetFileNameWithoutExtension(file).ToLowerInvariant();
+                    if (!copies.TryGetValue(id, out var files)) copies[id] = files = [];
+                    files.Add(file);
+                }
+        return copies.ToDictionary(pair => pair.Key,
+            pair => pair.Value.Count == 1 ? pair.Value[0] : ClaudeSessionSync.Current(pair.Value) ?? pair.Value[0], StringComparer.Ordinal);
     }
 
     private static void RemoveStalePartials(string directory)
