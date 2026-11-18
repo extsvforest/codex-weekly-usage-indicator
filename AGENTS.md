@@ -68,6 +68,8 @@ Run:
 
 On a PC someone is using, run `.\scripts\build-hidden.ps1` instead: the same build and tests on a Windows desktop that is never shown, so no test window takes the screen or the keyboard focus. The pointer-driven hover check cannot run there and is skipped; say so when reporting.
 
+When the widget's memory grows, watch it for more than ten minutes, past a round of filling lists, before judging. To see what holds it without installing anything, take an ETW heap walk of the running widget and read it with `scripts/etw-heap.py` (the capture commands are in its header).
+
 Keep regression coverage for:
 
 1. Settings migration, metric selection without a query, independent window expiry, consistent rounding, per-account request spacing across duplicate profiles and profile-bound recovery values.
