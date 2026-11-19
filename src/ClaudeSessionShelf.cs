@@ -16,9 +16,11 @@ internal sealed record ClaudeShelfAccount(string AccountUuid, string OrgUuid, st
 internal sealed record ClaudeShelfPaths(string SessionsRoot, string ProjectsRoot, string ScratchRoot,
     IReadOnlyList<string> RegistryDirectories, string LedgerDirectory, string? DesktopConfig = null)
 {
-    internal static ClaudeShelfPaths CreateDefault(string? claudeConfigDirectory = null)
+    /// <summary>The lists, scratch folders and stores in the app's profile folder (<see cref="ClaudeAppData"/>, found
+    /// now unless <paramref name="appRoot"/> names it).</summary>
+    internal static ClaudeShelfPaths CreateDefault(string? claudeConfigDirectory = null, string? appRoot = null)
     {
-        var roaming = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+        var app = appRoot ?? ClaudeAppData.Root();
         var local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
         var config = claudeConfigDirectory ?? Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude");
@@ -28,8 +30,8 @@ internal sealed record ClaudeShelfPaths(string SessionsRoot, string ProjectsRoot
         var profiles = Path.Combine(local, "CodexWeeklyUsageIndicator.ClaudeProfiles", "profiles");
         if (Directory.Exists(profiles))
             registries.AddRange(Directory.EnumerateDirectories(profiles).Select(path => Path.Combine(path, "sessions")));
-        return new(Path.Combine(roaming, "Claude", "claude-code-sessions"), Path.Combine(config, "projects"),
-            Path.Combine(roaming, "Claude", "scratch-workspaces"), registries,
+        return new(Path.Combine(app, ClaudeAppData.SessionsFolder), Path.Combine(config, "projects"),
+            Path.Combine(app, "scratch-workspaces"), registries,
             Path.Combine(local, "CodexWeeklyUsageIndicator.SessionShelf"),
             // Automatic sidebar writes stay off: holding the web UI store's lock while Desktop starts can make Chromium
             // fail to open it and recreate it. Writes run only as a controlled step (see ClaudeLocalStorage).

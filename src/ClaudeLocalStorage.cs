@@ -5,7 +5,7 @@ namespace WeeklyUsageIndicator;
 
 /// <summary>
 /// Reads and appends to the Chromium localStorage LevelDB that Claude Desktop's web UI uses
-/// (<c>%APPDATA%\Claude\Local Storage\leveldb</c>). The sidebar keeps its groups there (pins are in IndexedDB, read
+/// (<c>Local Storage\leveldb</c> in the app's profile folder, see <see cref="ClaudeAppData"/>). The sidebar keeps its groups there (pins are in IndexedDB, read
 /// through <see cref="ReadMatching"/>; see <see cref="ClaudeSidebarPins"/>); the settings file is only a mirror the UI
 /// rewrites on start. Writes happen only while Desktop is closed and the database is not locked: the
 /// whole directory is backed up, one write batch is appended to the live log, and the result is read back. Anything

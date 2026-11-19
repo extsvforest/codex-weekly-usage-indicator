@@ -15,6 +15,9 @@ internal static class Program
         // A read-only planning command for the claude-session-sync skill: no window, no single-instance claim.
         if (args.Length > 0 && args[0].Equals(ClaudeSessionSync.CommandFlag, StringComparison.OrdinalIgnoreCase))
             return ClaudeSessionSync.RunCommand(args[1..]);
+        // Read-only as well: which Claude profile folder the widget uses, for checking a new PC.
+        if (args.Length > 0 && args[0].Equals(ClaudeAppData.CommandFlag, StringComparison.OrdinalIgnoreCase))
+            return ClaudeAppData.RunCommand();
         var openAccounts = args.Any(argument => argument.Equals("--accounts", StringComparison.OrdinalIgnoreCase));
         if (args.Any(argument => argument.Equals("--supervise", StringComparison.OrdinalIgnoreCase)))
             return WidgetSupervisor.Run();

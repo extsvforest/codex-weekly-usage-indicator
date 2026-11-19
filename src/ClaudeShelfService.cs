@@ -75,7 +75,10 @@ internal sealed class ClaudeShelfService : IDisposable
     internal static readonly TimeSpan SettleWindow = TimeSpan.FromMinutes(2);
     private readonly Control _owner;
     private readonly Func<IReadOnlyList<ClaudeProfile>> _profiles;
-    private readonly ClaudeSessionShelf _shelf;
+    private ClaudeSessionShelf _shelf;
+    // Whether this service made its own lists and stores, and so follows the app's profile folder (FollowAppData).
+    private readonly bool _followAppData;
+    private DateTimeOffset _appDataCheckAt = DateTimeOffset.MinValue;
     private readonly ClaudeShelfEnvironment _environment;
     private readonly ClaudeDesktopLogWatcher _log;
     private readonly System.Windows.Forms.Timer _timer = new() { Interval = 3000 };
@@ -110,7 +113,7 @@ internal sealed class ClaudeShelfService : IDisposable
     // Counts the user's reopen choices, so a pass that started before one never overrides it.
     private int _relaunchChoice;
     // What each account changed, kept by this widget alone; null until read or started.
-    private readonly ClaudeSessionSync.Sources _layoutSources;
+    private ClaudeSessionSync.Sources _layoutSources;
     private ClaudeSessionLayout? _layout;
     private bool _layoutChanged;
     // Per mapped account, where a plan command asks for its plan (see ClaudeSessionSync.Ask).
@@ -135,6 +138,7 @@ internal sealed class ClaudeShelfService : IDisposable
         ClaudeSessionSync.Sources? layoutSources = null)
     {
         _owner = owner; _profiles = profiles; _shelf = shelf ?? new ClaudeSessionShelf();
+        _followAppData = shelf is null && layoutSources is null;
         _environment = environment ?? ClaudeShelfEnvironment.Real; _log = log ?? new ClaudeDesktopLogWatcher();
         _layoutSources = layoutSources ?? ClaudeSessionSync.Sources.For(_shelf.Paths);
         _timer.Tick += (_, _) => Tick();
@@ -260,6 +264,7 @@ internal sealed class ClaudeShelfService : IDisposable
     {
         var now = _environment.Now();
         var choice = Volatile.Read(ref _relaunchChoice);
+        FollowAppData(now);
         RefreshAccounts(profiles, now);
         KeepLayout(now);
         var runtime = _environment.Observe();
@@ -332,6 +337,20 @@ internal sealed class ClaudeShelfService : IDisposable
         return new ClaudeShelfPass(new ClaudeShelfStatus(runtime.State, app, profileId, _pending, _accounts.Count, _lastFillAt,
             _lastCreated, _lastComplete, _problem, _problemDetail, null, runtime.HostStartedAt, _unreviewed, _damaged), accepted,
             package ?? _environment.FindPackage(), switchedFrom, choice);
+    }
+
+    /// <summary>Every minute, when this service made its own lists, moves them to the profile folder the app uses now: the
+    /// packaged app can move it out of its package at a launch (<see cref="ClaudeAppData"/>), and lists written to the
+    /// folder it left would never be read. The ledger and session layouts stay where they are.</summary>
+    private void FollowAppData(DateTimeOffset now)
+    {
+        if (!_followAppData || now < _appDataCheckAt) return;
+        _appDataCheckAt = now + AccountsInterval;
+        var root = ClaudeAppData.Root();
+        if (string.Equals(Path.Combine(root, ClaudeAppData.SessionsFolder), Path.TrimEndingDirectorySeparator(
+                Path.GetFullPath(_shelf.Paths.SessionsRoot)), StringComparison.OrdinalIgnoreCase)) return;
+        _shelf = new ClaudeSessionShelf(ClaudeShelfPaths.CreateDefault(appRoot: root));
+        _layoutSources = ClaudeSessionSync.Sources.For(_shelf.Paths);
     }
 
     /// <summary>Reads the installed app's version against the shelf design: an incompatible one stops filling and is

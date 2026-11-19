@@ -10,6 +10,7 @@ if (args.Contains("--claude-layout-dry-run")) { ClaudeSessionShelfTests.LayoutDr
 if (args.Contains("--claude-older-states")) { ClaudeOlderStatesProbe.Run(args); return; }
 if (args.Contains("--claude-sidebar-store-shape")) { ClaudeSessionShelfTests.SidebarStoreShape(); return; }
 if (args.Contains("--claude-layout-diff")) { ClaudeSessionShelfTests.LayoutDiff(args[Array.IndexOf(args, "--claude-layout-diff") + 1], args[Array.IndexOf(args, "--claude-layout-diff") + 2]); return; }
+if (args.Contains("--claude-app-data-tests")) { await ClaudeAppDataTests.RunAsync(); Console.WriteLine("PASS: Claude profile folder"); return; }
 if (args.Contains("--claude-shelf-tests")) { await ClaudeSessionShelfTests.RunAsync(); Console.WriteLine("PASS: Claude session shelf"); return; }
 if (args.Contains("--claude-sync-tests")) { await ClaudeSessionSyncTests.RunAsync(); Console.WriteLine("PASS: Claude session sync"); return; }
 if (args.Contains("--widget-face-preview")) { WidgetFaceTests.Preview(args); return; }
@@ -48,6 +49,7 @@ var tests = new (string Name, Func<Task> Run)[]
     ("widget face: gauges, grounds and states", WidgetFaceTests.RunAsync),
     ("Claude weekly metric, independent expiry and profile cache", ClaudeMetricTests.RunAll),
     ("Claude official profile identity and shared local work", ClaudeProfileTests.RunAsync),
+    ("Claude profile folder: legacy roaming, moved out of the package, inside it", ClaudeAppDataTests.RunAsync),
     ("Claude session shelf: fill by adding and advancing, closed- and running-app writes, account mapping and log observation", ClaudeSessionShelfTests.RunAsync),
     ("Claude combined weekly total and session-layout plan", ClaudeSessionSyncTests.RunAsync),
     ("Claude login waits, transient observation and identity invalidation", ClaudeControllerTests.RunAsync),

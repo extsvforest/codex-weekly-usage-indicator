@@ -64,7 +64,7 @@ Local file-based ChatGPT authentication is supported. Keyring and managed authen
 
 ### Keep your Code sessions in every account
 
-The Claude desktop app lists Code sessions per account, so signing in with another account used to show an empty list even though the conversations were still on this PC. The widget fixes the list, not the login: it adds each registered account's missing Code sessions to the other accounts' lists. The accounts Claude is not showing are filled while it runs; the account it shows is filled when Claude is fully closed. The next time you open Claude with either account, the same sessions are there, and opening one continues the same conversation.
+The Claude desktop app lists Code sessions per account in its profile folder (`%APPDATA%\Claude`, or `%LOCALAPPDATA%\Claude-Data\claude_…` once the Microsoft Store version has moved it there; the widget finds and follows it), so signing in with another account used to show an empty list even though the conversations were still on this PC. The widget fixes the list, not the login: it adds each registered account's missing Code sessions to the other accounts' lists. The accounts Claude is not showing are filled while it runs; the account it shows is filled when Claude is fully closed. The next time you open Claude with either account, the same sessions are there, and opening one continues the same conversation.
 
 - It adds entries, and brings an entry up to date when you continued that conversation in another account (below). It never deletes a list entry, never touches conversations themselves, and never reads or copies sign-in data.
 - While Claude runs, it writes only the lists of accounts Claude has not shown for two minutes (just after a switch the app is still ending the previous account's sessions), and only after following the app's log for two minutes. Signing out lets it fill the account you sign in to next before Claude reads that list; the account you signed out of is left alone until Claude shows the next one. If you switch accounts and the new account still lacks sessions, the widget says how many and arms **Reopen after quitting** for you: quit Claude once, the sessions are added and Claude reopens (once, within 30 minutes). Cancel it on the account tab if you meant to stop.
@@ -129,6 +129,10 @@ The choice is saved locally. Existing installations keep Korean; new installatio
 ```powershell
 .\scripts\install.ps1
 ```
+
+From a terminal inside a packaged app (an agent's shell in Codex or Claude, for example), run `.\scripts\install-outside.ps1` instead: it runs the installer through a one-off scheduled task of your user, with no window, and checks that the installed executable is the one in the zip.
+
+To see which Claude profile folder the widget found, run `& "$env:LOCALAPPDATA\CodexWeeklyUsageIndicator\WeeklyUsageIndicator.exe" --claude-data`. It prints the folder, why it was chosen, how many lists and sessions it holds, and whether the installed Claude version is one the session lists were reviewed with. Only names, counts and times are read.
 
 The app is installed to `%LOCALAPPDATA%\CodexWeeklyUsageIndicator`. A per-user `CodexWeeklyUsageIndicator-<Windows SID>` scheduled task starts its supervisor at sign-in with normal user privileges and no stored password. Installation starts the task immediately. Two processes from the same EXE are expected: the supervisor and one widget.
 

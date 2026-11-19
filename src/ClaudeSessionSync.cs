@@ -841,10 +841,10 @@ internal static class ClaudeSessionSync
     {
         internal static Sources Default() => For(ClaudeShelfPaths.CreateDefault());
 
-        /// <summary>The app's own stores beside the given lists and ledger.</summary>
+        /// <summary>The app's own stores beside the given lists and ledger: the same profile folder holds both.</summary>
         internal static Sources For(ClaudeShelfPaths paths)
         {
-            var app = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Claude");
+            var app = Path.GetDirectoryName(Path.TrimEndingDirectorySeparator(Path.GetFullPath(paths.SessionsRoot)))!;
             return new(paths.SessionsRoot, Path.Combine(app, "Local Storage", "leveldb"),
                 Path.Combine(app, "IndexedDB", "https_claude.ai_0.indexeddb.leveldb"), paths.ProjectsRoot, paths.LedgerDirectory);
         }

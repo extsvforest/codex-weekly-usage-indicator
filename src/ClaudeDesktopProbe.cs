@@ -140,15 +140,14 @@ internal static class ClaudeDesktopProbe
     private static readonly object ContractGate = new();
     private static (string Key, ClaudeDesktopContract Contract)? _contract;
 
-    internal static string LogDirectory => Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Claude", "Logs");
+    internal static string LogDirectory => ClaudeAppData.LogDirectory;
 
     /// <summary>The packaged app or one of its Code CLIs counts as running. Terminal CLIs are not Desktop writers.
     /// A process whose image cannot be inspected makes the answer unknown, never "closed".</summary>
     internal static ClaudeDesktopRuntime Observe()
     {
-        var cliRoot = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-            "Claude", "claude-code") + Path.DirectorySeparatorChar;
+        // The app runs its Code CLIs from its profile folder, wherever that is (ClaudeAppData); found when first needed.
+        IReadOnlyList<string>? cliRoots = null;
         var running = false; var unknown = false; DateTime? host = null;
         foreach (var process in Process.GetProcessesByName("claude"))
         {
@@ -162,7 +161,8 @@ internal static class ClaudeDesktopProbe
                     running = true;
                     if (created is { } start && (host is null || start < host)) host = start;
                 }
-                else if (path.StartsWith(cliRoot, StringComparison.OrdinalIgnoreCase)) running = true;
+                else if ((cliRoots ??= ClaudeAppData.CliRoots()).Any(root => path.StartsWith(root, StringComparison.OrdinalIgnoreCase)))
+                    running = true;
             }
         }
         return new ClaudeDesktopRuntime(running ? ClaudeDesktopRunState.Running
