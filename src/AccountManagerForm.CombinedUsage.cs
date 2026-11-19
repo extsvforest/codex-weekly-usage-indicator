@@ -28,7 +28,7 @@ internal sealed partial class AccountManagerForm
                     var fresh = _store.ListAccounts();
                     if (!_combined.Reconcile(fresh) || fresh.SingleOrDefault(a => a.IsActive)?.Id != activeId)
                         throw new InvalidOperationException("조회 중 계정 구성이 바뀌었습니다. 목록을 확인한 뒤 전체 갱신해 주세요.");
-                    if (_store.HasPendingRecovery || _store.GetUsageQueryStatus().State == UsageQueryState.RecoveryRequired)
+                    if (_store.HasPendingRecovery || HasLinkedRecovery || _store.GetUsageQueryStatus().State == UsageQueryState.RecoveryRequired)
                         throw new InvalidOperationException("중단된 계정 작업을 복구한 뒤 전체 갱신해 주세요.");
                     var target = fresh.Single(a => a.Id == member.Id);
                     using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));

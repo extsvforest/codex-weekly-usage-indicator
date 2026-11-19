@@ -34,8 +34,21 @@ internal static class AccountStylePreview
                 snapshot.Initialize(accounts, batch: true);
                 foreach (var account in accounts) snapshot.SetResult(account.Id, account, CombinedReadState.Success);
                 snapshot.CompletedAt = now;
+                var claudeHome = Directory.CreateDirectory(Path.Combine(root, "claude-original")).FullName;
+                var claudeStore = new ClaudeProfileStore(Path.Combine(root, "claude-profiles"), claudeHome, false);
+                var identity = new ClaudeProfileIdentity(new string('A', 64), "m*** · PREVIEW", "max");
+                var claudeMain = claudeStore.RegisterDefault("메인 Claude", identity);
+                var claudeOther = claudeStore.CreateProfile("서브 Claude");
+                claudeOther = claudeStore.RecordVerifiedIdentity(claudeOther.Id, new(new string('B', 64), "s*** · PREVIEW", "max"));
+                using var claudeController = new ClaudeAccountController(claudeStore,
+                    new ClaudeProfileRuntime(claudeStore, new PreviewClaudeRunner(), "preview-claude.exe"));
+                var observations = (Dictionary<string, ClaudeUsageResult>)typeof(ClaudeAccountController).GetField("_observations", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.GetValue(claudeController)!;
+                var failures = (Dictionary<string, Exception>)typeof(ClaudeAccountController).GetField("_failures", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.GetValue(claudeController)!;
+                observations[claudeMain.Id] = new(new(new(10, now.AddHours(2)), new(32, now.AddDays(3)), new(15, now.AddDays(3))), now, null, false);
+                observations[claudeOther.Id] = new(new(new(20, now.AddHours(2)), new(57, now.AddDays(4)), new(25, now.AddDays(4))), now, null, false);
                 using var form = new AccountManagerForm(store, () => Task.CompletedTask, () => { },
                     refreshAllOnOpen: false, combined: snapshot,
+                    claudeAccounts: claudeController,
                     queryUsage: (_, _) => throw new InvalidOperationException("디자인 미리보기에서는 실제 계정을 조회하지 않습니다."));
                 form.Text += UiText.IsEnglish ? " · Design preview" : " · 디자인 미리보기";
                 form.Shown += async (_, _) =>
@@ -43,6 +56,34 @@ internal static class AccountStylePreview
                     try
                     {
                         await Task.Delay(200); Capture(form, "manager.png");
+                        AssertSharedCopy(form, now);
+                        ((Button)form.Controls.Find("ClaudeProviderTab", true).Single()).PerformClick();
+                        await Task.Delay(100); Capture(form, "claude.png");
+                        AssertSharedCopy(form, now);
+                        var claudePanel = (ClaudeAccountPanel)form.Controls.Find("ClaudeAccountPanel", true).Single();
+                        var claudeThird = claudeStore.CreateProfile("Claude · 추가 로그인 대기");
+                        claudeStore.Rename(claudeMain.Id, "메인 Claude · 긴 계정 이름과 English 0123456789");
+                        observations[claudeMain.Id] = observations[claudeMain.Id] with { IsStale = true, RetryAfter = now.AddMinutes(10) };
+                        claudePanel.Reload();
+                        await Task.Delay(100); Capture(form, "claude-states.png");
+                        if (Walk(claudePanel).OfType<ScrollableControl>().Any(c => c.AutoScroll && c.VerticalScroll.Visible))
+                            throw new InvalidOperationException("Three Claude profiles must fit without vertical scrolling.");
+                        observations.Remove(claudeMain.Id);
+                        failures[claudeMain.Id] = new ClaudeLoginRequiredException(); claudePanel.Reload();
+                        await Task.Delay(100); Capture(form, "claude-login-required.png");
+                        AssertClaudeRecovery(form, claudePanel, claudeMain.Id);
+                        failures[claudeMain.Id] = new ClaudeIdentityChangedException(); claudePanel.Reload();
+                        await Task.Delay(100); Capture(form, "claude-identity-changed.png");
+                        AssertClaudeRecovery(form, claudePanel, claudeMain.Id);
+                        failures.Clear();
+                        AssertClaudeUsageRecovery(claudePanel, observations, failures, claudeMain.Id, claudeOther.Id, now);
+                        claudeStore.Rename(claudeMain.Id, "메인 Claude");
+                        claudeStore.Remove(claudeOther.Id); claudeStore.Remove(claudeThird.Id);
+                        observations.Remove(claudeMain.Id); claudePanel.Reload();
+                        await Task.Delay(100); Capture(form, "claude-single.png");
+                        ((Button)form.Controls.Find("CodexProviderTab", true).Single()).PerformClick();
+                        using (var environments = new WslCodexConnectionsDialog(store, new WslCodexService(Path.Combine(root, "wsl-preview"), new PreviewWslBridge()), new WslCodexConnections(Path.Combine(root, "wsl-preview"))))
+                        { environments.Show(form); await Task.Delay(100); Capture(environments, "environments.png"); environments.Close(); }
                         using (var widget = new UsageIndicatorForm(previewMode: true))
                         {
                             typeof(UsageIndicatorForm).GetField("_showClaude", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.SetValue(widget, true);
@@ -97,11 +138,81 @@ internal static class AccountStylePreview
         using var bitmap = new Bitmap(form.Width, form.Height);
         form.DrawToBitmap(bitmap, new Rectangle(Point.Empty, bitmap.Size));
         bitmap.Save(Path.Combine(Path.GetDirectoryName(output)!, name), ImageFormat.Png);
-        IEnumerable<Control> Walk(Control c) => new[] { c }.Concat(c.Controls.Cast<Control>().SelectMany(Walk));
         foreach (var c in Walk(form).Where(c => c.Visible && c.Parent is not null && c.Parent is not ScrollableControl { AutoScroll: true }))
             if (!c.Parent!.ClientRectangle.Contains(c.Bounds))
-                throw new InvalidOperationException($"Native preview clips {c.Name} ({c.GetType().Name}) at {c.DeviceDpi} DPI.");
+                throw new InvalidOperationException($"Native preview clips {c.Name} ({c.GetType().Name}) at {c.DeviceDpi} DPI: {c.Bounds} in {c.Parent.ClientRectangle} ({c.Parent.Name}).");
         File.WriteAllText(Path.ChangeExtension(Path.Combine(Path.GetDirectoryName(output)!, name), ".json"),
             System.Text.Json.JsonSerializer.Serialize(Walk(form).Select(c => new { c.Name, Type = c.GetType().Name, c.Text, Bounds = c.Bounds.ToString(), c.DeviceDpi, Font = c.Font.Size, Parent = c.Parent?.GetType().Name })));
+    }
+
+    private static IEnumerable<Control> Walk(Control c) => new[] { c }.Concat(c.Controls.Cast<Control>().SelectMany(Walk));
+
+    private static void AssertSharedCopy(Form form, DateTimeOffset checkedAt)
+    {
+        var visible = Walk(form).Where(control => control.Visible).ToArray();
+        if (visible.Single(control => control.Name == "UsageSummaryTitle").Text != UiText.T("주간 잔여")
+            || visible.Single(control => control.Name == "RefreshAllUsageButton").Text != UiText.T("갱신")
+            || visible.Single(control => control.Name == "CombinedCheckedAtLabel").Text != AccountUsageText.LastUpdated(checkedAt, DateTimeOffset.Now))
+            throw new InvalidOperationException("Both provider tabs must share the summary title, refresh label and observation-time format.");
+        if (visible.Any(control => control.Name.StartsWith("AccountReadState-", StringComparison.Ordinal)
+            || control.Name.StartsWith("ClaudeProfileState-", StringComparison.Ordinal)))
+            throw new InvalidOperationException("Healthy account rows must not repeat their observation time below the name.");
+        if (visible.Any(control => control is Label && (control.Text == UiText.T("여기서 새로 여는 Claude에 적용됩니다. 이미 열린 작업은 바뀌지 않습니다.")
+            || control.Text == UiText.T("ⓘ  창을 열 때 한 번 확인하며, 이후에는 직접 갱신합니다."))))
+            throw new InvalidOperationException("Action-specific guidance belongs with the relevant action, not in a permanent footer.");
+    }
+
+    private static void AssertClaudeRecovery(Form form, ClaudeAccountPanel panel, string profileId)
+    {
+        if (Walk(panel).OfType<ScrollableControl>().Any(control => control.AutoScroll && control.VerticalScroll.Visible))
+            throw new InvalidOperationException("Three Claude profiles and recovery must fit without vertical scrolling.");
+        var recovery = (Button)form.Controls.Find("ClaudeRecoverAccountButton", true).Single();
+        var rowAction = (Button)form.Controls.Find("ClaudeSelect-" + profileId, true).Single();
+        if (!recovery.Visible || !recovery.Enabled || recovery.Text != UiText.T("다시 로그인") || !rowAction.Enabled || rowAction.Text != UiText.T("로그인"))
+            throw new InvalidOperationException("Claude authentication recovery must be explicit and available in both the notice and row.");
+        if (form.Controls.Find("ClaudeSelectedWeeklyRemainingLabel", true).Single().Text != "—")
+            throw new InvalidOperationException("An unauthenticated or changed identity must never display another account's usage.");
+    }
+
+    private static void AssertClaudeUsageRecovery(ClaudeAccountPanel panel, Dictionary<string, ClaudeUsageResult> observations,
+        Dictionary<string, Exception> failures, string profileId, string otherId, DateTimeOffset now)
+    {
+        // Set only fixture state: no login, verification or usage process is invoked.
+        observations[profileId] = new(new(null, new(32, now.AddDays(3)), null), now.AddMinutes(-3), null, true);
+        failures[profileId] = new IOException("fixture usage failure");
+        var setStatus = typeof(ClaudeAccountPanel).GetMethod("SetStatus", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
+        setStatus.Invoke(panel, new object?[] { UiText.T("조회 실패"), true, false, profileId });
+        observations[otherId] = observations[otherId] with { LastUpdatedAt = now.AddMinutes(-2), IsStale = false };
+        panel.Reload();
+        if (!panel.Controls.Find("ClaudeNotice", true).Single().Visible)
+            throw new InvalidOperationException("Another profile's success must not clear a tracked usage failure.");
+        failures.Remove(profileId);
+        observations[profileId] = observations[profileId] with { LastUpdatedAt = now.AddMinutes(-2), IsStale = false };
+        panel.Reload();
+        if (panel.Controls.Find("ClaudeNotice", true).Single().Visible)
+            throw new InvalidOperationException("A new accepted observation must clear that profile's old manual usage failure.");
+        setStatus.Invoke(panel, new object?[] { "fixture non-usage action failure", true, false, null });
+        observations[profileId] = observations[profileId] with { LastUpdatedAt = now.AddMinutes(-1) }; panel.Reload();
+        if (!panel.Controls.Find("ClaudeNotice", true).Single().Visible)
+            throw new InvalidOperationException("An observation must not dismiss errors from other account actions.");
+        setStatus.Invoke(panel, new object?[] { "", false, true, null });
+    }
+
+    private sealed class PreviewClaudeRunner : IClaudeProfileCommandRunner
+    {
+        private static Exception NoAccess() => new InvalidOperationException("A visual fixture must never invoke Claude.");
+        public Task<ClaudeProfileCommandResult> RunStatusAsync(System.Diagnostics.ProcessStartInfo start, CancellationToken token) => throw NoAccess();
+        public Task<int> RunInteractiveAsync(System.Diagnostics.ProcessStartInfo start, CancellationToken token) => throw NoAccess();
+        public Task<int> RunQuietAsync(System.Diagnostics.ProcessStartInfo start, CancellationToken token) => throw NoAccess();
+    }
+    private sealed class PreviewWslBridge : IWslCodexBridge
+    {
+        public Task<IReadOnlyList<string>> ListRunningDistributionsAsync(CancellationToken token) => Task.FromResult<IReadOnlyList<string>>(["Ubuntu"]);
+        public Task<WslCodexProbe> ProbeAsync(string distribution, WslCodexTarget? expected, CancellationToken token) => Task.FromResult(new WslCodexProbe(distribution, WslCodexAvailability.Ready,
+            new(distribution, 1000, "user", "/home/user", "/home/user/.codex", "/usr/local/bin/codex", "codex-cli 0.153.2"), 0, "ready"));
+        public Task<byte[]> ReadAuthAsync(WslCodexTarget target, CancellationToken token) => throw new InvalidOperationException("No fixture authentication access.");
+        public Task ReplaceAuthAsync(WslCodexTarget target, string digest, byte[] auth, CancellationToken token) => throw new InvalidOperationException("No fixture authentication access.");
+        public Task<bool> VerifyOfficialClientAsync(WslCodexTarget target, CancellationToken token) => throw new InvalidOperationException("No fixture authentication access.");
+        public Task<byte[]> LoginAsync(WslCodexTarget target, CancellationToken token, Action<Uri>? onAuthorizationUrl = null) => throw new InvalidOperationException("No fixture authentication access.");
     }
 }

@@ -45,3 +45,12 @@ namespace WeeklyUsageIndicator {
         }
     }
 }
+
+function Enter-WidgetAccountOperation {
+    $operationRoot = Join-Path $env:LOCALAPPDATA 'CodexWeeklyUsageIndicator.Accounts'
+    New-Item -ItemType Directory -Path $operationRoot -Force | Out-Null
+    Assert-WidgetInstallPath -Path $operationRoot
+    $operationPath = Join-Path $operationRoot 'ui-operation.lock'
+    try { return [IO.File]::Open($operationPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
+    catch { throw 'An account operation is in progress. Finish it before installing or uninstalling.' }
+}

@@ -42,7 +42,7 @@ internal sealed class ClaudeCodeUsageSource : IClaudeUsageSource
             if (LooksLikeAuthenticationFailure(result.StandardError) ||
                 LooksLikeAuthenticationFailure(result.StandardOutput))
             {
-                throw new UnauthorizedAccessException("Claude Code login is required.");
+                throw new ClaudeLoginRequiredException();
             }
 
             throw new IOException($"Claude Code /usage exited with code {result.ExitCode}.");
@@ -55,6 +55,30 @@ internal sealed class ClaudeCodeUsageSource : IClaudeUsageSource
     {
         using var document = JsonDocument.Parse(json);
         var root = document.RootElement;
+        JsonElement? usageReport = null;
+        var verbose = root.ValueKind == JsonValueKind.Array;
+        if (verbose)
+        {
+            JsonElement? finalResult = null;
+            foreach (var entry in root.EnumerateArray())
+            {
+                if (entry.ValueKind != JsonValueKind.Object ||
+                    !TryReadString(entry, "type", out var type)) continue;
+                if (type == "result")
+                {
+                    if (finalResult is not null)
+                        throw new InvalidDataException("Claude Code returned multiple /usage results.");
+                    finalResult = entry;
+                }
+                else if (type == "assistant" && entry.TryGetProperty("usage_report", out var report))
+                {
+                    if (usageReport is not null)
+                        throw new InvalidDataException("Claude Code returned multiple /usage reports.");
+                    usageReport = report;
+                }
+            }
+            root = finalResult ?? throw new InvalidDataException("Claude Code returned no /usage result.");
+        }
         if (root.ValueKind != JsonValueKind.Object ||
             !TryReadBoolean(root, "is_error", out var isError) ||
             !TryReadInt32(root, "num_turns", out var numTurns) ||
@@ -67,7 +91,7 @@ internal sealed class ClaudeCodeUsageSource : IClaudeUsageSource
         if (isError)
         {
             if (LooksLikeAuthenticationFailure(resultText))
-                throw new UnauthorizedAccessException("Claude Code login is required.");
+                throw new ClaudeLoginRequiredException();
             throw new IOException("Claude Code could not retrieve /usage.");
         }
 
@@ -75,11 +99,39 @@ internal sealed class ClaudeCodeUsageSource : IClaudeUsageSource
         if (numTurns != 0 || Math.Abs(totalCost) > double.Epsilon)
             throw new InvalidDataException("Claude Code /usage unexpectedly consumed a model turn.");
 
+        if (verbose) RequireCurrentLimits(usageReport);
         return ParseUsageText(resultText, now);
+    }
+
+    private static void RequireCurrentLimits(JsonElement? report)
+    {
+        if (report is not { ValueKind: JsonValueKind.Object } usage ||
+            !usage.TryGetProperty("rate_limits", out var rateLimits))
+            throw new InvalidDataException("Claude Code returned no structured /usage report.");
+
+        // Current CLIs render old fallback percentages without a last-known label,
+        // but omit their structured limits. Reject that fallback. An official
+        // successful snapshot up to 60 seconds old may still be returned here;
+        // this is a check time, not proof of a new network request.
+        if (rateLimits.ValueKind == JsonValueKind.Null)
+            throw new IOException("Claude Code could not retrieve current usage limits.");
+        if (rateLimits.ValueKind != JsonValueKind.Object)
+            throw new InvalidDataException("Claude Code returned invalid structured usage limits.");
+        if (!rateLimits.TryGetProperty("limits", out var limits))
+            throw new IOException("Claude Code returned last-known usage instead of current limits.");
+        if (limits.ValueKind != JsonValueKind.Array)
+            throw new InvalidDataException("Claude Code returned invalid structured usage limits.");
+        if (limits.GetArrayLength() == 0)
+            throw new IOException("Claude Code did not return current usage limits.");
     }
 
     internal static ClaudeUsageSnapshot ParseUsageText(string text, DateTimeOffset now)
     {
+        // The official CLI can fall back to its own cached output. Its observation
+        // time is unavailable here, so do not label that response as a fresh check.
+        if (text.Contains("Showing last-known usage", StringComparison.OrdinalIgnoreCase))
+            throw new IOException("Claude Code returned last-known usage instead of a fresh check.");
+
         ClaudeUsageWindow? fiveHour = null;
         ClaudeUsageWindow? weekly = null;
         ClaudeUsageWindow? fable = null;
@@ -94,10 +146,10 @@ internal sealed class ClaudeCodeUsageSource : IClaudeUsageSource
                 fable = window;
         }
 
-        // Only Fable drives the compact panel. An absent or malformed optional
-        // window must not discard other independently valid limits.
-        if (fable is null)
-            throw new InvalidDataException("Claude Code /usage did not return a valid Fable limit.");
+        // Each limit is independent. Plans without a model-scoped window still
+        // have an all-model weekly window; never substitute one for another.
+        if (fiveHour is null && weekly is null && fable is null)
+            throw new InvalidDataException("Claude Code /usage did not return a valid usage limit.");
 
         return new ClaudeUsageSnapshot(fiveHour, weekly, fable);
     }
@@ -239,17 +291,33 @@ internal sealed class ClaudeCodeUsageSource : IClaudeUsageSource
 
 internal sealed class ClaudeCodeProcessRunner : IClaudeCommandRunner
 {
-    internal static readonly TimeSpan CommandTimeout = TimeSpan.FromSeconds(20);
+    // Claude Code 2.1.321 computes "What's contributing to your usage?" from this machine's
+    // transcripts alongside the limits fetch and answers only when both finish. Observed
+    // 2026-11-14: 27 s and 50 s for one week of shared transcripts, so 20 s timed out the
+    // usual read. The ten-minute interval spaces requests, not this wait.
+    internal static readonly TimeSpan CommandTimeout = TimeSpan.FromMinutes(2);
     private const int MaximumOutputCharacters = 128 * 1024;
+    private readonly string? _configDirectory;
+    private readonly Action<ProcessStartInfo>? _configureProcess;
+
+    internal ClaudeCodeProcessRunner(string? configDirectory = null, Action<ProcessStartInfo>? configureProcess = null)
+    {
+        _configDirectory = configDirectory;
+        _configureProcess = configureProcess;
+    }
 
     public async Task<ClaudeCommandResult> RunUsageAsync(CancellationToken cancellationToken)
     {
         var executablePath = FindClaudeExecutable();
-        var startInfo = CreateStartInfo(executablePath);
+        var startInfo = CreateStartInfo(executablePath, _configDirectory);
+        _configureProcess?.Invoke(startInfo);
         using var process = new Process { StartInfo = startInfo };
         try
         {
             if (!process.Start()) throw new IOException("Claude Code could not be started.");
+            // The prompt is an argument. Close stdin so a print-mode CLI never waits for piped input.
+            try { process.StandardInput.Close(); }
+            catch (IOException) { /* An early exit already closed the pipe; its result follows. */ }
         }
         catch (Win32Exception exception)
         {
@@ -281,13 +349,14 @@ internal sealed class ClaudeCodeProcessRunner : IClaudeCommandRunner
         }
     }
 
-    internal static ProcessStartInfo CreateStartInfo(string executablePath)
+    internal static ProcessStartInfo CreateStartInfo(string executablePath, string? configDirectory = null)
     {
         var startInfo = new ProcessStartInfo
         {
             FileName = executablePath,
             UseShellExecute = false,
             CreateNoWindow = true,
+            RedirectStandardInput = true,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             StandardOutputEncoding = System.Text.Encoding.UTF8,
@@ -302,13 +371,32 @@ internal sealed class ClaudeCodeProcessRunner : IClaudeCommandRunner
             "/usage",
             "--output-format",
             "json",
+            "--verbose",
             "--max-turns",
             "0"
         })
         {
             startInfo.ArgumentList.Add(argument);
         }
+        if (configDirectory is not null)
+        {
+            ConfigureProfileEnvironment(startInfo, configDirectory);
+        }
         return startInfo;
+    }
+
+    internal static void ConfigureProfileEnvironment(ProcessStartInfo startInfo, string configDirectory)
+    {
+        if (!Path.IsPathFullyQualified(configDirectory))
+            throw new ArgumentException("Claude profile directory must be an absolute path.", nameof(configDirectory));
+        startInfo.Environment["CLAUDE_CONFIG_DIR"] = configDirectory;
+        foreach (var variable in new[]
+        {
+            "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR", "ANTHROPIC_PROFILE", "ANTHROPIC_BASE_URL",
+            "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
+            "CLAUDE_CODE_SKIP_BEDROCK_AUTH", "CLAUDE_CODE_SKIP_VERTEX_AUTH", "CLAUDE_CODE_SKIP_FOUNDRY_AUTH"
+        }) startInfo.Environment.Remove(variable);
     }
 
     private static string FindClaudeExecutable()

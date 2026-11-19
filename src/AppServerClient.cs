@@ -436,6 +436,26 @@ internal sealed class AppServerClient : IDisposable
             // Continue to PATH lookup.
         }
 
+        // The npm package puts its native binary under its node_modules; PATH holds only codex.cmd/codex.ps1 shims.
+        var npmCodex = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "npm", "node_modules", "@openai");
+        try
+        {
+            if (Directory.Exists(npmCodex))
+            {
+                var packaged = Directory
+                    .EnumerateFiles(npmCodex, "codex.exe", SearchOption.AllDirectories)
+                    .Select(path => new FileInfo(path))
+                    .OrderByDescending(file => file.LastWriteTimeUtc)
+                    .FirstOrDefault();
+                if (packaged is not null) return packaged.FullName;
+            }
+        }
+        catch
+        {
+            // Continue to PATH lookup.
+        }
+
         var pathValue = Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
         foreach (var directory in pathValue.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries))
         {

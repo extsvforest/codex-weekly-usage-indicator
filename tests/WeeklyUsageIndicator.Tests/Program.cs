@@ -2,6 +2,22 @@ using System.Text.Json;
 using WeeklyUsageIndicator;
 
 if (args.Contains("--english")) UiText.SetLanguage("en");
+if (args.Contains("--live-environment-smoke")) { await LiveEnvironmentSmoke.RunAsync(); return; }
+if (args.Contains("--claude-shelf-live-probe")) { ClaudeSessionShelfTests.LiveProbe(); return; }
+if (args.Contains("--claude-shelf-memory-probe")) { ClaudeShelfMemoryProbe.Run(args); return; }
+if (args.Contains("--account-manager-memory-probe")) { await AccountManagerMemoryProbe.RunAsync(args); return; }
+if (args.Contains("--claude-layout-dry-run")) { ClaudeSessionShelfTests.LayoutDryRun(); return; }
+if (args.Contains("--claude-older-states")) { ClaudeOlderStatesProbe.Run(args); return; }
+if (args.Contains("--claude-sidebar-store-shape")) { ClaudeSessionShelfTests.SidebarStoreShape(); return; }
+if (args.Contains("--claude-layout-diff")) { ClaudeSessionShelfTests.LayoutDiff(args[Array.IndexOf(args, "--claude-layout-diff") + 1], args[Array.IndexOf(args, "--claude-layout-diff") + 2]); return; }
+if (args.Contains("--claude-app-data-tests")) { await ClaudeAppDataTests.RunAsync(); Console.WriteLine("PASS: Claude profile folder"); return; }
+if (args.Contains("--claude-shelf-tests")) { await ClaudeSessionShelfTests.RunAsync(); Console.WriteLine("PASS: Claude session shelf"); return; }
+if (args.Contains("--claude-sync-tests")) { await ClaudeSessionSyncTests.RunAsync(); Console.WriteLine("PASS: Claude session sync"); return; }
+if (args.Contains("--widget-face-preview")) { WidgetFaceTests.Preview(args); return; }
+if (args.Contains("--widget-native-preview")) { await WidgetFaceTests.NativePreview(args); return; }
+if (args.Contains("--widget-face-tests")) { await WidgetFaceTests.RunAsync(); Console.WriteLine("PASS: widget face"); return; }
+if (args.Contains("--claude-menu-smoke")) { await ClaudeAccountMenuSmoke.RunAsync(); return; }
+if (args.Contains("--live-claude-menu-smoke")) { await ClaudeAccountMenuSmoke.RunAsync(live: true); return; }
 if (args.Contains("--language-ui-smoke")) { await LanguageUiSmoke.RunAsync(); return; }
 if (args.Contains("--localization-tests")) { await LocalizationTests.RunAsync(); return; }
 if (args.Contains("--account-style-preview")) { await AccountStylePreview.RunAsync(args.Contains("--hold"), args.Contains("--standard-dpi")); return; }
@@ -30,6 +46,16 @@ var tests = new (string Name, Func<Task> Run)[]
     // Run the brief cursor-driven check first so a local user can resume using the
     // mouse while the slower credential and lifecycle fixtures continue.
     ("stable light tooltip hover, placement and focus", UsageTooltipHoverSmoke.RunAsync),
+    ("widget face: gauges, grounds and states", WidgetFaceTests.RunAsync),
+    ("Claude weekly metric, independent expiry and profile cache", ClaudeMetricTests.RunAll),
+    ("Claude official profile identity and shared local work", ClaudeProfileTests.RunAsync),
+    ("Claude profile folder: legacy roaming, moved out of the package, inside it", ClaudeAppDataTests.RunAsync),
+    ("Claude session shelf: fill by adding and advancing, closed- and running-app writes, account mapping and log observation", ClaudeSessionShelfTests.RunAsync),
+    ("Claude combined weekly total and session-layout plan", ClaudeSessionSyncTests.RunAsync),
+    ("Claude login waits, transient observation and identity invalidation", ClaudeControllerTests.RunAsync),
+    ("Claude account menu actions and inactive-profile usage", () => ClaudeAccountMenuSmoke.RunAsync()),
+    ("account operation lease blocks lifecycle replacement across awaits", AccountOperationLeaseTests.RunAsync),
+    ("WSL native targets, independent login and joint recovery", WslCodexTests.RunAsync),
     ("language switching preserves bounds, snapshots and account data", LanguageUiSmoke.RunAsync),
     ("translation catalogs, known errors and language preferences", LocalizationTests.RunAsync),
     ("Codex app-server lifecycle isolation", AppServerLifecycleTests.RunAsync),
@@ -44,6 +70,7 @@ var tests = new (string Name, Func<Task> Run)[]
     ("multi-account tooltip observations and refresh boundaries", UsageTooltipTests.RunAsync),
     ("supervisor retries abnormal exits but respects normal Quit", TestSupervisorAsync),
     ("official Claude /usage output is parsed", TestObservedUsageOutputAsync),
+    ("verbose official usage rejects seeded fallback and local behavior percentages", TestVerboseUsageOutputAsync),
     ("usage without reset times remains valid through client and tooltip", TestUsageWithoutResetsAsync),
     ("optional limits fail independently", TestIndependentLimitsAsync),
     ("unknown reset format preserves verified percentages", TestUnknownResetFormatAsync),
@@ -52,6 +79,7 @@ var tests = new (string Name, Func<Task> Run)[]
     ("model turns and costs are rejected", TestNoModelTurnGuardAsync),
     ("authentication and malformed output are hard failures", TestSourceHardFailuresAsync),
     ("Claude process invocation is shell-free and session-free", TestProcessArgumentsAsync),
+    ("slow current /usage report parses and a timed-out retry names its cause", TestSlowUsageReportAsync),
     ("ten-minute cache prevents duplicate commands", TestFreshCacheAsync),
     ("transient command failures keep cached usage and back off", TestTransientRecoveryAsync),
     ("persisted usage protects a transient cold start", TestPersistedColdStartAsync),
@@ -63,8 +91,26 @@ var tests = new (string Name, Func<Task> Run)[]
     ("stale tooltip reports last success and next retry", TestStaleTooltipAsync)
 };
 
+if (args.Contains("--claude-usage-tests"))
+{
+    // Window-free Claude usage checks: parsing, invocation, client cache/backoff, metric and controller.
+    var first = Array.FindIndex(tests, test => test.Name == "official Claude /usage output is parsed");
+    foreach (var test in new (string Name, Func<Task> Run)[]
+             {
+                 ("Claude weekly metric, independent expiry and profile cache", ClaudeMetricTests.RunAll),
+                 ("Claude login waits, transient observation and identity invalidation", ClaudeControllerTests.RunAsync)
+             }.Concat(tests[first..]))
+    {
+        await test.Run();
+        Console.WriteLine($"PASS: {test.Name}");
+    }
+    return;
+}
+
 foreach (var test in tests)
 {
+    if (args.Contains("--skip-live-pointer-check") && test.Name == "stable light tooltip hover, placement and focus")
+    { Console.WriteLine("SKIP: live pointer check (explicit flag; run separately)"); continue; }
     await test.Run();
     Console.WriteLine($"PASS: {test.Name}");
 }
@@ -113,6 +159,48 @@ static Task TestObservedUsageOutputAsync()
     Assert(snapshot.Fable?.UsedPercent == 24, "the Fable weekly percentage should be parsed");
     Assert(snapshot.FiveHour?.ResetsAt == new DateTimeOffset(2026, 9, 1, 18, 19, 0, TimeSpan.FromHours(9)),
         "the reset should preserve the reported time zone");
+    return Task.CompletedTask;
+}
+
+static Task TestVerboseUsageOutputAsync()
+{
+    var now = DateTimeOffset.UtcNow;
+    object current = new { rate_limits = new { limits = new[] { new { kind = "weekly", percent = 20 } } } };
+    string Envelope(object? report, string? text = null, int turns = 0, double cost = 0) =>
+        JsonSerializer.Serialize(new object[]
+        {
+            new { type = "system", subtype = "init" },
+            new { type = "assistant", usage_report = report },
+            new { type = "result", is_error = false, num_turns = turns,
+                total_cost_usd = cost, result = text ?? SampleUsageText() }
+        });
+
+    var accepted = ClaudeCodeUsageSource.ParseEnvelope(Envelope(current), now);
+    Assert(accepted.Weekly?.UsedPercent == 20 && accepted.Fable?.UsedPercent == 30,
+        "verbose output retains independently parsed official quota windows");
+    foreach (var unavailable in new object[]
+    {
+        new { rate_limits = (object?)null },
+        new { rate_limits = new { extra_usage = (object?)null } },
+        new { rate_limits = new { limits = Array.Empty<object>() } }
+    })
+    {
+        AssertThrows<IOException>(() => ClaudeCodeUsageSource.ParseEnvelope(Envelope(unavailable), now),
+            "a seeded headless response must not relabel old text percentages as a new observation");
+    }
+    AssertThrows<IOException>(() => ClaudeCodeUsageSource.ParseEnvelope(
+        Envelope(new { rate_limits = (object?)null }, "Last 7d\n87% of your usage was at >150k context"), now),
+        "local behavior percentages are not quota availability");
+    AssertThrows<InvalidDataException>(() => ClaudeCodeUsageSource.ParseEnvelope(Envelope(null), now),
+        "an unknown verbose report schema is rejected");
+    AssertThrows<InvalidDataException>(() => ClaudeCodeUsageSource.ParseEnvelope(Envelope(current, turns: 1), now),
+        "verbose results retain the no-model-turn guard");
+    AssertThrows<InvalidDataException>(() => ClaudeCodeUsageSource.ParseEnvelope(Envelope(current, cost: 0.01), now),
+        "verbose results retain the zero-cost guard");
+    var duplicateResult = "[" + UsageEnvelope(SampleUsageText()).Replace("{", "{\"type\":\"result\",", StringComparison.Ordinal)
+        + "," + UsageEnvelope(SampleUsageText()).Replace("{", "{\"type\":\"result\",", StringComparison.Ordinal) + "]";
+    AssertThrows<InvalidDataException>(() => ClaudeCodeUsageSource.ParseEnvelope(duplicateResult, now),
+        "ambiguous final results are rejected");
     return Task.CompletedTask;
 }
 
@@ -174,9 +262,10 @@ static Task TestInvalidFableAsync()
     var now = DateTimeOffset.UtcNow;
     foreach (var fable in new[] { "", "Current week (Fable): unavailable", "Current week (Fable): 101% used", "Current week (Fable): -1% used", "Current week (Fable): NaN% used", "Current week (Fable): 30% used garbage" })
     {
-        AssertThrows<InvalidDataException>(() => ClaudeCodeUsageSource.ParseUsageText(
-            "Current session: 10% used\nCurrent week (all models): 20% used\n" + fable, now),
-            "invalid Fable usage must not become zero usage or another limit");
+        var result = ClaudeCodeUsageSource.ParseUsageText(
+            "Current session: 10% used\nCurrent week (all models): 20% used\n" + fable, now);
+        Assert(result.Fable is null && result.Weekly?.UsedPercent == 20,
+            "invalid Fable stays missing while an independently valid weekly value survives");
     }
     return Task.CompletedTask;
 }
@@ -214,9 +303,15 @@ static async Task TestSourceHardFailuresAsync()
     var loginRunner = new SequenceCommandRunner(
         new ClaudeCommandResult(1, string.Empty, "Not logged in. Please login."));
     var loginSource = new ClaudeCodeUsageSource(loginRunner, clock);
-    await AssertThrowsAsync<UnauthorizedAccessException>(
+    await AssertThrowsAsync<ClaudeLoginRequiredException>(
         () => loginSource.ReadAsync(CancellationToken.None),
         "a Claude Code login failure should remain a hard failure");
+
+    var loginEnvelope = JsonSerializer.Serialize(new { is_error = true, num_turns = 0,
+        total_cost_usd = 0, result = "Not logged in. Please login." });
+    await AssertThrowsAsync<ClaudeLoginRequiredException>(
+        () => Task.FromResult(ClaudeCodeUsageSource.ParseEnvelope(loginEnvelope, clock.GetUtcNow())),
+        "usage authentication failures expose the same recovery action as auth status");
 
     var malformedSource = new ClaudeCodeUsageSource(
         new SequenceCommandRunner(new ClaudeCommandResult(0, "not-json", string.Empty)),
@@ -243,10 +338,74 @@ static Task TestProcessArgumentsAsync()
     Assert(arguments.Contains("--no-session-persistence"), "the lookup must not leave a resumable session");
     Assert(arguments.Contains("--no-chrome"), "the lookup must not open browser integration");
     Assert(arguments.SequenceEqual([
-        "-p", "--safe-mode", "--no-session-persistence", "--no-chrome", "/usage", "--output-format", "json", "--max-turns", "0"]),
+        "-p", "--safe-mode", "--no-session-persistence", "--no-chrome", "/usage", "--output-format", "json", "--verbose", "--max-turns", "0"]),
         "the command contract should remain exact and reviewable");
     Assert(UsageIndicatorForm.ClaudeRefreshTimeout > ClaudeCodeProcessRunner.CommandTimeout,
         "the UI timeout must leave the process runner time to classify a slow command as transient");
+    Assert(UsageIndicatorForm.ClaudeRefreshTimeout - ClaudeCodeProcessRunner.CommandTimeout >= TimeSpan.FromSeconds(30),
+        "the UI timeout must also cover the identity check that precedes the read");
+    // Observed 2026-11-14 with Claude Code 2.1.321: /usage answered after 27 s and 50 s.
+    Assert(ClaudeCodeProcessRunner.CommandTimeout >= TimeSpan.FromMinutes(2),
+        "the read must outlast the official CLI's local usage analysis");
+    Assert(startInfo.RedirectStandardInput, "print mode must not wait on an inherited or open stdin");
+    return Task.CompletedTask;
+}
+
+static Task TestSlowUsageReportAsync()
+{
+    // Shape of Claude Code 2.1.321 output (2026-11-14): no five-hour line while that window is
+    // idle, structured limits beside the text, and the local analysis after the limits.
+    var now = new DateTimeOffset(2026, 11, 14, 6, 30, 0, TimeSpan.Zero);
+    var text = """
+        You are currently using your subscription to power your Claude Code usage
+
+        Current week (all models): 87% used · resets Nov 14, 6pm (Asia/Seoul)
+        Current week (Fable): 82% used · resets Nov 14, 6pm (Asia/Seoul)
+
+        What's contributing to your usage?
+        Approximate · sessions on this machine only · shares overlap
+
+        Last 24h · 5000 requests · 20 sessions
+          95%  Start fresh when you switch tasks · run /clear
+        """;
+    var raw = JsonSerializer.Serialize(new object[]
+    {
+        new { type = "system", subtype = "init" },
+        new
+        {
+            type = "assistant",
+            usage_report = new
+            {
+                session = new { total_cost_usd = 0, total_duration_ms = 49518 },
+                rate_limits = new
+                {
+                    limits = new object[]
+                    {
+                        new { kind = "weekly_all", group = "weekly", percent = 87, resets_at = "2026-11-14T09:00:00.410151+00:00", scope = (object?)null, is_active = true },
+                        new { kind = "weekly_scoped", group = "weekly", percent = 82, resets_at = "2026-11-14T09:00:00.410262+00:00", scope = new { model = new { display_name = "Fable" } }, is_active = false }
+                    },
+                    extra_usage = new { is_enabled = false }
+                }
+            }
+        },
+        new { type = "result", subtype = "success", is_error = false, num_turns = 0, total_cost_usd = 0,
+            duration_ms = 48587, local_command = "usage", result = text }
+    });
+    var snapshot = ClaudeCodeUsageSource.ParseEnvelope(raw, now);
+    Assert(snapshot.FiveHour is null && snapshot.Weekly?.UsedPercent == 87 && snapshot.Fable?.UsedPercent == 82,
+        "the current report parses its weekly windows and leaves the idle session window absent");
+    Assert(snapshot.Weekly?.ResetsAt == new DateTimeOffset(2026, 11, 14, 18, 0, 0, TimeSpan.FromHours(9)),
+        "the hour-only reset keeps its reported time zone");
+
+    var waited = new TimeoutException("Claude Code /usage timed out.");
+    var retry = DateTimeOffset.Now.AddMinutes(10);
+    var shown = UsageIndicatorForm.FriendlyClaudeError(new ClaudeUsageTemporarilyUnavailableException(retry,
+        new ClaudeUsageTemporarilyUnavailableException(retry, waited)));
+    Assert(shown.StartsWith(UiText.T("Claude 응답 시간이 초과되었습니다."), StringComparison.Ordinal),
+        "a retry wait that follows a timed-out read names the timeout");
+    shown = UsageIndicatorForm.FriendlyClaudeError(new ClaudeUsageTemporarilyUnavailableException(retry));
+    Assert(shown == UiText.T("Claude 사용량 조회가 지연되었습니다. 다음 시도: {0}", shown[(shown.LastIndexOf(": ", StringComparison.Ordinal) + 2)..]),
+        "a plain interval wait keeps the general text");
     return Task.CompletedTask;
 }
 
@@ -281,13 +440,13 @@ static async Task TestTransientRecoveryAsync()
     await client.GetUsageAsync(CancellationToken.None);
     clock.Advance(TimeSpan.FromMinutes(10));
     var first = await client.GetUsageAsync(CancellationToken.None);
-    Assert(first.IsStale && first.RetryAfter == clock.GetUtcNow().AddMinutes(5),
-        "the first transient failure should keep the cache and wait five minutes");
+    Assert(first.IsStale && first.RetryAfter == clock.GetUtcNow().AddMinutes(10),
+        "the first transient failure keeps the cache and observes the ten-minute floor");
 
     var suppressed = await client.GetUsageAsync(CancellationToken.None);
     Assert(suppressed.IsStale && source.ReadCount == 2, "backoff should suppress repeated commands");
 
-    clock.Advance(TimeSpan.FromMinutes(5));
+    clock.Advance(TimeSpan.FromMinutes(10));
     var second = await client.GetUsageAsync(CancellationToken.None);
     Assert(second.RetryAfter == clock.GetUtcNow().AddMinutes(10), "the second failure should wait ten minutes");
 
@@ -391,15 +550,15 @@ static async Task TestExpiredPersistedCacheAsync()
         new SequenceUsageSource(new IOException("offline")),
         new ManualTimeProvider(start),
         resetStore);
-    await AssertThrowsAsync<ClaudeUsageTemporarilyUnavailableException>(
-        () => resetClient.GetUsageAsync(CancellationToken.None),
-        "a snapshot past its Fable reset should not be shown");
-    Assert(resetStore.Entry is null, "a snapshot past its reset should be deleted");
+    var independentlyValid = await resetClient.GetUsageAsync(CancellationToken.None);
+    Assert(ClaudeDisplayMetric.FableWeekly.SelectUsedPercent(independentlyValid.Snapshot, start) is null &&
+        ClaudeDisplayMetric.OverallWeekly.SelectUsedPercent(independentlyValid.Snapshot, start) == 20,
+        "expired Fable is hidden while the still-valid overall window remains visible");
 }
 
 static Task TestFileCacheAsync()
 {
-    var temporaryDirectory = Path.Combine(Path.GetTempPath(), $"WeeklyUsageIndicator.Tests-{Guid.NewGuid():N}");
+    var temporaryDirectory = Path.Combine(Environment.GetEnvironmentVariable("GFS_ACCOUNT_TEST_ROOT") ?? Path.Combine(Path.GetTempPath(), "gfs-agent", "indicator-tests"), $"cache-{Guid.NewGuid():N}");
     Directory.CreateDirectory(temporaryDirectory);
     try
     {
@@ -412,8 +571,8 @@ static Task TestFileCacheAsync()
         using (var document = JsonDocument.Parse(File.ReadAllText(cachePath)))
         {
             var fields = document.RootElement.EnumerateObject().Select(property => property.Name).ToArray();
-            Assert(fields.SequenceEqual(["Snapshot", "LastUpdatedAt"]),
-                "the cache should contain only snapshot and update time");
+            Assert(fields.SequenceEqual(["Snapshot", "LastUpdatedAt", "ProfileKey"]),
+                "the cache contains only sanitized usage and a nonsecret attribution key");
         }
         Assert(store.Load() == entry, "the file cache should round-trip the sanitized snapshot");
 

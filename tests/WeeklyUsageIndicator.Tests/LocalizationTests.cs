@@ -20,6 +20,7 @@ internal static class LocalizationTests
             CheckCatalogs();
             CheckSourceLiteralCoverage();
             CheckMessages();
+            CheckTemplateMatching();
             CheckSnapshotAndTooltip();
             CheckSettings();
             return Task.CompletedTask;
@@ -149,6 +150,58 @@ internal static class LocalizationTests
             Check(UiText.Message("prefix " + canonicalKorean + " suffix") == "prefix " + canonicalKorean + " suffix",
                 "known error matching is anchored to the whole message");
         }
+    }
+
+    /// <summary>
+    /// Known messages are found by ordinal search, not regular expressions (a thousand NonBacktracking patterns held the
+    /// widget near a gigabyte). The oracle is the pattern that search replaced, <c>\A part (?&lt;p0&gt;.*?) part … \z</c>
+    /// (single-line, culture-invariant), on the backtracking engine. With UITEXT_ORACLE=nonbacktracking it runs on the
+    /// engine the widget used before (about 0.7 MB a pattern).
+    /// </summary>
+    private static void CheckTemplateMatching()
+    {
+        var templates = UiText.Templates;
+        var options = RegexOptions.Singleline | RegexOptions.CultureInvariant
+            | (Environment.GetEnvironmentVariable("UITEXT_ORACLE") == "nonbacktracking" ? RegexOptions.NonBacktracking : RegexOptions.None);
+        var oracles = templates.Select(template =>
+        {
+            var pattern = new StringBuilder(@"\A").Append(Regex.Escape(template.Literals[0]));
+            for (var i = 0; i < template.Indices.Length; i++)
+                pattern.Append("(?<p").Append(template.Indices[i]).Append(">.*?)").Append(Regex.Escape(template.Literals[i + 1]));
+            return new Regex(pattern.Append(@"\z").ToString(), options, TimeSpan.FromSeconds(5));
+        }).ToArray();
+        // What each template could have produced (plain values, empty ones, values holding the next part or a placeholder
+        // and a line break, a repeated placeholder given different values), and near misses.
+        var messages = new List<string>();
+        foreach (var template in templates)
+        {
+            string Fill(Func<int, int, string> value)
+            {
+                var text = new StringBuilder(template.Literals[0]);
+                for (var i = 0; i < template.Indices.Length; i++)
+                    text.Append(value(template.Indices[i], i)).Append(template.Literals[i + 1]);
+                return text.ToString();
+            }
+            var plain = Fill((index, _) => "A1B2C3D4-" + index);
+            messages.AddRange([plain, "prefix " + plain, plain + " suffix", plain.Length > 0 ? plain[..^1] : "x",
+                Fill((_, _) => ""),
+                Fill((index, i) => template.Literals[i + 1] + "‘x’" + index + template.Literals[i + 1]),
+                Fill((index, i) => "{0}\r\n" + template.Literals[i] + index),
+                Fill((_, i) => "v" + i)]);
+        }
+        var matched = 0;
+        foreach (var message in messages.Distinct(StringComparer.Ordinal))
+            for (var t = 0; t < templates.Count; t++)
+            {
+                var match = oracles[t].Match(message);
+                var expected = match.Success
+                    ? Enumerable.Range(0, templates[t].ArgumentCount).Select(i => match.Groups["p" + i].Value).ToArray() : null;
+                var actual = templates[t].Match(message)?.Cast<string>().ToArray();
+                if (expected is null ? actual is not null : actual is null || !expected.SequenceEqual(actual))
+                    throw new InvalidOperationException($"template match differs from its pattern {oracles[t]} on: {message}");
+                if (actual is not null) matched++;
+            }
+        Check(matched >= templates.Count, "every template matches what it produced");
     }
 
     private static void CheckSnapshotAndTooltip()

@@ -27,5 +27,7 @@
   "Claude Code could not be started.": "Claude Code를 시작하지 못했습니다.",
   "Claude Code returned too much /usage output.": "Claude Code /usage 응답이 허용 크기를 초과했습니다.",
   "Claude Code /usage timed out.": "Claude Code /usage 응답 시간이 초과되었습니다.",
-  "Claude Code executable was not found.": "Claude Code 실행 파일을 찾지 못했습니다."
+  "Claude Code executable was not found.": "Claude Code 실행 파일을 찾지 못했습니다.",
+  "Claude Code did not return a usable usage limit.": "Claude Code가 유효한 사용량 한도 정보를 반환하지 않았습니다.",
+  "Claude Code /usage did not return a valid usage limit.": "Claude Code /usage가 유효한 사용량 한도 정보를 반환하지 않았습니다."
 }

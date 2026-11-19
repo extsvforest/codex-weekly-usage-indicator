@@ -4,17 +4,20 @@ namespace WeeklyUsageIndicator;
 
 internal static class AccountUiTheme
 {
-    internal static readonly Color Background = Color.FromArgb(251, 250, 248);
-    internal static readonly Color Surface = Color.FromArgb(255, 254, 252);
-    internal static readonly Color Raised = Color.FromArgb(235, 232, 232);
-    internal static readonly Color Border = Color.FromArgb(225, 220, 223);
-    internal static readonly Color Text = Color.FromArgb(44, 28, 39);
-    internal static readonly Color Muted = Color.FromArgb(112, 104, 113);
+    internal static readonly Color Background = Color.FromArgb(246, 243, 237);
+    internal static readonly Color Surface = Color.FromArgb(253, 251, 248);
+    internal static readonly Color Raised = Color.FromArgb(241, 236, 228);
+    internal static readonly Color Border = Color.FromArgb(230, 223, 212);
+    internal static readonly Color Rule = Color.FromArgb(238, 232, 223);
+    internal static readonly Color Text = Color.FromArgb(41, 45, 50);
+    internal static readonly Color Muted = Color.FromArgb(95, 88, 82);
+    internal static readonly Color Subtle = Color.FromArgb(115, 107, 100);
     internal static readonly Color Accent = Color.FromArgb(64, 46, 56);
-    internal static readonly Color Apricot = Color.FromArgb(234, 152, 111);
-    internal static readonly Color Blue = Color.FromArgb(194, 205, 226);
+    internal static readonly Color Apricot = Color.FromArgb(229, 137, 95);
+    internal static readonly Color ActiveInk = Color.FromArgb(156, 74, 39);
+    internal static readonly Color Blue = Color.FromArgb(143, 165, 214);
     internal static readonly Color Butter = Color.FromArgb(240, 213, 155);
-    internal static readonly Color ActiveSurface = Color.FromArgb(244, 241, 239);
+    internal static readonly Color ActiveSurface = Color.FromArgb(252, 240, 227);
     internal static readonly Color Error = Color.FromArgb(171, 52, 42);
     internal static readonly Color Warning = Color.FromArgb(143, 86, 13);
 
@@ -42,6 +45,8 @@ internal static class AccountUiTheme
         form.Font = AccountFonts.Create(9.5f);
         form.AutoScaleDimensions = new SizeF(96, 96);
         form.BackColor = Background;
+        form.BackgroundImage = AccountPaperTexture.Grain;
+        form.BackgroundImageLayout = ImageLayout.Tile;
         form.ForeColor = Text;
         form.ShowIcon = false;
     }
@@ -82,6 +87,18 @@ internal static class AccountUiTheme
         path.AddArc(bounds.Left, bounds.Bottom - diameter, diameter, diameter, 90, 90);
         path.CloseFigure(); return path;
     }
+
+    internal static void PaintSheet(Graphics graphics, Rectangle bounds, float scale)
+    {
+        if (bounds.Width < 3 || bounds.Height < 4) return;
+        graphics.SmoothingMode = SmoothingMode.AntiAlias;
+        var face = new RectangleF(bounds.Left + scale, bounds.Top + scale, bounds.Width - 2 * scale, bounds.Height - 4 * scale);
+        using var shadowShape = Rounded(new RectangleF(face.X, face.Y + 2 * scale, face.Width, face.Height), 8 * scale);
+        using var shadow = new SolidBrush(Color.FromArgb(13, 64, 46, 56)); graphics.FillPath(shadow, shadowShape);
+        using var shape = Rounded(face, 8 * scale);
+        AccountPaperTexture.Fill(graphics, shape, Surface);
+        using var edge = new Pen(Border, scale); graphics.DrawPath(edge, shape);
+    }
 }
 
 internal sealed class AccountButton : Button
@@ -95,8 +112,8 @@ internal sealed class AccountButton : Button
         try { base.OnEnabledChanged(e); }
         finally { SetStyle(ControlStyles.UserPaint, true); Invalidate(); }
     }
-    internal bool Primary { get; init; }
-    internal bool Quiet { get; init; }
+    internal bool Primary { get; set; }
+    internal bool Quiet { get; set; }
     internal bool ActiveBadge { get; set; }
     private bool _hover, _pressed;
     internal AccountButton() => SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
@@ -112,16 +129,21 @@ internal sealed class AccountButton : Button
         // Paint the parent first so eased corners remain clean on every paper tone.
         ButtonRenderer.DrawParentBackground(g, ClientRectangle, this);
         var bounds = new RectangleF(scale, scale, Width - 2 * scale, Height - 3 * scale);
-        using var shape = AccountUiTheme.Rounded(bounds, (ActiveBadge ? 14 : 5) * scale);
-        var fill = ActiveBadge ? Color.FromArgb(251, 224, 213) : !Enabled ? AccountUiTheme.Raised : Primary
+        using var shape = AccountUiTheme.Rounded(bounds, 5 * scale);
+        var fill = !Enabled ? AccountUiTheme.Raised : Primary
             ? (_pressed ? Color.FromArgb(47, 33, 41) : _hover ? Color.FromArgb(87, 63, 77) : AccountUiTheme.Accent)
-            : (_pressed ? AccountUiTheme.Blue : _hover ? Color.FromArgb(243, 237, 229) : AccountUiTheme.Surface);
-        if (!Quiet || (_hover && Enabled))
+            : (_pressed ? Color.FromArgb(235, 225, 215) : _hover ? Color.FromArgb(247, 241, 233) : AccountUiTheme.Surface);
+        if (!ActiveBadge && (!Quiet || (_hover && Enabled)))
         {
-            using var brush = new SolidBrush(fill); g.FillPath(brush, shape);
-            if (!ActiveBadge && !Quiet)
+            if (!Quiet)
             {
-                using var border = new Pen(Primary && Enabled ? fill : Color.FromArgb(181, 166, 179), scale); g.DrawPath(border, shape);
+                using var shadowShape = AccountUiTheme.Rounded(new RectangleF(bounds.X, bounds.Y + scale, bounds.Width, bounds.Height), 5 * scale);
+                using var shadow = new SolidBrush(Color.FromArgb(17, 64, 46, 56)); g.FillPath(shadow, shadowShape);
+            }
+            AccountPaperTexture.Fill(g, shape, fill, dark: Primary && Enabled);
+            if (!Quiet)
+            {
+                using var border = new Pen(Primary && Enabled ? fill : Color.FromArgb(217, 207, 195), scale); g.DrawPath(border, shape);
             }
         }
         if (Focused && ShowFocusCues)
@@ -129,8 +151,17 @@ internal sealed class AccountButton : Button
             using var focus = new Pen(Primary ? AccountUiTheme.Butter : AccountUiTheme.Accent, 1.5f * scale);
             using var ring = AccountUiTheme.Rounded(RectangleF.Inflate(bounds, -3 * scale, -3 * scale), 3 * scale); g.DrawPath(focus, ring);
         }
-        TextRenderer.DrawText(g, Text, Font, Rectangle.Round(bounds), ActiveBadge ? Color.FromArgb(123, 65, 49) : !Enabled ? AccountUiTheme.Muted : Primary ? AccountUiTheme.Surface : AccountUiTheme.Text,
-            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+        var textBounds = Rectangle.Round(bounds);
+        if (ActiveBadge)
+        {
+            var textWidth = TextRenderer.MeasureText(g, Text, Font, Size.Empty, TextFormatFlags.NoPadding | TextFormatFlags.SingleLine).Width;
+            var left = Math.Max(3 * scale, (Width - textWidth - 18 * scale) / 2f);
+            using var check = new Pen(AccountUiTheme.ActiveInk, 1.4f * scale) { StartCap = LineCap.Round, EndCap = LineCap.Round };
+            g.DrawLines(check, new[] { new PointF(left, Height / 2f), new PointF(left + 3 * scale, Height / 2f + 3 * scale), new PointF(left + 9 * scale, Height / 2f - 4 * scale) });
+            textBounds = Rectangle.FromLTRB((int)(left + 14 * scale), textBounds.Top, Width, textBounds.Bottom);
+        }
+        TextRenderer.DrawText(g, Text, Font, textBounds, ActiveBadge ? AccountUiTheme.ActiveInk : !Enabled ? AccountUiTheme.Muted : Primary ? AccountUiTheme.Surface : AccountUiTheme.Text,
+            (ActiveBadge ? TextFormatFlags.Left : TextFormatFlags.HorizontalCenter) | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
     }
     protected override void OnMouseEnter(EventArgs e) { _hover = true; Invalidate(); base.OnMouseEnter(e); }
     protected override void OnMouseLeave(EventArgs e) { _hover = _pressed = false; Invalidate(); base.OnMouseLeave(e); }
@@ -142,22 +173,32 @@ internal sealed class AccountButton : Button
     protected override void OnGotFocus(EventArgs e) { Invalidate(); base.OnGotFocus(e); }
 }
 
-// Flat surfaces use rules and a single active-row tint, rather than nested cards.
+// One shallow sheet contains the overview; the table uses the same paper edge.
 internal sealed class AccountSummaryLayout : TableLayoutPanel
 {
-    internal AccountSummaryLayout() => DoubleBuffered = true;
+    internal AccountSummaryLayout() { DoubleBuffered = true; BackColor = Color.Transparent; }
     protected override void OnPaintBackground(PaintEventArgs e)
     {
         base.OnPaintBackground(e);
         var scale = DeviceDpi / 96f;
-        using var rule = new Pen(AccountUiTheme.Border, scale);
-        e.Graphics.DrawLine(rule, 0, Height - scale, Width, Height - scale);
+        AccountUiTheme.PaintSheet(e.Graphics, ClientRectangle, scale);
+        using var rule = new Pen(AccountUiTheme.Rule, scale);
         var x = 0;
-        foreach (var width in GetColumnWidths().Take(2))
+        foreach (var width in GetColumnWidths().Take(Math.Max(0, ColumnCount - 1)))
         {
             x += width;
-            e.Graphics.DrawLine(rule, x, 6 * scale, x, Height - 28 * scale);
+            e.Graphics.DrawLine(rule, x, 18 * scale, x, Height - 22 * scale);
         }
+    }
+}
+
+internal sealed class AccountSheetLayout : TableLayoutPanel
+{
+    internal AccountSheetLayout() { DoubleBuffered = true; BackColor = Color.Transparent; }
+    protected override void OnPaintBackground(PaintEventArgs e)
+    {
+        base.OnPaintBackground(e);
+        AccountUiTheme.PaintSheet(e.Graphics, ClientRectangle, DeviceDpi / 96f);
     }
 }
 
@@ -169,32 +210,15 @@ internal sealed class AccountRowLayout : TableLayoutPanel
     {
         base.OnPaintBackground(e);
         var scale = DeviceDpi / 96f;
+        AccountPaperTexture.Fill(e.Graphics, ClientRectangle, Active ? AccountUiTheme.ActiveSurface : AccountUiTheme.Surface);
         if (Active)
         {
             e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-            using var shape = AccountUiTheme.Rounded(new RectangleF(0, 0, Width, Height), 5 * scale);
-            using var fill = new SolidBrush(AccountUiTheme.ActiveSurface); e.Graphics.FillPath(fill, shape);
+            using var shape = AccountUiTheme.Rounded(new RectangleF(0, 18 * scale, 3 * scale, Math.Max(1, Height - 36 * scale)), 1.5f * scale);
+            using var fill = new SolidBrush(AccountUiTheme.Apricot); e.Graphics.FillPath(fill, shape);
         }
-        using var rule = new Pen(AccountUiTheme.Border, scale);
+        using var rule = new Pen(AccountUiTheme.Rule, scale);
         e.Graphics.DrawLine(rule, 0, Height - scale, Width, Height - scale);
-    }
-}
-
-internal sealed class AccountIdentityTile : Control
-{
-    internal Color TileColor { get; set; }
-    internal AccountIdentityTile()
-    {
-        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.SupportsTransparentBackColor, true);
-        BackColor = Color.Transparent; Font = AccountFonts.Create(12, semibold: true);
-    }
-    protected override void OnPaint(PaintEventArgs e)
-    {
-        var scale = DeviceDpi / 96f; e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-        using var shape = AccountUiTheme.Rounded(new RectangleF(0, 0, Width, Height), 8 * scale);
-        using var fill = new SolidBrush(TileColor); e.Graphics.FillPath(fill, shape);
-        TextRenderer.DrawText(e.Graphics, Text, Font, ClientRectangle, AccountUiTheme.Text,
-            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
     }
 }
 
@@ -221,8 +245,8 @@ internal sealed class AccountMenuColors : ProfessionalColorTable
 {
     public override Color ToolStripDropDownBackground => AccountUiTheme.Surface;
     public override Color MenuBorder => AccountUiTheme.Border;
-    public override Color MenuItemSelected => AccountUiTheme.Blue;
-    public override Color MenuItemBorder => AccountUiTheme.Blue;
+    public override Color MenuItemSelected => AccountUiTheme.ActiveSurface;
+    public override Color MenuItemBorder => AccountUiTheme.Border;
     public override Color SeparatorDark => AccountUiTheme.Border;
     public override Color SeparatorLight => AccountUiTheme.Surface;
 }
@@ -232,6 +256,7 @@ internal sealed class AccountUsageBar : Control
     private int? _remaining;
     internal int? Remaining { get => _remaining; set { _remaining = value; Invalidate(); } }
     internal Color FillColor { get; set; } = AccountUiTheme.Accent;
+    internal Color TrackColor { get; set; } = AccountUiTheme.Raised;
 
     internal AccountUsageBar()
     {
@@ -247,14 +272,70 @@ internal sealed class AccountUsageBar : Control
         e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
         var bounds = new RectangleF(0, 0, Width, Height);
         using var shape = AccountUiTheme.Rounded(bounds, Height / 2f);
-        using var track = new SolidBrush(AccountUiTheme.Raised);
+        using var track = new SolidBrush(TrackColor);
         e.Graphics.FillPath(track, shape);
-        if (_remaining is { } remaining)
+        if (_remaining is { } remaining && remaining > 0)
         {
-            using var fill = new SolidBrush(remaining <= 15 ? AccountUiTheme.Warning : FillColor);
+            using var fill = new SolidBrush(FillColor);
             var state = e.Graphics.Save(); e.Graphics.SetClip(shape);
-            e.Graphics.FillRectangle(fill, 0, 0, Width * Math.Clamp(remaining, 0, 100) / 100f, Height);
+            using var amount = AccountUiTheme.Rounded(new RectangleF(0, 0, Width * Math.Clamp(remaining, 0, 100) / 100f, Height), Height / 2f);
+            e.Graphics.FillPath(fill, amount);
             e.Graphics.Restore(state);
         }
+    }
+}
+
+// A native Label keeps its text and accessibility contract while units use a
+// smaller face on the same baseline. The value is never baked into an image.
+internal sealed class AccountMetricLabel : Label
+{
+    private Font? _unitFont;
+    private const TextFormatFlags MeasureFlags = TextFormatFlags.NoPadding | TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix;
+    private Font UnitFont => _unitFont ??= AccountFonts.Create(Font.SizeInPoints * .64f);
+
+    internal AccountMetricLabel(float size)
+    {
+        SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+        Font = AccountFonts.Create(size, semibold: true); ForeColor = AccountUiTheme.Text;
+        BackColor = Color.Transparent; AutoSize = false; AutoEllipsis = true;
+        TextAlign = ContentAlignment.MiddleLeft; Margin = new Padding(0); UseMnemonic = false;
+    }
+
+    internal int ContentWidth => Parts().Sum(part => TextRenderer.MeasureText(part.Text, part.Number ? Font : UnitFont, Size.Empty, MeasureFlags).Width);
+
+    private IEnumerable<(string Text, bool Number)> Parts() => System.Text.RegularExpressions.Regex.Matches(Text, @"[0-9]+|[^0-9]+")
+        .Cast<System.Text.RegularExpressions.Match>().Select(match => (match.Value, char.IsDigit(match.Value[0])));
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        var parts = Parts().ToArray();
+        var width = parts.Sum(part => TextRenderer.MeasureText(e.Graphics, part.Text, part.Number ? Font : UnitFont, Size.Empty, MeasureFlags).Width);
+        if (!parts.Any(part => part.Number) || width > ClientSize.Width)
+        {
+            TextRenderer.DrawText(e.Graphics, Text, UnitFont, ClientRectangle, ForeColor,
+                MeasureFlags | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
+            return;
+        }
+        var lineHeight = TextRenderer.MeasureText(e.Graphics, "0123456789", Font, Size.Empty, MeasureFlags).Height;
+        var top = Math.Max(0, (Height - lineHeight) / 2);
+        float Ascent(Font font) => font.SizeInPoints * e.Graphics.DpiY / 72f * font.FontFamily.GetCellAscent(font.Style) / font.FontFamily.GetEmHeight(font.Style);
+        var baseline = top + Ascent(Font); var x = 0;
+        foreach (var part in parts)
+        {
+            var font = part.Number ? Font : UnitFont;
+            var measured = TextRenderer.MeasureText(e.Graphics, part.Text, font, Size.Empty, MeasureFlags);
+            var y = (int)Math.Round(baseline - Ascent(font));
+            TextRenderer.DrawText(e.Graphics, part.Text, font, new Rectangle(x, y, measured.Width + 2, Math.Max(measured.Height, Height - y)), ForeColor, MeasureFlags);
+            x += measured.Width;
+        }
+    }
+
+    protected override void OnFontChanged(EventArgs e)
+    {
+        _unitFont?.Dispose(); _unitFont = null; base.OnFontChanged(e);
+    }
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing) _unitFont?.Dispose(); base.Dispose(disposing);
     }
 }
