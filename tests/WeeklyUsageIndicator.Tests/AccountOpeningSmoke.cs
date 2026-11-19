@@ -96,7 +96,9 @@ internal static class AccountOpeningSmoke
                                 if (i < 2) Check(Same(opening, Geometry()), "rows must not shuffle or resize after each partial response");
                             }
                             await Until(() => !form.IsOperationInProgress);
-                            Check(Table().Items.Count == 3 && !Table().VerticalScroll.Visible, "three rows fit without scroll after completion");
+                            // A screen smaller than the designed window (the CI runners') clamps it and the list scrolls.
+                            var designedSize = form.Height < Screen.FromControl(form).WorkingArea.Height;
+                            Check(Table().Items.Count == 3 && (!designedSize || !Table().VerticalScroll.Visible), "three rows fit without scroll after completion");
                             var expectedOrder = form.CombinedUsage.ByReset().Select(r => "AccountRow-" + r.Account.Id);
                             var actualOrder = Geometry().Where(p => p.Key.StartsWith("AccountRow-", StringComparison.Ordinal)).OrderBy(p => p.Value.Top).Select(p => p.Key);
                             Check(expectedOrder.SequenceEqual(actualOrder), "the final rows use nearest reset order");
