@@ -1,6 +1,8 @@
 using System.Text.Json;
 using WeeklyUsageIndicator;
 
+// Started by an Antigravity read under test in place of agy: nothing else of this program runs.
+if (AntigravityTests.StandIn(args) is { } standInExit) Environment.Exit(standInExit);
 if (args.Contains("--english")) UiText.SetLanguage("en");
 if (args.Contains("--live-environment-smoke")) { await LiveEnvironmentSmoke.RunAsync(); return; }
 if (args.Contains("--claude-shelf-live-probe")) { ClaudeSessionShelfTests.LiveProbe(); return; }
@@ -17,6 +19,9 @@ if (args.Contains("--claude-sync-tests")) { await ClaudeSessionSyncTests.RunAsyn
 if (args.Contains("--widget-face-preview")) { WidgetFaceTests.Preview(args); return; }
 if (args.Contains("--widget-native-preview")) { await WidgetFaceTests.NativePreview(args); return; }
 if (args.Contains("--widget-face-tests")) { await WidgetFaceTests.RunAsync(); Console.WriteLine("PASS: widget face"); return; }
+if (args.Contains("--widget-scale-tests")) { await WidgetScaleTests.RunAsync(); Console.WriteLine("PASS: widget scale"); return; }
+if (args.Contains("--antigravity-tests")) { await AntigravityTests.RunAsync(); Console.WriteLine("PASS: Antigravity usage"); return; }
+if (args.Contains("--antigravity-live-check")) { await AntigravityTests.LiveCheckAsync(); return; }
 if (args.Contains("--claude-menu-smoke")) { await ClaudeAccountMenuSmoke.RunAsync(); return; }
 if (args.Contains("--live-claude-menu-smoke")) { await ClaudeAccountMenuSmoke.RunAsync(live: true); return; }
 if (args.Contains("--language-ui-smoke")) { await LanguageUiSmoke.RunAsync(); return; }
@@ -48,6 +53,8 @@ var tests = new (string Name, Func<Task> Run)[]
     // mouse while the slower credential and lifecycle fixtures continue.
     ("stable light tooltip hover, placement and focus", UsageTooltipHoverSmoke.RunAsync),
     ("widget face: gauges, grounds and states", WidgetFaceTests.RunAsync),
+    ("widget scale: placement, menu and the size window", WidgetScaleTests.RunAsync),
+    ("Antigravity usage: report, account, store and one read at a time", AntigravityTests.RunAsync),
     ("Claude weekly metric, independent expiry and profile cache", ClaudeMetricTests.RunAll),
     ("Claude official profile identity, link-free profiles and junction-only retirement", ClaudeProfileTests.RunAsync),
     ("Claude profile folder: legacy roaming, moved out of the package, inside it", ClaudeAppDataTests.RunAsync),

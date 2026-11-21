@@ -23,8 +23,10 @@ style: firm Korean typography against warm, thin paper surfaces.
   The name field keeps a native TextBox inside a padded frame. Menus and hover
   details use the same paper palette and typography.
 - Tooltip placement, mouse transparency, nonactivation and hover lifecycle are
-  unchanged. The widget's dimensions, provider colors and alias-free display stay
-  unchanged. No account authentication or usage query implementation changed.
+  unchanged. The widget's dimensions (272 × 64 by default, drawn at the scale the
+  user chooses and still not following the display's), provider colors and
+  alias-free display stay unchanged. No account authentication or usage query
+  implementation changed.
 
 Font source: https://github.com/orioncactus/pretendard/tree/v1.3.9/packages/pretendard/dist/public/static/alternative
 See `THIRD_PARTY_NOTICES.txt` for the full SIL Open Font License and copyright.
