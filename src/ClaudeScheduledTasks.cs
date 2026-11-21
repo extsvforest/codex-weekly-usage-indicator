@@ -1144,11 +1144,12 @@ internal sealed class ClaudeScheduledSync
         JsonObject Extra, string? FilePath, ClaudeScheduledChoice Chosen, string[] Stamps);
 
     /// <summary>Records, for each list that reads, what changed since it was last seen (a list seen for the first time
-    /// is only taken as it is). A task gone from a list is removed there only. A task back as it was before this
-    /// widget's write, which the app has not loaded since, may be the user undoing it or the app saving a copy it read
-    /// before: it is neither spread nor written again (a task this widget made counts as removed there, a changed one as
-    /// in conflict). A deleted task's id that turns up is a new task when it was made after the deletion, and otherwise
-    /// a copy of the one deleted, removed there too.</summary>
+    /// is only taken as it is, but for a deleted task's id, as below). A task gone from a list is removed there only. A
+    /// task back as it was before this widget's write, which the app has not loaded since, may be the user undoing it or
+    /// the app saving a copy it read before: it is neither spread nor written again (a task this widget made counts as
+    /// removed there, a changed one as in conflict). A deleted task's id that turns up, in a list seen before or for the
+    /// first time, is a new task when it was made after the deletion, and otherwise a copy of the one deleted, removed
+    /// there too.</summary>
     internal static void Record(ClaudeScheduledState state, IReadOnlyList<ClaudeScheduledFile> files, DateTimeOffset now,
         ClaudeScheduledLogView? log)
     {
@@ -1163,6 +1164,13 @@ internal sealed class ClaudeScheduledSync
             if (!state.Accounts.TryGetValue(file.Key, out var account))
             {
                 state.Accounts[file.Key] = new ClaudeScheduledState.AccountState { Since = now, Seen = now, Entries = current };
+                // Taken as it is, but a deleted task's id in it is still a new task or a copy of the one deleted.
+                foreach (var id in current.Keys)
+                {
+                    if (!state.Deleted.TryGetValue(id, out var deletion)) continue;
+                    if (MadeAfter(file.Entries[id], deletion)) reborn.Add(id);
+                    else copies.Add((id, file.Key));
+                }
                 continue;
             }
             var lower = account.Seen;

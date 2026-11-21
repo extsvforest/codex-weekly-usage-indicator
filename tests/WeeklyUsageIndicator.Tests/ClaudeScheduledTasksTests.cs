@@ -26,6 +26,7 @@ internal static class ClaudeScheduledTasksTests
         TestRemoveCommand();
         TestNamedSeedRestores();
         TestDeletedIdMadeAgain();
+        TestDeletedIdInFirstSeenList();
         TestRevertIsNoChange();
         TestUnorderedChangesConflict();
         TestUpdateKeepsTargetFields();
@@ -539,6 +540,38 @@ internal static class ClaudeScheduledTasksTests
             "a seed naming a task removed by command ends the deletion and fills it from the account still holding it");
         Pass(sync, fixture, T0.AddMinutes(8));
         Check(Are(fixture.Ids(a), "other", "brief") && Are(fixture.Ids(b), "brief", "other"), "and nothing removes it after");
+    }
+
+    // A list seen for the first time holding a deleted task's id: a copy (made at or before the deletion) is removed
+    // there too, the loaded list once it may be written, its previous content kept; one made after is a new task.
+    private static void TestDeletedIdInFirstSeenList()
+    {
+        using var fixture = new Fixture("A", "B");
+        var (a, b) = (fixture[0], fixture[1]);
+        fixture.Define("old", "brief", "keep");
+        foreach (var account in fixture.Accounts) fixture.Write(account, List(Entry("old"), Entry("brief"), Entry("keep")));
+        var sync = fixture.Sync();
+        Pass(sync, fixture, T0);
+        Pass(sync, fixture, T0.AddMinutes(1), request: new("remove", ["old", "brief"]));
+        // Two lists not seen before: D with a copy, E (the one the app has loaded) with a copy and a "brief" made after
+        // the removal, running with more than asking.
+        var (d, e) = (fixture.Folder("D"), fixture.Folder("E"));
+        var made = T0.AddMinutes(2).ToUnixTimeMilliseconds();
+        fixture.Write(d, List(Entry("old"), Entry("keep")));
+        fixture.Write(e, List(Entry("old"), Entry("brief", "0 6 * * *", entry => { entry["createdAt"] = made; Bypass(entry); })));
+        var before = fixture.Bytes(d);
+        Pass(sync, fixture, T0.AddMinutes(3), key => key != e.Key);
+        Check(Are(fixture.Ids(d), "keep") && Are(fixture.Ids(e), "old", "brief")
+              && Directory.GetFiles(sync.BackupFolder(d.Key)).Any(path => File.ReadAllBytes(path).SequenceEqual(before)),
+            "a copy of a deleted task in a list seen for the first time is removed there, its previous content kept");
+        Pass(sync, fixture, T0.AddMinutes(4));
+        Check(Are(fixture.Ids(e), "brief") && Are(fixture.Ids(a), "keep") && Are(fixture.Ids(b), "keep") && Are(fixture.Ids(d), "keep"),
+            "and from the loaded one once it may be written; the task made after stays, and a first look spreads nothing");
+        fixture.Edit(e, "brief", entry => entry["cronExpression"] = "0 7 * * *");
+        var pass = Pass(sync, fixture, T0.AddMinutes(5));
+        var seed = Pass(sync, fixture, T0.AddMinutes(6), request: new("seed", [])).Answer!;
+        Check(Are(pass.Held, "brief") && Skipped(seed, "brief") == "raises_permission" && Are(fixture.Ids(a), "keep") && Are(fixture.Ids(d), "keep"),
+            "the task made after is a new task, its deletion over, though first seen: its edit does not carry what it was not seen choosing");
     }
 
     // P0-5: a task back to what it held before this widget's write is not spread, nor written again.
