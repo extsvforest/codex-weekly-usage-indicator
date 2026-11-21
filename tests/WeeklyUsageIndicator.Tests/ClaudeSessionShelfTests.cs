@@ -679,6 +679,32 @@ internal static class ClaudeSessionShelfTests
     private const string Header5 = "const e=require(\"./index.chunk-B2zFLoEJ.js\"),Gt=require(\"./index.chunk-Q2iYtP6L.js\"),Kt=require(\"./index.chunk-BNMstLw_.js\");";
     private const string Exports5 = "exports.c=Ge,exports.d=We,exports.f=Ze,exports.i=Ke,exports.u=tt;";
     private const string Other5 = "async function Qe(e,t,n){return null}";
+    // 6.28899.6.0, verbatim: the removal is split into a first pass that writes markers (`it`), a second pass that
+    // reaps (`at`) and the exported function that joins them (`ot`, exports.f); the session delete names a block-local
+    // list like its checks. The other parts are the 5.11492 shapes under new minified names.
+    private const string Walk6 =
+        "for(let n of c){if(!n.isDirectory()||i?.currentOrgOnly&&n.name!==r().accountId)continue;let c=(0,Z.join)(s,n.name),l;try{l=await Q.default.promises.readdir(c,{withFileTypes:!0})}catch(e){if(i?.failClosed)throw e;o&&Ic(e)&&(o.indexUnreadable=!0,t.lWt.warn(`${t.$Mt} session index account dir unreadable (${t.LUt(e)})`));continue}for(let s of l){if(!s.isDirectory())continue;let l=(0,Z.join)(c,s.name),u=a===void 0&&n.name===r().accountId&&s.name===r().orgId;if(i?.currentOrgOnly&&!u)continue;let d;try{d=await Q.default.promises.readdir(l,{withFileTypes:!0})}catch(e){if(i?.failClosed)throw e;o&&Ic(e)&&(o.indexUnreadable=!0,t.lWt.warn(`${t.$Mt} session index org dir unreadable (${t.LUt(e)})`));continue}for(let r of d){if(!r.isFile())continue;if(r.name.startsWith(\"deleted_\")){i?.recordsOnly||e.add(r.name.slice(gn.r.length)),o&&Lc(o,await Kc((0,Z.join)(l,r.name),o),\"delete tombstone\");continue}if(o&&r.name===nl){for(let e of await qc((0,Z.join)(l,r.name),o))Lc(o,e,\"scheduled task\");continue}let a=i?.mirrors&&r.name.endsWith(\".json.tmp\")?\".json.tmp\":\".json\";if(!r.name.startsWith(\"local_\")||!r.name.endsWith(a)||u&&i?.skipOwnRecordsOf?.has(r.name.slice(0,-a.length)))continue;let c=r.name.slice(t.TFt.length,-a.length);if(!u)e.add(c);else if(i?.foldedSessionStems?.has(c)){e.add(c);continue}let d=(0,Z.join)(l,r.name),f=async(a,o,c)=>{let l=await Jc(a,void 0,{failClosed:!0});e.add(o);for(let t of[...l.live,...l.lineage,...i?.mirrors?l.remoteLineage:[]])e.add(t);t.lWt.warn(`[CCD] session record ${n.name}/${s.name}/${r.name} ${c}; its ids kept as claims`)};try{let n=await Q.default.promises.stat(d);if(n.size>10485760){if(i?.failClosed){await f(d,c,`oversized (${n.size} bytes)`);continue}i?.localOnly||Vc(await Jc(d,o),e,u,o,c);continue}let r=JSON.parse(await Q.default.promises.readFile(d,\"utf-8\"));if(u&&e.add(c),(r.sshConfig||r.wslConfig)&&typeof r.lastAssistantUuid==\"string\"&&t.XWt(r.lastAssistantUuid)&&i?.lastAnswers?.add(r.lastAssistantUuid),o&&zc(o,{...r,stem:c,priorCliSessionIds:We.i(r.priorCliSessionIds)},\"session record\"),i?.localOnly&&(r.sshConfig||r.wslConfig||t.LY({violinBow:r.violinBow===!0})))continue;";
+    private const string CollectIds6 =
+        "for(let n of[r.cliSessionId,r.unarchivedCliSessionId])typeof n==\"string\"&&(!i?.localOnly||t.XWt(n))&&e.add(n);for(let t of[...We.i(r.priorCliSessionIds)??[],...We.i(r.overflowCliSessionIds,5e3)??[],...i?.mirrors&&[...We.i(r.priorRemoteCliSessionIds,1900)??[],...We.i(r.overflowRemoteCliSessionIds,5e3)??[]]||[]])e.add(t)}catch(a){}";
+    private const string Reap6 =
+        "async function qie(e,n,r,i,a,o){let s=i!==void 0,c=(e,t)=>R5(n,e,t,s);if(i!==void 0&&await Wie(r,i))return c(\"written_since_idle_cutoff\",\"was written into after the cleanup's idle cutoff\");let l=await(await e.discovery()).liveOwnershipRefusal(n);if(l?.reason===t.YIt.Running)return c(\"writer_running\",\"is in use by a Claude Code process\");if(l?.reason===t.YIt.LivenessUnknown&&i===void 0)return c(\"liveness_unknown\",`could not be checked against running Claude Code processes (${l.detail})`);let u=await e.claimedOnDisk();return u===null?c(\"records_unreadable\",\"could not be checked against the session records on disk\"):u.has(n)?c(\"claimed_elsewhere\",\"is claimed by a session of another account or profile on this computer\"):!s&&t.hZ()&&await Gie(r,o+L5)?c(\"written_since_own_activity\",\"was written into, since this app last used it, by a process the app did not run\"):!e.claims().localIdsClaimedByOthers(a,{adopting:!0}).has(n)||c(\"claimed_elsewhere\",\"is claimed by another session\")}";
+    private const string Claims6 =
+        "cliSessionIdsClaimedOnDisk(){let n=Date.now(),r=`${this.currentAccountId??\"\"}/${this.currentOrgId??\"\"}`;if(this.onDiskClaims&&this.onDiskClaims.scope===r&&n-this.onDiskClaims.at<e.ON_DISK_CLAIMS_TTL_MS)return this.onDiskClaims.ids;let i={failClosed:!0,localOnly:!0,recordsOnly:!0,skipOwnRecordsOf:new Set([...this.sessions.keys(),...this.deletingSessionIds.keys()])},a=(async()=>{let e=new Set;try{await il(e,{userDataPath:this.userDataPath,baseDir:this.baseDir},(()=>this.getAccountIds()),i);for(let t of await Yc({userDataPath:this.userDataPath,baseDir:this.baseDir},{refuseUnc:!0}))await il(e,{userDataPath:this.userDataPath,baseDir:this.baseDir},(()=>this.getAccountIds()),{...i,foreignRootDir:t});return e}catch(e){return t.lWt.warn(`[CCD] session records on disk unreadable (${t.LUt(e)}); transcripts left on disk for Claude Code's periodic cleanup`),null}})();return this.onDiskClaims={at:n,scope:r,ids:a},a}";
+    private const string Release6 =
+        "function Jie(e,t,n,r,i){let a=i!==void 0;return{mayRelease:async t=>!((await e.claimedOnDisk())?.has(t)??!1),reapAfter:r,reapIf:async(o,s)=>r!==void 0&&!await r?R5(o,\"own_process_running\",\"may still be written by this session's Claude Code process, whose exit could not be confirmed\",a):qie(e,o,s,i,t,Uie(n,o)),keptInDoubt:e=>Kie(e,a)}}";
+    private const string Call6 =
+        "let i=Jie(this.reapChecks,e,m,k,r.reapTranscriptsIdleSince),l=this.transcriptIdClaims.localTranscriptIds(m),u=await(a?.owe(l,k,o&&!m.prewarmHidden&&A?.length===l.length?Yie(this.reapChecks,i,e,{resolver:this.diskTranscript,ids:l,hints:mn.C(m),beforeSetAside:()=>this.clearOnDiskClaimsOlderThan(D)}):void 0));if(o){await Q.default.promises.rm(`${o}.tmp`,{force:!0}),await Q.default.promises.rm(o,{force:!0}),c=!0,this.archivedIdsHint.forget((0,Z.dirname)(o),e);let n=this.getScratchScope();if(m.backend.kind===\"local\"&&!$c(m.cwd,this,this.changeCwdInFlight)&&!m.prewarmHidden&&n!==null){let e=t.N1(m.cwd),r=t.j1(n.accountId,n.orgId);e!==null&&e.startsWith(r+Z.sep)&&!this.listSessionCwds().some((n=>t.N1(n)===e))&&mn.removeScratchWorkspace(e).catch((e=>t.lWt.warn(`[CCD] scratch workspace removal on delete failed: ${e.code??\"unknown\"}`)))}if(m.stagedTranscriptPath&&t.sUt(m.stagedTranscriptPath,(0,Z.join)((0,Z.dirname)(o),\"imported-staging\"))&&await Q.default.promises.rm(m.stagedTranscriptPath,{force:!0}).catch((e=>{t.lWt.warn(`[CCD] staged import transcript could not be removed on delete (${t.LUt(e)})`)})),m.prewarmHidden){s=!0;return}let r=this.transcriptIdClaims.cliSessionIdsClaimedByLoadedSessions({localOnly:!0,except:e}),i=[...new Set([e.startsWith(\"local_\")?e.slice(t.TFt.length):e,...this.transcriptIdClaims.localTranscriptIds(m)].filter((e=>!!e&&!r.has(e))))];await gn.c((0,Z.dirname)(o),i,Date.now()),b.n()}if(A&&!u){let t=this.transcriptIdClaims.localIdsClaimedByOthers(e);this.clearOnDiskClaimsOlderThan(D);let n=mn.f(this.diskTranscript,A.filter((e=>!t.has(e))),mn.C(m),\"delete\",i);a?.reaps(n)}";
+    private const string Aside6 =
+        "function Yie(e,t,n,r){let i=t=>e.claims().localIdsClaimedByOthers(n,{adopting:!0}).has(t);return{setAside:(e,n)=>(r.beforeSetAside(),mn.d(r.resolver,r.ids,r.hints,{...t,nonce:e,notWrittenSince:n,mayRelease:async e=>!i(e)&&await t.mayRelease(e)})),finish:async(a,o)=>{let s=await mn.i(a,o,(async n=>i(n)||await e.claimedOnDisk()===null||!await t.mayRelease(n))),c=e.claims().localIdsClaimedByOthers(n,{adopting:!0});return await mn.f(r.resolver,r.ids.filter((e=>!c.has(e))),r.hints,\"delete\",{mayRelease:t.mayRelease}),s}}}";
+    private const string Remove6 =
+        "async function it(e,n,r,i,a={}){let o=[],s=[],c;for(let l of new Set(n)){if(!l||!I(l))continue;let n={cliSessionId:l,declined:!1,resolved:null,dirs:[],marked:[],complete:!1};s.push(n),o.push(z(l,async()=>{try{if(a.mayRelease&&!await a.mayRelease(l)){n.declined=!0;return}}catch{return}let{resolved:o,dirs:s,complete:u}=await U(e,l,r,()=>c??=V());Object.assign(n,{resolved:o,dirs:s,complete:u});for(let e of s){let r=Be(e,l);try{await t.JHt(r,{v:1,releasedAt:new Date().toISOString(),reason:i}),n.marked.push(e)}catch(e){t.lWt.debug(\"desktop-released marker: write failed\",{cliSessionId:l,markerPath:r,err:e})}}}))}return await Promise.all(o),s}async function at(e,n){let r=[],i=[],a;for(let{cliSessionId:o,resolved:s,dirs:c,marked:l,complete:u}of e)r.push(z(o,async e=>{if(!I(o)||s===null||!l.includes(s)||!n.reapIf)return;await e(n.reapAfter);let r=!1;try{let e=await $(H(s,o)),t=(await Promise.all(l.filter(e=>e!==s).map(e=>$(H(e,o))))).filter(e=>e!==null);if(e!==null){let i=[e,...t],a=async e=>{let t=(await Promise.all(i.map(e))).filter(e=>e!==void 0);return t.length>0?Math.max(...t):void 0};r=await n.reapIf(o,{mtimeMs:Math.max(...i.map(e=>e.mtimeMs)),lastEntryMs:()=>a(e=>e.lastEntryMs()),lastConversationEntryMs:()=>a(e=>e.lastConversationEntryMs())})}}catch(e){t.lWt.debug(\"desktop-released marker: reap check failed\",{cliSessionId:o,err:e});try{n.keptInDoubt?.(o)}catch{}}if(!r)return;let d=u&&l.length===c.length;for(let e of l){let n=H(e,o),r=!1,i=!1;for(let[a,s]of[[n,!1],[(0,f.join)(e,o),!0]])try{await t.VHt(async()=>{if(await p.default.promises.realpath(e).catch(()=>null)!==e)throw new rt;await p.default.promises.rm(a,{force:!0,recursive:s})},A,s?[\"ENOTEMPTY\"]:[]),a===n&&(r=!0)}catch(e){if(i=e instanceof rt,t.lWt.warn(i?\"desktop-released marker: project dir moved during the reap; nothing more removed there\":`desktop-released marker: transcript removal failed (${e.code??\"unknown\"}); left on disk for Claude Code's periodic cleanup`,{cliSessionId:o}),i)break}r&&!i&&(await Oe(o,e),t.lWt.info(\"desktop-released marker: transcript removed\",{cliSessionId:o})),d&&=r}d&&(i.push(o),await qe(o,()=>a??=N()))}));return await Promise.all(r),i}async function ot(e,t,n,r,i={}){return at(await it(e,t,n,r,i),i)}";
+    private const string SetAside6 =
+        "async function Ze(e,t,n,r){if(!W.test(r.nonce))return null;let i,a=!1,o=[],s=[];if(await Promise.all([...new Set(t)].map(t=>z(t,async()=>{let c=[];try{if(!I(t)||!await r.mayRelease(t)){a=!0;return}let{dirs:s,complete:l}=await U(e,t,n,()=>i??=V()),u=await Promise.all(s.map(async e=>({dir:e,times:await $(H(e,t)),absent:await Q(H(e,t))}))),d=u.flatMap(({dir:e,times:t})=>t?[{dir:e,times:t}]:[]);if(!l||u.some(e=>e.times===null&&!e.absent)){a=!0;return}if(d.length===0){a=!0;return}let f=async e=>{let t=(await Promise.all(d.map(({times:t})=>e(t)))).filter(e=>e!==void 0);return t.length>0?Math.max(...t):void 0},p=Math.max(...d.map(({times:e})=>e.mtimeMs));if(p>r.notWrittenSince||!await r.reapIf(t,{mtimeMs:p,lastEntryMs:()=>f(e=>e.lastEntryMs()),lastConversationEntryMs:()=>f(e=>e.lastConversationEntryMs())}).catch(()=>(r.keptInDoubt?.(t),!1))){a=!0;return}for(let{dir:e}of d){let n=await Xe(t,e,r.nonce);if(n===null||n===\"stuck\"){a=!0,n===\"stuck\"&&o.push(t);return}c.push(n)}}catch{a=!0}finally{s.push(...c)}}))),!a)return s;if(!await Qe(s)||o.length>0){let e=await Promise.all(s.map(async e=>await q(e.asidePath)?e.id:null)),n=[...o,...e].find(e=>e!==null)??t[0];throw Error(`Could not finish deleting session ${n}: a transcript set aside during the delete could not be restored. It is still in its project folder (under ~/.claude/projects, or projects in CLAUDE_CONFIG_DIR when that is set) as ${n}.jsonl.desktop-deleted-${r.nonce}; renaming it to ${n}.jsonl restores it.`)}return null}";
+    private const string Finish6 =
+        "async function $e(e,n,r){let i=!1,a,o=new Map;for(let t of e)o.set(t.id,[...o.get(t.id)??[],t]);return await Promise.all([...o].map(([e,o])=>z(e,async()=>{let s=await r(e).catch(()=>!0),c=[];for(let r of o){let a=H(r.dir,e),o=await q(r.asidePath);if(!(!s&&o!==null&&K(o,r)&&o.nlink===1n&&Number(o.mtimeMs)<=n&&await p.default.promises.realpath(r.dir).catch(()=>null)===r.dir&&await Q(a))){i=!0,await J(r.asidePath,a,r);continue}await Ye(r.dir,e)&&await t.VHt(async()=>{if(!await X(r.dir))throw Z();await p.default.promises.rm(r.asidePath,{force:!0})},A).then(()=>!0,()=>!1)?c.push(r.dir):i=!0}if(c.length===o.length&&await Je(e)){for(let t of c)await Ge(e,t);await qe(e,()=>a??=N())}}))),{kept:i}}";
+    private const string Header6 = "const t=require(\"./index.chunk-CCkEi--u.js\"),mn=require(\"./index.chunk-cpsM356y.js\"),gn=require(\"./index.chunk-TEO440xf.js\");";
+    private const string Exports6 = "exports.d=Ze,exports.f=ot,exports.i=$e,exports.u=ut;";
+    private const string Other6 = "async function Qe(e,t,n){return null}";
 
     private static byte[] Bundle(string collect = CollectIds, string reap = Reap, string release = Release, string remove = Remove, string walk = Walk,
         string call = Call, string aside = Aside, string setAside = SetAside, string finish = Finish) =>
@@ -692,6 +718,14 @@ internal static class ClaudeSessionShelfTests
             + "\n" + walk + collect + "\n" + reap + "\n" + ReapChecks + "\n" + claims + "\n" + release + "\n" + call + "\n" + aside
             + "\n//# sourceMappingURL=index.chunk-CjUF9KtU.js.map\"use strict\";" + Other5 + remove + "\n" + setAside + "\n" + finish
             + "\n" + exports + "\n//# sourceMappingURL=index.chunk-Q2iYtP6L.js.map\n\"use strict\";exports.f=Qe;\n//# sourceMappingURL=index.chunk-BNMstLw_.js.map");
+
+    private static byte[] Bundle6(string header = Header6, string walk = Walk6, string collect = CollectIds6, string reap = Reap6,
+        string claims = Claims6, string release = Release6, string call = Call6, string aside = Aside6, string setAside = SetAside6,
+        string finish = Finish6, string remove = Remove6, string exports = Exports6) =>
+        Encoding.UTF8.GetBytes(string.Join("\n", ClaudeDesktopProbe.ContractMarkers.Select(spellings => spellings[0])) + "\n" + header
+            + "\n" + walk + collect + "\n" + reap + "\n" + ReapChecks + "\n" + claims + "\n" + release + "\n" + call + "\n" + aside
+            + "\n//# sourceMappingURL=index.chunk-DvDp99eh.js.map\"use strict\";" + setAside + "\n" + finish + "\n" + Other6 + remove
+            + "\n" + exports + "\n//# sourceMappingURL=index.chunk-cpsM356y.js.map\n\"use strict\";exports.f=Qe;\n//# sourceMappingURL=index.chunk-TEO440xf.js.map");
 
     private static void TestContractGuard()
     {
@@ -904,6 +938,67 @@ internal static class ClaudeSessionShelfTests
             "a failed 5.11492 finishing check that removes anyway is not reviewed");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle5(collect: CollectIds5.Replace("])e.add(t)}", "])void t}"))),
             "the 5.11492 shape that stops claiming earlier ids is not reviewed");
+        // 6.28899: the removal is two passes joined by the function the chunk exports, and the session delete gives a
+        // block-local list the checks' name.
+        Check(ClaudeDesktopProbe.Contract(Bundle6()) == ClaudeDesktopContract.Reviewed, "the reviewed 6.28899 shape is reviewed");
+        Check(ClaudeDesktopProbe.IsCompatible(Bundle6(call: Call6.Replace(",i=[...new Set([", ",q=[...new Set([")
+                .Replace("(0,Z.dirname)(o),i,Date.now())", "(0,Z.dirname)(o),q,Date.now())"))),
+            "the tombstones' list under another name stays compatible");
+        var inside = Call6.Replace("b.n()}if(A&&!u){", "b.n();if(A&&!u){").Replace("a?.reaps(n)}", "a?.reaps(n)}}");
+        Check(!ClaudeDesktopProbe.IsCompatible(Bundle6(call: inside))
+              && ClaudeDesktopProbe.Unmatched(Bundle6(call: inside)).Any(failure => failure.StartsWith("flow 3 ", StringComparison.Ordinal)),
+            "a removal inside the block whose list has the checks' name is not reviewed, and the probe names the flow");
+        Check(!ClaudeDesktopProbe.IsCompatible(Bundle6(call: Call6.Replace("cliSessionIdsClaimedByLoadedSessions({localOnly:!0,except:e}),i=[",
+                "cliSessionIdsClaimedByLoadedSessions({localOnly:!0,except:e});i=["))),
+            "the delete's list assigned to the checks' name instead of declared is not reviewed");
+        Check(!ClaudeDesktopProbe.IsCompatible(Bundle6(call: Call6.Replace("let t=this.transcriptIdClaims.localIdsClaimedByOthers(e);",
+                "i={};let t=this.transcriptIdClaims.localIdsClaimedByOthers(e);"))),
+            "the 6.28899 checks replaced before the removal are not reviewed");
+        Check(!ClaudeDesktopProbe.IsCompatible(Bundle6(call: Call6.Replace(",\"delete\",i)", ",\"delete\",{})"))),
+            "a 6.28899 removal not given the checks is not reviewed");
+        Check(!ClaudeDesktopProbe.IsCompatible(Bundle6(call: Call6.Replace("=mn.f(this.diskTranscript,", "=gn.f(this.diskTranscript,"))),
+            "removing through the same export name of another required file is not reviewed");
+        // The second pass removes only what the reap check allows, about the transcript it marked.
+        var regardless = Remove6.Replace("if(!r)return;", "");
+        Check(!ClaudeDesktopProbe.IsCompatible(Bundle6(remove: regardless))
+              && ClaudeDesktopProbe.Unmatched(Bundle6(remove: regardless)).Any(failure => failure.StartsWith("flow 4 ", StringComparison.Ordinal)),
+            "removing regardless of the reap check is not reviewed, and the probe names the flow");
+        foreach (var (from, to, what) in new[]
+        {
+            ("if(!r)return;", "if(r)return;", "returning when the check allows"),
+            ("let r=!1;try{", "let r=!0;try{", "a decision that starts allowed"),
+            ("catch(e){t.lWt.debug(\"desktop-released marker: reap", "catch(e){r=!0;t.lWt.debug(\"desktop-released marker: reap",
+                "a failed reap check that removes anyway"),
+            ("lastConversationEntryMs())})}}catch", "lastConversationEntryMs())});r=!0}}catch", "overriding the reap decision after it returns"),
+            ("let r=!1;try{", "let r=!1;try{r=!0;", "setting the decision before the reap check"),
+            ("let r=!1;try{let e=", "let r=!1;try{let o=l[0],e=", "asking the reap check about another id"),
+            ("let r=!1;try{let e=", "let r=!1;try{let n={reapIf:async()=>!0},e=", "asking another object's reap check"),
+            ("await e(n.reapAfter);", "await e(n.reapIf(o));", "waiting on anything but the checks' own process exit"),
+            ("||!n.reapIf)return;", ")return;", "reaping without the guard on a missing reap check"),
+            ("||!l.includes(s)", "", "reaping a transcript no marker was written for"),
+            ("||s===null", "", "reaping a transcript the first pass did not resolve"),
+            // The joining function hands both passes the same checks.
+            ("return at(await it(e,t,n,r,i),i)}", "return at(await it(e,t,n,r,i),{...i,reapIf:async()=>!0})}",
+                "the joining function handing the second pass other checks"),
+            ("await it(e,t,n,r,i),i)", "await it(e,t,n,r),i)", "the joining function skipping the release test"),
+            // The first pass removes nothing, and a transcript it does not release stays unresolved.
+            ("Object.assign(n,{resolved:o,dirs:s,complete:u});",
+                "Object.assign(n,{resolved:o,dirs:s,complete:u});await p.default.promises.rm(H(o,l),{force:!0});", "removing in the first pass"),
+            ("{n.declined=!0;return}", "{n.declined=!0}", "a refused release that goes on"),
+            ("if(a.mayRelease&&!await a.mayRelease(l))", "if(a.mayRelease&&await a.mayRelease(l))", "a release test whose answer is inverted"),
+            ("declined:!1,resolved:null,", "declined:!1,resolved:void 0,", "a first pass that starts resolved"),
+            ("n.declined=!0;return}}catch{return}", "n.declined=!0;return}}catch{}", "a failed release test that goes on"),
+        })
+            Check(!ClaudeDesktopProbe.IsCompatible(Bundle6(remove: Remove6.Replace(from, to))), what + " is not reviewed");
+        Check(ClaudeDesktopProbe.IsCompatible(Bundle6(remove: Remove6.Replace("async function it(", "async function iq(")
+                .Replace("async function ot(e,t,n,r,i={}){return at(await it(", "async function ot(e,t,n,r,i={}){return at(await iq("))),
+            "renamed passes stay compatible");
+        Check(ClaudeDesktopProbe.IsCompatible(Bundle6(remove: Remove6.Replace("async function ot(", "async function oq("),
+                exports: Exports6.Replace("exports.f=ot", "exports.f=oq"))),
+            "a renamed joining function exported under the same name stays compatible");
+        Check(!ClaudeDesktopProbe.IsCompatible(Bundle6(exports: Exports6.Replace("exports.f=ot", "exports.f=at")))
+              && !ClaudeDesktopProbe.IsCompatible(Bundle6(exports: Exports6.Replace("exports.f=ot", "exports.f=Qe"))),
+            "an export that names the second pass or another function instead of the joining one is not reviewed");
     }
 
     private static void TestWidgetGate()

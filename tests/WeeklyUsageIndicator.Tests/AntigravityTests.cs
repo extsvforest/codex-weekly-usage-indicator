@@ -406,6 +406,13 @@ internal static class AntigravityTests
         try { _ = closing.ReadAsync(); throw Fail("a disposed reader starts no read"); }
         catch (ObjectDisposedException) { }
 
+        // A log a widget left when it ended mid-read goes as soon as a reader is made; no agy run starts for it.
+        var stale = Path.Combine(run, "usage-" + new string('2', 32) + ".log");
+        File.WriteAllText(stale, LogLine(OtherAddress)); File.SetLastWriteTimeUtc(stale, DateTime.UtcNow.AddMinutes(-10));
+        before = Runs(run).Count;
+        using (new AntigravityUsageReader(store, () => agy, TimeSpan.FromSeconds(30), time)) { }
+        Check(!File.Exists(stale) && Runs(run).Count == before, "a new reader clears a left log without starting agy");
+
         // A store that cannot take the account says why, and keeps its file.
         var file = Path.Combine(root, "accounts.json");
         var good = File.ReadAllBytes(file);

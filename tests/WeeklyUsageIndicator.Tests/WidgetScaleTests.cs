@@ -31,6 +31,11 @@ internal static class WidgetScaleTests
 
     private static void CheckPlacement()
     {
+        // On a small screen where the size window fits on no side of the widget's reach, it still stays on the screen.
+        var small = new Rectangle(0, 0, 1093, 574);
+        var reachAll = new Rectangle(300, 150, 544, 300);
+        var placed = UsageToolTip.PlaceOutside(reachAll, new Size(550, 400), small, 8);
+        Check(placed.Y >= small.Top && placed.Y + 400 <= small.Bottom, $"the size window stays on a small screen ({placed})");
         var screen = new Rectangle(0, 0, 1920, 1080);
         var floating = new Rectangle(800, 500, 272, 64);
         Check(WidgetScale.Place(floating, new Size(237, 56), null, screen) == new Rectangle(818, 504, 237, 56),

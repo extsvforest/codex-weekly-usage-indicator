@@ -323,6 +323,9 @@ internal sealed class AntigravityUsageReader : IDisposable
         _locate = locate ?? AntigravityCli.Locate;
         _timeout = timeout ?? DefaultTimeout;
         _time = time ?? TimeProvider.System;
+        // A widget that ended during a read (exit, crash, kill) can leave a log that names the account. Only files go;
+        // no agy run starts here.
+        if (Directory.Exists(_store.RunDirectory)) ClearLeftovers(_store.RunDirectory);
     }
 
     internal bool IsReading { get { lock (_gate) return _read is { IsCompleted: false }; } }
@@ -436,7 +439,11 @@ internal sealed class AntigravityUsageReader : IDisposable
             if (_disposed) return;
             _disposed = true;
         }
-        // Ends a read under way, and everything its CLI started.
+        // Ends a read under way, and everything its CLI started, then gives that read a bounded moment to delete its log.
         _lifetime.Cancel();
+        Task? read;
+        lock (_gate) read = _read;
+        try { read?.Wait(TimeSpan.FromSeconds(10)); }
+        catch (AggregateException) { }
     }
 }
