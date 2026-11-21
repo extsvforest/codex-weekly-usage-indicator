@@ -24,9 +24,12 @@ internal static class ClaudeScheduledTasksTests
         TestLoadFailureIsNoDeletion();
         TestDefinitionDeletionSpreads();
         TestRemoveCommand();
+        TestNamedSeedRestores();
+        TestDeletedIdMadeAgain();
         TestRevertIsNoChange();
         TestUnorderedChangesConflict();
         TestUpdateKeepsTargetFields();
+        TestChromeAndApprovalsRaise();
         TestCreateNeverOverwrites();
         TestStoppedWriteSettles();
         TestRootChangeTakesStartingPoint();
@@ -423,11 +426,12 @@ internal static class ClaudeScheduledTasksTests
             "a task whose definition folder went is deleted from every account (the one not written now waits)");
         Pass(sync, fixture, T0.AddMinutes(2));
         Check(Are(fixture.Ids(a), "brief", "keep"), "and from that one once it may be written");
+        // A copy made before the deletion turns up in C (the app saving a list it read before): removed there too.
         fixture.Define("old");
         fixture.Write(c, List(Entry("brief"), Entry("keep"), Entry("old", "0 5 * * *")));
         Pass(sync, fixture, T0.AddMinutes(3));
-        Check(fixture.Task(a, "old") is null && fixture.Task(b, "old") is null && fixture.Task(c, "old") is not null,
-            "a deleted id made again in one account is never filled into the others");
+        Check(fixture.Task(a, "old") is null && fixture.Task(b, "old") is null && fixture.Task(c, "old") is null,
+            "a copy of a deleted task that turns up is removed again, and filled nowhere");
         // Every definition folder going at once is the folder replaced (another config folder, a restore): none is deleted.
         foreach (var id in new[] { "old", "brief", "keep" }) fixture.Undefine(id);
         Pass(sync, fixture, T0.AddMinutes(4));
@@ -457,14 +461,84 @@ internal static class ClaudeScheduledTasksTests
             "keeping each list's previous content");
         Pass(sync, fixture, T0.AddMinutes(2));
         Check(Are(fixture.Ids(a), "brief"), "the loaded list is done once it may be written");
+        // A copy made before the removal turns up in C.
         fixture.Write(c, List(Entry("brief"), Entry("old", "0 4 * * *")));
-        var seed = Pass(sync, fixture, T0.AddMinutes(3), request: new("seed", ["old"])).Answer!;
+        var seed = Pass(sync, fixture, T0.AddMinutes(3), request: new("seed", [])).Answer!;
+        Check(Skipped(seed, "old") == "deleted" && Are(fixture.Ids(a), "brief") && Are(fixture.Ids(b), "brief"),
+            "a seed of every task skips a removed one");
         Pass(sync, fixture, T0.AddMinutes(4));
-        Check(Are(fixture.Ids(a), "brief") && Are(fixture.Ids(b), "brief") && Skipped(seed, "old") == "deleted" && Status(seed) == "incomplete",
-            "a removed task is never filled again, by a pass or a seed");
+        Check(Are(fixture.Ids(a), "brief") && Are(fixture.Ids(b), "brief") && Are(fixture.Ids(c), "brief"),
+            "and the next pass removes the copy again: a removed task is never filled again");
         Check(Status(Pass(sync, fixture, T0.AddMinutes(5), request: new("remove", ["brief"])).Answer) == "ok"
-              && fixture.Ids(a).Length == 0 && fixture.Ids(b).Length == 0 && Are(fixture.Ids(c), "old"),
+              && fixture.Ids(a).Length == 0 && fixture.Ids(b).Length == 0 && fixture.Ids(c).Length == 0,
             "a removal that does all it was asked is ok");
+    }
+
+    // A list the app lost (it loaded none, and saved only what came after): the tasks gone from it are removed there
+    // alone, until `seed --task` names one.
+    private static void TestNamedSeedRestores()
+    {
+        using var fixture = new Fixture("A", "B", "C");
+        var (a, b, c) = (fixture[0], fixture[1], fixture[2]);
+        fixture.Define("brief", "other", "raised");
+        foreach (var account in fixture.Accounts) fixture.Write(account, List(Entry("brief"), Entry("other"), Entry("raised", extra: Bypass)));
+        var sync = fixture.Sync();
+        Pass(sync, fixture, T0);
+        fixture.Write(a, List());
+        Check(Are(Pass(sync, fixture, T0.AddMinutes(1)).RemovedHere, "brief", "other", "raised") && fixture.Ids(a).Length == 0,
+            "the tasks gone from the lost list are removed there alone");
+        var all = Pass(sync, fixture, T0.AddMinutes(2), request: new("seed", [])).Answer!;
+        Check(Skipped(all, "brief") == "removed_in_one_account" && all["cleared"]!.AsArray().Count == 0 && fixture.Ids(a).Length == 0,
+            "a seed of every task keeps the removals");
+        var named = Pass(sync, fixture, T0.AddMinutes(3), request: new("seed", ["brief", "raised"]));
+        var answer = named.Answer!;
+        var cleared = answer["cleared"]!.AsArray();
+        Check(Are(fixture.Ids(a), "brief") && Are(Ids(answer["fill"]), "brief") && Are(Strings(answer["fill"]![0]!["into"]), "A")
+              && Are(Ids(cleared), "brief", "raised") && cleared.All(item => Are(Strings(item!["removedIn"]), "A") && item!["deletion"] is null)
+              && Skipped(answer, "raised") == "raises_permission" && Status(answer) == "incomplete" && Are(named.RemovedHere, "other"),
+            "a seed naming tasks clears their removals in every account and fills them as usual (not one running with more than asking)");
+        Check(Are(Pass(sync, fixture, T0.AddMinutes(4)).RemovedHere, "other") && Are(fixture.Ids(a), "brief")
+              && Are(fixture.Ids(b), "brief", "other", "raised") && Are(fixture.Ids(c), "brief", "other", "raised"),
+            "and a task not named stays removed there");
+    }
+
+    // A deleted task's id that turns up: made after the deletion (createdAt), a new task; made before, a copy of the
+    // task deleted. `seed --task` brings back a task removed by command while its definition is there.
+    private static void TestDeletedIdMadeAgain()
+    {
+        using var fixture = new Fixture("A", "B", "C");
+        var (a, b, c) = (fixture[0], fixture[1], fixture[2]);
+        fixture.Define("brief", "other");
+        foreach (var account in fixture.Accounts) fixture.Write(account, List(Entry("brief"), Entry("other")));
+        var sync = fixture.Sync();
+        Pass(sync, fixture, T0);
+        Pass(sync, fixture, T0.AddMinutes(1), request: new("remove", ["brief"]));
+        Check(fixture.Accounts.All(account => Are(fixture.Ids(account), "other")), "removed from every account");
+        // B's app saves the list it read before the removal.
+        fixture.Write(b, List(Entry("brief"), Entry("other")));
+        Pass(sync, fixture, T0.AddMinutes(2));
+        Check(fixture.Accounts.All(account => Are(fixture.Ids(account), "other")), "a copy of the task deleted is removed again, and filled nowhere");
+        // The user makes a task with that id in C after the removal.
+        var made = T0.AddMinutes(3).ToUnixTimeMilliseconds();
+        fixture.Write(c, List(Entry("other"), Entry("brief", "0 6 * * *", entry => entry["createdAt"] = made)));
+        Pass(sync, fixture, T0.AddMinutes(4));
+        Check(fixture.Accounts.All(account => Cron(fixture, account, "brief") == "0 6 * * *"
+                  && fixture.Task(account, "brief")!["createdAt"]!.GetValue<long>() == made),
+            "a task made with the id after the deletion is a new task, made in every account");
+        fixture.Edit(a, "brief", entry => entry["cronExpression"] = "0 7 * * *");
+        Pass(sync, fixture, T0.AddMinutes(5));
+        Check(fixture.Accounts.All(account => Cron(fixture, account, "brief") == "0 7 * * *"), "the deletion is over: its edits go too");
+        // Removed by command while A may not be written: A keeps it, and a seed naming it brings it back.
+        Pass(sync, fixture, T0.AddMinutes(6), key => key != a.Key, request: new("remove", ["other"]));
+        Check(Are(fixture.Ids(a), "other", "brief") && Are(fixture.Ids(b), "brief") && Are(fixture.Ids(c), "brief"),
+            "removed but from the list not written");
+        var restored = Pass(sync, fixture, T0.AddMinutes(7), key => key != a.Key, request: new("seed", ["other"])).Answer!;
+        var cleared = restored["cleared"]!.AsArray();
+        Check(cleared.Count == 1 && cleared[0]!["deletion"]!.GetValue<string>() == "command" && Status(restored) == "ok"
+              && Are(Strings(restored["fill"]![0]!["into"]), "B", "C") && Are(fixture.Ids(b), "brief", "other") && Are(fixture.Ids(c), "brief", "other"),
+            "a seed naming a task removed by command ends the deletion and fills it from the account still holding it");
+        Pass(sync, fixture, T0.AddMinutes(8));
+        Check(Are(fixture.Ids(a), "other", "brief") && Are(fixture.Ids(b), "brief", "other"), "and nothing removes it after");
     }
 
     // P0-5: a task back to what it held before this widget's write is not spread, nor written again.
@@ -594,6 +668,68 @@ internal static class ClaudeScheduledTasksTests
         Check(made["newerEntryField"]!.GetValue<string>() == "kept" && !made.ContainsKey("importedFrom") && !made.ContainsKey("observedToolUse")
               && !fixture.Read(b).ContainsKey("runRetries"),
             "a task made in a list brings the fields this widget does not know, not the account's own fields or its retries");
+    }
+
+    // A Chrome mode with fewer checks, a site and an approval are raises: each reaches another account only from an edit
+    // seen choosing it. Lowering and removals go as any change.
+    private static void TestChromeAndApprovalsRaise()
+    {
+        static JsonObject Approval(string tool, string? rule = null)
+        {
+            var approval = new JsonObject { ["toolName"] = tool };
+            if (rule is not null) approval["ruleContent"] = rule;
+            return approval;
+        }
+        static string[] Tools(JsonObject? entry) => entry?["approvedPermissions"] is JsonArray items
+            ? items.Select(item => item!["toolName"]!.GetValue<string>() + (item["ruleContent"] is { } rule ? "(" + rule.GetValue<string>() + ")" : "")).ToArray()
+            : [];
+        static string? Chrome(JsonObject? entry) => entry?["chromePermissionMode"]?.GetValue<string>();
+        using var fixture = new Fixture("A", "B", "C");
+        var (a, b, c) = (fixture[0], fixture[1], fixture[2]);
+        fixture.Define("brief", "made");
+        var made = Entry("made", extra: entry => entry["approvedPermissions"] = new JsonArray(Approval("Read")));
+        // At the starting point A's copy allows more than B's: Chrome without checks, a site, and another approval.
+        fixture.Write(a, List(Entry("brief", extra: entry =>
+        {
+            entry["chromePermissionMode"] = "skip_all_permission_checks";
+            entry["chromeAllowedDomains"] = new JsonArray("example.org");
+            entry["approvedPermissions"] = new JsonArray(Approval("Read"), Approval("Bash", "npm test"));
+        }), (JsonObject)made.DeepClone()));
+        fixture.Write(b, List(Entry("brief", extra: entry =>
+        {
+            entry["chromePermissionMode"] = "ask";
+            entry["approvedPermissions"] = new JsonArray(Approval("Read"));
+        }), (JsonObject)made.DeepClone()));
+        fixture.Write(c, List());
+        var sync = fixture.Sync();
+        Pass(sync, fixture, T0);
+        // An edit in A that chose none of that: B gets the schedule, not A's permissions, and C, lacking the task, is not
+        // given it.
+        fixture.Edit(a, "brief", entry => entry["cronExpression"] = "0 5 * * *");
+        var pass = Pass(sync, fixture, T0.AddMinutes(1));
+        var kept = fixture.Task(b, "brief");
+        Check(Cron(fixture, b, "brief") == "0 5 * * *" && Chrome(kept) == "ask" && kept!["chromeAllowedDomains"] is null
+              && Are(Tools(kept), "Read") && fixture.Task(c, "brief") is null && Are(pass.Held, "brief"),
+            "a Chrome mode with fewer checks, a site and an approval no edit chose do not reach another account");
+        // A adds an approval: that one goes, the one A had before does not.
+        fixture.Edit(a, "brief", entry => entry["approvedPermissions"]!.AsArray().Add(Approval("Write")));
+        Pass(sync, fixture, T0.AddMinutes(2));
+        Check(Are(Tools(fixture.Task(b, "brief")), "Read", "Write") && Chrome(fixture.Task(b, "brief")) == "ask",
+            "an approval seen added reaches the others");
+        // An edit in B that chose nothing: A's Chrome mode is lowered to B's, and the site and approval B lacks go.
+        fixture.Edit(b, "brief", entry => entry["cronExpression"] = "0 6 * * *");
+        Pass(sync, fixture, T0.AddMinutes(3));
+        var lowered = fixture.Task(a, "brief");
+        Check(Cron(fixture, a, "brief") == "0 6 * * *" && Chrome(lowered) == "ask" && lowered!["chromeAllowedDomains"] is null
+              && Are(Tools(lowered), "Read", "Write"),
+            "lowering and removals go as any change");
+        // B chooses a Chrome mode with fewer checks: seen chosen, it goes.
+        fixture.Edit(b, "brief", entry => entry["chromePermissionMode"] = "follow_a_plan");
+        Pass(sync, fixture, T0.AddMinutes(4));
+        Check(Chrome(fixture.Task(a, "brief")) == "follow_a_plan" && Pass(sync, fixture, T0.AddMinutes(5)).Written == 0,
+            "a Chrome mode seen chosen reaches the others, and what each keeps of its own is not written again");
+        var seed = Pass(sync, fixture, T0.AddMinutes(6), request: new("seed", ["made"])).Answer!;
+        Check(Skipped(seed, "made") == "raises_permission" && fixture.Task(c, "made") is null, "a seed never makes a task with an approval");
     }
 
     // P0-8: a list made where there was none never replaces one the app made meanwhile.
