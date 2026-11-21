@@ -5,7 +5,6 @@ using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
-using System.Text.Json.Nodes;
 using Microsoft.Win32.SafeHandles;
 
 namespace WeeklyUsageIndicator;
@@ -13,8 +12,6 @@ namespace WeeklyUsageIndicator;
 internal sealed record ClaudeProfileCommandResult(int ExitCode, string StandardOutput);
 internal sealed class ClaudeLoginRequiredException() : UnauthorizedAccessException("Claude Code 로그인이 필요합니다.");
 internal sealed class ClaudeIdentityChangedException() : UnauthorizedAccessException("저장된 Claude 계정과 다른 계정이 로그인되어 있습니다. 원래 계정으로 다시 로그인하세요.");
-internal sealed record ClaudeProfileSharing(IReadOnlyList<string> SharedDirectories,
-    bool PromptHistoryShared, bool InstructionsShared, bool InstructionsCopied);
 
 internal interface IClaudeProfileCommandRunner
 {
@@ -33,9 +30,15 @@ internal sealed class ClaudeProfileRuntime
     private readonly ClaudeProfileStore _store;
     private readonly IClaudeProfileCommandRunner _runner;
     private readonly string? _executablePath;
-    private static readonly string[] SharedDirectoryNames =
+    // Folders that earlier builds linked into each utility profile from the original home, for the interactive
+    // sessions they ran there (gone since 0568ef0). Print-mode /usage builds its "What's contributing" report from every
+    // conversation under <CLAUDE_CONFIG_DIR>\projects, so the link made each check take about twenty seconds
+    // (anthropics/claude-code#77018). Only these names are examined, and only a junction among them is removed.
+    private static readonly string[] RetiredLinkNames =
         ["projects", "skills", "agents", "commands", "memory", "agent-memory", "rules", "output-styles",
-         "workflows", "hooks", "scripts", "file-history", "plans", "tasks", "paste-cache"];
+         "workflows", "hooks", "scripts", "file-history", "plans", "tasks", "paste-cache",
+         Path.Combine("plugins", "cache"), Path.Combine("plugins", "marketplaces")];
+    private static volatile bool s_retirementHalted;
 
     public ClaudeProfileRuntime(ClaudeProfileStore store, IClaudeProfileCommandRunner? runner = null,
         string? executablePath = null)
@@ -63,32 +66,52 @@ internal sealed class ClaudeProfileRuntime
         throw new FileNotFoundException("Claude Code 실행 파일을 찾을 수 없습니다.");
     }
 
-    public ClaudeProfileSharing PrepareProfile(ClaudeProfile profile)
+    /// <summary>Makes a utility profile's private folder ready for the official login. A profile is only an official
+    /// sign-in and the CLI's own state: nothing from the original home is linked or copied into it (settings are passed
+    /// by path, see <see cref="AddSharedSettingsArguments"/>). Links an earlier build left there are retired first;
+    /// returns their names.</summary>
+    public IReadOnlyList<string> PrepareProfile(ClaudeProfile profile)
     {
         _store.ValidateProfile(profile);
-        if (!Directory.Exists(_store.DefaultConfigDirectory))
-            throw new DirectoryNotFoundException("기존 Claude 작업 폴더를 찾을 수 없습니다.");
-        if (profile.IsDefault) return new ClaudeProfileSharing([], true, true, false);
+        if (profile.IsDefault) return [];
         ClaudeProfileStore.CreatePrivateDirectory(_store.RootPath);
         ClaudeProfileStore.CreatePrivateDirectory(_store.ProfilesDirectory);
         ClaudeProfileStore.CreatePrivateDirectory(profile.ConfigDirectory);
-        var shared = new List<string>();
-        foreach (var name in SharedDirectoryNames)
-        {
-            var original = Path.Combine(_store.DefaultConfigDirectory, name);
-            if (!Directory.Exists(original)) continue;
-            var destination = Path.Combine(profile.ConfigDirectory, name);
-            ShareDirectory(original, destination);
-            shared.Add(name);
-        }
-        PrepareLocalPlugins(profile, shared);
+        return RetireSharedLinks(profile);
+    }
 
-        // Prompt recall is separate from projects/ (the conversation picker). It is optional on Windows
-        // without developer-mode symlinks. Do not use hard links: a CLI rewrite can silently split them.
-        var historyShared = TryShareFile(profile.ConfigDirectory, "history.jsonl", allowInitialCopy: false,
-            out _);
-        var instructionsShared = PrepareInstructions(profile.ConfigDirectory, out var instructionsCopied);
-        return new ClaudeProfileSharing(shared, historyShared, instructionsShared, instructionsCopied);
+    /// <summary>Removes the folder junctions an earlier build made in a utility profile (<see cref="RetiredLinkNames"/>).
+    /// Only a junction to a folder on a drive is removed, and only the link itself: <c>RemoveDirectory</c> on a junction
+    /// never enters or empties its target, and nothing here deletes recursively. A real folder, a file, a symbolic link
+    /// or a volume mount point stays as it is, and so does a link that cannot be removed now (it is tried again later).
+    /// The folder a removed link pointed to must still be there afterwards; otherwise retirement stops for this
+    /// process and an <see cref="IOException"/> says so. Returns the names removed.</summary>
+    public IReadOnlyList<string> RetireSharedLinks(ClaudeProfile profile)
+    {
+        _store.ValidateProfile(profile);
+        if (profile.IsDefault || profile.UseDefaultHome || s_retirementHalted) return [];
+        var removed = new List<string>();
+        foreach (var name in RetiredLinkNames)
+        {
+            var link = Path.Combine(profile.ConfigDirectory, name);
+            string target;
+            bool targetExisted;
+            try
+            {
+                if (!TryReadJunctionTarget(link, out target)) continue;
+                targetExisted = Directory.Exists(target);
+                if (!RemoveDirectory(link)) continue;
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or Win32Exception)
+            { continue; }
+            if (targetExisted && !Directory.Exists(target))
+            {
+                s_retirementHalted = true;
+                throw new IOException("Claude 프로필의 옛 연결을 정리한 뒤 원래 작업 폴더가 보이지 않아 정리를 멈췄습니다.");
+            }
+            removed.Add(name);
+        }
+        return removed;
     }
 
     public async Task<ClaudeProfileIdentity> VerifyAsync(ClaudeProfile profile, CancellationToken cancellationToken,
@@ -242,239 +265,33 @@ internal sealed class ClaudeProfileRuntime
         return text;
     }
 
-    private bool TryShareFile(string profileDirectory, string name, bool allowInitialCopy, out bool copied)
-    {
-        copied = false;
-        var original = Path.Combine(_store.DefaultConfigDirectory, name);
-        var destination = Path.Combine(profileDirectory, name);
-        if (!File.Exists(original)) return false;
-        if (File.Exists(destination))
-        {
-            var linked = new FileInfo(destination).ResolveLinkTarget(returnFinalTarget: true);
-            if (linked is not null)
-            {
-                var originalTarget = new FileInfo(original).ResolveLinkTarget(returnFinalTarget: true)?.FullName ?? original;
-                if (!ClaudeProfileStore.PathsEqual(linked.FullName, originalTarget))
-                    throw new IOException("Claude 프로필의 공유 파일이 다른 위치를 가리키고 있습니다.");
-                return true;
-            }
-            return false;
-        }
-        try { File.CreateSymbolicLink(destination, original); return true; }
-        catch (Exception exception) when (exception is UnauthorizedAccessException or IOException or PlatformNotSupportedException)
-        {
-            if (!allowInitialCopy) return false;
-            // A one-time copy preserves instructions on systems without file symlinks. It never replaces
-            // a later user edit. Directories holding conversations and skills remain live shared links.
-            File.Copy(original, destination, overwrite: false);
-            copied = true;
-            return false;
-        }
-    }
-
-    private void PrepareLocalPlugins(ClaudeProfile profile, List<string> shared)
-    {
-        var original = Path.Combine(_store.DefaultConfigDirectory, "plugins");
-        if (!Directory.Exists(original)) return;
-        var destination = Path.Combine(profile.ConfigDirectory, "plugins");
-        ClaudeProfileStore.CreatePrivateDirectory(destination);
-        foreach (var name in new[] { "cache", "marketplaces" })
-        {
-            if (!Directory.Exists(Path.Combine(original, name))) continue;
-            ShareDirectory(Path.Combine(original, name), Path.Combine(destination, name));
-            shared.Add("plugins/" + name);
-        }
-        foreach (var name in new[] { "installed_plugins.json", "known_marketplaces.json" })
-        {
-            var source = Path.Combine(original, name);
-            var target = Path.Combine(destination, name);
-            if (!File.Exists(source) || File.Exists(target)) continue;
-            if (new FileInfo(source).Length > 1024 * 1024)
-                throw new InvalidDataException("Claude 로컬 플러그인 목록이 너무 큽니다.");
-            var bytes = SanitizePluginRegistry(name, File.ReadAllText(source, Encoding.UTF8), original);
-            var temporary = Path.Combine(destination, ".registry-" + Guid.NewGuid().ToString("N") + ".tmp");
-            try
-            {
-                using (var stream = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None,
-                           4096, FileOptions.WriteThrough))
-                { stream.Write(bytes); stream.Flush(flushToDisk: true); }
-                // Compare-and-create: an official CLI or a user-owned registry always wins. These files
-                // describe plugin installations only; credentials and account-synced plugins stay local.
-                try { File.Move(temporary, target, overwrite: false); }
-                catch (IOException) when (File.Exists(target)) { }
-            }
-            finally { if (File.Exists(temporary)) File.Delete(temporary); }
-        }
-    }
-
-    internal static byte[] SanitizePluginRegistry(string fileName, string json, string originalPluginsDirectory)
-    {
-        try
-        {
-            var root = JsonNode.Parse(json) as JsonObject ?? throw new JsonException();
-            var output = new JsonObject();
-            if (fileName == "installed_plugins.json")
-            {
-                if (root["version"]?.GetValue<int>() != 2 || root["plugins"] is not JsonObject plugins)
-                    throw new JsonException();
-                var kept = new JsonObject();
-                foreach (var pair in plugins)
-                {
-                    if (pair.Value is not JsonArray entries) throw new JsonException();
-                    var retainedEntries = new JsonArray();
-                    foreach (var item in entries)
-                    {
-                        if (item is not JsonObject entry || entry["installPath"]?.GetValue<string>() is not { } path)
-                            throw new JsonException();
-                        if (!Path.IsPathFullyQualified(path)) throw new JsonException();
-                        if (IsAccountSyncedPlugin(path, originalPluginsDirectory)) continue;
-                        var retained = new JsonObject();
-                        foreach (var field in new[] { "scope", "projectPath", "installPath", "version", "installedAt",
-                                     "lastUpdated", "gitCommitSha", "isLocal" })
-                            CopyRegistryScalar(entry, retained, field, boolean: field == "isLocal");
-                        retainedEntries.Add(retained);
-                    }
-                    if (retainedEntries.Count > 0) kept[pair.Key] = retainedEntries;
-                }
-                output["version"] = 2;
-                output["plugins"] = kept;
-            }
-            else if (fileName == "known_marketplaces.json")
-            {
-                foreach (var pair in root)
-                {
-                    if (pair.Value is not JsonObject entry || entry["source"] is not JsonObject source
-                        || entry["installLocation"]?.GetValue<string>() is not { } path
-                        || !Path.IsPathFullyQualified(path)) throw new JsonException();
-                    if (IsAccountSyncedPlugin(path, originalPluginsDirectory)) continue;
-                    var kind = source["source"]?.GetValue<string>();
-                    var retainedSource = new JsonObject { ["source"] = kind };
-                    switch (kind)
-                    {
-                        case "github":
-                            var repo = source["repo"]?.GetValue<string>() ?? throw new JsonException();
-                            if (repo.Length > 200 || repo.Count(character => character == '/') != 1
-                                || repo.Any(character => !char.IsAsciiLetterOrDigit(character)
-                                    && character is not '/' and not '_' and not '-' and not '.')) throw new JsonException();
-                            retainedSource["repo"] = repo;
-                            CopyRegistryScalar(source, retainedSource, "ref");
-                            break;
-                        case "directory":
-                            var directory = source["path"]?.GetValue<string>() ?? throw new JsonException();
-                            if (!Path.IsPathFullyQualified(directory)) throw new JsonException();
-                            retainedSource["path"] = directory;
-                            break;
-                        case "git":
-                            var rawUrl = source["url"]?.GetValue<string>() ?? throw new JsonException();
-                            if (!Uri.TryCreate(rawUrl, UriKind.Absolute, out var url)
-                                || url.Scheme is not "https" and not "http"
-                                || url.UserInfo.Length != 0 || url.Query.Length != 0 || url.Fragment.Length != 0)
-                                throw new JsonException();
-                            retainedSource["url"] = rawUrl;
-                            CopyRegistryScalar(source, retainedSource, "ref");
-                            break;
-                        default:
-                            throw new NotSupportedException("이 Claude 플러그인 등록 방식은 자동으로 공유할 수 없습니다. 기존 설정은 보존했습니다.");
-                    }
-                    var retained = new JsonObject { ["source"] = retainedSource, ["installLocation"] = path };
-                    foreach (var field in new[] { "lastUpdated", "autoUpdate" })
-                        CopyRegistryScalar(entry, retained, field, boolean: field == "autoUpdate");
-                    output[pair.Key] = retained;
-                }
-            }
-            else throw new ArgumentException("Unsupported plugin registry.", nameof(fileName));
-            return JsonSerializer.SerializeToUtf8Bytes(output);
-        }
-        catch (Exception exception) when (exception is JsonException or InvalidOperationException or FormatException)
-        { throw new InvalidDataException("Claude 로컬 플러그인 목록을 읽을 수 없습니다."); }
-    }
-
-    private static void CopyRegistryScalar(JsonObject source, JsonObject destination, string field, bool boolean = false)
-    {
-        if (!source.TryGetPropertyValue(field, out var value) || value is null) return;
-        if (boolean)
-        {
-            if (value.GetValueKind() is not JsonValueKind.True and not JsonValueKind.False) throw new JsonException();
-        }
-        else if (value.GetValueKind() != JsonValueKind.String || value.GetValue<string>().Length > 4096
-                 || value.GetValue<string>().Any(char.IsControl)) throw new JsonException();
-        destination[field] = value.DeepClone();
-    }
-
-    private static bool IsAccountSyncedPlugin(string path, string pluginsDirectory)
-    {
-        var synced = Path.GetFullPath(Path.Combine(pluginsDirectory, "synced"));
-        return ClaudeProfileStore.PathsEqual(path, synced)
-            || Path.GetFullPath(path).StartsWith(synced + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static void ShareDirectory(string original, string destination)
-    {
-        if (Directory.Exists(destination))
-        {
-            // An unexpected real directory may contain user data. Never replace or merge it silently.
-            var target = new DirectoryInfo(destination).ResolveLinkTarget(returnFinalTarget: true);
-            if (target is null || !ClaudeProfileStore.PathsEqual(target.FullName, ResolveDirectory(original)))
-                throw new IOException("Claude 프로필에 별도 작업 자료가 있습니다. 기존 자료는 보존했습니다.");
-        }
-        else if (File.Exists(destination))
-            throw new IOException("Claude 작업 폴더를 연결할 수 없습니다. 기존 파일은 보존했습니다.");
-        else CreateDirectoryJunction(destination, original);
-    }
-
-    private bool PrepareInstructions(string profileDirectory, out bool copied)
-    {
-        copied = false;
-        var original = Path.Combine(_store.DefaultConfigDirectory, "CLAUDE.md");
-        var destination = Path.Combine(profileDirectory, "CLAUDE.md");
-        if (!File.Exists(original)) return false;
-        var importPath = original.Replace('\\', '/');
-        // Official user-scope imports keep future edits in sync and need neither elevation nor a read
-        // of the original text. Ambiguous import syntax falls back to an OS file link (or an initial copy).
-        if (!importPath.Any(character => char.IsWhiteSpace(character) || character is '"' or '`' or '@'))
-        {
-            var import = "<!-- Shared user instructions; edit the original file. -->\n@" + importPath + "\n";
-            if (!File.Exists(destination))
-            {
-                using var stream = new FileStream(destination, FileMode.CreateNew, FileAccess.Write, FileShare.Read);
-                stream.Write(Encoding.UTF8.GetBytes(import));
-                return true;
-            }
-            // This is our tiny generated reference, never the original instruction or a login file.
-            if ((File.GetAttributes(destination) & FileAttributes.ReparsePoint) == 0
-                && new FileInfo(destination).Length <= 8192 && File.ReadAllText(destination) == import) return true;
-        }
-        return TryShareFile(profileDirectory, "CLAUDE.md", allowInitialCopy: true, out copied);
-    }
-
-    private static string ResolveDirectory(string path) =>
-        new DirectoryInfo(path).ResolveLinkTarget(returnFinalTarget: true)?.FullName ?? Path.GetFullPath(path);
     private static InvalidDataException InvalidStatus() => new("Claude Code의 계정 확인 응답을 읽을 수 없습니다.");
 
-    internal static void CreateDirectoryJunction(string linkPath, string targetPath)
+    /// <summary>True when <paramref name="path"/> itself is a directory junction to a folder on a drive: a mount-point
+    /// reparse point whose substitute name is <c>\??\X:\…</c>. A symbolic link, a volume mount point
+    /// (<c>\??\Volume{…}</c>) or anything else is not. The link is read, never followed.</summary>
+    internal static bool TryReadJunctionTarget(string path, out string target)
     {
-        if (!OperatingSystem.IsWindows()) { Directory.CreateSymbolicLink(linkPath, targetPath); return; }
-        var target = Path.TrimEndingDirectorySeparator(Path.GetFullPath(targetPath));
-        if (target.StartsWith(@"\\", StringComparison.Ordinal))
-            throw new IOException("Claude 작업 자료는 로컬 폴더에서만 공유할 수 있습니다.");
-        var substitute = @"\??\" + target;
-        var names = Encoding.Unicode.GetBytes(substitute + '\0' + target + '\0');
-        var buffer = new byte[16 + names.Length];
-        BitConverter.GetBytes(0xA0000003u).CopyTo(buffer, 0);
-        BitConverter.GetBytes(checked((ushort)(names.Length + 8))).CopyTo(buffer, 4);
-        BitConverter.GetBytes(checked((ushort)(substitute.Length * 2))).CopyTo(buffer, 10);
-        BitConverter.GetBytes(checked((ushort)((substitute.Length + 1) * 2))).CopyTo(buffer, 12);
-        BitConverter.GetBytes(checked((ushort)(target.Length * 2))).CopyTo(buffer, 14);
-        names.CopyTo(buffer, 16);
-        Directory.CreateDirectory(linkPath);
-        try
-        {
-            using var handle = CreateFile(linkPath, 0x40000000, 7, IntPtr.Zero, 3, 0x02200000, IntPtr.Zero);
-            if (handle.IsInvalid || !DeviceIoControl(handle, 0x000900A4, buffer, buffer.Length,
-                    IntPtr.Zero, 0, out _, IntPtr.Zero))
-                throw new Win32Exception(Marshal.GetLastWin32Error(), "Claude 작업 폴더를 연결하지 못했습니다.");
-        }
-        catch { Directory.Delete(linkPath, recursive: false); throw; }
+        const FileAttributes junctionLike = FileAttributes.Directory | FileAttributes.ReparsePoint;
+        target = string.Empty;
+        if (!OperatingSystem.IsWindows()) return false;
+        var attributes = new FileInfo(path).Attributes; // the entry's own attributes; -1 when it is absent
+        if ((int)attributes == -1 || (attributes & junctionLike) != junctionLike) return false;
+        // Reading reparse data needs no access rights. Open the link itself, not what it points to.
+        using var handle = CreateFile(path, 0, 7, IntPtr.Zero, 3, 0x02200000, IntPtr.Zero);
+        if (handle.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error());
+        var buffer = new byte[16 * 1024];
+        if (!DeviceIoControl(handle, 0x000900A8, IntPtr.Zero, 0, buffer, buffer.Length, out var length, IntPtr.Zero))
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+        if (length < 16 || BitConverter.ToUInt32(buffer, 0) != 0xA0000003u) return false;
+        int offset = BitConverter.ToUInt16(buffer, 8), size = BitConverter.ToUInt16(buffer, 10);
+        if (size == 0 || 16 + offset + size > length) return false;
+        var substitute = Encoding.Unicode.GetString(buffer, 16 + offset, size);
+        if (!substitute.StartsWith(@"\??\", StringComparison.Ordinal)) return false;
+        var folder = substitute[4..];
+        if (folder.Length < 3 || !char.IsAsciiLetter(folder[0]) || folder[1] != ':' || folder[2] != '\\') return false;
+        target = folder;
+        return true;
     }
 
     [DllImport("kernel32.dll", EntryPoint = "CreateFileW", CharSet = CharSet.Unicode, SetLastError = true)]
@@ -482,8 +299,12 @@ internal sealed class ClaudeProfileRuntime
         uint creation, uint flags, IntPtr template);
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool DeviceIoControl(SafeFileHandle handle, uint controlCode, byte[] input,
-        int inputLength, IntPtr output, int outputLength, out int bytesReturned, IntPtr overlapped);
+    private static extern bool DeviceIoControl(SafeFileHandle handle, uint controlCode, IntPtr input,
+        int inputLength, byte[] output, int outputLength, out int bytesReturned, IntPtr overlapped);
+    // Removes an empty folder or a junction itself; it neither recurses nor follows the link.
+    [DllImport("kernel32.dll", EntryPoint = "RemoveDirectoryW", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool RemoveDirectory(string path);
 }
 
 internal sealed class ClaudeProfileProcessRunner : IClaudeProfileCommandRunner

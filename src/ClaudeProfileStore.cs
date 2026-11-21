@@ -31,6 +31,9 @@ internal sealed class ClaudeProfileStore
         null, null, false, _defaultUsesHome);
     public string? SelectedProfileId => ReadLocked().SelectedProfileId;
     public ClaudeProfile? SelectedProfile => ListProfiles().SingleOrDefault(profile => profile.IsSelected);
+    /// <summary>The account registered on the default home moved to a profile of its own (<see cref="AdoptDefault"/>):
+    /// the utility no longer uses the default home until its login is connected again (<see cref="RegisterDefault"/>).</summary>
+    public bool DefaultHomeRetired => ReadLocked().DefaultHomeRetired;
 
     public ClaudeProfileStore(string? root = null, string? defaultConfigDirectory = null,
         bool? defaultUsesHome = null)
@@ -76,6 +79,7 @@ internal sealed class ClaudeProfileStore
             metadata.Profiles.Insert(0, profile);
         }
         metadata.SelectedProfileId ??= profile.Id;
+        metadata.DefaultHomeRetired = false;
         Write(metadata);
         return profile with { IsSelected = metadata.SelectedProfileId == profile.Id };
     }
@@ -85,9 +89,7 @@ internal sealed class ClaudeProfileStore
         using var gate = AcquireLock();
         var metadata = Read();
         RequireCapacity(metadata);
-        var id = Guid.NewGuid().ToString("N");
-        var profile = new ClaudeProfile(id, ValidateLabel(label), Path.Combine(ProfilesDirectory, id),
-            false, null, null);
+        var profile = NewDetachedProfile(label);
         // Never seed an authentication file. The official login command creates its own state later.
         CreatePrivateDirectory(RootPath);
         CreatePrivateDirectory(ProfilesDirectory);
@@ -95,6 +97,38 @@ internal sealed class ClaudeProfileStore
         metadata.Profiles.Add(profile);
         Write(metadata);
         return profile;
+    }
+
+    /// <summary>A new utility profile that is not in the list: its folder is made by the official login, and it joins
+    /// the list only through <see cref="AdoptDefault"/>.</summary>
+    public ClaudeProfile NewDetachedProfile(string label)
+    {
+        var id = Guid.NewGuid().ToString("N");
+        return new ClaudeProfile(id, ValidateLabel(label), Path.Combine(ProfilesDirectory, id), false, null, null);
+    }
+
+    /// <summary>Puts <paramref name="replacement"/>, a detached profile signed in to the default row's own account, in
+    /// that row's place with its label, position and selection. No row uses the default home afterwards, and
+    /// <see cref="DefaultHomeRetired"/> is set. The default home itself is not touched.</summary>
+    public ClaudeProfile AdoptDefault(ClaudeProfile replacement, ClaudeProfileIdentity identity,
+        DateTimeOffset? verifiedAt = null)
+    {
+        ValidateIdentity(identity);
+        using var gate = AcquireLock();
+        var metadata = Read();
+        var index = metadata.Profiles.FindIndex(value => value.IsDefault);
+        if (index < 0 || metadata.Profiles[index].Identity?.Key != identity.Key
+            || metadata.Profiles.Any(value => value.Id == replacement.Id))
+            throw new InvalidOperationException("기존 Claude 계정이 바뀌어 옮기지 못했습니다. 계정 목록을 다시 확인하세요.");
+        var before = metadata.Profiles[index];
+        var profile = new ClaudeProfile(replacement.Id, before.Label, replacement.ConfigDirectory, false, identity,
+            verifiedAt ?? DateTimeOffset.UtcNow);
+        ValidateProfile(profile);
+        metadata.Profiles[index] = profile;
+        if (metadata.SelectedProfileId == before.Id) metadata.SelectedProfileId = profile.Id;
+        metadata.DefaultHomeRetired = true;
+        Write(metadata);
+        return profile with { IsSelected = metadata.SelectedProfileId == profile.Id };
     }
 
     public ClaudeProfile RecordVerifiedIdentity(string id, ClaudeProfileIdentity identity,
@@ -284,6 +318,8 @@ internal sealed class ClaudeProfileStore
         public int Version { get; set; } = 1;
         public string? SelectedProfileId { get; set; }
         public List<ClaudeProfile> Profiles { get; set; } = [];
+        // False when absent. Earlier builds ignore it when reading and drop it when they write.
+        public bool DefaultHomeRetired { get; set; }
     }
     private sealed class Gate(Mutex mutex) : IDisposable
     {

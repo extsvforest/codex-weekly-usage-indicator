@@ -34,7 +34,8 @@ internal static class AccountManagerMemoryProbe
                 claudeStore.RegisterDefault("메인 Claude", new ClaudeProfileIdentity(new string('A', 64), "m*** · PROBE", "max"));
                 var other = claudeStore.CreateProfile("서브 Claude");
                 claudeStore.RecordVerifiedIdentity(other.Id, new(new string('B', 64), "s*** · PROBE", "max"));
-                using var claude = new ClaudeAccountController(claudeStore, new ClaudeProfileRuntime(claudeStore, new NoClaude(), "probe-claude.exe"));
+                using var claude = new ClaudeAccountController(claudeStore, new ClaudeProfileRuntime(claudeStore, new NoClaude(), "probe-claude.exe"),
+                    usageCache: new ClaudeUsageFileCacheStore(Path.Combine(root, "claude-usage-cache.json")));
                 Report("start");
                 for (var cycle = 1; cycle <= cycles; cycle++)
                 {

@@ -38,7 +38,8 @@ internal static class ClaudeAccountMenuSmoke
                 using var controller = live ? new ClaudeAccountController(store, runtime)
                     : new ClaudeAccountController(store, runtime, clientFactory: (profile, key, accountKey) =>
                         new ClaudeUsageClient(new FixtureSource(() => sourceCalls.Add(profile.Id)),
-                            TimeProvider.System, ClaudeUsageNullCacheStore.Instance, key, accountKey: accountKey), clearRecoveryCache: () => { });
+                            TimeProvider.System, ClaudeUsageNullCacheStore.Instance, key, accountKey: accountKey),
+                        usageCache: new ClaudeUsageFileCacheStore(Path.Combine(root, "usage-cache.json")));
                 using var form = new Form { ClientSize = new(960, 650), Text = "Claude account interaction check" };
                 AccountUiTheme.SetForm(form);
                 // Never started: no real Desktop observation or fill runs inside this fixture.

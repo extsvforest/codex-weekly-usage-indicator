@@ -92,12 +92,31 @@ internal static class ClaudeMetricTests
 
             var cache = new ClaudeUsageFileCacheStore(Path.Combine(root, "cache.json"));
             var entry = new ClaudeUsageCacheEntry(new(null, new(42, null), null), DateTimeOffset.UtcNow, "profile-fixture");
-            cache.Save(entry);
-            Check(cache.Load() == entry, "a profile-bound overall-only cache round trips without Fable");
+            cache.For(entry.ProfileKey).Save(entry);
+            Check(cache.For(entry.ProfileKey).Load() == entry, "a profile-bound overall-only cache round trips without Fable");
             File.WriteAllText(Path.Combine(root, "cache.json"), JsonSerializer.Serialize(new
             { entry.Snapshot, entry.LastUpdatedAt }));
-            Check(cache.Load()?.ProfileKey == ClaudeUsageCacheEntry.DefaultProfileKey,
+            Check(cache.For(ClaudeUsageCacheEntry.DefaultProfileKey).Load()?.ProfileKey == ClaudeUsageCacheEntry.DefaultProfileKey
+                  && cache.For(entry.ProfileKey).Load() is null,
                 "pre-profile caches are bound only to the default profile");
+            // Each account keeps its own last value under its profile ID and identity digest.
+            var first = entry with { ProfileKey = "profile-a:digest-a" };
+            var second = entry with { ProfileKey = "profile-b:digest-b", Snapshot = new(null, new(7, null), null) };
+            var similar = entry with { ProfileKey = "profile-a2:digest-c" };
+            foreach (var value in new[] { first, second, similar }) cache.For(value.ProfileKey).Save(value);
+            cache.For(second.ProfileKey).Save(second with { ProfileKey = "spoofed" });
+            cache.For(second.ProfileKey).Clear();
+            Check(cache.For(first.ProfileKey).Load() == first && cache.For(second.ProfileKey).Load() is null
+                  && cache.Last(second.ProfileKey) == second && cache.Last("spoofed") is null,
+                "per-account values stay apart, and ending one account's recovery keeps its last value");
+            cache.EndRecovery("profile-a");
+            Check(cache.For(first.ProfileKey).Load() is null && cache.Last(first.ProfileKey) == first
+                  && cache.For(similar.ProfileKey).Load() == similar,
+                "ending a profile's recovery covers that profile's keys only");
+            cache.Move(similar.ProfileKey, "profile-moved:digest-c");
+            Check(cache.Last(similar.ProfileKey) is null
+                  && cache.For("profile-moved:digest-c").Load() == similar with { ProfileKey = "profile-moved:digest-c" },
+                "moving a value to another key keeps the value and its recovery state");
         });
     }
 

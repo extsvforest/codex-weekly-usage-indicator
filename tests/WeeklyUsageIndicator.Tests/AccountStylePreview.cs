@@ -41,7 +41,8 @@ internal static class AccountStylePreview
                 var claudeOther = claudeStore.CreateProfile("서브 Claude");
                 claudeOther = claudeStore.RecordVerifiedIdentity(claudeOther.Id, new(new string('B', 64), "s*** · PREVIEW", "max"));
                 using var claudeController = new ClaudeAccountController(claudeStore,
-                    new ClaudeProfileRuntime(claudeStore, new PreviewClaudeRunner(), "preview-claude.exe"));
+                    new ClaudeProfileRuntime(claudeStore, new PreviewClaudeRunner(), "preview-claude.exe"),
+                    usageCache: new ClaudeUsageFileCacheStore(Path.Combine(root, "claude-usage-cache.json")));
                 var observations = (Dictionary<string, ClaudeUsageResult>)typeof(ClaudeAccountController).GetField("_observations", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.GetValue(claudeController)!;
                 var failures = (Dictionary<string, Exception>)typeof(ClaudeAccountController).GetField("_failures", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.GetValue(claudeController)!;
                 observations[claudeMain.Id] = new(new(new(10, now.AddHours(2)), new(32, now.AddDays(3)), new(15, now.AddDays(3))), now, null, false);
