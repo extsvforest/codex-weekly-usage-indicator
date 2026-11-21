@@ -6,8 +6,7 @@ The user asked for a more refined account manager without changing what it does
 changes: queries only when the user asks, an Antigravity tab, and a widget size
 set as a number. Two designers worked from the same brief without seeing each
 other's work, and the two proposals were compared screen by screen (A–G) on a
-[comparison board](https://claude.ai/artifact/ENrgBKKqw1mSxFjGSJpSff). The
-agent recommended the Antigravity proposal in its second revision; the user
+comparison board. The agent recommended the Antigravity proposal in its second revision; the user
 chose it and asked for it to be installed. It is the decided design, and it
 builds on the 2026-09-22 ordered list rather than replacing it.
 

@@ -8,7 +8,7 @@ See how much weekly usage you have left, then choose the account for your next s
 
 Blue is Codex; orange is Claude. Choose **all-model weekly** or **Fable weekly** for the Claude number from the right-click menu.
 
-![A light account manager showing combined Codex usage, reset times and manual switch actions](docs/design/2026-09-28/100/manager.png)
+![The account manager on its Codex page: three accounts with their weekly balance, reset times, Switch and a refresh button on each row](docs/design/2026-11-21/manager.png)
 
 - **See what is left across your Codex accounts.** Check their remaining weekly percentages and the next reset without signing out of your current account.
 - **Choose the account you want to use.** Switch Codex manually. For Claude, switch accounts in the Claude app; every account keeps this PC's Code sessions in its list.
