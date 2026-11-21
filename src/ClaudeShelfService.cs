@@ -139,7 +139,9 @@ internal sealed class ClaudeShelfService : IDisposable
     private static readonly JsonSerializerOptions AnswerOptions = new()
     { WriteIndented = true, Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping };
     private ClaudeScheduledSync _scheduled;
-    private ClaudeScheduledSeedChannel? _seedChannel;
+    private ClaudeScheduledChannel? _scheduledChannel;
+    // The package whose running image this pass found reviewed (null: none): lists are written only while it still runs.
+    private ClaudeDesktopPackage? _scheduledPackage;
     private IReadOnlyDictionary<string, string>? _scheduledStamps;
     private string? _scheduledPhase;
     private long _scheduledMark = -1;
@@ -166,15 +168,15 @@ internal sealed class ClaudeShelfService : IDisposable
         _environment = environment ?? ClaudeShelfEnvironment.Real; _log = log ?? new ClaudeDesktopLogWatcher();
         _layoutSources = layoutSources ?? ClaudeSessionSync.Sources.For(_shelf.Paths);
         _scheduled = NewScheduled();
-        // The ledger folder stays when the app's profile folder moves, and so does where a seed is asked for.
-        _seedChannel = _environment.ScheduledContract is null ? null : ClaudeScheduledSeedChannel.Open(_shelf.Paths.LedgerDirectory);
+        // The ledger folder stays when the app's profile folder moves, and so does where a mirror is asked for.
+        _scheduledChannel = _environment.ScheduledContract is null ? null : ClaudeScheduledChannel.Open(_shelf.Paths.LedgerDirectory);
         _timer.Tick += (_, _) => Tick();
     }
 
-    /// <summary>The scheduled-task alignment over the shelf's lists and store.</summary>
+    /// <summary>The scheduled-task mirror over the shelf's lists and store.</summary>
     private ClaudeScheduledSync NewScheduled() =>
         new(_shelf.Paths.SessionsRoot, Path.Combine(_shelf.Paths.LedgerDirectory, ClaudeScheduledSync.StoreFolder),
-            _shelf.Paths.ScheduledTasksRoot, _shelf.AcquireLease, _environment.Now);
+            _shelf.Paths.ScheduledTasksRoot, _shelf.Paths.AppScheduledTasksRoot, _shelf.AcquireLease);
 
     internal void Start() { if (!_disposed) { _timer.Start(); Tick(); } }
 
@@ -374,20 +376,21 @@ internal sealed class ClaudeShelfService : IDisposable
     }
 
     /// <summary>
-    /// Aligns the scheduled-task lists of the accounts on this PC (<see cref="ClaudeScheduledSync"/>): when one it read or
-    /// wrote changed on disk, a few seconds after the app resets or loads its list, when the app starts, stops or has been
-    /// closed for a moment, every ten minutes, every minute while a list waits to be written, and when a seed or a removal
-    /// is asked for. While the app runs only a list other than the one its log shows loaded is written, and none while
-    /// that cannot be told (its log not read whole, a reset not followed by a load yet, a line a few seconds old), asked
-    /// again before each file; once the app has been closed for a moment every list is, its state read again before each
-    /// file. Nothing is written while that state is unknown or while its version's way of keeping the lists does not read
-    /// as reviewed. A problem that lasts, and what aligning left for the user to settle, is reported in the status.
+    /// Mirrors the scheduled tasks a person chose into the lists of the accounts on this PC (<see cref="ClaudeScheduledSync"/>):
+    /// when a list it read or wrote changed on disk, a few seconds after the app resets or loads its list, when the app
+    /// starts, stops or has been closed for a moment, every ten minutes, every minute while a list waits to be written,
+    /// and when a command asks (a plan, read only, whatever the app's version; an apply). While the app runs only a list
+    /// other than the one its log shows loaded is written, and none while that cannot be told (its log not read whole, a
+    /// reset not followed by a load yet, a line a few seconds old), asked again before each file; once the app has been
+    /// closed for a moment every list is, its state read again before each file. Nothing is written while that state is
+    /// unknown, or unless the installed version's way of keeping the lists reads as reviewed and the app running is that
+    /// installation. A problem that lasts, and what a mirror left for a person to settle, is reported in the status.
     /// </summary>
     private void Schedule(ClaudeDesktopRuntime runtime, ClaudeDesktopPackage? package, DateTimeOffset now)
     {
         if (_environment.ScheduledContract is not { } review) return;
-        var channel = _seedChannel;
-        (string Id, ClaudeScheduledRequest Request)? asked;
+        var channel = _scheduledChannel;
+        (string Id, ClaudeScheduledRequest? Request)? asked;
         try { asked = channel?.Request(); }
         catch (ObjectDisposedException) { return; }
         void Answer(JsonObject answer)
@@ -395,6 +398,11 @@ internal sealed class ClaudeShelfService : IDisposable
             if (asked is not { } request) return;
             try { channel!.Answer(request.Id, answer.ToJsonString(AnswerOptions)); }
             catch (ObjectDisposedException) { }
+        }
+        if (asked is { Request: null })
+        {
+            Answer(new JsonObject { ["status"] = "invalid_request" });
+            asked = null;
         }
         if (runtime.State == ClaudeDesktopRunState.Unknown)
         {
@@ -413,52 +421,54 @@ internal sealed class ClaudeShelfService : IDisposable
         _scheduledPhase = phase; _scheduledAt = now;
         if (marked) _scheduledMark = log.Mark;
         package ??= _environment.FindPackage();
-        if ((package is null ? ClaudeDesktopContract.Incompatible : review(package.AsarPath)) != ClaudeDesktopContract.Reviewed)
+        var reviewed = package is not null && review(package.AsarPath) == ClaudeDesktopContract.Reviewed
+                       && ClaudeDesktopProbe.RunsFrom(runtime, package);
+        _scheduledPackage = reviewed ? package : null;
+        Func<string, bool> mayWrite = !reviewed ? _ => false
+            : runtime.State == ClaudeDesktopRunState.Running ? MayWriteScheduled
+            : closedLong ? _ => _environment.Observe().State == ClaudeDesktopRunState.Closed : _ => false;
+        var running = runtime.State == ClaudeDesktopRunState.Running;
+        ClaudeScheduledScene? Scene() => _scheduled.Scene(_accounts, running ? log : null, running);
+        if (asked is { Request: { } request })
+        {
+            JsonObject answer;
+            try { answer = Scene() is { } scene ? _scheduled.Serve(request, scene, mayWrite, now, reviewed) : new() { ["status"] = "sessions_unlisted" }; }
+            catch (Exception exception) { answer = new JsonObject { ["status"] = "failed", ["failure"] = exception.Message }; }
+            Answer(answer);
+        }
+        if (!reviewed)
         {
             _scheduledShown = new(ClaudeScheduledProblemKind.Unreviewed, package?.Version.ToString());
             _scheduledStamps = NoStamps;
-            Answer(new JsonObject { ["status"] = "unreviewed_app_version" });
             return;
         }
-        Func<string, bool> mayWrite = runtime.State == ClaudeDesktopRunState.Running ? MayWriteScheduled
-            : closedLong ? _ => _environment.Observe().State == ClaudeDesktopRunState.Closed : _ => false;
-        var request = asked?.Request;
         ClaudeScheduledPass pass;
-        try { pass = _scheduled.Pass(_accounts, log, mayWrite, now, request); }
-        catch (Exception exception)
-        {
-            pass = new(false, 0, [], [], exception.Message,
-                request is null ? null : new JsonObject { ["status"] = "failed", ["failure"] = exception.Message });
-        }
-        // A request's pass writes only what it asked for: the next tick runs a whole one.
-        _scheduledStamps = request is null ? pass.Processed ?? NoStamps : null;
+        try { pass = Scene() is { } scene ? _scheduled.Pass(scene, mayWrite, now) : new(0, [], [], "sessions_unlisted", null); }
+        catch (Exception exception) { pass = new(0, [], [], exception.Message, null); }
+        _scheduledStamps = pass.Processed ?? NoStamps;
         _scheduledWaiting = pass.Waiting.Count > 0;
         var trouble = pass.Failure is { } failure ? new ClaudeScheduledProblem(ClaudeScheduledProblemKind.Failed, failure)
             : pass.Unreadable.Count > 0 ? new ClaudeScheduledProblem(ClaudeScheduledProblemKind.Unreadable, Names(pass.Unreadable))
             : null;
         if (trouble is null) _scheduledTroubleSince = null;
         else { _scheduledTroubleSince ??= now; _scheduledWaiting = true; }
-        _scheduledShown = trouble is not null && now - _scheduledTroubleSince >= UnreadableGrace ? trouble
-            : pass.TooLarge is { Count: > 0 } large ? new(ClaudeScheduledProblemKind.TooLarge, Names(large))
-            : pass.Conflicts is { Count: > 0 } conflicts ? new(ClaudeScheduledProblemKind.Conflict, Names(conflicts))
-            : pass.RemovedHere is { Count: > 0 } removed ? new(ClaudeScheduledProblemKind.RemovedHere, Names(removed))
-            : pass.Held is { Count: > 0 } held ? new(ClaudeScheduledProblemKind.Held, Names(held))
-            : null;
-        Answer(pass.Answer ?? new JsonObject { ["status"] = pass.Failure ?? "failed" });
+        _scheduledShown = trouble is not null && now - _scheduledTroubleSince >= UnreadableGrace ? trouble : pass.Notice;
     }
 
     /// <summary>The first three names, and how many more.</summary>
     private static string Names(IReadOnlyList<string> names) =>
         string.Join(", ", names.Take(3)) + (names.Count > 3 ? $" +{names.Count - 3}" : "");
 
-    /// <summary>While the app runs, whether a scheduled-task list may be written now, read again before every file: every
-    /// line of the app's log in this run was read, its scheduled-task manager has a list loaded and its last line is a
-    /// few seconds old, and this list is another one, by name and on disk.</summary>
+    /// <summary>While the app runs, whether a scheduled-task list may be written now, read again before every file: the
+    /// app running is the installation found reviewed, every line of its log in this run was read, its scheduled-task
+    /// manager has a list loaded and its last line is a few seconds old, and this list is another one, by name and on
+    /// disk.</summary>
     private bool MayWriteScheduled(string key)
     {
         var now = _environment.Now();
         var runtime = _environment.Observe();
-        if (runtime.State != ClaudeDesktopRunState.Running) return false;
+        if (runtime.State != ClaudeDesktopRunState.Running || _scheduledPackage is not { } package
+            || !ClaudeDesktopProbe.RunsFrom(runtime, package)) return false;
         Watch(runtime, now);
         var log = _log.Scheduled;
         return log is { Known: true, Pending: false, Loaded: { } loaded }
@@ -791,7 +801,7 @@ internal sealed class ClaudeShelfService : IDisposable
         _disposed = true;
         _timer.Stop(); _timer.Dispose();
         // A pass may still be running: it finds the channel gone and answers nothing. Its other handles go with the process.
-        Interlocked.Exchange(ref _seedChannel, null)?.Dispose();
+        Interlocked.Exchange(ref _scheduledChannel, null)?.Dispose();
     }
 
     /// <summary>The layout this widget keeps, for tests: read after a pass, never while one runs.</summary>

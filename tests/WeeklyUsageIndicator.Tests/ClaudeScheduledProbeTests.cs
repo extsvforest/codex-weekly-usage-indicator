@@ -43,12 +43,10 @@ internal static class ClaudeScheduledProbeTests
         logs.Append(logs.Initialized(12, b));
         watcher.Update(logs.Start, [a, b]);
         var view = watcher.Scheduled;
-        Check(view is { Known: true, Pending: false, Loaded: { } next } && next == b.Key
-              && view.Loads[b.Key] == new DateTimeOffset(logs.Start.AddSeconds(5)),
-            "the next load names the list again, begun no later than the last line before the lost ones");
+        Check(view is { Known: true, Pending: false, Loaded: { } next } && next == b.Key, "the next load names the list again");
         // The line read as it stands, the same in one read through Apply.
         var log = new ClaudeScheduledLog();
-        log.Start(new DateTimeOffset(logs.Start));
+        log.Start();
         ClaudeDesktopLogWatcher.Apply(ClaudeDesktopAccountState.Unknown,
             [logs.Initialized(2, a), "", "[warn] Lines are missing here: this log could not be written (EIO)", logs.Line(4, "unrelated")],
             logs.Start, [a, b], null, log);
@@ -78,9 +76,7 @@ internal static class ClaudeScheduledProbeTests
         Check(watcher.Scheduled is { Pending: true, Loaded: null }, "a cut line finished by the next write leaves it unknown");
         logs.Append(logs.Initialized(9, b));
         watcher.Update(logs.Start, [a, b]);
-        Check(watcher.Scheduled is { Pending: false, Loaded: { } next } && next == b.Key
-              && watcher.Scheduled.Loads[b.Key] == new DateTimeOffset(logs.Start.AddSeconds(2)),
-            "the next load names the list again, begun no later than the last line before the cut");
+        Check(watcher.Scheduled is { Pending: false, Loaded: { } next } && next == b.Key, "the next load names the list again");
         // A load caught while the app writes it is unknown until its newline, and then names the list.
         logs.Append(logs.Reset(20));
         logs.Write(logs.Initialized(21, a));

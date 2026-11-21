@@ -11,29 +11,19 @@ using Microsoft.Win32.SafeHandles;
 
 namespace WeeklyUsageIndicator;
 
-internal enum ClaudeScheduledProblemKind { None, Unreviewed, Unreadable, Failed, TooLarge, Conflict, RemovedHere, Held }
+/// <summary>What the scheduled-task mirror left for the user (see <see cref="ClaudeShelfService"/>). <c>Conflict</c>
+/// and <c>RemovedHere</c> are lines of the account panel from before the mirror; it never reports them.</summary>
+internal enum ClaudeScheduledProblemKind { None, Unreviewed, Unreadable, Failed, TooLarge, Conflict, RemovedHere, Held, Differs, Stopped, Unfilled }
 
-/// <summary>Why scheduled tasks are not being aligned, or what aligning left for the user to settle (see
-/// <see cref="ClaudeShelfService"/>).</summary>
+/// <summary>Why scheduled tasks are not being mirrored, or what mirroring left for the user to settle.
+/// <see cref="Detail"/> names the tasks and accounts.</summary>
 internal sealed record ClaudeScheduledProblem(ClaudeScheduledProblemKind Kind, string? Detail = null);
 
 internal enum ClaudeScheduledReadStatus { Missing, Ok, Unreadable }
 
-/// <summary>What a task may do without asking, as an account holds it: its permission mode and whether the app carries
-/// it over, its Chrome mode, and the sites Chrome may use and the approvals of its runs, each by a fingerprint of its key
-/// (the site; the tool and its rule).</summary>
-internal sealed record ClaudeScheduledGrant(string Mode, bool Carried, string? Chrome, string[] Sites, string[] Approvals);
-
-/// <summary>What of that an edit in one account was seen choosing: the permission mode, the Chrome mode, and the sites
-/// and approvals it added (fingerprints). Only these may raise what another account's copy allows.</summary>
-internal sealed record ClaudeScheduledChoice(bool Mode, bool Chrome, string[] Sites, string[] Approvals)
-{
-    internal static readonly ClaudeScheduledChoice None = new(false, false, [], []);
-}
-
 /// <summary>One account's scheduled-task list as read now. <see cref="Entries"/> are the entries with ids the app keeps,
-/// by id; <see cref="Bytes"/> the file as read (null when missing); <see cref="Stamp"/> its size and last write as read;
-/// <see cref="FileId"/> and <see cref="FolderId"/> what the file and its folder are on disk.</summary>
+/// by id, inside <see cref="Root"/>; <see cref="Bytes"/> the file as read (null when missing); <see cref="Stamp"/> its
+/// size and last write as read; <see cref="FileId"/> and <see cref="FolderId"/> what the file and its folder are on disk.</summary>
 internal sealed record ClaudeScheduledFile(string Key, string Path, ClaudeScheduledReadStatus Status, byte[]? Bytes,
     JsonObject? Root, IReadOnlyDictionary<string, JsonObject> Entries, DateTimeOffset? WrittenAt, string? Problem = null,
     string? Stamp = null, string? FileId = null, string? FolderId = null)
@@ -43,49 +33,40 @@ internal sealed record ClaudeScheduledFile(string Key, string Path, ClaudeSchedu
 
 /// <summary>What the app's log says of its scheduled-task manager in this run (<see cref="ClaudeDesktopLogWatcher"/>):
 /// whether every line of the run was read (<see cref="Known"/>), the list it has loaded (null: none, or one it is loading
-/// while <see cref="Pending"/>), when its last line was, and, per list it loaded, when that load began. <see cref="Mark"/>
-/// counts its lines.</summary>
-internal sealed record ClaudeScheduledLogView(bool Known, string? Loaded, bool Pending, DateTimeOffset? LastLine,
-    IReadOnlyDictionary<string, DateTimeOffset> Loads, long Mark)
-{
-    internal IEnumerable<string> Initialized => Loads.Keys;
-}
+/// while <see cref="Pending"/>) and when its last line was. <see cref="Mark"/> counts its lines.</summary>
+internal sealed record ClaudeScheduledLogView(bool Known, string? Loaded, bool Pending, DateTimeOffset? LastLine, long Mark);
 
 /// <summary>Collects what the app's log says of its scheduled-task manager (6.28899: a <c>Reset</c> line when it lets
 /// its list go, an <c>Initialized</c> line naming the list it loaded), for <see cref="ClaudeScheduledLogView"/>. After
-/// a reset, and at the start of a run, it holds no list until the next load, which began reading after that reset.</summary>
+/// a reset, and at the start of a run, it holds no list until the next load.</summary>
 internal sealed class ClaudeScheduledLog
 {
-    private readonly Dictionary<string, DateTimeOffset> _loads = new(StringComparer.Ordinal);
     private string? _loaded;
     private bool _pending;
-    private DateTimeOffset? _boundary, _last;
+    private DateTimeOffset? _last;
     private long _mark;
 
     /// <summary>A run of the app read from its start.</summary>
-    internal void Start(DateTimeOffset at) { _loaded = null; _pending = true; _boundary = at; _last = null; }
+    internal void Start() { _loaded = null; _pending = true; _last = null; }
 
-    /// <summary>The app is closed: it holds no list. The loads seen stay.</summary>
-    internal void Close() { _loaded = null; _pending = false; _boundary = null; }
+    /// <summary>The app is closed: it holds no list.</summary>
+    internal void Close() { _loaded = null; _pending = false; }
 
-    internal void Reset(DateTimeOffset at) { _loaded = null; _pending = true; _boundary = at; _last = at; _mark++; }
+    internal void Reset(DateTimeOffset at) { _loaded = null; _pending = true; _last = at; _mark++; }
 
-    internal void Initialized(string key, DateTimeOffset at)
-    {
-        _loaded = key; _pending = false; _last = at; _mark++;
-        if (_boundary is { } began && (!_loads.TryGetValue(key, out var known) || began > known)) _loads[key] = began;
-    }
+    internal void Initialized(string key, DateTimeOffset at) { _loaded = key; _pending = false; _last = at; _mark++; }
 
-    internal ClaudeScheduledLogView View(bool known) =>
-        new(known, _loaded, _pending, _last, new Dictionary<string, DateTimeOffset>(_loads, StringComparer.Ordinal), _mark);
+    internal ClaudeScheduledLogView View(bool known) => new(known, _loaded, _pending, _last, _mark);
 }
 
-/// <summary>A command asked of the running widget: <c>seed</c> (fill the tasks the accounts agree on into the ones
-/// lacking them) or <c>remove</c> (delete tasks from every account), for <see cref="Tasks"/> (none: every task, seed only).</summary>
-internal sealed record ClaudeScheduledRequest(string Op, IReadOnlyList<string> Tasks);
+/// <summary>A command the running widget performs (<see cref="ClaudeScheduledChannel"/>): <c>mirror</c> a task from one
+/// account to every account (its plan; with <see cref="Apply"/> the plan whose token is <see cref="Expect"/>),
+/// <c>unmirror</c> it, or <c>remove</c> a task that is not mirrored.</summary>
+internal sealed record ClaudeScheduledRequest(string Op, string Task, string? From = null, bool Apply = false,
+    string? Expect = null, bool AllowRaise = false, IReadOnlyList<string>? Replaces = null);
 
-/// <summary>What a path is on disk with every link in it followed (its volume and file index), how many names it has,
-/// and its size and last write, read through one handle.</summary>
+/// <summary>What a path is on disk with every link in it followed (its volume and file index, and its final path), how
+/// many names it has, and its size and last write, read through one handle.</summary>
 internal static class ClaudeFileIdentity
 {
     internal sealed record Info(string Id, uint Links, long Length, DateTime LastWriteUtc);
@@ -94,8 +75,7 @@ internal static class ClaudeFileIdentity
     {
         try
         {
-            // FILE_READ_ATTRIBUTES, every share mode, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS (folders too).
-            using var handle = CreateFile(Extended(path), 0x80, 7, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero);
+            using var handle = Open(path);
             return handle.IsInvalid ? null : Of(handle);
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or ArgumentException) { return null; }
@@ -112,6 +92,26 @@ internal static class ClaudeFileIdentity
         }
         catch (ArgumentOutOfRangeException) { return null; }
     }
+
+    /// <summary>Where a folder or file really is, every link followed; null when that cannot be told.</summary>
+    internal static string? FinalPath(string path)
+    {
+        try
+        {
+            using var handle = Open(path);
+            if (handle.IsInvalid) return null;
+            var buffer = new StringBuilder(1024);
+            var length = GetFinalPathNameByHandle(handle, buffer, buffer.Capacity, 0);
+            if (length == 0 || length >= buffer.Capacity) return null;
+            var final = buffer.ToString();
+            return final.StartsWith(@"\\?\UNC\", StringComparison.OrdinalIgnoreCase) ? @"\\" + final[8..]
+                : final.StartsWith(@"\\?\", StringComparison.Ordinal) ? final[4..] : final;
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or ArgumentException) { return null; }
+    }
+
+    // FILE_READ_ATTRIBUTES, every share mode, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS (folders too).
+    private static SafeFileHandle Open(string path) => CreateFile(Extended(path), 0x80, 7, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero);
 
     private static string Extended(string path)
     {
@@ -135,14 +135,17 @@ internal static class ClaudeFileIdentity
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool GetFileInformationByHandle(SafeFileHandle file, out FileInformation information);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true, EntryPoint = "GetFinalPathNameByHandleW")]
+    private static extern int GetFinalPathNameByHandle(SafeFileHandle file, StringBuilder path, int length, uint flags);
 }
 
 /// <summary>
 /// The Claude app's scheduled-task list of one account and organization
 /// (<c>claude-code-sessions\account\org\scheduled-tasks.json</c>), as Claude 6.28899 reads it: at most 10 MiB, and the
 /// whole file passes its schema or the app loads none of it (and its next save keeps only what is made after).
-/// <see cref="IsValid"/> mirrors that schema; a file it refuses is never written or counted from. The definitions
-/// (<c>CLAUDE_CONFIG_DIR\scheduled-tasks\id</c>) are shared by every account and are never read here.
+/// <see cref="IsValid"/> mirrors that schema; a file it refuses is never written or counted from. A list is changed
+/// whole as read: every other entry, nested value and file-level field stays as it is.
 /// </summary>
 internal static class ClaudeScheduledRegistry
 {
@@ -153,26 +156,20 @@ internal static class ClaudeScheduledRegistry
     private static readonly Regex KeyPattern = new(
         "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
         RegexOptions.CultureInvariant);
-    // What a task is, the same in every account: a change made in one account brings these to the others.
-    internal static readonly string[] SyncedFields = ["displayName", "cronExpression", "fireAt", "enabled", "model", "createdAt",
-        "userSelectedFolders", "userSelectedFiles", "userSelectedProjectUuids", "chromePermissionMode", "chromeAllowedDomains", "cwd",
-        "place", "useWorktree", "sourceBranch", "permissionMode", "permissionModeCarried", "madeByClaude", "changedByClaudeAt",
-        "approvedPermissions", "disableJitter", "notifySessionId", "promptWrittenBy", "promptFileHash", "dispatchSubscribed", "watcher"];
-    // Each account's own, never copied nor compared: the definition path (the app sets it on load), an import's origin
-    // (it brings the import rules with it), what the app observed of the runs there, and where the task moved from or to.
-    internal static readonly string[] OwnFields = ["filePath", "importedFrom", "observedToolUse", "migratedFromRemote",
-        "migratedToRemoteAt", "migratedFromSpaceId", "migratedToRemote", "spaceId"];
-    // When a task last ran (see ClaudeScheduledSync.Plan).
-    internal static readonly string[] RunFields = ["lastRunAt", "lastScheduledFor", "missedRunScanFloor"];
-    // File-level markers of the two cron matcher upgrades: a list without them gets its affected tasks' slots raised.
-    internal static readonly string[] MigrationStamps = ["sundayAliasBoundaryStamped", "dayFieldsOrBoundaryStamped"];
+    /// <summary>The settings a mirror keeps the same in every account (the permission pair included). The other fields of
+    /// an entry are each account's own; the run times are the app's.</summary>
+    internal static readonly string[] Settings = ["displayName", "cronExpression", "enabled", "cwd", "model", "useWorktree",
+        "sourceBranch", "permissionMode", "permissionModeCarried"];
+    /// <summary>The file-level maps the app keeps by task id (6.28899): a task made under an id one of them still holds
+    /// would take what is there (a retry run, skips).</summary>
+    internal static readonly string[] TaskMaps = ["runRetries", "recordedSkips", "recordedPlaceSkips"];
     private static readonly string[] Strings = ["displayName", "migratedToRemoteAt", "migratedFromSpaceId", "cronExpression",
         "model", "lastRunAt", "lastScheduledFor", "missedRunScanFloor", "spaceId", "cwd", "sourceBranch", "notifySessionId"];
     private static readonly string[] Booleans = ["migratedFromRemote", "useWorktree", "disableJitter", "dispatchSubscribed"];
     private static readonly string[] StringArrays = ["userSelectedFolders", "userSelectedFiles", "userSelectedProjectUuids",
         "chromeAllowedDomains"];
     private static readonly string[] ChromeModes = ["ask", "skip_all_permission_checks", "follow_a_plan"];
-    private static readonly string[] PermissionModes = ["default", "acceptEdits", "plan", "bypassPermissions", "dontAsk", "auto"];
+    internal static readonly string[] PermissionModes = ["default", "acceptEdits", "plan", "bypassPermissions", "dontAsk", "auto"];
     private static readonly JsonSerializerOptions WriteOptions = new()
     { WriteIndented = true, Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping };
     internal static readonly IReadOnlyDictionary<string, JsonObject> None = new Dictionary<string, JsonObject>(StringComparer.Ordinal);
@@ -181,12 +178,6 @@ internal static class ClaudeScheduledRegistry
 
     /// <summary>An account/organization pair as this widget names it: both lowercase GUIDs.</summary>
     internal static bool IsKey(string? key) => key is not null && KeyPattern.IsMatch(key);
-
-    internal static string PathFor(string sessionsRoot, string key)
-    {
-        var parts = key.Split('/');
-        return System.IO.Path.Combine(sessionsRoot, parts[0], parts[1], FileName);
-    }
 
     internal static ClaudeScheduledFile Unread(string key, string path, string problem, string? stamp = null) =>
         new(key, path, ClaudeScheduledReadStatus.Unreadable, null, null, None, null, problem, stamp ?? CheapStamp(path));
@@ -226,10 +217,9 @@ internal static class ClaudeScheduledRegistry
         // The app parses the text as is: a byte order mark fails it.
         if (bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF) return Fails("bom");
         JsonNode? root;
-        try { root = JsonNode.Parse(bytes); }
+        try { root = JsonNode.Parse(bytes); if (!IsValid(root)) return Fails("schema"); }
         catch (Exception exception) when (exception is JsonException or ArgumentException or InvalidOperationException)
         { return Fails("json"); }
-        if (!IsValid(root)) return Fails("schema");
         var entries = new Dictionary<string, JsonObject>(StringComparer.Ordinal);
         foreach (var item in root!["scheduledTasks"]!.AsArray())
         {
@@ -262,7 +252,7 @@ internal static class ClaudeScheduledRegistry
         root is JsonObject file && file["scheduledTasks"] is JsonArray tasks && tasks.All(IsValidEntry);
 
     /// <summary>The app's entry schema (Claude 6.28899). Fields that fall back to nothing on a bad value are not
-    /// checked; a JSON null is a bad value for every optional field.</summary>
+    /// checked; a JSON null is a bad value for every optional field, and a number has to be finite.</summary>
     internal static bool IsValidEntry(JsonNode? node)
     {
         if (node is not JsonObject entry) return false;
@@ -288,13 +278,23 @@ internal static class ClaudeScheduledRegistry
         return true;
     }
 
-    private static bool IsString(JsonObject entry, string name, bool required = false) =>
+    internal static bool IsString(JsonObject entry, string name, bool required = false) =>
         entry.TryGetPropertyValue(name, out var value) ? value is JsonValue text && text.GetValueKind() == JsonValueKind.String : !required;
 
-    private static bool IsNumber(JsonObject entry, string name, bool required = false) =>
-        entry.TryGetPropertyValue(name, out var value) ? value is JsonValue number && number.GetValueKind() == JsonValueKind.Number : !required;
+    // The app reads a JSON number as a double: 1e400 is Infinity there, which its schema refuses.
+    internal static bool IsNumber(JsonObject entry, string name, bool required = false) =>
+        entry.TryGetPropertyValue(name, out var value) ? IsFinite(value) : !required;
 
-    private static bool IsBoolean(JsonObject entry, string name, bool required = false) =>
+    internal static bool IsFinite(JsonNode? node) => Number(node) is not null;
+
+    /// <summary>A JSON number as the app reads it (a double), read from its text so that a number made here reads as one
+    /// parsed from a file; null when the node is no number or not a finite one.</summary>
+    internal static double? Number(JsonNode? node) =>
+        node is JsonValue number && number.GetValueKind() == JsonValueKind.Number
+        && double.TryParse(number.ToJsonString(), NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed) && double.IsFinite(parsed)
+            ? parsed : null;
+
+    internal static bool IsBoolean(JsonObject entry, string name, bool required = false) =>
         entry.TryGetPropertyValue(name, out var value)
             ? value is JsonValue flag && flag.GetValueKind() is JsonValueKind.True or JsonValueKind.False : !required;
 
@@ -307,139 +307,78 @@ internal static class ClaudeScheduledRegistry
         !entry.TryGetPropertyValue(name, out var value)
         || value is JsonValue text && text.GetValueKind() == JsonValueKind.String && allowed.Contains(text.GetValue<string>());
 
-    /// <summary>What a task is, the same in every account: its synced fields.</summary>
-    internal static JsonObject Synced(JsonObject entry)
+    /// <summary>Why a task is not one the mirror keeps (a recurring cron task run on this PC, in a folder of it), or null.
+    /// A one-time task's runs and its switching off after one are the app's; a remote one runs elsewhere.</summary>
+    internal static string? KindProblem(JsonObject entry) =>
+        Text(entry, "cronExpression") is not { Length: > 0 } ? "not_cron"
+        : entry.ContainsKey("fireAt") ? "one_time"
+        : entry.ContainsKey("place") || entry["migratedToRemote"] is JsonValue moved && moved.GetValueKind() == JsonValueKind.True ? "remote"
+        : entry.ContainsKey("watcher") ? "watcher"
+        : Text(entry, "cwd") is not { Length: > 0 } ? "no_folder"
+        : null;
+
+    /// <summary>One setting of an entry as the mirror compares it: absent is null, and a carried mode is only a true
+    /// <c>permissionModeCarried</c> (the app reads nothing else as carried).</summary>
+    internal static JsonNode? Setting(JsonObject entry, string name) => name == "permissionModeCarried"
+        ? entry[name] is JsonValue carried && carried.GetValueKind() == JsonValueKind.True ? JsonValue.Create(true) : null
+        : entry[name]?.DeepClone();
+
+    internal static JsonObject SettingsOf(JsonObject entry)
     {
-        var content = new JsonObject();
-        foreach (var name in SyncedFields)
-            if (entry.TryGetPropertyValue(name, out var value)) content[name] = value?.DeepClone();
-        return content;
+        var settings = new JsonObject();
+        foreach (var name in Settings)
+            if (Setting(entry, name) is { } value) settings[name] = value;
+        return settings;
     }
 
-    /// <summary>The fields this widget does not know: kept as they are in every account, and copied with a task into a
-    /// list it is made in.</summary>
-    internal static JsonObject Extra(JsonObject entry)
+    /// <summary>The settings in which an entry differs from the mirror's: a field set on one side alone differs too.</summary>
+    internal static string[] Differences(JsonObject entry, JsonObject settings) =>
+        Settings.Where(name => Hash(Setting(entry, name)) != Hash(settings[name])).ToArray();
+
+    /// <summary>Gives an entry the mirror's settings exactly, absent ones removed; nothing else changes.</summary>
+    internal static void SetSettings(JsonObject entry, JsonObject settings)
     {
-        var extra = new JsonObject();
-        foreach (var (name, value) in entry)
-            if (name != "id" && !SyncedFields.Contains(name) && !OwnFields.Contains(name) && !RunFields.Contains(name))
-                extra[name] = value?.DeepClone();
-        return extra;
-    }
-
-    internal static string HashOf(JsonObject entry) => Hash(Synced(entry));
-
-    /// <summary>The permission mode a task runs in, and whether the app carries it over without asking again.</summary>
-    internal static (string Mode, bool Carried) Permission(JsonObject entry) =>
-        (Text(entry, "permissionMode") ?? "default", entry["permissionModeCarried"] is JsonValue carried && carried.GetValueKind() == JsonValueKind.True);
-
-    /// <summary>A mode beyond asking (accept edits, auto, bypass) or one carried over: made in a list without the user
-    /// seeing it chosen, it would run there with more than the user gave.</summary>
-    internal static bool Raises((string Mode, bool Carried) permission) =>
-        permission.Carried || permission.Mode is not ("default" or "dontAsk" or "plan");
-
-    // The fields of what a task may do without asking: each moves to another account only as chosen.
-    internal static readonly string[] GrantFields = ["permissionMode", "permissionModeCarried", "chromePermissionMode",
-        "chromeAllowedDomains", "approvedPermissions"];
-
-    // How few checks a Chrome mode makes (the app's own order, 6.28899 kGr). A task with none asks, as "ask" does.
-    private static int ChromeRank(string? mode) => mode switch { "follow_a_plan" => 1, "skip_all_permission_checks" => 2, _ => 0 };
-
-    private static string SiteKey(JsonNode? item) => item is JsonValue value && value.GetValueKind() == JsonValueKind.String ? value.GetValue<string>() : "";
-
-    // Two approvals are one when the tool and its rule are (the app's own key, 6.28899 y8).
-    private static string ApprovalKey(JsonNode? item) =>
-        item is JsonObject approval ? (Text(approval, "toolName") ?? "") + "\0" + (Text(approval, "ruleContent") ?? "") : "";
-
-    private static string ItemOf(JsonNode? item, Func<JsonNode?, string> key) => Hash((JsonNode)key(item));
-
-    private static string[] Items(JsonObject entry, string name, Func<JsonNode?, string> key) =>
-        entry[name] is JsonArray items
-            ? items.Select(item => ItemOf(item, key)).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray() : [];
-
-    internal static ClaudeScheduledGrant GrantOf(JsonObject entry)
-    {
-        var (mode, carried) = Permission(entry);
-        return new(mode, carried, Text(entry, "chromePermissionMode"), Items(entry, "chromeAllowedDomains", SiteKey),
-            Items(entry, "approvedPermissions", ApprovalKey));
-    }
-
-    internal static bool IsChromeMode(string? mode) => mode is null || ChromeModes.Contains(mode);
-
-    private static string[] Union(IEnumerable<string> first, IEnumerable<string> second) =>
-        first.Union(second, StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray();
-
-    /// <summary>What an edit in one account was seen choosing, from what the account held before (null: the task was
-    /// made there, and chose all it has) and after.</summary>
-    internal static ClaudeScheduledChoice Chosen(ClaudeScheduledGrant? was, ClaudeScheduledGrant held) =>
-        was is null ? new(true, true, held.Sites, held.Approvals)
-            : new(was.Mode != held.Mode || was.Carried != held.Carried, was.Chrome != held.Chrome,
-                held.Sites.Except(was.Sites, StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray(),
-                held.Approvals.Except(was.Approvals, StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray());
-
-    /// <summary>A choice seen in the change known before (made <paramref name="before"/>) holds on in a later change
-    /// (<paramref name="after"/>) for what that change keeps of it.</summary>
-    internal static ClaudeScheduledChoice Kept(ClaudeScheduledChoice chosen, ClaudeScheduledChoice known, ClaudeScheduledGrant before,
-        ClaudeScheduledGrant after) =>
-        new(chosen.Mode || known.Mode && before.Mode == after.Mode && before.Carried == after.Carried,
-            chosen.Chrome || known.Chrome && before.Chrome == after.Chrome,
-            Union(chosen.Sites, known.Sites.Intersect(after.Sites, StringComparer.Ordinal)),
-            Union(chosen.Approvals, known.Approvals.Intersect(after.Approvals, StringComparer.Ordinal)));
-
-    /// <summary>Whether a task made in a list where it was not would do more there without asking than an edit was seen
-    /// choosing: a permission mode beyond asking or carried over, a Chrome mode checking less than asking, a site or
-    /// an approval.</summary>
-    internal static bool RaisesBeyond(JsonObject content, ClaudeScheduledChoice chosen)
-    {
-        var grant = GrantOf(content);
-        return Raises((grant.Mode, grant.Carried)) && !chosen.Mode || ChromeRank(grant.Chrome) > 0 && !chosen.Chrome
-            || grant.Sites.Except(chosen.Sites, StringComparer.Ordinal).Any()
-            || grant.Approvals.Except(chosen.Approvals, StringComparer.Ordinal).Any();
-    }
-
-    /// <summary>Brings what a task may do without asking from a change to the entry an account holds: its permission
-    /// mode only when the change was seen choosing it; a Chrome mode checking as much or more, or one the change was
-    /// seen choosing; and of the change's sites and approvals those the entry holds or the change was seen adding.
-    /// What the change lacks goes.</summary>
-    internal static void Grant(JsonObject entry, JsonObject content, ClaudeScheduledChoice chosen)
-    {
-        if (chosen.Mode) Copy(entry, content, "permissionMode", "permissionModeCarried");
-        if (chosen.Chrome || ChromeRank(Text(content, "chromePermissionMode")) <= ChromeRank(Text(entry, "chromePermissionMode")))
-            Copy(entry, content, "chromePermissionMode");
-        Within(entry, content, "chromeAllowedDomains", SiteKey, chosen.Sites);
-        Within(entry, content, "approvedPermissions", ApprovalKey, chosen.Approvals);
-    }
-
-    private static void Copy(JsonObject entry, JsonObject content, params string[] names)
-    {
-        foreach (var name in names)
-            if (content.TryGetPropertyValue(name, out var value)) entry[name] = value?.DeepClone();
+        foreach (var name in Settings)
+            if (settings[name] is { } value) entry[name] = value.DeepClone();
             else entry.Remove(name);
     }
 
-    private static void Within(JsonObject entry, JsonObject content, string name, Func<JsonNode?, string> key, string[] chosen)
+    internal static JsonArray Tasks(JsonObject root) => root["scheduledTasks"]!.AsArray();
+
+    internal static JsonObject? Find(JsonObject root, string id) =>
+        Tasks(root).OfType<JsonObject>().FirstOrDefault(entry => Text(entry, "id") == id);
+
+    internal static void Drop(JsonObject root, Func<JsonObject, bool> match)
     {
-        if (content[name] is not JsonArray wanted)
-        {
-            entry.Remove(name);
-            return;
-        }
-        var allowed = Items(entry, name, key).Concat(chosen).ToHashSet(StringComparer.Ordinal);
-        var kept = wanted.Where(item => allowed.Contains(ItemOf(item, key))).Select(item => item?.DeepClone()).ToArray();
-        if (kept.Length > 0 || entry.ContainsKey(name)) entry[name] = new JsonArray(kept);
+        var tasks = Tasks(root);
+        for (var index = tasks.Count - 1; index >= 0; index--)
+            if (tasks[index] is JsonObject entry && match(entry)) tasks.RemoveAt(index);
     }
 
-    /// <summary>Which run of a task the run times belong to: made at <c>createdAt</c>, and for a one-time task due at
-    /// <c>fireAt</c>. A new due time starts a new run, with no run times.</summary>
-    internal static string Lineage(JsonObject entry) =>
-        (entry["createdAt"]?.ToJsonString() ?? "") + "|" + (entry["fireAt"]?.ToJsonString() ?? "");
+    /// <summary>A task's <c>createdAt</c> as written (the JSON number), or null.</summary>
+    internal static string? Created(JsonObject entry) => IsFinite(entry["createdAt"]) ? entry["createdAt"]!.ToJsonString() : null;
+
+    /// <summary>Whether an entry is the task made at <paramref name="createdAt"/> (a JSON number), as the app compares it.</summary>
+    internal static bool SameCreated(JsonObject entry, string createdAt) =>
+        Number(entry["createdAt"]) is { } at
+        && double.TryParse(createdAt, NumberStyles.Float, CultureInfo.InvariantCulture, out var expected) && at == expected;
+
+    internal static bool HasTaskMap(JsonObject root, string id) =>
+        TaskMaps.Any(name => root[name] is JsonObject map && map.ContainsKey(id));
+
+    internal static DateTimeOffset? Time(string? text) =>
+        text is not null && DateTimeOffset.TryParse(text, CultureInfo.InvariantCulture,
+            DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var at) ? at : null;
+
+    /// <summary>A time as the app writes one (<c>Date.toISOString</c>).</summary>
+    internal static string Iso(DateTimeOffset at) => at.UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'", CultureInfo.InvariantCulture);
 
     /// <summary>A fingerprint of a JSON value that ignores the order of object members.</summary>
     internal static string Hash(JsonNode? node)
     {
         var text = new StringBuilder();
         Canonical(node, text);
-        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(text.ToString())))[..32];
+        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(text.ToString())));
     }
 
     private static void Canonical(JsonNode? node, StringBuilder text)
@@ -472,392 +411,348 @@ internal static class ClaudeScheduledRegistry
         }
     }
 
-    /// <summary>Orders two times (ISO text): none, or one that does not parse, comes first.</summary>
-    internal static int Compare(string? first, string? second)
-    {
-        static DateTimeOffset? Parsed(string? text) =>
-            text is not null && DateTimeOffset.TryParse(text, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var at) ? at : null;
-        var (a, b) = (Parsed(first), Parsed(second));
-        return a is null ? b is null ? 0 : -1 : b is null ? 1 : a.Value.CompareTo(b.Value);
-    }
-
-    internal static bool IsTime(string? text) =>
-        text is not null && DateTimeOffset.TryParse(text, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out _);
-
-    internal static string? Later(string? first, string? second) => Compare(first, second) >= 0 ? first ?? second : second;
-
     internal static string? Text(JsonObject entry, string name) =>
         entry[name] is JsonValue value && value.GetValueKind() == JsonValueKind.String ? value.GetValue<string>() : null;
 
     internal static byte[] Serialize(JsonObject root) => Encoding.UTF8.GetBytes(root.ToJsonString(WriteOptions));
+}
 
-    internal static string? Sha(byte[]? bytes) => bytes is null ? null : Convert.ToHexString(SHA256.HashData(bytes));
+/// <summary>What a task may start with, as an entry holds it: its permission mode (null: none set, so the session's own),
+/// whether the app carries it over (<c>permissionModeCarried</c>) and whether it was imported (<c>importedFrom</c>).</summary>
+internal readonly record struct ClaudeScheduledAccess(string? Mode, bool Carried, bool Imported)
+{
+    internal static ClaudeScheduledAccess Of(JsonObject entry) => new(ClaudeScheduledRegistry.Text(entry, "permissionMode"),
+        ClaudeScheduledRegistry.Setting(entry, "permissionModeCarried") is not null, entry["importedFrom"] is not null);
+
+    internal JsonObject Json() => new() { ["mode"] = Mode, ["carried"] = Carried, ["imported"] = Imported };
+
+    /// <summary>As a plan shows it: the fields, and the mode a run starts in with the kill switch on and off.</summary>
+    internal JsonObject Shown()
+    {
+        var shown = Json();
+        shown["startsAs"] = new JsonObject
+        {
+            ["killSwitchOn"] = ClaudeScheduledPermission.StartName(this, killSwitch: true),
+            ["killSwitchOff"] = ClaudeScheduledPermission.StartName(this, killSwitch: false)
+        };
+        return shown;
+    }
+
+    internal static ClaudeScheduledAccess? Read(JsonNode? node) =>
+        node is JsonObject access && access.Count == 3 && access["mode"] is var mode
+        && (mode is null || mode is JsonValue text && text.GetValueKind() == JsonValueKind.String
+            && ClaudeScheduledRegistry.PermissionModes.Contains(text.GetValue<string>()))
+        && ClaudeScheduledRegistry.IsBoolean(access, "carried", required: true) && ClaudeScheduledRegistry.IsBoolean(access, "imported", required: true)
+        && access.ContainsKey("mode")
+            ? new(mode?.GetValue<string>(), access["carried"]!.GetValue<bool>(), access["imported"]!.GetValue<bool>()) : null;
 }
 
 /// <summary>
-/// What this widget keeps to align scheduled tasks, in its own folder (owner-only), tied to the profile folder it read:
-/// per account the tasks it last saw there (or wrote), the ones removed there alone and the ones it wrote that the app
-/// has not loaded yet; per task the newest change any account made, a conflict two accounts made, a deletion from every
-/// account, a fill asked for, and the newest run; and per account a write begun. Written whole and atomically, and read
-/// strictly: a record that does not read stops every write. The tasks' prompts live in their definitions and are never
-/// kept.
+/// The mode a scheduled run starts in (Claude 6.28899, <c>normalizeStartOptionsAtIngress</c>), for one entry, with the
+/// kill switch for carried modes (flags not loaded, or gate 396417011 on) on and off. With it on, a carried mode above
+/// Default, or none, starts as Default (<c>ur</c>); otherwise the run starts in the mode set, or with none set in the
+/// session's own (null: unknown). An imported entry is under the import rules besides (<c>dr</c>: an imported, carried
+/// Auto task starts in nothing above Default but Auto; and the update tool does not switch a switched-off import back
+/// on), which a copy, never imported, is not.
+/// </summary>
+internal static class ClaudeScheduledPermission
+{
+    // 6.28899 nR.
+    private static int Rank(string mode) => mode switch
+    {
+        "plan" => 0, "default" or "dontAsk" => 1, "acceptEdits" => 2, "auto" => 3, _ => 4
+    };
+
+    /// <summary>The mode a run of the entry starts in, ranked (null: the session's own, so unknown).</summary>
+    internal static int? Start(ClaudeScheduledAccess access, bool killSwitch)
+    {
+        int? rank = access.Mode is null ? null : Rank(access.Mode);
+        return killSwitch && access.Carried && rank is null or > 1 ? 1 : rank;
+    }
+
+    /// <summary>The start's mode by name, for a plan.</summary>
+    internal static string StartName(ClaudeScheduledAccess access, bool killSwitch) =>
+        killSwitch && access.Carried && (access.Mode is null || Rank(access.Mode) > 1) ? "default" : access.Mode ?? "(the session's own)";
+
+    /// <summary>Whether a task held as <paramref name="before"/> may start with more as <paramref name="after"/>: the
+    /// import rules lost, or with the kill switch on or off a higher start (the session's own counting as anything: above
+    /// a set mode but the highest, below one but the lowest).</summary>
+    internal static bool Raises(ClaudeScheduledAccess before, ClaudeScheduledAccess after)
+    {
+        if (before == after) return false;
+        if (before.Imported && !after.Imported) return true;
+        foreach (var killSwitch in new[] { false, true })
+        {
+            var higher = (Start(before, killSwitch), Start(after, killSwitch)) switch
+            {
+                (null, null) => false,
+                (null, { } set) => set > 0,
+                ({ } set, null) => set < 4,
+                ({ } from, { } to) => to > from
+            };
+            if (higher) return true;
+        }
+        return false;
+    }
+}
+
+/// <summary>A task's definition as the app runs it: the definitions folder (as named, and where it really is), its
+/// <c>SKILL.md</c>, and what its own folder is on disk (a folder made again is another).</summary>
+internal sealed record ClaudeScheduledDefinition(string Root, string RealRoot, string Skill, string Folder);
+
+/// <summary>A mode change a person allowed for one account when mirroring (<c>--allow-raise</c>).</summary>
+internal sealed record ClaudeScheduledAllowed(string Key, ClaudeScheduledAccess Before, ClaudeScheduledAccess After);
+
+/// <summary>Why a mirror stopped until a person mirrors it again: <c>differs</c> (an account's settings), <c>identity</c>
+/// (another task under its id), <c>kind</c> (no longer a recurring local task), <c>definition_missing</c> or
+/// <c>definition_replaced</c>; with the accounts and fields.</summary>
+internal sealed record ClaudeScheduledHold(string Reason, IReadOnlyList<(string Key, string[] Fields)> Accounts, DateTimeOffset Since);
+
+/// <summary>A task a person chose to mirror: from which account's entry (its id and <c>createdAt</c>), its definition,
+/// its settings as taken, whether that entry was imported, the mode changes allowed, the tasks it replaces, and a hold.</summary>
+internal sealed record ClaudeScheduledMirror(string Id, string SourceKey, string SourceCreatedAt, ClaudeScheduledDefinition Definition,
+    JsonObject Settings, bool SourceImported, IReadOnlyList<ClaudeScheduledAllowed> Allowed, IReadOnlyList<(string Id, string CreatedAt)> Replaces,
+    DateTimeOffset ChosenAt, ClaudeScheduledHold? Hold)
+{
+    internal ClaudeScheduledAccess SourceAccess => new(ClaudeScheduledRegistry.Text(Settings, "permissionMode"),
+        Settings["permissionModeCarried"] is not null, SourceImported);
+    /// <summary>A copy made in another list: the same settings, never imported.</summary>
+    internal ClaudeScheduledAccess CopyAccess => SourceAccess with { Imported = false };
+
+    internal bool Allows(string key, ClaudeScheduledAccess before, ClaudeScheduledAccess after) =>
+        Allowed.Any(allowed => allowed.Key == key && allowed.Before == before && allowed.After == after);
+
+    /// <summary>The entry made in a list lacking it: the settings, the source's <c>createdAt</c>, the definition and a
+    /// scan floor of now (as the app's own imports). No run times, approvals, Chrome sites, sessions or prompt record.</summary>
+    internal JsonObject Copy(DateTimeOffset now)
+    {
+        var entry = new JsonObject { ["id"] = Id };
+        ClaudeScheduledRegistry.SetSettings(entry, Settings);
+        entry["filePath"] = Definition.Skill;
+        entry["createdAt"] = JsonNode.Parse(SourceCreatedAt);
+        entry["missedRunScanFloor"] = ClaudeScheduledRegistry.Iso(now);
+        return entry;
+    }
+
+    private static string Time(DateTimeOffset at) => at.ToString("O", CultureInfo.InvariantCulture);
+
+    internal JsonObject Body() => new()
+    {
+        ["id"] = Id,
+        ["source"] = new JsonObject { ["key"] = SourceKey, ["createdAt"] = JsonNode.Parse(SourceCreatedAt) },
+        ["definition"] = new JsonObject
+        { ["root"] = Definition.Root, ["realRoot"] = Definition.RealRoot, ["skill"] = Definition.Skill, ["folder"] = Definition.Folder },
+        ["settings"] = Settings.DeepClone(),
+        ["sourceImported"] = SourceImported,
+        ["allowed"] = new JsonArray(Allowed.Select(allowed => (JsonNode)new JsonObject
+        { ["key"] = allowed.Key, ["before"] = allowed.Before.Json(), ["after"] = allowed.After.Json() }).ToArray()),
+        ["replaces"] = new JsonArray(Replaces.Select(replaced => (JsonNode)new JsonObject
+        { ["id"] = replaced.Id, ["createdAt"] = JsonNode.Parse(replaced.CreatedAt) }).ToArray()),
+        ["chosenAt"] = Time(ChosenAt),
+        ["hold"] = Hold is null ? null : new JsonObject
+        {
+            ["reason"] = Hold.Reason, ["since"] = Time(Hold.Since),
+            ["accounts"] = new JsonArray(Hold.Accounts.Select(account => (JsonNode)new JsonObject
+            { ["key"] = account.Key, ["fields"] = new JsonArray(account.Fields.Select(field => (JsonNode)field).ToArray()) }).ToArray())
+        }
+    };
+
+    /// <summary>A body as <see cref="Body"/> writes it, read strictly: anything missing, added or of another type reads
+    /// as null.</summary>
+    internal static ClaudeScheduledMirror? Read(JsonNode? node)
+    {
+        try
+        {
+            var body = Members(node, "id", "source", "definition", "settings", "sourceImported", "allowed", "replaces", "chosenAt", "hold");
+            var source = Members(body["source"], "key", "createdAt");
+            var definition = Members(body["definition"], "root", "realRoot", "skill", "folder");
+            var settings = body["settings"] as JsonObject ?? throw new InvalidDataException();
+            var probe = new JsonObject { ["id"] = "x", ["enabled"] = true, ["filePath"] = "x", ["createdAt"] = 0 };
+            foreach (var (name, value) in settings)
+            {
+                if (!ClaudeScheduledRegistry.Settings.Contains(name) || name == "enabled") continue;
+                probe[name] = value?.DeepClone();
+            }
+            if (settings.Any(member => !ClaudeScheduledRegistry.Settings.Contains(member.Key))
+                || !ClaudeScheduledRegistry.IsValidEntry(probe) || !ClaudeScheduledRegistry.IsBoolean(settings, "enabled", required: true)
+                || !ClaudeScheduledRegistry.IsString(settings, "cronExpression", required: true)
+                || settings.ContainsKey("permissionModeCarried") && ClaudeScheduledRegistry.Setting(settings, "permissionModeCarried") is null)
+                throw new InvalidDataException();
+            ClaudeScheduledHold? hold = null;
+            if (body["hold"] is { } held)
+            {
+                var members = Members(held, "reason", "since", "accounts");
+                hold = new(Text(members["reason"]), Array(members["accounts"]).Select(item =>
+                {
+                    var account = Members(item, "key", "fields");
+                    return (Key(Text(account["key"])), Array(account["fields"]).Select(Text).ToArray());
+                }).ToArray(), Moment(members["since"]));
+            }
+            else if (!body.ContainsKey("hold")) throw new InvalidDataException();
+            var id = Text(body["id"]);
+            return new(ClaudeScheduledRegistry.IsSafeId(id) ? id : throw new InvalidDataException(), Key(Text(source["key"])),
+                Number(source["createdAt"]),
+                new(Text(definition["root"]), Text(definition["realRoot"]), Text(definition["skill"]), Text(definition["folder"])),
+                settings.DeepClone().AsObject(), Flag(body["sourceImported"]),
+                Array(body["allowed"]).Select(item =>
+                {
+                    var allowed = Members(item, "key", "before", "after");
+                    return new ClaudeScheduledAllowed(Key(Text(allowed["key"])),
+                        ClaudeScheduledAccess.Read(allowed["before"]) ?? throw new InvalidDataException(),
+                        ClaudeScheduledAccess.Read(allowed["after"]) ?? throw new InvalidDataException());
+                }).ToArray(),
+                Array(body["replaces"]).Select(item =>
+                {
+                    var replaced = Members(item, "id", "createdAt");
+                    var replacedId = Text(replaced["id"]);
+                    return (ClaudeScheduledRegistry.IsSafeId(replacedId) ? replacedId : throw new InvalidDataException(), Number(replaced["createdAt"]));
+                }).ToArray(),
+                Moment(body["chosenAt"]), hold);
+        }
+        catch (Exception exception) when (exception is InvalidDataException or InvalidOperationException or FormatException) { return null; }
+    }
+
+    private static JsonObject Members(JsonNode? node, params string[] names) =>
+        node is JsonObject members && members.Count == names.Length && names.All(members.ContainsKey) ? members : throw new InvalidDataException();
+
+    private static JsonArray Array(JsonNode? node) => node as JsonArray ?? throw new InvalidDataException();
+
+    private static string Text(JsonNode? node) =>
+        node is JsonValue value && value.GetValueKind() == JsonValueKind.String ? value.GetValue<string>() : throw new InvalidDataException();
+
+    private static string Key(string key) => ClaudeScheduledRegistry.IsKey(key) ? key : throw new InvalidDataException();
+
+    private static bool Flag(JsonNode? node) =>
+        node is JsonValue value && value.GetValueKind() is JsonValueKind.True or JsonValueKind.False ? value.GetValue<bool>() : throw new InvalidDataException();
+
+    private static string Number(JsonNode? node) => ClaudeScheduledRegistry.IsFinite(node) ? node!.ToJsonString() : throw new InvalidDataException();
+
+    private static DateTimeOffset Moment(JsonNode? node) =>
+        DateTimeOffset.ParseExact(Text(node), "O", CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind);
+}
+
+/// <summary>
+/// What this widget keeps to mirror scheduled tasks (<see cref="ClaudeScheduledSync.StateFile"/>, in its own folder): the
+/// mirrors chosen, each with a fingerprint of its body. A body whose fingerprint does not match, or that does not read,
+/// is kept as it is and its task frozen. A file of another format is not read at all (that of the first version is left
+/// where it is, never taken).
 /// </summary>
 internal sealed class ClaudeScheduledState
 {
-    private const int Version = 2;
-    internal string? Root { get; set; }
-    internal string? DefinitionsRoot { get; set; }
-    internal SortedSet<string> DefinitionsSeen { get; set; } = new(StringComparer.Ordinal);
-    internal SortedDictionary<string, AccountState> Accounts { get; } = new(StringComparer.Ordinal);
-    internal SortedDictionary<string, Change> Changes { get; } = new(StringComparer.Ordinal);
-    internal SortedDictionary<string, Conflict> Conflicts { get; } = new(StringComparer.Ordinal);
-    internal SortedDictionary<string, Deletion> Deleted { get; } = new(StringComparer.Ordinal);
-    internal SortedDictionary<string, Seeding> Seeds { get; } = new(StringComparer.Ordinal);
-    internal SortedDictionary<string, SortedDictionary<string, Run>> Runs { get; } = new(StringComparer.Ordinal);
-    internal SortedDictionary<string, Intent> Intents { get; } = new(StringComparer.Ordinal);
-    // Lists the app's log showed it load: aligned even before they hold a file.
-    internal SortedSet<string> Known { get; } = new(StringComparer.Ordinal);
-    internal SortedDictionary<string, string> Labels { get; } = new(StringComparer.Ordinal);
+    internal const string Format = "gfs-scheduled-mirror/2";
+    internal SortedDictionary<string, ClaudeScheduledMirror> Mirrors { get; } = new(StringComparer.Ordinal);
+    internal SortedDictionary<string, JsonNode?> Frozen { get; } = new(StringComparer.Ordinal);
 
-    internal sealed class AccountState
+    internal static ClaudeScheduledState? Read(byte[] bytes)
     {
-        // When this widget first saw the account: changes made before are not brought to it.
-        internal DateTimeOffset Since { get; set; }
-        internal DateTimeOffset Seen { get; set; }
-        internal SortedDictionary<string, Entry> Entries { get; set; } = new(StringComparer.Ordinal);
-        internal SortedDictionary<string, DateTimeOffset> Removed { get; } = new(StringComparer.Ordinal);
-        internal SortedDictionary<string, Written> Writes { get; } = new(StringComparer.Ordinal);
-    }
-
-    /// <summary>A task as an account holds it: its synced fields' hash, and what it may do without asking.</summary>
-    internal sealed record Entry(string Hash, ClaudeScheduledGrant Grant);
-
-    /// <summary>This widget's write of a task to an account the app has not loaded since: when, what the task was there
-    /// before the first such write (null: absent), and what it wrote.</summary>
-    internal sealed record Written(DateTimeOffset At, string? Before, string After);
-
-    /// <summary>The newest change to a task: made in account <c>By</c> after <c>Lower</c> and by <c>Upper</c>; what it
-    /// is now (its synced fields, hashed as <c>Hash</c>); the fields this widget does not know (copied into a list it is
-    /// made in); its definition path; the parts of what it may do without asking that were seen chosen; and the
-    /// migration stamps of its list.</summary>
-    internal sealed record Change(DateTimeOffset Lower, DateTimeOffset Upper, string By, string Hash, JsonObject Content,
-        JsonObject Extra, string? FilePath, ClaudeScheduledChoice Chosen, string[] Stamps);
-
-    /// <summary>Changes to one task in several accounts whose order cannot be told, found at <c>At</c>.</summary>
-    internal sealed record Conflict(DateTimeOffset At, string[] Accounts);
-
-    /// <summary>A task deleted from every account (by <c>definitions</c>: its definition folder went; by <c>command</c>:
-    /// asked for), and the accounts still to remove it from.</summary>
-    internal sealed record Deletion(DateTimeOffset At, string By, SortedSet<string> Pending);
-
-    /// <summary>A task a seed fills into the accounts still lacking it (<c>Pending</c>), as account <c>Source</c> held it.</summary>
-    internal sealed record Seeding(DateTimeOffset At, string Source, string Hash, JsonObject Content, JsonObject Extra,
-        string? FilePath, string[] Stamps, SortedSet<string> Pending);
-
-    /// <summary>A run of a task: its newest run times, as one account held them, the latest scan floor, and the newest
-    /// run an account finished without a retry pending.</summary>
-    internal sealed record Run(string? LastRunAt, string? LastScheduledFor, string? Floor, string? Completed);
-
-    /// <summary>A write begun: its list is moved into place after this is kept. <c>Partial</c> is the new list beside it
-    /// while it is not; <c>Before</c> and <c>After</c> the file's hashes before and after.</summary>
-    internal sealed record Intent(DateTimeOffset At, string Partial, string? Before, string After,
-        SortedDictionary<string, Entry> Entries, SortedDictionary<string, Written> Writes);
-
-    internal ClaudeScheduledState Clone() => Load(Save()) ?? throw new InvalidDataException();
-
-    private static string Time(DateTimeOffset at) => at.ToString("O", CultureInfo.InvariantCulture);
-    private static JsonArray Strings(IEnumerable<string> items) => new(items.Select(item => (JsonNode)item).ToArray());
-
-    private static JsonObject EntriesJson(IEnumerable<KeyValuePair<string, Entry>> entries)
-    {
-        var json = new JsonObject();
-        foreach (var (id, entry) in entries)
-            json[id] = new JsonObject
+        try
+        {
+            if (JsonNode.Parse(bytes) is not JsonObject root || root.Count != 2 || root["format"] is not JsonValue format
+                || format.GetValueKind() != JsonValueKind.String || format.GetValue<string>() != Format || root["mirrors"] is not JsonObject mirrors)
+                return null;
+            var state = new ClaudeScheduledState();
+            foreach (var (id, record) in mirrors)
             {
-                ["hash"] = entry.Hash, ["mode"] = entry.Grant.Mode, ["carried"] = entry.Grant.Carried, ["chrome"] = entry.Grant.Chrome,
-                ["sites"] = Strings(entry.Grant.Sites), ["approvals"] = Strings(entry.Grant.Approvals)
-            };
-        return json;
-    }
-
-    private static JsonObject WritesJson(IEnumerable<KeyValuePair<string, Written>> writes)
-    {
-        var json = new JsonObject();
-        foreach (var (id, write) in writes) json[id] = new JsonObject { ["at"] = Time(write.At), ["before"] = write.Before, ["after"] = write.After };
-        return json;
+                if (!ClaudeScheduledRegistry.IsSafeId(id)) return null;
+                var mirror = record is JsonObject { Count: 2 } kept && kept["sha256"] is JsonValue hash && hash.GetValueKind() == JsonValueKind.String
+                             && string.Equals(hash.GetValue<string>(), ClaudeScheduledRegistry.Hash(kept["body"]), StringComparison.OrdinalIgnoreCase)
+                    ? ClaudeScheduledMirror.Read(kept["body"]) : null;
+                if (mirror is not null && mirror.Id == id) state.Mirrors[id] = mirror;
+                else state.Frozen[id] = record?.DeepClone();
+            }
+            return state;
+        }
+        catch (Exception exception) when (exception is JsonException or ArgumentException or InvalidOperationException) { return null; }
     }
 
     internal JsonObject Save()
     {
-        var accounts = new JsonObject();
-        foreach (var (key, account) in Accounts)
+        var mirrors = new JsonObject();
+        foreach (var (id, record) in Frozen) mirrors[id] = record?.DeepClone();
+        foreach (var (id, mirror) in Mirrors)
         {
-            var removed = new JsonObject();
-            foreach (var (id, at) in account.Removed) removed[id] = Time(at);
-            accounts[key] = new JsonObject
-            {
-                ["since"] = Time(account.Since), ["seen"] = Time(account.Seen), ["entries"] = EntriesJson(account.Entries),
-                ["removed"] = removed, ["writes"] = WritesJson(account.Writes)
-            };
+            var body = mirror.Body();
+            mirrors[id] = new JsonObject { ["body"] = body, ["sha256"] = ClaudeScheduledRegistry.Hash(body) };
         }
-        var changes = new JsonObject();
-        foreach (var (id, change) in Changes)
-            changes[id] = new JsonObject
-            {
-                ["lower"] = Time(change.Lower), ["upper"] = Time(change.Upper), ["by"] = change.By, ["hash"] = change.Hash,
-                ["content"] = change.Content.DeepClone(), ["extra"] = change.Extra.DeepClone(), ["filePath"] = change.FilePath,
-                ["chosen"] = new JsonObject
-                {
-                    ["mode"] = change.Chosen.Mode, ["chrome"] = change.Chosen.Chrome, ["sites"] = Strings(change.Chosen.Sites),
-                    ["approvals"] = Strings(change.Chosen.Approvals)
-                },
-                ["stamps"] = Strings(change.Stamps)
-            };
-        var conflicts = new JsonObject();
-        foreach (var (id, conflict) in Conflicts) conflicts[id] = new JsonObject { ["at"] = Time(conflict.At), ["accounts"] = Strings(conflict.Accounts) };
-        var deleted = new JsonObject();
-        foreach (var (id, deletion) in Deleted)
-            deleted[id] = new JsonObject { ["at"] = Time(deletion.At), ["by"] = deletion.By, ["pending"] = Strings(deletion.Pending) };
-        var seeds = new JsonObject();
-        foreach (var (id, seeding) in Seeds)
-            seeds[id] = new JsonObject
-            {
-                ["at"] = Time(seeding.At), ["source"] = seeding.Source, ["hash"] = seeding.Hash, ["content"] = seeding.Content.DeepClone(),
-                ["extra"] = seeding.Extra.DeepClone(), ["filePath"] = seeding.FilePath, ["stamps"] = Strings(seeding.Stamps),
-                ["pending"] = Strings(seeding.Pending)
-            };
-        var runs = new JsonObject();
-        foreach (var (id, lineages) in Runs)
-        {
-            var json = new JsonObject();
-            foreach (var (lineage, run) in lineages)
-                json[lineage] = new JsonObject { ["lastRunAt"] = run.LastRunAt, ["lastScheduledFor"] = run.LastScheduledFor, ["floor"] = run.Floor, ["completed"] = run.Completed };
-            runs[id] = json;
-        }
-        var intents = new JsonObject();
-        foreach (var (key, intent) in Intents)
-            intents[key] = new JsonObject
-            {
-                ["at"] = Time(intent.At), ["partial"] = intent.Partial, ["before"] = intent.Before, ["after"] = intent.After,
-                ["entries"] = EntriesJson(intent.Entries), ["writes"] = WritesJson(intent.Writes)
-            };
-        var labels = new JsonObject();
-        foreach (var (key, label) in Labels) labels[key] = label;
-        return new JsonObject
-        {
-            ["version"] = Version, ["root"] = Root, ["definitionsRoot"] = DefinitionsRoot, ["definitionsSeen"] = Strings(DefinitionsSeen),
-            ["accounts"] = accounts, ["changes"] = changes, ["conflicts"] = conflicts, ["deleted"] = deleted, ["seeds"] = seeds,
-            ["runs"] = runs, ["intents"] = intents, ["known"] = Strings(Known), ["labels"] = labels
-        };
-    }
-
-    /// <summary>Null unless every record reads whole, with the types, keys and ids this widget writes.</summary>
-    internal static ClaudeScheduledState? Load(JsonObject root)
-    {
-        try
-        {
-            if (Number(root["version"]) != Version) return null;
-            var state = new ClaudeScheduledState { Root = Optional(root["root"]), DefinitionsRoot = Optional(root["definitionsRoot"]) };
-            foreach (var id in Array(root["definitionsSeen"])) state.DefinitionsSeen.Add(Id(String(id)));
-            foreach (var (key, node) in Object(root["accounts"]))
-            {
-                var value = Object(node);
-                var account = new AccountState { Since = Moment(value["since"]), Seen = Moment(value["seen"]), Entries = Entries(value["entries"]) };
-                foreach (var (id, at) in Object(value["removed"])) account.Removed[Id(id)] = Moment(at);
-                foreach (var (id, write) in Writes(value["writes"])) account.Writes[id] = write;
-                state.Accounts[Key(key)] = account;
-            }
-            foreach (var (id, node) in Object(root["changes"]))
-            {
-                var value = Object(node);
-                state.Changes[Id(id)] = new(Moment(value["lower"]), Moment(value["upper"]), Key(String(value["by"])), String(value["hash"]),
-                    Content(value["content"]), Extra(value["extra"]), Optional(value["filePath"]), Choice(value["chosen"]),
-                    Stamps(value["stamps"]));
-            }
-            foreach (var (id, node) in Object(root["conflicts"]))
-            {
-                var value = Object(node);
-                state.Conflicts[Id(id)] = new(Moment(value["at"]), Array(value["accounts"]).Select(key => Key(String(key))).ToArray());
-            }
-            foreach (var (id, node) in Object(root["deleted"]))
-            {
-                var value = Object(node);
-                var by = String(value["by"]);
-                if (by is not ("definitions" or "command")) return null;
-                state.Deleted[Id(id)] = new(Moment(value["at"]), by, Keys(value["pending"]));
-            }
-            foreach (var (id, node) in Object(root["seeds"]))
-            {
-                var value = Object(node);
-                state.Seeds[Id(id)] = new(Moment(value["at"]), Key(String(value["source"])), String(value["hash"]), Content(value["content"]),
-                    Extra(value["extra"]), Optional(value["filePath"]), Stamps(value["stamps"]), Keys(value["pending"]));
-            }
-            foreach (var (id, node) in Object(root["runs"]))
-            {
-                var lineages = new SortedDictionary<string, Run>(StringComparer.Ordinal);
-                foreach (var (lineage, run) in Object(node))
-                {
-                    var value = Object(run);
-                    lineages[lineage] = new(Optional(value["lastRunAt"]), Optional(value["lastScheduledFor"]), Optional(value["floor"]),
-                        Optional(value["completed"]));
-                }
-                state.Runs[Id(id)] = lineages;
-            }
-            foreach (var (key, node) in Object(root["intents"]))
-            {
-                var value = Object(node);
-                var writes = new SortedDictionary<string, Written>(StringComparer.Ordinal);
-                foreach (var (id, write) in Writes(value["writes"])) writes[id] = write;
-                state.Intents[Key(key)] = new(Moment(value["at"]), String(value["partial"]), Optional(value["before"]), String(value["after"]),
-                    Entries(value["entries"]), writes);
-            }
-            foreach (var key in Array(root["known"])) state.Known.Add(Key(String(key)));
-            foreach (var (key, label) in Object(root["labels"])) state.Labels[Key(key)] = String(label);
-            return state;
-        }
-        catch (Exception exception) when (exception is InvalidDataException or InvalidOperationException or FormatException
-                                              or JsonException or KeyNotFoundException or ArgumentException)
-        { return null; }
-    }
-
-    private static JsonObject Object(JsonNode? node) => node as JsonObject ?? throw new InvalidDataException();
-    private static JsonArray Array(JsonNode? node) => node as JsonArray ?? throw new InvalidDataException();
-
-    private static string String(JsonNode? node) =>
-        node is JsonValue value && value.GetValueKind() == JsonValueKind.String ? value.GetValue<string>() : throw new InvalidDataException();
-
-    private static string? Optional(JsonNode? node) => node is null ? null : String(node);
-
-    private static bool Boolean(JsonNode? node) =>
-        node is JsonValue value && value.GetValueKind() is JsonValueKind.True or JsonValueKind.False ? value.GetValue<bool>() : throw new InvalidDataException();
-
-    private static int Number(JsonNode? node) =>
-        node is JsonValue value && value.GetValueKind() == JsonValueKind.Number && value.TryGetValue<int>(out var number) ? number : -1;
-
-    private static DateTimeOffset Moment(JsonNode? node) =>
-        DateTimeOffset.ParseExact(String(node), "O", CultureInfo.InvariantCulture, DateTimeStyles.None);
-
-    private static string Key(string key) => ClaudeScheduledRegistry.IsKey(key) ? key : throw new InvalidDataException();
-    private static string Id(string id) => ClaudeScheduledRegistry.IsSafeId(id) ? id : throw new InvalidDataException();
-
-    private static SortedSet<string> Keys(JsonNode? node) => new(Array(node).Select(key => Key(String(key))), StringComparer.Ordinal);
-
-    // Fingerprints, sorted and distinct, as this widget writes them.
-    private static string[] Items(JsonNode? node)
-    {
-        var items = Array(node).Select(String).ToArray();
-        return items.SequenceEqual(items.Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal)) ? items : throw new InvalidDataException();
-    }
-
-    private static ClaudeScheduledChoice Choice(JsonNode? node)
-    {
-        var value = Object(node);
-        return new(Boolean(value["mode"]), Boolean(value["chrome"]), Items(value["sites"]), Items(value["approvals"]));
-    }
-
-    private static string[] Stamps(JsonNode? node) =>
-        Array(node).Select(stamp => String(stamp) is var name && ClaudeScheduledRegistry.MigrationStamps.Contains(name) ? name : throw new InvalidDataException()).ToArray();
-
-    private static SortedDictionary<string, Entry> Entries(JsonNode? node)
-    {
-        var entries = new SortedDictionary<string, Entry>(StringComparer.Ordinal);
-        foreach (var (id, entry) in Object(node))
-        {
-            var value = Object(entry);
-            var chrome = Optional(value["chrome"]);
-            if (!ClaudeScheduledRegistry.IsChromeMode(chrome)) throw new InvalidDataException();
-            entries[Id(id)] = new(String(value["hash"]), new(String(value["mode"]), Boolean(value["carried"]), chrome, Items(value["sites"]),
-                Items(value["approvals"])));
-        }
-        return entries;
-    }
-
-    private static IEnumerable<(string Id, Written Write)> Writes(JsonNode? node)
-    {
-        var writes = new List<(string, Written)>();
-        foreach (var (id, write) in Object(node))
-        {
-            var value = Object(write);
-            writes.Add((Id(id), new(Moment(value["at"]), Optional(value["before"]), String(value["after"]))));
-        }
-        return writes;
-    }
-
-    private static JsonObject Content(JsonNode? node)
-    {
-        var content = (JsonObject)Object(node).DeepClone();
-        foreach (var (name, _) in content) if (!ClaudeScheduledRegistry.SyncedFields.Contains(name)) throw new InvalidDataException();
-        return content;
-    }
-
-    private static JsonObject Extra(JsonNode? node)
-    {
-        var extra = (JsonObject)Object(node).DeepClone();
-        foreach (var (name, _) in extra)
-            if (name == "id" || ClaudeScheduledRegistry.SyncedFields.Contains(name) || ClaudeScheduledRegistry.OwnFields.Contains(name)
-                || ClaudeScheduledRegistry.RunFields.Contains(name)) throw new InvalidDataException();
-        return extra;
+        return new JsonObject { ["format"] = Format, ["mirrors"] = mirrors };
     }
 }
 
-/// <summary>What aligning would write to one account: the list as it should be, which tasks it creates, changes,
-/// removes or only brings the run times of, and the tasks it then holds and the ones it wrote.</summary>
-internal sealed record ClaudeScheduledChange(string Key, ClaudeScheduledFile File, JsonObject Root, byte[] Bytes,
-    IReadOnlyList<string> Created, IReadOnlyList<string> Updated, IReadOnlyList<string> Deleted, IReadOnlyList<string> Runs,
-    SortedDictionary<string, ClaudeScheduledState.Entry> Entries, SortedDictionary<string, ClaudeScheduledState.Written> Writes);
+/// <summary>What one look at the lists found: each list (the registered accounts' among them, read or not), their
+/// labels, the list the app's log shows loaded (null: none, or unknown while <see cref="Known"/> is false), and the
+/// kept state (null, and why, when it does not read).</summary>
+internal sealed record ClaudeScheduledScene(IReadOnlyList<ClaudeScheduledFile> Files, IReadOnlyList<ClaudeShelfAccount> Registered,
+    bool Running, string? Loaded, bool Known, ClaudeScheduledState? State, string? StateProblem)
+{
+    internal string Label(string key) => Registered.FirstOrDefault(account => account.Key == key)?.Label ?? key[..8];
+}
 
-/// <summary>What a pass would write, the tasks it would not make in an account because they would run there with more
-/// permission than anyone chose there, and the lists the result would make too long for the app.</summary>
-internal sealed record ClaudeScheduledPlan(IReadOnlyList<ClaudeScheduledChange> Changes, IReadOnlyList<(string Key, string Id)> Held,
-    IReadOnlyList<string> TooLarge);
+/// <summary>A plan for one command: its answer, its token, and per list what would be written (null: nothing).</summary>
+internal sealed record ClaudeScheduledPlan(JsonObject Answer, string? Token, IReadOnlyList<ClaudeScheduledChange> Changes,
+    ClaudeScheduledMirror? Mirror = null, IReadOnlyList<ClaudeScheduledAllowed>? Raising = null)
+{
+    internal bool Refused => Token is null;
+}
 
-/// <summary>What one pass did and found: lists written, unreadable (labels), waiting, too long for the app; the tasks
-/// in conflict, removed in one account only and held; the answer to a request; and per list the stamp it was read or
-/// written with.</summary>
-internal sealed record ClaudeScheduledPass(bool First, int Written, IReadOnlyList<string> Unreadable, IReadOnlyList<string> Waiting,
-    string? Failure, JsonObject? Answer = null, IReadOnlyList<string>? TooLarge = null, IReadOnlyList<string>? Conflicts = null,
-    IReadOnlyList<string>? RemovedHere = null, IReadOnlyList<string>? Held = null, IReadOnlyDictionary<string, string>? Processed = null);
+internal sealed record ClaudeScheduledChange(ClaudeScheduledFile File, JsonObject Root, JsonObject Target);
+
+internal sealed record ClaudeScheduledPass(int Written, IReadOnlyList<string> Waiting, IReadOnlyList<string> Unreadable,
+    string? Failure, ClaudeScheduledProblem? Notice, IReadOnlyDictionary<string, string>? Processed = null, JsonArray? Report = null);
 
 /// <summary>
-/// Aligns the scheduled-task lists of the accounts on this PC (every account/organization folder holding a list, one
-/// the app's log showed it load, and the registered ones). Each pass reads every list and records what changed in each
-/// since it was last seen: a task made or changed there is that account's change (the newest one wins, when the order
-/// can be told; when it cannot, the task is in conflict and left alone until one account changes it again). A task gone
-/// from a list is removed there only: it is never made there again nor deleted elsewhere. A task is deleted from every
-/// account only when its definition folder goes, or when the remove command asks. The lists the caller lets it write
-/// (another account's while the app runs, the one it shows only once it is closed) get every change as made, field by
-/// field, and the newest run times; a task is not made in a list where it would run with more permission than anyone
-/// chose. The first pass, and the first after the profile folder moved, only take what is there as the starting point.
-/// Lists that do not read are neither written nor counted from.
+/// Mirrors the scheduled tasks a person chose (<c>--claude-scheduled-mirror</c>) into the lists of the accounts on this
+/// PC. A mirror takes one account's entry as it is, and only an explicit apply of its plan changes an entry that is
+/// there. Between applies, each pass only makes the task in a list lacking it, raises the scan floor of a copy past the
+/// slots another account ran, and reports what differs: once an account's entry differs from the mirror (or is another
+/// task under the id, or no longer a recurring local one, or the definition went), the task is held everywhere until
+/// it is mirrored again. Lists that do not read are neither written nor counted from, a list is written whole as read,
+/// and only a list the app has not loaded (<see cref="Pass"/>'s <c>mayWrite</c>).
 /// </summary>
 internal sealed class ClaudeScheduledSync
 {
-    // How old the kept times the lists were last looked at may get before a pass that changed nothing saves them.
-    private static readonly TimeSpan SeenRefresh = TimeSpan.FromMinutes(30);
-    // How long after this widget's write the app's log has to show it begin loading that list before the list counts as
-    // the app's again (the log tells whole seconds).
-    internal static readonly TimeSpan LoadMargin = TimeSpan.FromSeconds(1);
-    private const int Backups = 5;
     internal const string StoreFolder = "scheduled-tasks";
-    private const string PartialPattern = ".scheduled-tasks.*.widget-sync.partial";
+    internal const string StateFile = "mirror-v2.json";
+    private const int Backups = 5;
+    private static int s_writeCalls;
     private readonly string _sessionsRoot;
     private readonly string _store;
-    private readonly string? _definitions;
+    private readonly string? _definitions, _appDefinitions;
     private readonly Func<IDisposable> _lease;
-    private readonly Func<DateTimeOffset> _clock;
+    private readonly bool _readOnly;
 
-    internal ClaudeScheduledSync(string sessionsRoot, string storeDirectory, string? definitionsRoot, Func<IDisposable> lease,
-        Func<DateTimeOffset>? clock = null)
+    /// <param name="definitionsRoot">The definitions folder as this widget finds it.</param>
+    /// <param name="appDefinitionsRoot">The one the app uses (the user's <c>CLAUDE_CONFIG_DIR</c>): nothing is
+    /// written while the two differ.</param>
+    /// <param name="readOnly">A plan made outside the widget: every write throws.</param>
+    internal ClaudeScheduledSync(string sessionsRoot, string storeDirectory, string? definitionsRoot, string? appDefinitionsRoot,
+        Func<IDisposable> lease, bool readOnly = false)
     {
-        _sessionsRoot = sessionsRoot; _store = storeDirectory; _definitions = definitionsRoot; _lease = lease;
-        _clock = clock ?? (() => DateTimeOffset.Now);
+        _sessionsRoot = sessionsRoot; _store = storeDirectory; _definitions = definitionsRoot; _appDefinitions = appDefinitionsRoot;
+        _lease = lease; _readOnly = readOnly;
     }
 
-    internal string SessionsRoot => _sessionsRoot;
-    private string StatePath => Path.Combine(_store, "state.json");
-    // For tests: runs just before a list is moved into place, and just after (a throw there stands for the widget stopping).
+    /// <summary>How many times this process entered a function that writes (a list, a backup, the state).</summary>
+    internal static int WriteCalls => Volatile.Read(ref s_writeCalls);
+    internal string StatePath => Path.Combine(_store, StateFile);
+    internal string BackupFolder(string key) => Path.Combine(_store, "backups", key.Replace('/', '_'));
+    // For tests: runs just before a list is moved into place.
     internal Action<string>? BeforeMoveForTest { get; set; }
-    internal Action<string>? AfterMoveForTest { get; set; }
+
+    /// <summary>The definitions folder the app uses on this PC: the user's (or the machine's) <c>CLAUDE_CONFIG_DIR</c>,
+    /// else <c>~\.claude</c>.</summary>
+    internal static string? AppDefinitionsRoot()
+    {
+        var configured = Environment.GetEnvironmentVariable("CLAUDE_CONFIG_DIR", EnvironmentVariableTarget.User)
+                         ?? Environment.GetEnvironmentVariable("CLAUDE_CONFIG_DIR", EnvironmentVariableTarget.Machine);
+        return ClaudeShelfPaths.AppConfigDirectory(configured, Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)) is { } config
+            ? Path.Combine(config, "scheduled-tasks") : null;
+    }
+
+    private void Writing()
+    {
+        Interlocked.Increment(ref s_writeCalls);
+        if (_readOnly) throw new InvalidOperationException("A plan made outside the widget writes nothing.");
+    }
 
     private string FolderOf(string key)
     {
@@ -865,40 +760,38 @@ internal sealed class ClaudeScheduledSync
         return Path.Combine(_sessionsRoot, parts[0], parts[1]);
     }
 
-    /// <summary>The account/organization folders aligned (each holding a list, and each of <paramref name="wanted"/> that
-    /// is there), by key; null when the profile folder cannot be listed. Folders are never made.</summary>
-    internal SortedDictionary<string, string>? Discover(IEnumerable<string> wanted)
+    private static bool IsLink(string folder)
     {
-        var want = wanted.Where(ClaudeScheduledRegistry.IsKey).ToHashSet(StringComparer.Ordinal);
-        var found = new SortedDictionary<string, string>(StringComparer.Ordinal);
-        try
-        {
-            if (!Directory.Exists(_sessionsRoot)) return found;
-            foreach (var account in Directory.GetDirectories(_sessionsRoot))
-            {
-                if (!Guid.TryParseExact(Path.GetFileName(account), "D", out _)) continue;
-                string[] orgs;
-                try { orgs = Directory.GetDirectories(account); }
-                catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { continue; }
-                foreach (var org in orgs)
-                {
-                    if (!Guid.TryParseExact(Path.GetFileName(org), "D", out _)) continue;
-                    var key = (Path.GetFileName(account) + "/" + Path.GetFileName(org)).ToLowerInvariant();
-                    if (want.Contains(key) || File.Exists(Path.Combine(org, ClaudeScheduledRegistry.FileName))) found.TryAdd(key, org);
-                }
-            }
-            return found;
-        }
-        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { return null; }
+        var info = new DirectoryInfo(folder);
+        return info.Exists && (info.Attributes & FileAttributes.ReparsePoint) != 0;
     }
 
-    /// <summary>Each aligned list as read now (null when the profile folder cannot be listed). A list behind a link (its
-    /// account folder, its organization folder or the file), or reached by two keys, reads as unreadable; one that does
-    /// not read in a folder not aligned before is not taken for an account's.</summary>
+    /// <summary>Each list as read now: every account/organization folder holding one, and each of
+    /// <paramref name="wanted"/> (missing when it holds none); null when the profile folder cannot be listed. A list
+    /// behind a link, or reached by two keys, reads as unreadable. Folders are never made.</summary>
     internal IReadOnlyList<ClaudeScheduledFile>? Observe(IEnumerable<string> wanted)
     {
-        var want = wanted.ToHashSet(StringComparer.Ordinal);
-        if (Discover(want) is not { } folders) return null;
+        var want = wanted.Where(ClaudeScheduledRegistry.IsKey).ToHashSet(StringComparer.Ordinal);
+        var folders = new SortedDictionary<string, string>(StringComparer.Ordinal);
+        try
+        {
+            if (Directory.Exists(_sessionsRoot))
+                foreach (var account in Directory.GetDirectories(_sessionsRoot))
+                {
+                    if (!Guid.TryParseExact(Path.GetFileName(account), "D", out _)) continue;
+                    string[] orgs;
+                    try { orgs = Directory.GetDirectories(account); }
+                    catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { continue; }
+                    foreach (var org in orgs)
+                    {
+                        if (!Guid.TryParseExact(Path.GetFileName(org), "D", out _)) continue;
+                        var key = (Path.GetFileName(account) + "/" + Path.GetFileName(org)).ToLowerInvariant();
+                        if (want.Contains(key) || File.Exists(Path.Combine(org, ClaudeScheduledRegistry.FileName))) folders.TryAdd(key, org);
+                    }
+                }
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { return null; }
+        foreach (var key in want) folders.TryAdd(key, FolderOf(key));
         var files = new List<ClaudeScheduledFile>();
         foreach (var (key, folder) in folders)
         {
@@ -906,21 +799,20 @@ internal sealed class ClaudeScheduledSync
             ClaudeScheduledFile file;
             try
             {
-                file = (new DirectoryInfo(Path.GetDirectoryName(folder)!).Attributes & FileAttributes.ReparsePoint) != 0
-                       || (new DirectoryInfo(folder).Attributes & FileAttributes.ReparsePoint) != 0
-                    ? ClaudeScheduledRegistry.Unread(key, path, "redirected")
-                    : ClaudeScheduledRegistry.Read(key, path);
+                file = IsLink(Path.GetDirectoryName(folder)!) || IsLink(folder)
+                    ? ClaudeScheduledRegistry.Unread(key, path, "redirected") : ClaudeScheduledRegistry.Read(key, path);
             }
             catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
             { file = ClaudeScheduledRegistry.Unread(key, path, "io"); }
-            if (!file.Readable && !want.Contains(key)) continue;
+            if (file.Status == ClaudeScheduledReadStatus.Missing) { files.Add(file); continue; }
             var folderId = ClaudeFileIdentity.Of(folder)?.Id;
             files.Add(folderId is null && file.Readable ? ClaudeScheduledRegistry.Unread(key, path, "io") : file with { FolderId = folderId });
         }
         var shared = files.Where(file => file.FolderId is not null).GroupBy(file => file.FolderId)
             .Concat(files.Where(file => file.FileId is not null).GroupBy(file => file.FileId))
             .Where(group => group.Count() > 1).SelectMany(group => group).Select(file => file.Key).ToHashSet(StringComparer.Ordinal);
-        return files.Select(file => shared.Contains(file.Key) ? ClaudeScheduledRegistry.Unread(file.Key, file.Path, "shared") with { FolderId = file.FolderId } : file).ToArray();
+        return files.Select(file => shared.Contains(file.Key)
+            ? ClaudeScheduledRegistry.Unread(file.Key, file.Path, "shared") with { FolderId = file.FolderId } : file).ToArray();
     }
 
     /// <summary>Whether two keys' folders are one on disk, or that cannot be told: a list is never written under
@@ -941,29 +833,33 @@ internal sealed class ClaudeScheduledSync
         keys.Where(ClaudeScheduledRegistry.IsKey).Distinct(StringComparer.Ordinal).ToDictionary(key => key,
             key => ClaudeScheduledRegistry.CheapStamp(Path.Combine(FolderOf(key), ClaudeScheduledRegistry.FileName)), StringComparer.Ordinal);
 
-    /// <summary>The profile folder this widget aligns, by path and by what it is on disk; null when it is not there.</summary>
-    private string? RootIdentity() => ClaudeFileIdentity.Of(_sessionsRoot) is { } info
-        ? Path.TrimEndingDirectorySeparator(Path.GetFullPath(_sessionsRoot)).ToLowerInvariant() + "|" + info.Id : null;
+    /// <summary>The lists, the app's loaded one (from its log while it runs) and the kept state; null when the profile
+    /// folder cannot be listed.</summary>
+    internal ClaudeScheduledScene? Scene(IReadOnlyList<ClaudeShelfAccount> registered, ClaudeScheduledLogView? log, bool running)
+    {
+        var known = running && log is { Known: true, Pending: false, Loaded: not null };
+        var loaded = known ? log!.Loaded : null;
+        var accounts = registered.Where(account => ClaudeScheduledRegistry.IsKey(account.Key)).DistinctBy(account => account.Key).ToArray();
+        if (Observe(accounts.Select(account => account.Key).Concat(loaded is null ? [] : [loaded])) is not { } files) return null;
+        var (state, problem) = LoadState();
+        return new(files, accounts, running, loaded, known || !running, state, problem);
+    }
 
-    /// <summary>The kept state: none yet (a first pass), or null when it cannot be read. One of the first version starts
-    /// over: it could not tell a task removed in one account from one deleted.</summary>
-    internal (ClaudeScheduledState? State, bool Exists) LoadState()
+    internal (ClaudeScheduledState? State, string? Problem) LoadState()
     {
         try
         {
-            if (!File.Exists(StatePath)) return (new ClaudeScheduledState(), false);
-            var root = JsonNode.Parse(File.ReadAllBytes(StatePath)) as JsonObject;
-            if (root?["version"] is JsonValue version && version.GetValueKind() == JsonValueKind.Number && version.TryGetValue<int>(out var number)
-                && number == 1) return (new ClaudeScheduledState(), false);
-            return (root is null ? null : ClaudeScheduledState.Load(root), true);
+            var info = new FileInfo(StatePath);
+            if (!info.Exists) return (new ClaudeScheduledState(), null);
+            if ((info.Attributes & FileAttributes.ReparsePoint) != 0) return (null, "store_unreadable");
+            return ClaudeScheduledState.Read(File.ReadAllBytes(StatePath)) is { } state ? (state, null) : (null, "store_unreadable");
         }
-        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or JsonException
-                                              or ArgumentException or InvalidOperationException)
-        { return (null, true); }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { return (null, "store_unreadable"); }
     }
 
     internal bool SaveState(ClaudeScheduledState state)
     {
+        Writing();
         try
         {
             EnsureStore();
@@ -976,16 +872,7 @@ internal sealed class ClaudeScheduledSync
             finally { TryDelete(temporary); }
             return true;
         }
-        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidOperationException)
-        { return false; }
-    }
-
-    /// <summary>The kept state without the times each list was last looked at.</summary>
-    private static string Shape(ClaudeScheduledState state)
-    {
-        var saved = state.Save();
-        foreach (var (_, account) in saved["accounts"]!.AsObject()) account!.AsObject().Remove("seen");
-        return saved.ToJsonString();
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { return false; }
     }
 
     private void EnsureStore()
@@ -1007,885 +894,752 @@ internal sealed class ClaudeScheduledSync
         try { File.Delete(path); } catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { }
     }
 
-    /// <summary>Forgets what was seen of the lists (a new profile folder): the next pass takes the starting point again.
-    /// Deletions stay deleted, with nothing left to do in the old folder.</summary>
-    private static void Rebase(ClaudeScheduledState state)
-    {
-        state.Accounts.Clear(); state.Changes.Clear(); state.Conflicts.Clear(); state.Seeds.Clear(); state.Runs.Clear();
-        state.Intents.Clear();
-        foreach (var deletion in state.Deleted.Values) deletion.Pending.Clear();
-    }
+    private static bool SamePath(string first, string second) => string.Equals(
+        Path.TrimEndingDirectorySeparator(Path.GetFullPath(first)), Path.TrimEndingDirectorySeparator(Path.GetFullPath(second)),
+        StringComparison.OrdinalIgnoreCase);
 
-    private static SortedDictionary<string, ClaudeScheduledState.Entry> Current(IReadOnlyDictionary<string, JsonObject> entries)
+    /// <summary>A task's definition as the app would run it, or why not: <c>root</c> (the app uses another definitions
+    /// folder, or none is known), <c>unlisted</c> (the folder cannot be looked at now), <c>missing</c> (no folder for the
+    /// task), <c>unready</c> (the task's folder or its SKILL.md is a link, or SKILL.md is not a file that reads).</summary>
+    internal (ClaudeScheduledDefinition? Definition, string? Problem) Definition(string id)
     {
-        var current = new SortedDictionary<string, ClaudeScheduledState.Entry>(StringComparer.Ordinal);
-        foreach (var (id, entry) in entries)
+        if (string.IsNullOrEmpty(_definitions) || string.IsNullOrEmpty(_appDefinitions) || !SamePath(_definitions, _appDefinitions))
+            return (null, "root");
+        try
         {
-            current[id] = new(ClaudeScheduledRegistry.HashOf(entry), ClaudeScheduledRegistry.GrantOf(entry));
+            if (!Directory.Exists(_definitions) || ClaudeFileIdentity.FinalPath(_definitions) is not { } real) return (null, "unlisted");
+            var folder = Path.Combine(_definitions, id);
+            var folderInfo = new DirectoryInfo(folder);
+            if (!folderInfo.Exists) return File.Exists(folder) ? (null, "unready") : (null, "missing");
+            var skill = Path.Combine(folder, "SKILL.md");
+            var skillInfo = new FileInfo(skill);
+            if ((folderInfo.Attributes & FileAttributes.ReparsePoint) != 0 || !skillInfo.Exists
+                || (skillInfo.Attributes & (FileAttributes.ReparsePoint | FileAttributes.Directory)) != 0) return (null, "unready");
+            using (new FileStream(skill, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete)) { }
+            return ClaudeFileIdentity.Of(folder)?.Id is { } identity ? (new(_definitions, real, skill, identity), null) : (null, "unlisted");
         }
-        return current;
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { return (null, "unready"); }
     }
 
-    private static string[] StampsOf(JsonObject? root) => root is null ? []
-        : ClaudeScheduledRegistry.MigrationStamps.Where(name => root[name] is JsonValue value && value.GetValueKind() == JsonValueKind.True).ToArray();
-
-    /// <summary>Settles the writes a stopped widget began. A write whose new list is still beside the old one never
-    /// happened (only the move takes it away). One whose list holds what it wrote did. Any other list was written and
-    /// changed since, even back to what it held before (the user deleting what was made there): what it holds now is its
-    /// starting point, a task gone from it counts as removed there, and nothing in it counts as a change. A list that does
-    /// not read keeps its write begun until it does.</summary>
-    internal static void Recover(ClaudeScheduledState state, IReadOnlyList<ClaudeScheduledFile> files, DateTimeOffset now, bool readOnly = false)
+    /// <summary>Whether a mirror's definition is still the one chosen: null when it is; else a lasting hold (gone, or
+    /// made again or moved), or a passing reason to wait (<see cref="Definition"/>'s other problems).</summary>
+    private (ClaudeScheduledHold? Hold, string? Wait) DefinitionStill(ClaudeScheduledMirror mirror, DateTimeOffset now)
     {
-        var byKey = files.ToDictionary(file => file.Key, StringComparer.Ordinal);
-        foreach (var (key, intent) in state.Intents.ToArray())
+        var (definition, problem) = Definition(mirror.Id);
+        if (problem == "missing") return (new("definition_missing", [], now), null);
+        if (definition is null) return (null, "definition_" + problem);
+        return !SamePath(definition.RealRoot, mirror.Definition.RealRoot) || definition.Folder != mirror.Definition.Folder
+            || !SamePath(definition.Skill, mirror.Definition.Skill) ? (new("definition_replaced", [], now), null) : (null, null);
+    }
+
+    /// <summary>What holds a mirror until it is mirrored again, as the readable lists show it: another task under its id
+    /// (another <c>createdAt</c>), one no longer recurring and local, or settings that differ, in any account, the one
+    /// the app has loaded included.</summary>
+    private static ClaudeScheduledHold? Differing(ClaudeScheduledMirror mirror, ClaudeScheduledScene scene, DateTimeOffset now)
+    {
+        List<(string, string[])> identity = [], kind = [], differs = [];
+        foreach (var file in scene.Files.Where(file => file.Status == ClaudeScheduledReadStatus.Ok))
         {
-            if (!byKey.TryGetValue(key, out var file) || !state.Accounts.TryGetValue(key, out var account))
+            if (!file.Entries.TryGetValue(mirror.Id, out var entry)) continue;
+            if (!ClaudeScheduledRegistry.SameCreated(entry, mirror.SourceCreatedAt)) identity.Add((file.Key, ["createdAt"]));
+            else if (ClaudeScheduledRegistry.KindProblem(entry) is { } problem) kind.Add((file.Key, [problem]));
+            else if (ClaudeScheduledRegistry.Differences(entry, mirror.Settings) is { Length: > 0 } fields) differs.Add((file.Key, fields));
+        }
+        return identity.Count > 0 ? new("identity", identity, now) : kind.Count > 0 ? new("kind", kind, now)
+            : differs.Count > 0 ? new("differs", differs, now) : null;
+    }
+
+    /// <summary>The newest slot of a mirror an account ran: the <c>lastScheduledFor</c> of the entries of the task itself
+    /// (its <c>createdAt</c>) on its cron, switched on, not ahead of now, and not below that entry's own scan floor (a
+    /// slot from before its cron was changed or it was switched on, which both raise its floor). A run started by hand
+    /// leaves none.</summary>
+    private static DateTimeOffset? Ran(ClaudeScheduledMirror mirror, ClaudeScheduledScene scene, DateTimeOffset now) =>
+        scene.Files.Where(file => file.Status == ClaudeScheduledReadStatus.Ok)
+            .Select(file => file.Entries.GetValueOrDefault(mirror.Id))
+            .Where(entry => entry is not null && ClaudeScheduledRegistry.SameCreated(entry, mirror.SourceCreatedAt)
+                            && ClaudeScheduledRegistry.Text(entry, "cronExpression") == ClaudeScheduledRegistry.Text(mirror.Settings, "cronExpression")
+                            && entry["enabled"] is JsonValue on && on.GetValueKind() == JsonValueKind.True)
+            .Select(entry => (Slot: ClaudeScheduledRegistry.Time(ClaudeScheduledRegistry.Text(entry!, "lastScheduledFor")),
+                Floor: ClaudeScheduledRegistry.Time(ClaudeScheduledRegistry.Text(entry!, "missedRunScanFloor"))))
+            .Where(ran => ran.Slot is { } slot && slot <= now && (ran.Floor is not { } floor || slot >= floor))
+            .Select(ran => ran.Slot).Max();
+
+    private static JsonObject Labelled(ClaudeScheduledScene scene, string key) => new() { ["account"] = scene.Label(key), ["key"] = key };
+
+    private static JsonArray Names(IEnumerable<string> names) => new(names.Select(name => (JsonNode)name).ToArray());
+
+    private static JsonNode HoldJson(ClaudeScheduledHold hold, ClaudeScheduledScene scene) => new JsonObject
+    {
+        ["reason"] = hold.Reason, ["since"] = hold.Since.ToString("O", CultureInfo.InvariantCulture),
+        ["accounts"] = new JsonArray(hold.Accounts.Select(account =>
+        {
+            var item = Labelled(scene, account.Key);
+            item["fields"] = Names(account.Fields);
+            return (JsonNode)item;
+        }).ToArray())
+    };
+
+    /// <summary>How the plan shows a setting: its value, or that none is set (a model then comes from the definition).</summary>
+    private static JsonNode? Shown(JsonNode? value, string name) =>
+        value?.DeepClone() ?? (name == "model" ? "(none: the definition's)" : "(none)");
+
+    private static string TokenOf(JsonNode parts) => ClaudeScheduledRegistry.Hash(parts)[..16].ToLowerInvariant();
+
+    /// <summary>
+    /// The plan for mirroring <see cref="ClaudeScheduledRequest.Task"/> from the account <see cref="ClaudeScheduledRequest.From"/>
+    /// names (an <c>account:org</c> key, a label naming one key, or <c>loaded</c>): every readable list gets that entry's
+    /// settings (a missing entry is made, another task under the id replaced, one that differs fixed), and the tasks it
+    /// replaces removed in the same write. Its token covers the source, the settings, the replaced tasks and every
+    /// list's entry before and after; <c>--apply</c> writes only the plan with that token.
+    /// </summary>
+    internal ClaudeScheduledPlan PlanMirror(ClaudeScheduledRequest request, ClaudeScheduledScene scene, DateTimeOffset now)
+    {
+        var answer = new JsonObject { ["status"] = "plan", ["task"] = request.Task };
+        ClaudeScheduledPlan Refuse(string reason, string? detail = null)
+        {
+            answer["status"] = "refused"; answer["reason"] = reason;
+            if (detail is not null) answer["detail"] = detail;
+            return new(answer, null, []);
+        }
+        if (!ClaudeScheduledRegistry.IsSafeId(request.Task)) return Refuse("invalid_task");
+        var replaces = (request.Replaces ?? []).Distinct(StringComparer.Ordinal).ToArray();
+        if (replaces.FirstOrDefault(id => !ClaudeScheduledRegistry.IsSafeId(id) || id == request.Task) is { } bad) return Refuse("invalid_replaces", bad);
+        if (scene.State is not { } state) return Refuse(scene.StateProblem ?? "store_unreadable");
+        if (replaces.FirstOrDefault(id => state.Mirrors.ContainsKey(id) || state.Frozen.ContainsKey(id)) is { } mirrored)
+            return Refuse("replaces_mirrored", mirrored);
+        var (sourceKey, fromProblem) = From(request.From, scene);
+        if (sourceKey is null) return Refuse(fromProblem!, request.From);
+        answer["from"] = Labelled(scene, sourceKey);
+        var source = scene.Files.FirstOrDefault(file => file.Key == sourceKey);
+        if (source is not { Status: ClaudeScheduledReadStatus.Ok }) return Refuse(source is null || source.Status == ClaudeScheduledReadStatus.Missing ? "source_missing" : "source_unreadable");
+        if (!source.Entries.TryGetValue(request.Task, out var sourceEntry)) return Refuse("not_in_source");
+        if (ClaudeScheduledRegistry.KindProblem(sourceEntry) is { } kind) return Refuse("not_recurring_local", kind);
+        var (definition, definitionProblem) = Definition(request.Task);
+        if (definition is null) return Refuse("definition_" + definitionProblem);
+        foreach (var file in scene.Files.Where(file => file.Status == ClaudeScheduledReadStatus.Ok))
+            if (file.Entries.TryGetValue(request.Task, out var other) && ClaudeScheduledRegistry.KindProblem(other) is { } otherKind)
+                return Refuse("target_not_recurring_local", scene.Label(file.Key) + ": " + otherKind);
+        var created = ClaudeScheduledRegistry.Created(sourceEntry)!;
+        var replaced = scene.Files.Where(file => file.Status == ClaudeScheduledReadStatus.Ok)
+            .SelectMany(file => replaces.Select(id => file.Entries.GetValueOrDefault(id)))
+            .Where(entry => entry is not null).Select(entry => (ClaudeScheduledRegistry.Text(entry!, "id")!, ClaudeScheduledRegistry.Created(entry!)!))
+            .Distinct().OrderBy(pair => pair.Item1, StringComparer.Ordinal).ThenBy(pair => pair.Item2, StringComparer.Ordinal).ToArray();
+        var mirror = new ClaudeScheduledMirror(request.Task, sourceKey, created, definition, ClaudeScheduledRegistry.SettingsOf(sourceEntry),
+            sourceEntry["importedFrom"] is not null, [], replaced, now, null);
+        var settingsShown = new JsonObject();
+        foreach (var name in ClaudeScheduledRegistry.Settings) settingsShown[name] = Shown(mirror.Settings[name], name);
+        answer["settings"] = settingsShown;
+        answer["source"] = new JsonObject { ["createdAt"] = JsonNode.Parse(created), ["permission"] = mirror.SourceAccess.Shown() };
+        answer["notCopied"] = Names(sourceEntry.Select(member => member.Key).Where(name => name is not ("id" or "filePath" or "createdAt"
+            or "lastRunAt" or "lastScheduledFor" or "missedRunScanFloor") && !ClaudeScheduledRegistry.Settings.Contains(name)).Order(StringComparer.Ordinal));
+        answer["replaces"] = new JsonArray(replaced.Select(pair => (JsonNode)new JsonObject { ["id"] = pair.Item1, ["createdAt"] = JsonNode.Parse(pair.Item2) }).ToArray());
+        answer["app"] = !scene.Running ? "closed" : scene.Loaded is { } loaded ? "shows " + scene.Label(loaded) : "loaded list unknown";
+        var targets = new JsonArray();
+        var tokens = new JsonArray();
+        var changes = new List<ClaudeScheduledChange>();
+        var raising = new List<ClaudeScheduledAllowed>();
+        foreach (var file in scene.Files)
+        {
+            var target = Labelled(scene, file.Key);
+            targets.Add(target);
+            if (scene.Loaded is { } shown && (file.Key == shown || SameFolder(file.Key, shown))) target["loaded"] = true;
+            if (file.Status != ClaudeScheduledReadStatus.Ok)
             {
-                state.Intents.Remove(key);
+                target["action"] = file.Status == ClaudeScheduledReadStatus.Missing ? "no_list" : "unreadable";
+                target["note"] = file.Status == ClaudeScheduledReadStatus.Missing
+                    ? "no list yet: open this account in the app once, then mirror again" : "not read (" + file.Problem + "): left out";
+                tokens.Add(new JsonObject { ["key"] = file.Key, ["action"] = target["action"]!.GetValue<string>() });
                 continue;
             }
-            if (File.Exists(intent.Partial))
+            var root = file.Root!.DeepClone().AsObject();
+            var existing = file.Entries.GetValueOrDefault(request.Task);
+            var removals = new JsonArray();
+            foreach (var (id, at) in replaced)
+                if (file.Entries.GetValueOrDefault(id) is { } old && ClaudeScheduledRegistry.SameCreated(old, at))
+                    removals.Add(new JsonObject
+                    {
+                        ["id"] = id, ["createdAt"] = JsonNode.Parse(at), ["enabled"] = old["enabled"]?.DeepClone(),
+                        ["permission"] = ClaudeScheduledAccess.Of(old).Shown(), ["hash"] = ClaudeScheduledRegistry.Hash(old)
+                    });
+            ClaudeScheduledRegistry.Drop(root, entry => replaced.Any(pair => ClaudeScheduledRegistry.Text(entry, "id") == pair.Item1
+                && ClaudeScheduledRegistry.SameCreated(entry, pair.Item2)));
+            var floor = false;
+            var raise = false;
+            string action;
+            if (existing is null || !ClaudeScheduledRegistry.SameCreated(existing, created))
             {
-                if (!readOnly) TryDelete(intent.Partial);
-                state.Intents.Remove(key);
-                continue;
-            }
-            if (!file.Readable) continue;
-            if (ClaudeScheduledRegistry.Sha(file.Bytes) == intent.After)
-            {
-                account.Entries = new(intent.Entries, StringComparer.Ordinal);
-                foreach (var (id, write) in intent.Writes) account.Writes[id] = write;
-                account.Seen = intent.At;
+                action = existing is null ? "insert" : "replace";
+                if (ClaudeScheduledRegistry.HasTaskMap(file.Root!, request.Task))
+                {
+                    target["action"] = "held";
+                    target["reason"] = "retries_or_skips_left";
+                    target["note"] = "the list still keeps runs of a task under this id: not made here until the app has settled them";
+                    tokens.Add(new JsonObject { ["key"] = file.Key, ["action"] = "held", ["before"] = existing is null ? "-" : ClaudeScheduledRegistry.Hash(existing) });
+                    continue;
+                }
+                // A copy is weighed against the source entry, and against the entry it replaces.
+                raise = ClaudeScheduledPermission.Raises(mirror.SourceAccess, mirror.CopyAccess)
+                        || existing is not null && ClaudeScheduledPermission.Raises(ClaudeScheduledAccess.Of(existing), mirror.CopyAccess);
+                target["permission"] = new JsonObject
+                {
+                    ["before"] = existing is null ? "(no entry here)" : ClaudeScheduledAccess.Of(existing).Shown(),
+                    ["source"] = mirror.SourceAccess.Shown(), ["after"] = mirror.CopyAccess.Shown(), ["raise"] = raise
+                };
+                if (raise) raising.Add(new(file.Key, mirror.SourceAccess, mirror.CopyAccess));
+                if (existing is not null)
+                {
+                    target["replacing"] = new JsonObject { ["createdAt"] = existing["createdAt"]?.DeepClone(), ["enabled"] = existing["enabled"]?.DeepClone() };
+                    ClaudeScheduledRegistry.Drop(root, entry => ClaudeScheduledRegistry.Text(entry, "id") == request.Task);
+                }
+                ClaudeScheduledRegistry.Tasks(root).Add(mirror.Copy(now));
             }
             else
             {
-                var current = Current(file.Entries);
-                foreach (var id in account.Entries.Keys.Concat(intent.Entries.Keys).Distinct().ToArray())
-                    if (!current.ContainsKey(id) && !state.Deleted.ContainsKey(id)) account.Removed[id] = now;
-                account.Entries = current;
-                account.Writes.Clear();
-                account.Seen = now;
-            }
-            state.Intents.Remove(key);
-        }
-    }
-
-    /// <summary>A list that was aligned and is gone, its folder still there, reads as unreadable: the app, finding none,
-    /// would save only what is made after, so what it held is kept as it was seen. An account whose folder is gone goes.</summary>
-    internal static IReadOnlyList<ClaudeScheduledFile> Settle(ClaudeScheduledState state, IReadOnlyList<ClaudeScheduledFile> files)
-    {
-        var present = files.Select(file => file.Key).ToHashSet(StringComparer.Ordinal);
-        foreach (var key in state.Accounts.Keys.Where(key => !present.Contains(key)).ToArray()) state.Accounts.Remove(key);
-        return files.Select(file => file.Status == ClaudeScheduledReadStatus.Missing && state.Accounts.TryGetValue(file.Key, out var account)
-            && account.Entries.Count > 0 ? file with { Status = ClaudeScheduledReadStatus.Unreadable, Problem = "gone" } : file).ToArray();
-    }
-
-    /// <summary>The definition folders there now, by id; null when the folder is not there or cannot be listed.</summary>
-    private SortedSet<string>? Definitions()
-    {
-        if (_definitions is null) return null;
-        try
-        {
-            if (!Directory.Exists(_definitions)) return null;
-            return new(Directory.GetDirectories(_definitions).Select(Path.GetFileName).Where(ClaudeScheduledRegistry.IsSafeId)!, StringComparer.Ordinal);
-        }
-        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { return null; }
-    }
-
-    private string? DefinitionsName => _definitions is null ? null
-        : Path.TrimEndingDirectorySeparator(Path.GetFullPath(_definitions)).ToLowerInvariant();
-
-    /// <summary>A definition folder seen before that is gone, in a definitions folder that lists and is the one seen
-    /// before, deletes its task from every account (the app's delete takes the folder with it). Every folder gone at
-    /// once reads as the folder being replaced, and deletes nothing.</summary>
-    internal void ObserveDefinitions(ClaudeScheduledState state, IReadOnlyList<ClaudeScheduledFile> files, DateTimeOffset now, bool first)
-    {
-        if (Definitions() is not { } present) return;
-        if (state.DefinitionsRoot != DefinitionsName || first)
-        {
-            state.DefinitionsRoot = DefinitionsName;
-            state.DefinitionsSeen = present;
-            return;
-        }
-        var gone = state.DefinitionsSeen.Where(id => !present.Contains(id)).ToArray();
-        if (gone.Length > 0 && !(gone.Length > 1 && gone.Length == state.DefinitionsSeen.Count))
-            foreach (var id in gone)
-                if (!state.Deleted.ContainsKey(id) && Tracked(state, files, id)) Delete(state, files, id, "definitions", now);
-        state.DefinitionsSeen = present;
-    }
-
-    private static bool Tracked(ClaudeScheduledState state, IReadOnlyList<ClaudeScheduledFile> files, string id) =>
-        files.Any(file => file.Entries.ContainsKey(id)) || state.Accounts.Values.Any(account => account.Entries.ContainsKey(id))
-        || state.Changes.ContainsKey(id) || state.Seeds.ContainsKey(id);
-
-    /// <summary>Deletes a task from every account: each list holding it, and each that does not read (it may), is
-    /// still to remove it. Its copies, made before it was deleted, are removed wherever they turn up; a task made with
-    /// its id after that is a new task (see <see cref="Record"/>). Its removals in one account go with it.</summary>
-    private static void Delete(ClaudeScheduledState state, IReadOnlyList<ClaudeScheduledFile> files, string id, string by, DateTimeOffset now)
-    {
-        var pending = files.Where(file => !file.Readable || file.Entries.ContainsKey(id)).Select(file => file.Key);
-        if (state.Deleted.TryGetValue(id, out var known)) known.Pending.UnionWith(pending);
-        else state.Deleted[id] = new(now, by, new(pending, StringComparer.Ordinal));
-        state.Changes.Remove(id); state.Seeds.Remove(id); state.Conflicts.Remove(id);
-        foreach (var account in state.Accounts.Values)
-        {
-            account.Writes.Remove(id);
-            account.Removed.Remove(id);
-        }
-    }
-
-    /// <summary>Whether an entry of a deleted task's id was made after the deletion (<c>createdAt</c>, the app's epoch
-    /// milliseconds): a new task. One made before is a copy of the task deleted.</summary>
-    private static bool MadeAfter(JsonObject entry, ClaudeScheduledState.Deletion deletion) =>
-        entry["createdAt"] is JsonValue made && made.GetValueKind() == JsonValueKind.Number
-        && double.TryParse(made.ToJsonString(), NumberStyles.Float, CultureInfo.InvariantCulture, out var at) && at > deletion.At.ToUnixTimeMilliseconds();
-
-    private sealed record Candidate(string Key, DateTimeOffset Lower, DateTimeOffset Upper, string Hash, JsonObject Content,
-        JsonObject Extra, string? FilePath, ClaudeScheduledChoice Chosen, string[] Stamps);
-
-    /// <summary>Records, for each list that reads, what changed since it was last seen (a list seen for the first time
-    /// is only taken as it is, but for a deleted task's id, as below). A task gone from a list is removed there only. A
-    /// task back as it was before this widget's write, which the app has not loaded since, may be the user undoing it or
-    /// the app saving a copy it read before: it is neither spread nor written again (a task this widget made counts as
-    /// removed there, a changed one as in conflict). A deleted task's id that turns up, in a list seen before or for the
-    /// first time, is a new task when it was made after the deletion, and otherwise a copy of the one deleted, removed
-    /// there too.</summary>
-    internal static void Record(ClaudeScheduledState state, IReadOnlyList<ClaudeScheduledFile> files, DateTimeOffset now,
-        ClaudeScheduledLogView? log)
-    {
-        var candidates = new SortedDictionary<string, List<Candidate>>(StringComparer.Ordinal);
-        // A deleted task's id: made again after the deletion in some list (a new task), or a copy of it turning up.
-        var reborn = new SortedSet<string>(StringComparer.Ordinal);
-        var copies = new List<(string Id, string Key)>();
-        foreach (var file in files)
-        {
-            if (!file.Readable) continue;
-            var current = Current(file.Entries);
-            if (!state.Accounts.TryGetValue(file.Key, out var account))
-            {
-                state.Accounts[file.Key] = new ClaudeScheduledState.AccountState { Since = now, Seen = now, Entries = current };
-                // Taken as it is, but a deleted task's id in it is still a new task or a copy of the one deleted.
-                foreach (var id in current.Keys)
+                var fields = ClaudeScheduledRegistry.Differences(existing, mirror.Settings);
+                action = file.Key == sourceKey ? "source" : fields.Length > 0 ? "fix" : "same";
+                var before = ClaudeScheduledAccess.Of(existing);
+                if (fields.Length > 0)
                 {
-                    if (!state.Deleted.TryGetValue(id, out var deletion)) continue;
-                    if (MadeAfter(file.Entries[id], deletion)) reborn.Add(id);
-                    else copies.Add((id, file.Key));
+                    target["fields"] = new JsonArray(fields.Select(name => (JsonNode)new JsonObject
+                    {
+                        ["name"] = name, ["before"] = Shown(ClaudeScheduledRegistry.Setting(existing, name), name),
+                        ["after"] = Shown(mirror.Settings[name], name)
+                    }).ToArray());
+                    var after = before with { Mode = mirror.SourceAccess.Mode, Carried = mirror.SourceAccess.Carried };
+                    var switchedOn = existing["enabled"] is JsonValue was && was.GetValueKind() == JsonValueKind.False
+                                     && mirror.Settings["enabled"] is JsonValue on && on.GetValueKind() == JsonValueKind.True;
+                    // The app's update tool does not switch a switched-off import back on (a person does, in the app).
+                    raise = ClaudeScheduledPermission.Raises(before, after) || switchedOn && before.Imported;
+                    target["permission"] = new JsonObject { ["before"] = before.Shown(), ["after"] = after.Shown(), ["raise"] = raise };
+                    if (switchedOn && before.Imported) target["permission"]!["switchesOnImport"] = true;
+                    if (raise) raising.Add(new(file.Key, before, after));
+                    var entry = ClaudeScheduledRegistry.Find(root, request.Task)!;
+                    floor = switchedOn || fields.Contains("cronExpression");
+                    ClaudeScheduledRegistry.SetSettings(entry, mirror.Settings);
+                    // As the app's own edit does: the slots before the change are not run.
+                    if (floor && !(ClaudeScheduledRegistry.Time(ClaudeScheduledRegistry.Text(entry, "missedRunScanFloor")) is { } kept && kept >= now))
+                        entry["missedRunScanFloor"] = ClaudeScheduledRegistry.Iso(now);
                 }
+                else target["permission"] = new JsonObject { ["now"] = before.Shown() };
+                // A retry or skip the app keeps of this task here runs or counts on its own.
+                if (ClaudeScheduledRegistry.TaskMaps.Where(name => file.Root![name] is JsonObject map && map.ContainsKey(request.Task)).ToArray() is { Length: > 0 } maps)
+                    target["pending"] = Names(maps);
+            }
+            target["action"] = action;
+            if (removals.Count > 0) target["removes"] = removals;
+            if (floor) target["floor"] = "raised to the time of the apply";
+            var changed = action is "insert" or "replace" or "fix" || removals.Count > 0;
+            var afterEntry = ClaudeScheduledRegistry.Find(root, request.Task)?.DeepClone().AsObject();
+            afterEntry?.Remove("missedRunScanFloor");
+            tokens.Add(new JsonObject
+            {
+                ["key"] = file.Key, ["action"] = action, ["before"] = existing is null ? "-" : ClaudeScheduledRegistry.Hash(existing),
+                ["after"] = changed && afterEntry is not null ? ClaudeScheduledRegistry.Hash(afterEntry) : "-",
+                ["removes"] = removals.DeepClone(), ["permission"] = target["permission"]?.DeepClone(), ["floor"] = floor
+            });
+            if (!changed) continue;
+            if (ClaudeScheduledRegistry.Serialize(root).LongLength > ClaudeScheduledRegistry.MaxBytes)
+            {
+                target["action"] = "held";
+                target["reason"] = "too_large";
+                tokens[^1]!["action"] = "held";
                 continue;
             }
-            var lower = account.Seen;
-            var upper = file.WrittenAt is { } written ? written < lower ? lower : written > now ? now : written : now;
-            foreach (var id in current.Keys.Union(account.Entries.Keys).ToArray())
-            {
-                var held = current.GetValueOrDefault(id);
-                var was = account.Entries.GetValueOrDefault(id);
-                if (account.Writes.TryGetValue(id, out var write) && held?.Hash == write.After && LoadedSince(log, file.Key, write.At))
-                    account.Writes.Remove(id);
-                if (held?.Hash == was?.Hash) continue;
-                if (state.Deleted.TryGetValue(id, out var deletion))
-                {
-                    if (held is null) continue;
-                    if (!MadeAfter(file.Entries[id], deletion))
-                    {
-                        copies.Add((id, file.Key));
-                        continue;
-                    }
-                    reborn.Add(id);
-                    was = null;
-                }
-                if (account.Writes.Remove(id, out write) && held?.Hash == write.Before)
-                {
-                    if (held is null) account.Removed[id] = now;
-                    else Conflict(state, id, [file.Key], now);
-                    continue;
-                }
-                if (held is null)
-                {
-                    account.Removed[id] = now;
-                    continue;
-                }
-                account.Removed.Remove(id);
-                var entry = file.Entries[id];
-                if (!candidates.TryGetValue(id, out var list)) candidates[id] = list = [];
-                list.Add(new(file.Key, lower, upper, held.Hash, ClaudeScheduledRegistry.Synced(entry), ClaudeScheduledRegistry.Extra(entry),
-                    ClaudeScheduledRegistry.Text(entry, "filePath"), ClaudeScheduledRegistry.Chosen(was?.Grant, held.Grant), StampsOf(file.Root)));
-            }
-            account.Entries = current;
-            account.Seen = now;
+            changes.Add(new(file, root, target));
         }
-        // A new task with a deleted task's id ends the deletion: it is aligned as any new task, and the copies of the
-        // one deleted take what it is. Otherwise a copy is removed from its list as well.
-        foreach (var id in reborn) state.Deleted.Remove(id);
-        foreach (var (id, key) in copies) if (state.Deleted.TryGetValue(id, out var deletion)) deletion.Pending.Add(key);
-        foreach (var (id, list) in candidates) Resolve(state, id, list, now);
-    }
-
-    /// <summary>Whether the app's log shows it begin loading this list after <paramref name="at"/>.</summary>
-    private static bool LoadedSince(ClaudeScheduledLogView? log, string key, DateTimeOffset at) =>
-        log is not null && log.Loads.TryGetValue(key, out var started) && started - at >= LoadMargin;
-
-    /// <summary>The change that wins among those seen in one pass: the one every other change (with other content) was
-    /// provably made before. Against the change known, the newer wins; when neither is provably newer, or no change
-    /// wins, the task is in conflict.</summary>
-    private static void Resolve(ClaudeScheduledState state, string id, List<Candidate> list, DateTimeOffset now)
-    {
-        var winners = list.GroupBy(candidate => candidate.Hash).Select(group => group.MaxBy(candidate => candidate.Lower)!)
-            .Where(latest => list.All(candidate => candidate.Hash == latest.Hash || candidate.Upper <= latest.Lower)).ToArray();
-        var winner = winners.Length == 1 ? winners[0] : null;
-        state.Changes.TryGetValue(id, out var known);
-        if (winner is not null && known is not null && known.Hash != winner.Hash && winner.Upper <= known.Lower
-            && !state.Conflicts.ContainsKey(id))
-            return; // Made before the change known: that one is brought to this account too.
-        if (winner is null || known is not null && known.Hash != winner.Hash && known.Upper > winner.Lower)
+        answer["targets"] = targets;
+        answer["raises"] = raising.Count;
+        var token = TokenOf(new JsonObject
         {
-            Conflict(state, id, list.Select(candidate => candidate.Key).Concat(known is null ? [] : [known.By]).ToArray(), now);
-            return;
-        }
-        if (state.Conflicts.TryGetValue(id, out var conflict))
+            ["op"] = "mirror", ["task"] = request.Task, ["source"] = sourceKey, ["createdAt"] = JsonNode.Parse(created),
+            ["settings"] = mirror.Settings.DeepClone(), ["imported"] = mirror.SourceImported,
+            ["replaces"] = answer["replaces"]!.DeepClone(), ["targets"] = tokens
+        });
+        answer["token"] = token;
+        answer["next"] = raising.Count > 0
+            ? $"some accounts would run it with more permission: to allow that, run again with --apply --expect {token} --allow-raise"
+            : $"to write this, run again with --apply --expect {token}";
+        return new(answer, token, changes, mirror, raising);
+    }
+
+    /// <summary>Which list <c>--from</c> names: <c>loaded</c> (the app's, when its log tells), an <c>account:org</c>
+    /// key, or a label that names exactly one key.</summary>
+    private static (string? Key, string? Problem) From(string? from, ClaudeScheduledScene scene)
+    {
+        if (string.IsNullOrWhiteSpace(from)) return (null, "from_missing");
+        if (from.Equals("loaded", StringComparison.OrdinalIgnoreCase))
+            return scene.Loaded is { } loaded ? (loaded, null) : (null, scene.Running ? "loaded_unknown" : "app_closed");
+        var parts = from.Split(':');
+        if (parts.Length == 2 && Guid.TryParseExact(parts[0], "D", out _) && Guid.TryParseExact(parts[1], "D", out _))
+            return ((parts[0] + "/" + parts[1]).ToLowerInvariant(), null);
+        var keys = scene.Registered.Where(account => string.Equals(account.Label, from, StringComparison.OrdinalIgnoreCase))
+            .Select(account => account.Key).Distinct(StringComparer.Ordinal).ToArray();
+        return keys.Length == 1 ? (keys[0], null) : (null, keys.Length == 0 ? "from_unknown" : "from_ambiguous");
+    }
+
+    /// <summary>The plan for removing a task that is not mirrored from every list holding it (each entry as the plan
+    /// shows it: its <c>createdAt</c> and the entry itself).</summary>
+    internal ClaudeScheduledPlan PlanRemove(ClaudeScheduledRequest request, ClaudeScheduledScene scene)
+    {
+        var answer = new JsonObject { ["status"] = "plan", ["task"] = request.Task };
+        if (!ClaudeScheduledRegistry.IsSafeId(request.Task)) { answer["status"] = "refused"; answer["reason"] = "invalid_task"; return new(answer, null, []); }
+        if (scene.State is not { } state) { answer["status"] = "refused"; answer["reason"] = scene.StateProblem ?? "store_unreadable"; return new(answer, null, []); }
+        if (state.Mirrors.ContainsKey(request.Task) || state.Frozen.ContainsKey(request.Task))
         {
-            // Made before the conflict was found, it does not settle it.
-            if (winner.Lower < conflict.At) return;
-            state.Conflicts.Remove(id);
+            answer["status"] = "refused"; answer["reason"] = "mirrored";
+            answer["next"] = "stop mirroring it first: --claude-scheduled-unmirror " + request.Task;
+            return new(answer, null, []);
         }
-        // What was seen chosen stays so while a later change keeps it.
-        var chosen = known is null ? winner.Chosen : ClaudeScheduledRegistry.Kept(winner.Chosen, known.Chosen,
-            ClaudeScheduledRegistry.GrantOf(known.Content), ClaudeScheduledRegistry.GrantOf(winner.Content));
-        state.Changes[id] = new(winner.Lower, winner.Upper, winner.Key, winner.Hash, winner.Content, winner.Extra, winner.FilePath,
-            chosen, winner.Stamps);
-    }
-
-    private static void Conflict(ClaudeScheduledState state, string id, string[] accounts, DateTimeOffset now)
-    {
-        state.Changes.Remove(id);
-        var all = state.Conflicts.TryGetValue(id, out var known) ? known.Accounts.Concat(accounts) : accounts;
-        state.Conflicts[id] = new(now, all.Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray());
-    }
-
-    /// <summary>After recording: what is left to remove and fill, the conflicts nothing is left to settle (every list
-    /// holds the task alike), and the newest run of every task the lists hold.</summary>
-    internal static void Track(ClaudeScheduledState state, IReadOnlyList<ClaudeScheduledFile> files)
-    {
-        var byKey = files.ToDictionary(file => file.Key, StringComparer.Ordinal);
-        bool Lacks(string key, string id) => byKey.TryGetValue(key, out var file) && file.Readable && !file.Entries.ContainsKey(id);
-        foreach (var (id, deletion) in state.Deleted)
-            deletion.Pending.RemoveWhere(key => !byKey.ContainsKey(key) || Lacks(key, id));
-        foreach (var (id, seeding) in state.Seeds.ToArray())
-        {
-            seeding.Pending.RemoveWhere(key => !byKey.TryGetValue(key, out var file)
-                || file.Readable && (file.Entries.ContainsKey(id) || state.Accounts.TryGetValue(key, out var account) && account.Removed.ContainsKey(id)));
-            if (seeding.Pending.Count == 0) state.Seeds.Remove(id);
-        }
-        if (files.All(file => file.Readable))
-            foreach (var id in state.Conflicts.Keys.ToArray())
-                if (files.Where(file => file.Entries.ContainsKey(id)).Select(file => ClaudeScheduledRegistry.HashOf(file.Entries[id]))
-                        .Distinct().Count() <= 1) state.Conflicts.Remove(id);
-        var lineages = new HashSet<(string, string)>();
-        foreach (var file in files.Where(file => file.Readable))
-            foreach (var (id, entry) in file.Entries)
-            {
-                var lineage = ClaudeScheduledRegistry.Lineage(entry);
-                lineages.Add((id, lineage));
-                if (!state.Runs.TryGetValue(id, out var runs)) state.Runs[id] = runs = new(StringComparer.Ordinal);
-                var known = runs.GetValueOrDefault(lineage);
-                var (ran, slot) = (ClaudeScheduledRegistry.Text(entry, "lastRunAt"), ClaudeScheduledRegistry.Text(entry, "lastScheduledFor"));
-                var at = slot ?? ran;
-                // The app catches up from the slot it ran last, or its last run: the pair that is furthest on goes together.
-                var newer = known is null || ClaudeScheduledRegistry.Compare(at, known.LastScheduledFor ?? known.LastRunAt) > 0;
-                var retrying = file.Root?["runRetries"] is JsonObject retries && retries.ContainsKey(id);
-                runs[lineage] = new(newer ? ran : known!.LastRunAt, newer ? slot : known!.LastScheduledFor,
-                    ClaudeScheduledRegistry.Later(ClaudeScheduledRegistry.Text(entry, "missedRunScanFloor"), known?.Floor),
-                    retrying ? known?.Completed : ClaudeScheduledRegistry.Later(at, known?.Completed));
-            }
-        foreach (var change in state.Changes) lineages.Add((change.Key, ClaudeScheduledRegistry.Lineage(change.Value.Content)));
-        foreach (var seeding in state.Seeds) lineages.Add((seeding.Key, ClaudeScheduledRegistry.Lineage(seeding.Value.Content)));
-        foreach (var (id, runs) in state.Runs.ToArray())
-        {
-            foreach (var lineage in runs.Keys.Where(lineage => !lineages.Contains((id, lineage))).ToArray()) runs.Remove(lineage);
-            if (runs.Count == 0) state.Runs.Remove(id);
-        }
-    }
-
-    internal bool HasDefinition(string id)
-    {
-        if (_definitions is null || !ClaudeScheduledRegistry.IsSafeId(id)) return false;
-        try { return Directory.Exists(Path.Combine(_definitions, id)); }
-        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { return false; }
-    }
-
-    /// <summary>
-    /// What each list that reads should become (<paramref name="op"/>: null for a normal pass, <c>seed</c> for the fill
-    /// alone, <c>remove</c> for the deletions alone): the tasks deleted removed; every change as made, field by field on
-    /// the entry there (its own and unknown fields kept, and nothing more allowed without asking than the change was
-    /// seen choosing), in a list seen before the change; the tasks it lacks made, unless removed there, without a
-    /// definition folder, or running with more permission than anyone chose; and the newest run of each task it holds.
-    /// Nothing for a task in conflict. Other entries, their order and the file's other fields stay as they are.
-    /// </summary>
-    internal ClaudeScheduledPlan Plan(ClaudeScheduledState state, IReadOnlyList<ClaudeScheduledFile> files, string? op, DateTimeOffset now)
-    {
-        var present = Definitions();
-        var definitions = new Dictionary<string, bool>(StringComparer.Ordinal);
-        bool Defined(string id) => definitions.TryGetValue(id, out var found) ? found
-            : definitions[id] = present?.Contains(id) == true || present is null && HasDefinition(id);
+        var targets = new JsonArray();
+        var tokens = new JsonArray();
         var changes = new List<ClaudeScheduledChange>();
-        var held = new List<(string, string)>();
-        var tooLarge = new List<string>();
-        foreach (var file in files)
+        foreach (var file in scene.Files)
         {
-            if (!file.Readable || !state.Accounts.TryGetValue(file.Key, out var account)) continue;
-            var root = file.Root is { } existing ? (JsonObject)existing.DeepClone() : new JsonObject { ["scheduledTasks"] = new JsonArray() };
-            var tasks = root["scheduledTasks"]!.AsArray();
-            var at = new Dictionary<string, int>(StringComparer.Ordinal);
-            for (var index = 0; index < tasks.Count; index++)
-                if (ClaudeScheduledRegistry.Text(tasks[index]!.AsObject(), "id") is { } id && ClaudeScheduledRegistry.IsSafeId(id)) at.TryAdd(id, index);
-            List<string> created = [], updated = [], deleted = [], ran = [];
-            var writes = new SortedDictionary<string, ClaudeScheduledState.Written>(StringComparer.Ordinal);
-            var sources = new List<string[]>();
-            string? Before(string id, string? hash) => account.Writes.TryGetValue(id, out var write) ? write.Before : hash;
-            void Create(string id, JsonObject content, JsonObject extra, string? filePath, ClaudeScheduledChoice chosen, string[] stamps)
+            if (file.Status == ClaudeScheduledReadStatus.Unreadable)
             {
-                if (at.ContainsKey(id) || account.Removed.ContainsKey(id) || !Defined(id)) return;
-                if (ClaudeScheduledRegistry.RaisesBeyond(content, chosen))
-                {
-                    held.Add((file.Key, id));
-                    return;
-                }
-                var entry = new JsonObject { ["id"] = id };
-                foreach (var (name, value) in content) entry[name] = value?.DeepClone();
-                foreach (var (name, value) in extra) entry[name] = value?.DeepClone();
-                entry["filePath"] = filePath ?? Path.Combine(_definitions!, id, "SKILL.md");
-                tasks.Add(entry);
-                at[id] = tasks.Count - 1;
-                created.Add(id);
-                writes[id] = new(now, Before(id, null), ClaudeScheduledRegistry.HashOf(entry));
-                sources.Add(stamps);
-            }
-            if (op != "seed")
-                foreach (var (id, deletion) in state.Deleted)
-                    if (deletion.Pending.Contains(file.Key) && at.TryGetValue(id, out var index) && tasks[index] is not null)
-                    {
-                        tasks[index] = null;
-                        deleted.Add(id);
-                    }
-            if (op is null)
-                foreach (var (id, change) in state.Changes)
-                {
-                    if (state.Conflicts.ContainsKey(id) || state.Deleted.ContainsKey(id) || account.Since > change.Lower) continue;
-                    if (!at.TryGetValue(id, out var index))
-                    {
-                        Create(id, change.Content, change.Extra, change.FilePath, change.Chosen, change.Stamps);
-                        continue;
-                    }
-                    if (tasks[index] is not JsonObject entry) continue;
-                    var hash = ClaudeScheduledRegistry.HashOf(entry);
-                    if (hash == change.Hash) continue;
-                    var next = Apply(entry, change);
-                    var nextHash = ClaudeScheduledRegistry.HashOf(next);
-                    if (nextHash == hash) continue;
-                    tasks[index] = next;
-                    updated.Add(id);
-                    writes[id] = new(now, Before(id, hash), nextHash);
-                }
-            if (op is null or "seed")
-                foreach (var (id, seeding) in state.Seeds)
-                {
-                    if (!seeding.Pending.Contains(file.Key) || state.Conflicts.ContainsKey(id) || state.Deleted.ContainsKey(id)) continue;
-                    // A change made since the fill was asked for is what is made.
-                    if (state.Changes.TryGetValue(id, out var change) && change.Upper > seeding.At)
-                        Create(id, change.Content, change.Extra, change.FilePath, change.Chosen, change.Stamps);
-                    else Create(id, seeding.Content, seeding.Extra, seeding.FilePath, ClaudeScheduledChoice.None, seeding.Stamps);
-                }
-            if (op != "remove")
-                for (var index = 0; index < tasks.Count; index++)
-                {
-                    if (tasks[index] is not JsonObject entry || ClaudeScheduledRegistry.Text(entry, "id") is not { } id
-                        || !ClaudeScheduledRegistry.IsSafeId(id) || state.Conflicts.ContainsKey(id) || state.Deleted.ContainsKey(id)
-                        || op == "seed" && !created.Contains(id) || !Defined(id)
-                        || state.Runs.GetValueOrDefault(id)?.GetValueOrDefault(ClaudeScheduledRegistry.Lineage(entry)) is not { } run) continue;
-                    if (Carry(root, entry, id, run) && !created.Contains(id) && !updated.Contains(id)) ran.Add(id);
-                }
-            for (var index = tasks.Count - 1; index >= 0; index--) if (tasks[index] is null) tasks.RemoveAt(index);
-            if (created.Count + updated.Count + deleted.Count + ran.Count == 0) continue;
-            // A list made here: the cron matcher upgrades the lists its tasks came from had are not done again on them.
-            if (file.Root is null && sources.Count > 0)
-                foreach (var stamp in ClaudeScheduledRegistry.MigrationStamps)
-                    if (sources.All(source => source.Contains(stamp))) root[stamp] = true;
-            var bytes = ClaudeScheduledRegistry.Serialize(root);
-            if (bytes.LongLength > ClaudeScheduledRegistry.MaxBytes)
-            {
-                tooLarge.Add(file.Key);
+                var unread = Labelled(scene, file.Key);
+                unread["action"] = "unreadable";
+                unread["note"] = "not read (" + file.Problem + "): it may still hold the task";
+                targets.Add(unread);
+                tokens.Add(new JsonObject { ["key"] = file.Key, ["action"] = "unreadable" });
                 continue;
             }
-            var after = new SortedDictionary<string, ClaudeScheduledState.Entry>(StringComparer.Ordinal);
-            foreach (var (id, entry) in Current(tasks.Select(item => item!.AsObject())
-                         .Where(item => ClaudeScheduledRegistry.Text(item, "id") is { } id && ClaudeScheduledRegistry.IsSafeId(id))
-                         .GroupBy(item => ClaudeScheduledRegistry.Text(item, "id")!).ToDictionary(group => group.Key, group => group.First(), StringComparer.Ordinal)))
-                after[id] = entry;
-            changes.Add(new(file.Key, file, root, bytes, created, updated, deleted, ran, after, writes));
+            if (file.Entries.GetValueOrDefault(request.Task) is not { } entry) continue;
+            var target = Labelled(scene, file.Key);
+            target["action"] = "remove";
+            target["createdAt"] = entry["createdAt"]?.DeepClone();
+            target["enabled"] = entry["enabled"]?.DeepClone();
+            target["permission"] = ClaudeScheduledAccess.Of(entry).Shown();
+            if (scene.Loaded is { } shown && (file.Key == shown || SameFolder(file.Key, shown))) target["loaded"] = true;
+            targets.Add(target);
+            tokens.Add(new JsonObject { ["key"] = file.Key, ["action"] = "remove", ["before"] = ClaudeScheduledRegistry.Hash(entry) });
+            var root = file.Root!.DeepClone().AsObject();
+            var created = ClaudeScheduledRegistry.Created(entry)!;
+            ClaudeScheduledRegistry.Drop(root, other => ClaudeScheduledRegistry.Text(other, "id") == request.Task
+                && ClaudeScheduledRegistry.SameCreated(other, created));
+            changes.Add(new(file, root, target));
         }
-        return new(changes, held, tooLarge);
+        answer["targets"] = targets;
+        var token = TokenOf(new JsonObject { ["op"] = "remove", ["task"] = request.Task, ["targets"] = tokens });
+        answer["token"] = token;
+        answer["next"] = changes.Count == 0 ? "no list holds it" : $"to remove it, run again with --apply --expect {token}";
+        return new(answer, token, changes);
     }
-
-    /// <summary>A change applied to the entry an account holds: its synced fields set or removed as the change has them
-    /// (what the task may do without asking as <see cref="ClaudeScheduledRegistry.Grant"/> brings it); a new run (a new
-    /// due time) without the run times of the one before.</summary>
-    private static JsonObject Apply(JsonObject entry, ClaudeScheduledState.Change change)
-    {
-        var next = (JsonObject)entry.DeepClone();
-        foreach (var name in ClaudeScheduledRegistry.SyncedFields)
-        {
-            if (ClaudeScheduledRegistry.GrantFields.Contains(name)) continue;
-            if (change.Content.TryGetPropertyValue(name, out var value)) next[name] = value?.DeepClone();
-            else next.Remove(name);
-        }
-        ClaudeScheduledRegistry.Grant(next, change.Content, change.Chosen);
-        if (ClaudeScheduledRegistry.Lineage(next) != ClaudeScheduledRegistry.Lineage(entry))
-            foreach (var name in ClaudeScheduledRegistry.RunFields) next.Remove(name);
-        return next;
-    }
-
-    /// <summary>Brings a run's newest run times to an entry of it: the pair furthest on (so the app catches up from where
-    /// that account did), the latest scan floor, and no retry of a slot an account already finished.</summary>
-    private static bool Carry(JsonObject root, JsonObject entry, string id, ClaudeScheduledState.Run run)
-    {
-        var moved = false;
-        var mine = ClaudeScheduledRegistry.Text(entry, "lastScheduledFor") ?? ClaudeScheduledRegistry.Text(entry, "lastRunAt");
-        if (ClaudeScheduledRegistry.Compare(run.LastScheduledFor ?? run.LastRunAt, mine) > 0)
-        {
-            foreach (var (name, value) in new[] { ("lastRunAt", run.LastRunAt), ("lastScheduledFor", run.LastScheduledFor) })
-                if (value is null) entry.Remove(name);
-                else entry[name] = value;
-            moved = true;
-        }
-        if (run.Floor is { } floor && ClaudeScheduledRegistry.Compare(floor, ClaudeScheduledRegistry.Text(entry, "missedRunScanFloor")) > 0)
-        {
-            entry["missedRunScanFloor"] = floor;
-            moved = true;
-        }
-        // The app drops a retry only once a later slot ran: one for a slot another account finished would run it again.
-        if (run.Completed is { } done && root["runRetries"] is JsonObject retries && retries[id] is JsonObject retry
-            && ClaudeScheduledRegistry.Text(retry, "slot") is { } slot && ClaudeScheduledRegistry.IsTime(slot)
-            && ClaudeScheduledRegistry.Compare(slot, done) <= 0)
-        {
-            retries.Remove(id);
-            if (retries.Count == 0) root.Remove("runRetries");
-            moved = true;
-        }
-        return moved;
-    }
-
-    /// <summary>A fill asked for: every task (or each of the request's) that the lists holding it hold alike, with its
-    /// definition folder, not deleted, removed nowhere, in no conflict, and not running with more permission than asking,
-    /// is made in the lists lacking it (the one the app shows once it is closed). A task asked for by id is restored
-    /// first: its removals in one account go, and so does its deletion while its definition folder is there. Nothing
-    /// is deleted or changed. Refused while a list does not read.</summary>
-    internal JsonObject Seed(ClaudeScheduledState state, IReadOnlyList<ClaudeScheduledFile> files, ClaudeScheduledRequest request,
-        DateTimeOffset now, Func<string, string> label)
-    {
-        var unreadable = files.Where(file => !file.Readable).Select(file => label(file.Key)).ToArray();
-        JsonArray filled = [], conflicts = [], skipped = [], everywhere = [], cleared = [];
-        if (unreadable.Length > 0)
-            return new JsonObject
-            {
-                ["status"] = "unreadable", ["fill"] = filled, ["conflicts"] = conflicts, ["skipped"] = skipped,
-                ["alreadyEverywhere"] = everywhere, ["cleared"] = cleared, ["unreadable"] = Labels(unreadable)
-            };
-        var asked = request.Tasks.Count > 0;
-        var ids = asked ? request.Tasks.Distinct(StringComparer.Ordinal).ToArray()
-            : files.SelectMany(file => file.Entries.Keys).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray();
-        var incomplete = false;
-        void Skip(string id, string reason, IEnumerable<string>? accounts = null)
-        {
-            var item = new JsonObject { ["id"] = id, ["reason"] = reason };
-            if (accounts is not null) item["accounts"] = Labels(accounts.Select(label));
-            skipped.Add(item);
-            incomplete |= asked;
-        }
-        // Asked for by id, a task removed in some accounts is wanted there again, and a deleted one back.
-        void Restore(string id)
-        {
-            var marks = new List<string>();
-            foreach (var (key, account) in state.Accounts)
-                if (account.Removed.Remove(id)) marks.Add(key);
-            var deletion = state.Deleted.TryGetValue(id, out var deleted) && HasDefinition(id) ? deleted.By : null;
-            if (deletion is not null) state.Deleted.Remove(id);
-            if (marks.Count == 0 && deletion is null) return;
-            var item = new JsonObject { ["id"] = id, ["removedIn"] = Labels(marks.Select(label)) };
-            if (deletion is not null) item["deletion"] = deletion;
-            cleared.Add(item);
-        }
-        foreach (var id in ids)
-        {
-            if (!ClaudeScheduledRegistry.IsSafeId(id)) { Skip(id, "invalid"); continue; }
-            if (asked) Restore(id);
-            var holders = files.Where(file => file.Entries.ContainsKey(id)).ToArray();
-            var lacking = files.Where(file => !file.Entries.ContainsKey(id)).Select(file => file.Key).ToArray();
-            if (holders.Length == 0) { Skip(id, "not_found"); continue; }
-            if (lacking.Length == 0) { if (asked) everywhere.Add(id); continue; }
-            if (state.Deleted.ContainsKey(id)) { Skip(id, "deleted"); continue; }
-            var removedIn = state.Accounts.Where(pair => pair.Value.Removed.ContainsKey(id)).Select(pair => pair.Key).ToArray();
-            if (removedIn.Length > 0) { Skip(id, "removed_in_one_account", removedIn); continue; }
-            if (!HasDefinition(id)) { Skip(id, "no_definition"); continue; }
-            var hashes = holders.Select(file => ClaudeScheduledRegistry.HashOf(file.Entries[id])).Distinct().ToArray();
-            if (state.Conflicts.ContainsKey(id) || hashes.Length > 1)
-            {
-                conflicts.Add(new JsonObject { ["id"] = id, ["accounts"] = Labels(holders.Select(file => label(file.Key))) });
-                incomplete |= asked;
-                continue;
-            }
-            var source = holders[0];
-            var entry = source.Entries[id];
-            if (ClaudeScheduledRegistry.RaisesBeyond(entry, ClaudeScheduledChoice.None)) { Skip(id, "raises_permission"); continue; }
-            state.Seeds[id] = new(now, source.Key, hashes[0], ClaudeScheduledRegistry.Synced(entry), ClaudeScheduledRegistry.Extra(entry),
-                ClaudeScheduledRegistry.Text(entry, "filePath"), StampsOf(source.Root), new(lacking, StringComparer.Ordinal));
-            filled.Add(new JsonObject { ["id"] = id, ["into"] = Labels(lacking.Select(label)) });
-        }
-        return new JsonObject
-        {
-            ["status"] = incomplete ? "incomplete" : "ok", ["fill"] = filled, ["conflicts"] = conflicts, ["skipped"] = skipped,
-            ["alreadyEverywhere"] = everywhere, ["cleared"] = cleared, ["unreadable"] = new JsonArray()
-        };
-    }
-
-    /// <summary>A removal asked for: each task is deleted from every account (the one the app shows once it is closed),
-    /// with the previous lists kept beside the state, and never filled again.</summary>
-    internal static JsonObject Remove(ClaudeScheduledState state, IReadOnlyList<ClaudeScheduledFile> files, ClaudeScheduledRequest request,
-        DateTimeOffset now, Func<string, string> label)
-    {
-        JsonArray removed = [], skipped = [];
-        var incomplete = request.Tasks.Count == 0;
-        foreach (var id in request.Tasks.Distinct(StringComparer.Ordinal))
-        {
-            if (!ClaudeScheduledRegistry.IsSafeId(id))
-            {
-                skipped.Add(new JsonObject { ["id"] = id, ["reason"] = "invalid" });
-                incomplete = true;
-                continue;
-            }
-            var holders = files.Where(file => file.Entries.ContainsKey(id)).Select(file => file.Key).ToArray();
-            if (holders.Length == 0 && !files.Any(file => !file.Readable) && !Tracked(state, files, id))
-            {
-                skipped.Add(new JsonObject { ["id"] = id, ["reason"] = "not_found" });
-                incomplete = true;
-                continue;
-            }
-            Delete(state, files, id, "command", now);
-            removed.Add(new JsonObject { ["id"] = id, ["from"] = Labels(holders.Select(label)) });
-        }
-        return new JsonObject
-        {
-            ["status"] = incomplete ? "incomplete" : "ok", ["removed"] = removed, ["skipped"] = skipped,
-            ["unreadable"] = Labels(files.Where(file => !file.Readable).Select(file => label(file.Key)))
-        };
-    }
-
-    private static JsonArray Labels(IEnumerable<string> labels) => new(labels.Select(text => (JsonNode)text).ToArray());
-
-    /// <summary>The tasks removed in some accounts alone that others still hold, each with where it is gone and where
-    /// it is not.</summary>
-    internal static IReadOnlyList<(string Id, string[] RemovedIn, string[] StillIn)> RemovedHere(ClaudeScheduledState state,
-        IReadOnlyList<ClaudeScheduledFile> files) =>
-        state.Accounts.SelectMany(pair => pair.Value.Removed.Keys).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal)
-            .Where(id => !state.Deleted.ContainsKey(id))
-            .Select(id => (id, state.Accounts.Where(pair => pair.Value.Removed.ContainsKey(id)).Select(pair => pair.Key).ToArray(),
-                files.Where(file => file.Entries.ContainsKey(id)).Select(file => file.Key).ToArray()))
-            .Where(item => item.Item3.Length > 0).ToArray();
 
     /// <summary>
-    /// One pass: reads every list, settles writes a stopped widget began, records what changed, answers a request, and
-    /// writes each list <paramref name="mayWrite"/> allows (asked again just before each file), under the account lease.
-    /// A list that changed after it was read is left for the next pass, and one made meanwhile is not replaced. Before a
-    /// list is replaced, its previous content is kept beside the state, and the write is kept as begun first.
+    /// Performs a command: a plan (read only, whatever the app's version), or, when <paramref name="reviewed"/>, the apply
+    /// of a plan whose token matches the plan made now: a mirror is kept first (so a stop midway leaves it chosen), then
+    /// each list it changes is written while <paramref name="mayWrite"/> allows it; a list changed since it was read
+    /// stops the writes there. A removal removes the entries the plan showed. Stopping a mirror only forgets it.
     /// </summary>
-    internal ClaudeScheduledPass Pass(IReadOnlyList<ClaudeShelfAccount> registered, ClaudeScheduledLogView? log, Func<string, bool> mayWrite,
-        DateTimeOffset now, ClaudeScheduledRequest? request = null)
+    internal JsonObject Serve(ClaudeScheduledRequest request, ClaudeScheduledScene scene, Func<string, bool> mayWrite,
+        DateTimeOffset now, bool reviewed)
     {
-        var labels = registered.Where(account => ClaudeScheduledRegistry.IsKey(account.Key))
-            .DistinctBy(account => account.Key).ToDictionary(account => account.Key, account => account.Label, StringComparer.Ordinal);
-        var (state, exists) = LoadState();
-        JsonObject Answer(string status) => new() { ["status"] = status };
-        if (state is null)
-            return new(false, 0, [], [], "store_unreadable", request is null ? null : Answer("store_unreadable"));
-        string Label(string key) => labels.GetValueOrDefault(key) ?? state.Labels.GetValueOrDefault(key) ?? key[..8];
-        var kept = Shape(state);
-        var keptAt = state.Accounts.Values.Select(account => (DateTimeOffset?)account.Seen).Max();
-        var first = !exists;
-        if (RootIdentity() is not { } root)
-            return new(false, 0, [], [], null, request is null ? null : Answer("no_lists"));
-        if (state.Root is { } before && before != root)
+        switch (request.Op)
         {
-            Rebase(state);
-            first = true;
+            case "unmirror":
+            {
+                if (scene.State is not { } state) return new() { ["status"] = scene.StateProblem ?? "store_unreadable" };
+                if (!state.Mirrors.Remove(request.Task) & !state.Frozen.Remove(request.Task))
+                    return new() { ["status"] = "not_mirrored", ["task"] = request.Task };
+                return SaveState(state) ? new() { ["status"] = "ok", ["task"] = request.Task, ["next"] = "the lists keep the task: --claude-scheduled-remove "
+                    + request.Task + " removes it" } : new() { ["status"] = "store_unwritable" };
+            }
+            case "mirror" or "remove":
+            {
+                var plan = request.Op == "mirror" ? PlanMirror(request, scene, now) : PlanRemove(request, scene);
+                var answer = plan.Answer;
+                answer["reviewed"] = reviewed;
+                if (!request.Apply || plan.Refused) return answer;
+                if (!reviewed) { answer["status"] = "unreviewed_app_version"; return answer; }
+                if (!string.Equals(request.Expect, plan.Token, StringComparison.OrdinalIgnoreCase))
+                {
+                    answer["status"] = "token_mismatch";
+                    answer["next"] = "the lists changed since that plan: this is the plan now; " + answer["next"]!.GetValue<string>();
+                    return answer;
+                }
+                if (plan.Raising is { Count: > 0 } && !request.AllowRaise)
+                {
+                    answer["status"] = "raise_needs_allow";
+                    return answer;
+                }
+                if (plan.Mirror is { } chosen)
+                {
+                    var state = scene.State!;
+                    state.Frozen.Remove(chosen.Id);
+                    state.Mirrors[chosen.Id] = chosen with { Allowed = request.AllowRaise ? plan.Raising ?? [] : [], ChosenAt = now };
+                    if (!SaveState(state)) { answer["status"] = "store_unwritable"; return answer; }
+                }
+                var (written, waiting, failure) = WriteChanges(plan.Changes.Select(change => (change.File, change.Root)).ToArray(), mayWrite, now);
+                foreach (var change in plan.Changes)
+                    change.Target["result"] = written.Contains(change.File.Key) ? "written" : waiting.Contains(change.File.Key) ? "not written now" : "not written";
+                answer["status"] = request.Op == "mirror" ? "mirrored" : "removed";
+                if (failure is not null) answer["failure"] = failure;
+                var left = plan.Changes.Where(change => !written.Contains(change.File.Key)).Select(change => scene.Label(change.File.Key));
+                if (request.Op == "remove")
+                    answer["remains"] = Names(left.Concat(scene.Files.Where(file => file.Status == ClaudeScheduledReadStatus.Unreadable)
+                        .Select(file => scene.Label(file.Key))).Distinct());
+                if (left.Any())
+                    answer["next"] = request.Op == "mirror"
+                        ? "a list was not written (the app shows it, or it changed): a missing task is made there later; an entry to fix or replace needs the same mirror once the app has left it"
+                        : "a list was not written (the app shows it, or it changed): the task stays there; run the same removal once the app has left it";
+                else answer.Remove("next");
+                return answer;
+            }
+            default: return new() { ["status"] = "invalid_request" };
         }
-        state.Root = root;
-        foreach (var key in log?.Initialized ?? []) if (ClaudeScheduledRegistry.IsKey(key)) state.Known.Add(key);
-        if (Observe(labels.Keys.Concat(state.Known).Concat(state.Accounts.Keys)) is not { } observed)
-            return new(false, 0, [], [], "sessions_unlisted", request is null ? null : Answer("sessions_unlisted"));
-        Recover(state, observed, now);
-        var files = Settle(state, observed);
-        ObserveDefinitions(state, files, now, first);
-        Record(state, files, now, log);
-        Track(state, files);
-        foreach (var (key, label) in labels) state.Labels[key] = label;
-        var answer = request switch
+    }
+
+    /// <summary>
+    /// One pass between commands, for each mirror: a lasting hold is kept and reported; else, when an account's entry
+    /// differs (in its settings, its <c>createdAt</c> or its kind) or the definition went, the mirror is held from now
+    /// on. Otherwise a list lacking the task gets it (with the tasks it replaces removed), unless the list still keeps
+    /// runs of a task under its id, the copy would run with more permission than the source and that was not allowed,
+    /// or the list has no file yet; and a copy whose scan floor is below the newest slot another account ran gets it
+    /// raised just past that slot. With <paramref name="preview"/> nothing is written and holds are only reported.
+    /// </summary>
+    internal ClaudeScheduledPass Pass(ClaudeScheduledScene scene, Func<string, bool> mayWrite, DateTimeOffset now, bool preview = false)
+    {
+        var unreadable = scene.Files.Where(file => !file.Readable).Select(file => scene.Label(file.Key)).ToArray();
+        var processed = scene.Files.ToDictionary(file => file.Key, file => file.Stamp ?? "?", StringComparer.Ordinal);
+        var report = new JsonArray();
+        if (scene.State is not { } state) return new(0, [], unreadable, scene.StateProblem ?? "store_unreadable", null, processed, report);
+        var notices = new List<(int Rank, ClaudeScheduledProblemKind Kind, string Detail)>();
+        void Notice(ClaudeScheduledProblemKind kind, string detail) => notices.Add((kind switch
         {
-            null => null,
-            { Op: "seed" } => Seed(state, files, request, now, Label),
-            { Op: "remove" } => Remove(state, files, request, now, Label),
-            _ => Answer("invalid_request")
-        };
-        var unreadable = files.Where(file => !file.Readable).Select(file => Label(file.Key)).ToArray();
-        var processed = files.ToDictionary(file => file.Key, file => file.Stamp ?? "?", StringComparer.Ordinal);
-        IReadOnlyList<string> Conflicts() => state.Conflicts.Keys.ToArray();
-        IReadOnlyList<string> Removed() => RemovedHere(state, files).Select(item => item.Id).ToArray();
-        // Only when something besides the times the lists were last looked at changed, or those are getting old.
-        var save = first || Shape(state) != kept || keptAt is not { } at || now - at >= SeenRefresh || at > now;
-        if (save && !SaveState(state))
+            ClaudeScheduledProblemKind.Differs => 0, ClaudeScheduledProblemKind.Stopped => 1, ClaudeScheduledProblemKind.Held => 2,
+            ClaudeScheduledProblemKind.TooLarge => 3, _ => 4
+        }, kind, detail));
+        var planned = new SortedDictionary<string, (ClaudeScheduledFile File, JsonObject Root)>(StringComparer.Ordinal);
+        var holds = false;
+        foreach (var id in state.Frozen.Keys)
         {
-            if (answer is not null) answer["status"] = "store_unwritable";
-            return new(first, 0, unreadable, [], "store_unwritable", answer, [], Conflicts(), Removed(), [], processed);
+            report.Add(new JsonObject { ["task"] = id, ["status"] = "frozen", ["note"] = "its record does not verify: mirror it again" });
+            Notice(ClaudeScheduledProblemKind.Stopped, id + ": record");
         }
-        // The first pass takes what is there as the starting point and changes nothing unless asked to.
-        if (first && request is null) return new(true, 0, unreadable, [], null, null, [], Conflicts(), Removed(), [], processed);
-        var plan = Plan(state, files, request?.Op, now);
+        foreach (var mirror in state.Mirrors.Values.ToArray())
+        {
+            var outcome = new JsonObject { ["task"] = mirror.Id, ["from"] = Labelled(scene, mirror.SourceKey) };
+            report.Add(outcome);
+            var (lost, wait) = mirror.Hold is null ? DefinitionStill(mirror, now) : (null, null);
+            var hold = mirror.Hold ?? lost ?? Differing(mirror, scene, now);
+            if (hold is not null)
+            {
+                if (mirror.Hold is null)
+                {
+                    state.Mirrors[mirror.Id] = mirror with { Hold = hold };
+                    holds = true;
+                }
+                outcome["status"] = "held";
+                outcome["hold"] = HoldJson(hold, scene);
+                outcome["next"] = "mirror it again to choose the entry to keep";
+                var where = hold.Accounts.Count == 0 ? "definition"
+                    : string.Join(", ", hold.Accounts.Select(account => scene.Label(account.Key) + " " + string.Join("/", account.Fields)));
+                Notice(hold.Reason == "differs" ? ClaudeScheduledProblemKind.Differs : ClaudeScheduledProblemKind.Stopped, mirror.Id + ": " + where);
+                continue;
+            }
+            if (wait is not null)
+            {
+                outcome["status"] = "waiting";
+                outcome["reason"] = wait;
+                Notice(ClaudeScheduledProblemKind.Stopped, mirror.Id + ": " + wait);
+                continue;
+            }
+            outcome["status"] = "ok";
+            var accounts = new JsonArray();
+            outcome["accounts"] = accounts;
+            var slot = Ran(mirror, scene, now);
+            if (slot is { } ran) outcome["newestSlotRun"] = ClaudeScheduledRegistry.Iso(ran);
+            var raises = ClaudeScheduledPermission.Raises(mirror.SourceAccess, mirror.CopyAccess);
+            foreach (var file in scene.Files)
+            {
+                JsonObject Account(string action, string? note = null)
+                {
+                    var item = Labelled(scene, file.Key);
+                    item["action"] = action;
+                    if (note is not null) item["note"] = note;
+                    accounts.Add(item);
+                    return item;
+                }
+                if (file.Status == ClaudeScheduledReadStatus.Missing)
+                {
+                    Account("no_list", "open this account in the app once: the task is made in its list then");
+                    Notice(ClaudeScheduledProblemKind.Unfilled, mirror.Id + ": " + scene.Label(file.Key));
+                    continue;
+                }
+                if (file.Status != ClaudeScheduledReadStatus.Ok) { Account("unreadable", file.Problem); continue; }
+                (ClaudeScheduledFile, JsonObject) Root() => planned.TryGetValue(file.Key, out var kept) ? kept : (file, file.Root!.DeepClone().AsObject());
+                if (file.Entries.GetValueOrDefault(mirror.Id) is not { } entry)
+                {
+                    if (ClaudeScheduledRegistry.HasTaskMap(file.Root!, mirror.Id))
+                    {
+                        Account("held", "the list still keeps runs of a task under this id");
+                        Notice(ClaudeScheduledProblemKind.Unfilled, mirror.Id + ": " + scene.Label(file.Key));
+                        continue;
+                    }
+                    if (raises && !mirror.Allows(file.Key, mirror.SourceAccess, mirror.CopyAccess))
+                    {
+                        Account("held", "a copy here would run with more permission than the source: mirror again with --allow-raise");
+                        Notice(ClaudeScheduledProblemKind.Held, mirror.Id);
+                        continue;
+                    }
+                    var (_, root) = Root();
+                    ClaudeScheduledRegistry.Drop(root, other => mirror.Replaces.Any(replaced => ClaudeScheduledRegistry.Text(other, "id") == replaced.Id
+                        && ClaudeScheduledRegistry.SameCreated(other, replaced.CreatedAt)));
+                    ClaudeScheduledRegistry.Tasks(root).Add(mirror.Copy(now));
+                    planned[file.Key] = (file, root);
+                    Account("make");
+                    continue;
+                }
+                // The scan floor: just past the newest slot an account ran (the app scans from the floor on, inclusive),
+                // unless this one ran it; only ever raised.
+                var own = ClaudeScheduledRegistry.Time(ClaudeScheduledRegistry.Text(entry, "lastScheduledFor"));
+                var floor = ClaudeScheduledRegistry.Time(ClaudeScheduledRegistry.Text(entry, "missedRunScanFloor"));
+                if (slot is { } newest && (own is null || own < newest) && (floor is null || floor < newest.AddMilliseconds(1)))
+                {
+                    var (_, root) = Root();
+                    ClaudeScheduledRegistry.Find(root, mirror.Id)!["missedRunScanFloor"] = ClaudeScheduledRegistry.Iso(newest.AddMilliseconds(1));
+                    planned[file.Key] = (file, root);
+                    Account("floor", ClaudeScheduledRegistry.Iso(newest.AddMilliseconds(1)));
+                    continue;
+                }
+                Account("same");
+            }
+        }
+        var waiting = new List<string>();
         var written = 0;
         string? failure = null;
-        List<string> waiting = [];
-        if (plan.Changes.Count > 0)
+        var writes = new List<(ClaudeScheduledFile File, JsonObject Root)>();
+        foreach (var (key, (file, root)) in planned)
         {
-            IDisposable? lease = null;
-            try
+            if (ClaudeScheduledRegistry.Serialize(root).LongLength > ClaudeScheduledRegistry.MaxBytes)
+                Notice(ClaudeScheduledProblemKind.TooLarge, scene.Label(key));
+            else writes.Add((file, root));
+        }
+        if (!preview && writes.Count > 0)
+        {
+            var (done, later, failed) = WriteChanges(writes, mayWrite, now);
+            written = done.Count;
+            waiting.AddRange(later.Select(scene.Label));
+            failure = failed;
+            foreach (var key in done) processed[key] = ClaudeScheduledRegistry.CheapStamp(writes.First(write => write.File.Key == key).File.Path);
+        }
+        else waiting.AddRange(writes.Select(write => scene.Label(write.File.Key)));
+        if (holds && !preview && !SaveState(state)) failure ??= "store_unwritable";
+        ClaudeScheduledProblem? notice = null;
+        if (notices.Count > 0)
+        {
+            var top = notices.Min(item => item.Rank);
+            var details = notices.Where(item => item.Rank == top).Select(item => item.Detail).Distinct().ToArray();
+            notice = new(notices.First(item => item.Rank == top).Kind,
+                string.Join(", ", details.Take(3)) + (details.Length > 3 ? $" +{details.Length - 3}" : ""));
+        }
+        return new(written, waiting.Distinct().ToArray(), unreadable, failure, notice, processed, report);
+    }
+
+    /// <summary>Writes each list (its new whole content), under the lease, while <paramref name="mayWrite"/> allows it;
+    /// a list found changed since it was read stops the writes. The keys written and not written now, and a failure.</summary>
+    private (HashSet<string> Written, HashSet<string> Waiting, string? Failure) WriteChanges(
+        IReadOnlyList<(ClaudeScheduledFile File, JsonObject Root)> changes, Func<string, bool> mayWrite, DateTimeOffset now)
+    {
+        var (written, waiting) = (new HashSet<string>(StringComparer.Ordinal), new HashSet<string>(StringComparer.Ordinal));
+        string? failure = null;
+        if (changes.Count == 0) return (written, waiting, null);
+        IDisposable? lease = null;
+        try
+        {
+            lease = _lease();
+            var stopped = false;
+            foreach (var (file, root) in changes)
             {
-                lease = _lease();
-                foreach (var change in plan.Changes)
+                if (stopped || !mayWrite(file.Key)) { waiting.Add(file.Key); continue; }
+                try
                 {
-                    if (!mayWrite(change.Key)) { waiting.Add(Label(change.Key)); continue; }
-                    try
+                    switch (Replace(file, ClaudeScheduledRegistry.Serialize(root), () => mayWrite(file.Key), now))
                     {
-                        if (Write(state, change, () => mayWrite(change.Key), now) is { } stamp)
-                        {
-                            written++;
-                            processed[change.Key] = stamp;
-                        }
-                        else waiting.Add(Label(change.Key));
-                    }
-                    catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
-                    {
-                        failure = exception.Message;
-                        waiting.Add(Label(change.Key));
+                        case true: written.Add(file.Key); break;
+                        case false: waiting.Add(file.Key); break;
+                        case null: waiting.Add(file.Key); stopped = true; break;
                     }
                 }
+                catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+                {
+                    failure = exception.Message;
+                    waiting.Add(file.Key);
+                }
             }
-            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidOperationException
-                                                  or TimeoutException)
-            {
-                // The installer or an account operation holds the lease: every list waits for the next pass.
-                failure = exception.Message;
-                waiting.AddRange(plan.Changes.Select(change => Label(change.Key)));
-            }
-            finally { lease?.Dispose(); }
-            if (written > 0 && !SaveState(state)) failure ??= "store_unwritable";
         }
-        if (answer is not null)
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidOperationException
+                                              or TimeoutException)
         {
-            if (failure is not null && answer["status"]?.GetValue<string>() == "ok") answer["failure"] = failure;
-            answer["written"] = written;
-            // Lists not written in this pass: the one the app shows (written once it closes), or one it is loading.
-            answer["waiting"] = Labels(waiting.Distinct());
-            if (plan.Held.Count > 0) answer["held"] = Labels(plan.Held.Select(item => item.Id).Distinct());
-            if (plan.TooLarge.Count > 0) answer["tooLarge"] = Labels(plan.TooLarge.Select(Label));
-            answer["removedInOneAccountOnly"] = RemovedJson(RemovedHere(state, files), Label);
+            // The installer or an account operation holds the lease: every list waits for the next pass.
+            failure = exception.Message;
+            foreach (var (file, _) in changes) if (!written.Contains(file.Key)) waiting.Add(file.Key);
         }
-        return new(first, written, unreadable, waiting.Distinct().ToArray(), failure, answer, plan.TooLarge.Select(Label).ToArray(),
-            Conflicts(), Removed(), plan.Held.Select(item => item.Id).Distinct().ToArray(), processed);
+        finally { lease?.Dispose(); }
+        return (written, waiting, failure);
     }
 
-    internal static JsonArray RemovedJson(IEnumerable<(string Id, string[] RemovedIn, string[] StillIn)> items, Func<string, string> label) =>
-        new(items.Select(item => (JsonNode)new JsonObject
-        {
-            ["id"] = item.Id, ["removedIn"] = Labels(item.RemovedIn.Select(label)), ["stillIn"] = Labels(item.StillIn.Select(label))
-        }).ToArray());
-
-    /// <summary>Replaces or makes one list: the new list is written beside it, the write is kept as begun, and only then
-    /// is it moved into place, while the list still holds what was read and <paramref name="mayWrite"/> still allows it
-    /// (a list that was not there is never replaced by one made meanwhile). The stamp of the list written, or null when
-    /// it changed or may no longer be written.</summary>
-    private string? Write(ClaudeScheduledState state, ClaudeScheduledChange change, Func<bool> mayWrite, DateTimeOffset now)
+    /// <summary>Replaces one list with <paramref name="bytes"/>: the old one is backed up, the new one written beside it
+    /// and moved into place only while the list still holds exactly what was read (read again just before) and
+    /// <paramref name="mayWrite"/> still allows it. True when written; false when it may not be written now; null when
+    /// the list changed since it was read. A list that was not there is never made.</summary>
+    private bool? Replace(ClaudeScheduledFile file, byte[] bytes, Func<bool> mayWrite, DateTimeOffset now)
     {
+        Writing();
         // What is written must read as the app reads it, or the app would load none of that account's tasks.
-        if (!ClaudeScheduledRegistry.IsValid(JsonNode.Parse(change.Bytes)) || change.Bytes.LongLength > ClaudeScheduledRegistry.MaxBytes)
-            throw new IOException("The aligned list does not pass the app's schema.");
-        var path = change.File.Path;
+        if (bytes.LongLength > ClaudeScheduledRegistry.MaxBytes || !ClaudeScheduledRegistry.IsValid(JsonNode.Parse(bytes)))
+            throw new IOException("The list to write does not pass the app's schema.");
+        if (file.Bytes is not { } previous) return false;
+        var path = file.Path;
         var folder = Path.GetDirectoryName(path)!;
-        if (!Same(path, change.File.Bytes)) return null;
-        // A partial a stopped widget left behind, once its write is settled.
-        foreach (var stale in Directory.GetFiles(folder, PartialPattern))
-            try { if (File.GetLastWriteTimeUtc(stale) < now.UtcDateTime.AddHours(-1) && state.Intents.Values.All(intent => intent.Partial != stale)) File.Delete(stale); }
+        if (!Same(path, previous)) return null;
+        // A partial a stopped widget left behind.
+        foreach (var stale in Directory.GetFiles(folder, ".scheduled-tasks.*.widget-*.partial"))
+            try { if (File.GetLastWriteTimeUtc(stale) < now.UtcDateTime.AddHours(-1)) File.Delete(stale); }
             catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { }
-        if (change.File.Bytes is { } previous) KeepBackup(change.Key, previous, now);
+        KeepBackup(file.Key, previous, now);
         // Not a session record, tombstone or temporary record name the app's recovery looks at.
-        var partial = Path.Combine(folder, ".scheduled-tasks." + Guid.NewGuid().ToString("N") + ".widget-sync.partial");
-        var keepPartial = false;
+        var partial = Path.Combine(folder, ".scheduled-tasks." + Guid.NewGuid().ToString("N") + ".widget-mirror.partial");
         try
         {
-            Commit(partial, change.Bytes);
-            var stamp = ClaudeScheduledRegistry.CheapStamp(partial);
-            if (!mayWrite() || !Same(path, change.File.Bytes)) return null;
-            var at = _clock();
-            var writes = new SortedDictionary<string, ClaudeScheduledState.Written>(StringComparer.Ordinal);
-            foreach (var (id, write) in change.Writes) writes[id] = write with { At = at };
-            state.Intents[change.Key] = new(at, partial, ClaudeScheduledRegistry.Sha(change.File.Bytes), ClaudeScheduledRegistry.Sha(change.Bytes)!,
-                change.Entries, writes);
-            if (!SaveState(state))
-            {
-                state.Intents.Remove(change.Key);
-                throw new IOException("store_unwritable");
-            }
-            // From here the write kept as begun names the partial: while it does, the partial stays to tell it was not
-            // moved (a widget stopped here leaves both).
-            keepPartial = true;
+            Commit(partial, bytes);
+            if (!mayWrite()) return false;
             BeforeMoveForTest?.Invoke(path);
-            try { File.Move(partial, path, overwrite: change.File.Bytes is not null); }
-            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
-            {
-                // Not moved: the write did not happen. Kept as begun when that cannot be saved, the partial tells so.
-                state.Intents.Remove(change.Key);
-                keepPartial = !SaveState(state);
-                if (change.File.Bytes is null && File.Exists(path)) return null;
-                throw;
-            }
-            keepPartial = false;
-            AfterMoveForTest?.Invoke(path);
-            state.Intents.Remove(change.Key);
-            var account = state.Accounts[change.Key];
-            account.Entries = new(change.Entries, StringComparer.Ordinal);
-            foreach (var id in change.Deleted) account.Writes.Remove(id);
-            foreach (var (id, write) in writes) account.Writes[id] = write;
-            account.Seen = now;
-            return stamp;
+            if (!Same(path, previous)) return null;
+            File.Move(partial, path, overwrite: true);
+            return true;
         }
-        finally { if (!keepPartial && File.Exists(partial)) TryDelete(partial); }
+        finally { if (File.Exists(partial)) TryDelete(partial); }
     }
 
-    private static bool Same(string path, byte[]? expected)
+    private static bool Same(string path, byte[] expected)
     {
-        try
-        {
-            if (!File.Exists(path)) return expected is null;
-            return expected is not null && File.ReadAllBytes(path).AsSpan().SequenceEqual(expected);
-        }
+        try { return File.Exists(path) && File.ReadAllBytes(path).AsSpan().SequenceEqual(expected); }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { return false; }
     }
 
     private void KeepBackup(string key, byte[] bytes, DateTimeOffset now)
     {
+        Writing();
         EnsureStore();
-        var folder = Directory.CreateDirectory(Path.Combine(_store, "backups", key.Replace('/', '_'))).FullName;
+        var folder = Directory.CreateDirectory(BackupFolder(key)).FullName;
         var name = now.UtcDateTime.ToString("yyyyMMdd'T'HHmmssfff'Z'", CultureInfo.InvariantCulture) + "_" + Guid.NewGuid().ToString("N")[..6] + ".json";
         Commit(Path.Combine(folder, name), bytes);
         foreach (var old in Directory.GetFiles(folder, "*.json").Order(StringComparer.Ordinal).SkipLast(Backups))
             TryDelete(old);
     }
-
-    internal string BackupFolder(string key) => Path.Combine(_store, "backups", key.Replace('/', '_'));
-
-    /// <summary>What the next pass would find and do, on a copy of the kept state: nothing is written.</summary>
-    internal (ClaudeScheduledState State, IReadOnlyList<ClaudeScheduledFile> Files, bool First)? Preview(ClaudeScheduledState kept, bool exists,
-        IReadOnlyList<ClaudeShelfAccount> registered, ClaudeScheduledLogView? log, DateTimeOffset now)
-    {
-        var state = kept.Clone();
-        var first = !exists;
-        if (RootIdentity() is not { } root) return null;
-        if (state.Root is { } before && before != root) { Rebase(state); first = true; }
-        state.Root = root;
-        foreach (var key in log?.Initialized ?? []) if (ClaudeScheduledRegistry.IsKey(key)) state.Known.Add(key);
-        if (Observe(registered.Select(account => account.Key).Concat(state.Known).Concat(state.Accounts.Keys)) is not { } observed) return null;
-        Recover(state, observed, now, readOnly: true);
-        var files = Settle(state, observed);
-        ObserveDefinitions(state, files, now, first);
-        Record(state, files, now, log);
-        Track(state, files);
-        return (state, files, first);
-    }
 }
 
-/// <summary>Where <c>--claude-scheduled-seed</c> and <c>--claude-scheduled-remove</c> ask the running widget: a request
+/// <summary>Where the scheduled-task commands ask the running widget (<see cref="Version"/> 2: the mirror): a request
 /// and an answer event and the shared memory carrying both, named after the widget's ledger folder (a test's folder
-/// names its own; the path reads the same inside a packaged app). Named kernel objects reach the widget from a process
-/// the app runs, where files it writes could be virtualized.</summary>
-internal sealed class ClaudeScheduledSeedChannel : IDisposable
+/// names its own). Named kernel objects reach the widget from a process the app runs, where files it writes could be
+/// virtualized. A request on the names of the first version is answered with a refusal.</summary>
+internal sealed class ClaudeScheduledChannel : IDisposable
 {
+    internal const int Version = 2;
     private const long MailboxBytes = 1024 * 1024;
     private const int AnswerOffset = 65536;
-    private const int MaxTasks = 256;
-    private readonly EventWaitHandle _requested, _answered;
-    private readonly MemoryMappedFile _mailbox;
-    private readonly MemoryMappedViewAccessor _view;
+    private const int MaxReplaces = 64;
+    private readonly Box _box;
+    private readonly Box? _old;
 
-    private ClaudeScheduledSeedChannel(EventWaitHandle requested, EventWaitHandle answered, MemoryMappedFile mailbox)
+    private sealed class Box(EventWaitHandle requested, EventWaitHandle answered, MemoryMappedFile mailbox) : IDisposable
     {
-        _requested = requested; _answered = answered; _mailbox = mailbox; _view = mailbox.CreateViewAccessor(0, MailboxBytes);
+        internal EventWaitHandle Requested { get; } = requested;
+        internal EventWaitHandle Answered { get; } = answered;
+        internal MemoryMappedViewAccessor View { get; } = mailbox.CreateViewAccessor(0, MailboxBytes);
+
+        internal static Box? Open((string Requested, string Answered, string Mailbox, string Lock) names)
+        {
+            EventWaitHandle? requested = null, answered = null;
+            MemoryMappedFile? mailbox = null;
+            try
+            {
+                requested = new EventWaitHandle(false, EventResetMode.AutoReset, names.Requested);
+                answered = new EventWaitHandle(false, EventResetMode.AutoReset, names.Answered);
+                mailbox = MemoryMappedFile.CreateOrOpen(names.Mailbox, MailboxBytes, MemoryMappedFileAccess.ReadWrite,
+                    MemoryMappedFileOptions.DelayAllocatePages, HandleInheritability.None);
+                return new(requested, answered, mailbox);
+            }
+            catch (Exception exception) when (exception is UnauthorizedAccessException or IOException or WaitHandleCannotBeOpenedException)
+            {
+                requested?.Dispose(); answered?.Dispose(); mailbox?.Dispose();
+                return null;
+            }
+        }
+
+        /// <summary>A request waiting: its id and text.</summary>
+        internal (string Id, JsonObject Request)? Take()
+        {
+            if (!Requested.WaitOne(0)) return null;
+            try
+            {
+                return ClaudeSessionSync.ReadSlot(View, 0, AnswerOffset) is { } text && JsonNode.Parse(text) is JsonObject request
+                       && request["id"] is JsonValue value && value.TryGetValue<string>(out var id) && id.Length is > 0 and <= 64
+                    ? (id, request) : null;
+            }
+            catch (JsonException) { return null; }
+        }
+
+        internal void Answer(string id, string answer)
+        {
+            ClaudeSessionSync.WriteSlot(View, AnswerOffset, MailboxBytes - AnswerOffset, Encoding.UTF8.GetBytes(id + "\n" + answer));
+            Answered.Set();
+        }
+
+        public void Dispose() { View.Dispose(); mailbox.Dispose(); Requested.Dispose(); Answered.Dispose(); }
     }
+
+    private ClaudeScheduledChannel(Box box, Box? old) { _box = box; _old = old; }
 
     private static string Suffix(string ledgerDirectory) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(
         Path.TrimEndingDirectorySeparator(Path.GetFullPath(ledgerDirectory)).ToLowerInvariant())))[..16];
 
     private static (string Requested, string Answered, string Mailbox, string Lock) Names(string ledgerDirectory)
     {
+        var prefix = @"Local\CodexWeeklyUsageIndicator.ScheduledMirror" + Version.ToString(CultureInfo.InvariantCulture) + ".";
+        var suffix = Suffix(ledgerDirectory);
+        return (prefix + "Request." + suffix, prefix + "Answer." + suffix, prefix + "Mailbox." + suffix, prefix + "Lock." + suffix);
+    }
+
+    // The first version's names (seed and remove), answered with a refusal only.
+    private static (string, string, string, string) OldNames(string ledgerDirectory)
+    {
         var suffix = Suffix(ledgerDirectory);
         return (@"Local\CodexWeeklyUsageIndicator.ScheduledSeed." + suffix, @"Local\CodexWeeklyUsageIndicator.ScheduledSeeded." + suffix,
             @"Local\CodexWeeklyUsageIndicator.ScheduledSeedMailbox." + suffix, @"Local\CodexWeeklyUsageIndicator.ScheduledSeedLock." + suffix);
     }
 
-    internal static ClaudeScheduledSeedChannel? Open(string ledgerDirectory)
+    internal static ClaudeScheduledChannel? Open(string ledgerDirectory) =>
+        Box.Open(Names(ledgerDirectory)) is { } box ? new(box, Box.Open(OldNames(ledgerDirectory))) : null;
+
+    /// <summary>A request waiting, if any: its id and what it asks (null when it does not read as this version's).</summary>
+    internal (string Id, ClaudeScheduledRequest? Request)? Request()
     {
-        EventWaitHandle? requested = null, answered = null;
-        MemoryMappedFile? mailbox = null;
-        try
-        {
-            var names = Names(ledgerDirectory);
-            requested = new EventWaitHandle(false, EventResetMode.AutoReset, names.Requested);
-            answered = new EventWaitHandle(false, EventResetMode.AutoReset, names.Answered);
-            mailbox = MemoryMappedFile.CreateOrOpen(names.Mailbox, MailboxBytes, MemoryMappedFileAccess.ReadWrite,
-                MemoryMappedFileOptions.DelayAllocatePages, HandleInheritability.None);
-            return new(requested, answered, mailbox);
-        }
-        catch (Exception exception) when (exception is UnauthorizedAccessException or IOException or WaitHandleCannotBeOpenedException)
-        {
-            requested?.Dispose(); answered?.Dispose(); mailbox?.Dispose();
-            return null;
-        }
+        if (_old?.Take() is { } old)
+            _old.Answer(old.Id, new JsonObject { ["status"] = "refused", ["reason"] = "old_command_version" }.ToJsonString());
+        return _box.Take() is { } taken ? (taken.Id, Parse(taken.Request)) : null;
     }
 
-    /// <summary>A request waiting, if any: its id and what it asks (one that does not read asks for nothing valid).</summary>
-    internal (string Id, ClaudeScheduledRequest Request)? Request()
+    private static ClaudeScheduledRequest? Parse(JsonObject request)
     {
-        if (!_requested.WaitOne(0)) return null;
-        try
-        {
-            if (ClaudeSessionSync.ReadSlot(_view, 0, AnswerOffset) is not { } text || JsonNode.Parse(text) is not JsonObject request
-                || request["id"] is not JsonValue value || !value.TryGetValue<string>(out var id) || id.Length is 0 or > 64) return null;
-            var op = !request.TryGetPropertyValue("op", out var named) ? "seed"
-                : named is JsonValue value2 && value2.TryGetValue<string>(out var asked) ? asked : "invalid";
-            var tasks = !request.TryGetPropertyValue("tasks", out var listed) ? []
-                : listed is JsonArray items ? items.Select(item => item is JsonValue task && task.TryGetValue<string>(out var name) ? name : null).ToArray()
-                : [null];
-            return op is "seed" or "remove" && tasks.Length <= MaxTasks && tasks.All(task => task is not null)
-                ? (id, new ClaudeScheduledRequest(op, tasks.Select(task => task!).ToArray())) : (id, new ClaudeScheduledRequest("invalid", []));
-        }
-        catch (JsonException) { return null; }
+        static string? Text(JsonNode? node) => node is JsonValue value && value.TryGetValue<string>(out var text) ? text : null;
+        static bool Flag(JsonNode? node) => node is JsonValue value && value.TryGetValue<bool>(out var flag) && flag;
+        if (request["v"] is not JsonValue version || !version.TryGetValue<int>(out var number) || number != Version) return null;
+        if (Text(request["op"]) is not ("mirror" or "unmirror" or "remove") || Text(request["task"]) is not { } task) return null;
+        var replaces = request["replaces"] is JsonArray items ? items.Select(Text).ToArray() : [];
+        if (replaces.Length > MaxReplaces || replaces.Any(id => id is null)) return null;
+        return new(Text(request["op"])!, task, Text(request["from"]), Flag(request["apply"]), Text(request["expect"]),
+            Flag(request["allowRaise"]), replaces.Select(id => id!).ToArray());
     }
 
-    internal void Answer(string id, string answer)
-    {
-        ClaudeSessionSync.WriteSlot(_view, AnswerOffset, MailboxBytes - AnswerOffset, Encoding.UTF8.GetBytes(id + "\n" + answer));
-        _answered.Set();
-    }
+    internal void Answer(string id, string answer) => _box.Answer(id, answer);
 
-    /// <summary>Asks the running widget and waits for its answer; null without a widget or an answer in time.</summary>
-    internal static string? Ask(string ledgerDirectory, TimeSpan wait, ClaudeScheduledRequest? request = null)
+    /// <summary>Asks the running widget and waits for its answer; null without a widget of this version, or without an
+    /// answer in time.</summary>
+    internal static string? Ask(string ledgerDirectory, TimeSpan wait, ClaudeScheduledRequest request)
     {
-        request ??= new("seed", []);
-        if (request.Tasks.Count > MaxTasks) return null;
         var names = Names(ledgerDirectory);
         try
         {
@@ -1907,8 +1661,9 @@ internal sealed class ClaudeScheduledSeedChannel : IDisposable
                         var id = Guid.NewGuid().ToString("N");
                         ClaudeSessionSync.WriteSlot(view, 0, AnswerOffset, JsonSerializer.SerializeToUtf8Bytes(new JsonObject
                         {
-                            ["id"] = id, ["op"] = request.Op,
-                            ["tasks"] = new JsonArray(request.Tasks.Select(task => (JsonNode)task).ToArray())
+                            ["id"] = id, ["v"] = Version, ["op"] = request.Op, ["task"] = request.Task, ["from"] = request.From,
+                            ["apply"] = request.Apply, ["expect"] = request.Expect, ["allowRaise"] = request.AllowRaise,
+                            ["replaces"] = new JsonArray((request.Replaces ?? []).Select(task => (JsonNode)task).ToArray())
                         }));
                         answered.Reset();
                         requested.Set();
@@ -1927,158 +1682,138 @@ internal sealed class ClaudeScheduledSeedChannel : IDisposable
         { return null; }
     }
 
-    public void Dispose() { _view.Dispose(); _mailbox.Dispose(); _requested.Dispose(); _answered.Dispose(); }
+    public void Dispose() { _box.Dispose(); _old?.Dispose(); }
 }
 
-/// <summary>The scheduled-task commands: a read-only plan, and a seed and a removal the running widget performs.</summary>
+/// <summary>The scheduled-task commands. A mirror or a removal shows its plan; with <c>--apply --expect token</c> the
+/// running widget writes that plan. Without a widget of this version running, a plan is made here, reading only.</summary>
 internal static class ClaudeScheduledCommand
 {
     internal const string PlanFlag = "--claude-scheduled-plan";
-    internal const string SeedFlag = "--claude-scheduled-seed";
+    internal const string MirrorFlag = "--claude-scheduled-mirror";
+    internal const string UnmirrorFlag = "--claude-scheduled-unmirror";
     internal const string RemoveFlag = "--claude-scheduled-remove";
     private static readonly JsonSerializerOptions Output = new()
     { WriteIndented = true, Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping };
 
-    /// <summary>Prints, as UTF-8 JSON and without writing anything: each list, whether a first pass is still to come (it
-    /// would only take what is there, so the tasks held by some accounts alone are listed), the changes, conflicts,
-    /// removals in one account only and deletions it finds, what the next pass would write to each list, and what a
-    /// seed would fill and skip.</summary>
+    /// <summary>The request the arguments after a flag ask for; null when they do not read.</summary>
+    internal static ClaudeScheduledRequest? Parse(string op, string[] args)
+    {
+        if (args.Length == 0 || args[0].StartsWith("--", StringComparison.Ordinal)) return null;
+        var task = args[0];
+        string? from = null, expect = null;
+        bool apply = false, allowRaise = false;
+        var replaces = new List<string>();
+        for (var index = 1; index < args.Length; index++)
+        {
+            var argument = args[index];
+            if (op == "mirror" && argument == "--from" && index + 1 < args.Length) from = args[++index];
+            else if (op != "unmirror" && argument == "--apply") apply = true;
+            else if (op != "unmirror" && argument == "--expect" && index + 1 < args.Length) expect = args[++index];
+            else if (op == "mirror" && argument == "--allow-raise") allowRaise = true;
+            else if (op == "mirror" && argument == "--replaces")
+            {
+                while (index + 1 < args.Length && !args[index + 1].StartsWith("--", StringComparison.Ordinal)) replaces.Add(args[++index]);
+            }
+            else return null;
+        }
+        if (apply && expect is null || op == "mirror" && from is null) return null;
+        return new(op, task, from, apply, expect, allowRaise, replaces);
+    }
+
+    internal static int Run(string op, string[] args)
+    {
+        if (Parse(op, args) is not { } request)
+            return Print(new JsonObject
+            {
+                ["status"] = "usage",
+                ["usage"] = op switch
+                {
+                    "mirror" => MirrorFlag + " <id> --from <account:org | label | loaded> [--replaces <id> ...] [--apply --expect <token>] [--allow-raise]",
+                    "remove" => RemoveFlag + " <id> [--apply --expect <token>]",
+                    _ => UnmirrorFlag + " <id>"
+                }
+            }, 2);
+        var paths = ClaudeShelfPaths.CreateDefault();
+        if (ClaudeScheduledChannel.Ask(paths.LedgerDirectory, TimeSpan.FromSeconds(60), request) is { } answer)
+        {
+            Write(answer);
+            return Exit(answer);
+        }
+        // Writing is the widget's: without it only a plan is made, here.
+        if (request.Apply || request.Op == "unmirror") return Print(new JsonObject { ["status"] = "widget_not_answering" }, 1);
+        var plan = Local(paths, scene => (request.Op == "mirror" ? Sync(paths).PlanMirror(request, scene, DateTimeOffset.Now)
+            : Sync(paths).PlanRemove(request, scene)).Answer);
+        return Print(plan, plan["status"]?.GetValue<string>() == "plan" ? 0 : 1);
+    }
+
+    /// <summary>What the next pass would do with each mirror, reading only.</summary>
     internal static int RunPlan()
     {
         var paths = ClaudeShelfPaths.CreateDefault();
-        var sync = new ClaudeScheduledSync(paths.SessionsRoot, Path.Combine(paths.LedgerDirectory, ClaudeScheduledSync.StoreFolder),
-            paths.ScheduledTasksRoot, () => new MemoryStream());
-        var (kept, exists) = sync.LoadState();
+        var answer = Local(paths, scene =>
+        {
+            var pass = Sync(paths).Pass(scene, _ => false, DateTimeOffset.Now, preview: true);
+            return new JsonObject
+            {
+                ["status"] = pass.Failure ?? "ok", ["mirrors"] = pass.Report, ["notice"] = pass.Notice is { } notice ? notice.Kind + ": " + notice.Detail : null,
+                ["unreadable"] = new JsonArray(pass.Unreadable.Select(name => (JsonNode)name).ToArray())
+            };
+        });
+        return Print(answer, answer["status"]?.GetValue<string>() == "ok" ? 0 : 1);
+    }
+
+    private static ClaudeScheduledSync Sync(ClaudeShelfPaths paths) =>
+        new(paths.SessionsRoot, Path.Combine(paths.LedgerDirectory, ClaudeScheduledSync.StoreFolder), paths.ScheduledTasksRoot,
+            paths.AppScheduledTasksRoot, () => new MemoryStream(), readOnly: true);
+
+    /// <summary>A plan made in this process: the lists, the accounts registered and the app's log as it is now. The
+    /// answer says so, with how many times anything that writes was entered (none).</summary>
+    private static JsonObject Local(ClaudeShelfPaths paths, Func<ClaudeScheduledScene, JsonObject> plan)
+    {
         IReadOnlyList<ClaudeShelfAccount> accounts;
         try { accounts = ClaudeShelfAccounts.Resolve(new ClaudeProfileStore().ListProfiles(), paths.LedgerDirectory, keepCache: false); }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidOperationException
                                               or JsonException)
         { accounts = []; }
-        return Print(Describe(sync, accounts, kept, exists, DateTimeOffset.Now), kept is null ? 1 : 0);
+        var runtime = ClaudeDesktopProbe.Observe();
+        var running = runtime.State == ClaudeDesktopRunState.Running;
+        var log = new ClaudeDesktopLogWatcher();
+        log.Update(running ? runtime.HostStartedAt : null, accounts);
+        var scene = Sync(paths).Scene(accounts, running ? log.Scheduled : null, running);
+        var answer = scene is null ? new JsonObject { ["status"] = "sessions_unlisted" } : plan(scene);
+        // Whether the widget would write an apply of it now: the installed version reviewed, and the app running that one.
+        var package = ClaudeDesktopProbe.FindPackage();
+        answer["reviewed"] = package is not null && ClaudeDesktopProbe.ScheduledContract(package.AsarPath) == ClaudeDesktopContract.Reviewed
+                             && ClaudeDesktopProbe.RunsFrom(runtime, package);
+        answer["madeBy"] = "this command (no widget of this version answered): nothing was written";
+        answer["writeCalls"] = ClaudeScheduledSync.WriteCalls;
+        return answer;
     }
 
-    internal static JsonObject Describe(ClaudeScheduledSync sync, IReadOnlyList<ClaudeShelfAccount> accounts,
-        ClaudeScheduledState? kept, bool exists, DateTimeOffset now, ClaudeScheduledLogView? log = null)
-    {
-        if (kept is null) return new JsonObject { ["status"] = "store_unreadable" };
-        if (sync.Preview(kept, exists, accounts, log, now) is not { } preview) return new JsonObject { ["status"] = "no_lists" };
-        var (state, files, first) = preview;
-        var labels = accounts.DistinctBy(account => account.Key).ToDictionary(account => account.Key, account => account.Label, StringComparer.Ordinal);
-        string Label(string key) => labels.GetValueOrDefault(key) ?? kept.Labels.GetValueOrDefault(key) ?? key[..8];
-        JsonArray Names(IEnumerable<string> keys) => new(keys.Select(key => (JsonNode)Label(key)).ToArray());
-        var result = new JsonObject
-        {
-            ["status"] = files.Count == 0 ? "no_lists" : "ok",
-            ["firstPass"] = first,
-            ["lists"] = new JsonArray(files.Select(file => (JsonNode)new JsonObject
-            {
-                ["account"] = Label(file.Key), ["key"] = file.Key, ["registered"] = labels.ContainsKey(file.Key),
-                ["read"] = file.Status switch
-                {
-                    ClaudeScheduledReadStatus.Ok => "ok", ClaudeScheduledReadStatus.Missing => "missing",
-                    _ => "unreadable:" + file.Problem
-                },
-                ["tasks"] = new JsonArray(file.Entries.Keys.Order(StringComparer.Ordinal).Select(id => (JsonNode)id).ToArray()),
-                ["known"] = kept.Accounts.ContainsKey(file.Key)
-            }).ToArray()),
-            ["conflicts"] = new JsonArray(state.Conflicts.Select(pair => (JsonNode)new JsonObject { ["id"] = pair.Key, ["accounts"] = Names(pair.Value.Accounts) }).ToArray()),
-            ["removedInOneAccountOnly"] = ClaudeScheduledSync.RemovedJson(ClaudeScheduledSync.RemovedHere(state, files), Label),
-            ["deleted"] = new JsonArray(state.Deleted.Where(pair => pair.Value.Pending.Count > 0).Select(pair => (JsonNode)new JsonObject
-            { ["id"] = pair.Key, ["by"] = pair.Value.By, ["pending"] = Names(pair.Value.Pending) }).ToArray()),
-            ["fillsPending"] = new JsonArray(state.Seeds.Select(pair => (JsonNode)new JsonObject { ["id"] = pair.Key, ["into"] = Names(pair.Value.Pending) }).ToArray())
-        };
-        if (first)
-        {
-            // What a first pass leaves where it is: tasks some lists hold and others lack.
-            var readable = files.Where(file => file.Readable).ToArray();
-            result["notSpreadByFirstPass"] = new JsonArray(readable.SelectMany(file => file.Entries.Keys).Distinct().Order(StringComparer.Ordinal)
-                .Where(id => readable.Any(file => !file.Entries.ContainsKey(id)))
-                .Select(id => (JsonNode)new JsonObject
-                {
-                    ["id"] = id,
-                    ["in"] = Names(readable.Where(file => file.Entries.ContainsKey(id)).Select(file => file.Key)),
-                    ["notIn"] = Names(readable.Where(file => !file.Entries.ContainsKey(id)).Select(file => file.Key))
-                }).ToArray());
-        }
-        else
-        {
-            result["changes"] = new JsonArray(state.Changes.Where(pair => !kept.Changes.TryGetValue(pair.Key, out var before)
-                    || before.Hash != pair.Value.Hash || before.By != pair.Value.By)
-                .Select(pair => (JsonNode)new JsonObject
-                {
-                    ["id"] = pair.Key, ["by"] = Label(pair.Value.By), ["at"] = pair.Value.Upper.ToString("O", CultureInfo.InvariantCulture)
-                }).ToArray());
-            var plan = sync.Plan(state, files, null, now);
-            result["writes"] = Writes(plan, Label);
-            result["held"] = new JsonArray(plan.Held.Select(item => (JsonNode)new JsonObject { ["id"] = item.Id, ["account"] = Label(item.Key) }).ToArray());
-            result["tooLarge"] = Names(plan.TooLarge);
-        }
-        var seeded = state.Clone();
-        result["seed"] = sync.Seed(seeded, files, new("seed", []), now, Label);
-        result["seedWrites"] = Writes(sync.Plan(seeded, files, "seed", now), Label);
-        return result;
-    }
-
-    private static JsonArray Writes(ClaudeScheduledPlan plan, Func<string, string> label) =>
-        new(plan.Changes.Select(change => (JsonNode)new JsonObject
-        {
-            ["account"] = label(change.Key), ["key"] = change.Key,
-            ["create"] = Ids(change.Created), ["update"] = Ids(change.Updated), ["delete"] = Ids(change.Deleted), ["runTimes"] = Ids(change.Runs)
-        }).ToArray());
-
-    private static JsonArray Ids(IEnumerable<string> ids) => new(ids.Select(id => (JsonNode)id).ToArray());
-
-    /// <summary>The task ids after <c>--task</c> (and, with <paramref name="bare"/>, any other argument); null when an
-    /// argument does not read.</summary>
-    internal static IReadOnlyList<string>? Tasks(string[] args, bool bare)
-    {
-        var tasks = new List<string>();
-        for (var index = 0; index < args.Length; index++)
-        {
-            if (args[index].Equals("--task", StringComparison.OrdinalIgnoreCase))
-            {
-                if (++index >= args.Length) return null;
-                tasks.Add(args[index]);
-            }
-            else if (bare && !args[index].StartsWith("--", StringComparison.Ordinal)) tasks.Add(args[index]);
-            else return null;
-        }
-        return tasks;
-    }
-
-    /// <summary>Asks the running widget to seed: every task (or each <c>--task id</c>) the accounts holding it agree on
-    /// is filled into the ones lacking it (the account the app shows once it is closed); nothing is deleted or changed.
-    /// Exits 0 only when the fill was kept.</summary>
-    internal static int RunSeed(string[] args) => Ask(args, "seed", bare: false);
-
-    /// <summary>Asks the running widget to delete tasks (<c>id ...</c> or <c>--task id</c>) from every account (the
-    /// account the app shows once it is closed), keeping the previous lists, and never fill them again.</summary>
-    internal static int RunRemove(string[] args) => Ask(args, "remove", bare: true);
-
-    private static int Ask(string[] args, string op, bool bare)
-    {
-        if (Tasks(args, bare) is not { } tasks || op == "remove" && tasks.Count == 0)
-            return Print(new JsonObject { ["status"] = "usage" }, 2);
-        var paths = ClaudeShelfPaths.CreateDefault();
-        var answer = ClaudeScheduledSeedChannel.Ask(paths.LedgerDirectory, TimeSpan.FromSeconds(60), new(op, tasks));
-        if (answer is null) return Print(new JsonObject { ["status"] = "widget_not_answering" }, 1);
-        Console.OutputEncoding = Encoding.UTF8;
-        Console.WriteLine(answer);
-        return Exit(answer);
-    }
-
-    /// <summary>The exit code for the widget's answer: 0 only when it reads <c>ok</c> (everything asked was done or
-    /// kept to be done).</summary>
+    /// <summary>The exit code for an answer: 0 when it is a plan or what was asked was done.</summary>
     internal static int Exit(string answer)
     {
-        try { return JsonNode.Parse(answer)?["status"] is JsonValue status && status.TryGetValue<string>(out var text) && text == "ok" ? 0 : 1; }
+        try
+        {
+            return JsonNode.Parse(answer)?["status"] is JsonValue status && status.TryGetValue<string>(out var text)
+                   && text is "plan" or "ok" or "mirrored" or "removed" ? 0 : 1;
+        }
         catch (JsonException) { return 1; }
     }
 
     private static int Print(JsonObject value, int code)
     {
-        Console.OutputEncoding = Encoding.UTF8;
-        Console.WriteLine(value.ToJsonString(Output));
+        Write(value.ToJsonString(Output));
         return code;
+    }
+
+    /// <summary>UTF-8 to standard output as bytes: the widget is a window program with no console of its own, where
+    /// setting the console's encoding fails.</summary>
+    private static void Write(string text)
+    {
+        using var output = Console.OpenStandardOutput();
+        output.Write(Encoding.UTF8.GetBytes(text));
+        output.Write("\n"u8);
     }
 }

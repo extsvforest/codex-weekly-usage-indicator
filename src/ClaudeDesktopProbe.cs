@@ -1293,7 +1293,7 @@ internal sealed class ClaudeDesktopLogWatcher(string? directory = null)
             // log files. An unfinished last line in main1.log may have been a sign-out or switch, so nothing before
             // it may confirm an account; only the complete lines of main.log count then.
             _state = ClaudeDesktopAccountState.Unknown;
-            _scheduled.Start(new DateTimeOffset(hostStartedAt.Value));
+            _scheduled.Start();
             _lastDated = null; _cut = null;
             finished = "";
             result = File.Exists(previous) ? ReadFrom(previous, 0, null, true, lines, out _, out finished, out _) : LogRead.Ok;

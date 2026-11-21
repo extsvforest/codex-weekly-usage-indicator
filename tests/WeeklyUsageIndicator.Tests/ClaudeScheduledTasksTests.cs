@@ -1,66 +1,57 @@
 using System.Diagnostics;
 using System.Globalization;
+using System.IO.MemoryMappedFiles;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json.Nodes;
 using WeeklyUsageIndicator;
 
-/// <summary>Aligning the accounts' scheduled-task lists, in a fake profile folder only (GFS_ACCOUNT_TEST_ROOT): fake lists,
-/// definitions, logs and app. Task ids, accounts, models and paths are made up. Each finding of the review of d845517
-/// (P0-n, P1-n) has a test that sets up its case first.</summary>
+/// <summary>Mirroring the scheduled tasks a person chose across the accounts' lists, in a fake profile folder only
+/// (GFS_ACCOUNT_TEST_ROOT): fake lists, definitions, logs and app. Task ids, accounts, models and paths are made up. Each
+/// decision of the mirror design (D1-D17) and each finding of its review (P0-n, P1-n) has a test that sets up its case.</summary>
 internal static class ClaudeScheduledTasksTests
 {
     internal static Task RunAsync()
     {
-        TestFirstPassTakesStartingPointOnly();
-        TestCreationSpreads();
-        TestUnreadableListsNeitherWrittenNorCounted();
-        TestLockedOrVanishedListIsNoDeletion();
-        TestWritesAreAtomic();
-        TestBackupsKept();
-        TestMissingDefinitionNotCopied();
-        TestPlanWritesNothing();
-        TestTooLargeIsNeitherWrittenNorRead();
-        TestSeedOnlyAdds();
-        TestLoadFailureIsNoDeletion();
-        TestDefinitionDeletionSpreads();
-        TestRemoveCommand();
-        TestNamedSeedRestores();
-        TestDeletedIdMadeAgain();
-        TestDeletedIdInFirstSeenList();
-        TestRevertIsNoChange();
-        TestUnorderedChangesConflict();
-        TestUpdateKeepsTargetFields();
-        TestChromeAndApprovalsRaise();
-        TestCreateNeverOverwrites();
-        TestStoppedWriteSettles();
-        TestRootChangeTakesStartingPoint();
-        TestMalformedStateStopsWrites();
+        TestNoAdoptionHoldsDifferences();
+        TestPermissionByEffect();
+        TestPlanPermissionPerTarget();
+        TestChangedListStopsTheRound();
+        TestServiceWritesOnlyListsTheAppLeft();
+        TestServiceNeedsReviewedRunningApp();
+        TestWholeListKept();
+        TestTooLargeHeld();
+        TestIdentityHolds();
+        TestDefinitionIdentityHolds();
+        TestStateVerified();
+        TestFloorFromConsumedSlots();
+        TestApplyRaisesFloor();
+        TestRecurringLocalOnly();
+        TestRetryMapsHoldInserts();
+        TestRemoveAndUnmirror();
+        TestReplaces();
+        TestPreparation();
+        TestTokenBindsPlan();
+        TestFields();
+        TestCommandChannel();
+        TestWritesAtomicAndBackedUp();
         TestRedirectedListsRefused();
-        TestRunPairCarried();
-        TestNewDueTimeClearsRunTimes();
-        TestProcessedOnlyAsRead();
-        TestNewListStamped();
-        TestRetryOfFinishedSlotDropped();
-        TestUnregisteredFoldersAligned();
         TestDefinitionsFollowConfigDir();
         TestCommandLine();
         TestLogLines();
-        TestServiceLeavesLoadedListAlone();
-        TestServiceRunsAfterSwitch();
-        TestServiceSeedAndRemoveFiveAccounts();
-        TestServiceStopsOnUnreviewedVersion();
+        TestServiceFiveAccounts();
         TestProbe();
         return Task.CompletedTask;
     }
 
-    private static readonly DateTimeOffset T0 = DateTimeOffset.UtcNow;
+    private static readonly DateTimeOffset T0 = new(2026, 11, 20, 0, 30, 0, TimeSpan.Zero);
 
     private static JsonObject Entry(string id, string cron = "0 9 * * *", Action<JsonObject>? extra = null)
     {
         var entry = new JsonObject
         {
             ["id"] = id, ["displayName"] = "Task " + id, ["cronExpression"] = cron, ["enabled"] = true,
-            ["filePath"] = @"X:\made-up\scheduled-tasks\" + id + @"\SKILL.md", ["createdAt"] = 1763600000000
+            ["filePath"] = @"X:\made-up\scheduled-tasks\" + id + @"\SKILL.md", ["createdAt"] = 1763600000000, ["cwd"] = @"X:\made-up\work"
         };
         extra?.Invoke(entry);
         return entry;
@@ -68,33 +59,53 @@ internal static class ClaudeScheduledTasksTests
 
     private static void Bypass(JsonObject entry) { entry["permissionMode"] = "bypassPermissions"; entry["permissionModeCarried"] = true; }
 
-    private static bool Raised(JsonObject entry) => ClaudeScheduledRegistry.Raises(ClaudeScheduledRegistry.Permission(entry));
-
     private static JsonObject List(params JsonObject[] entries) => new() { ["scheduledTasks"] = new JsonArray(entries) };
 
-    private static ClaudeScheduledPass Pass(ClaudeScheduledSync sync, Fixture fixture, DateTimeOffset now,
-        Func<string, bool>? mayWrite = null, ClaudeScheduledLogView? log = null, ClaudeScheduledRequest? request = null) =>
-        sync.Pass(fixture.Accounts, log, mayWrite ?? (_ => true), now, request);
+    private static ClaudeScheduledLogView Shows(ClaudeShelfAccount account) => new(true, account.Key, false, null, 1);
 
-    /// <summary>A log read whole that shows these lists loaded, each load begun at its time.</summary>
-    private static ClaudeScheduledLogView Loads(params (string Key, DateTimeOffset At)[] loads) =>
-        new(true, null, false, null, loads.ToDictionary(load => load.Key, load => load.At, StringComparer.Ordinal), 0);
+    private static ClaudeScheduledScene Scene(ClaudeScheduledSync sync, Fixture fixture, ClaudeShelfAccount? loaded = null,
+        IReadOnlyList<ClaudeShelfAccount>? registered = null) =>
+        sync.Scene(registered ?? fixture.Accounts, loaded is null ? null : Shows(loaded), running: loaded is not null)!;
+
+    private static Func<string, bool> Leaving(ClaudeShelfAccount? loaded) => key => loaded is null || key != loaded.Key;
+
+    private static JsonObject Ask(ClaudeScheduledSync sync, Fixture fixture, ClaudeScheduledRequest request, DateTimeOffset now,
+        ClaudeShelfAccount? loaded = null, bool reviewed = true, IReadOnlyList<ClaudeShelfAccount>? registered = null) =>
+        sync.Serve(request, Scene(sync, fixture, loaded, registered), Leaving(loaded), now, reviewed);
+
+    /// <summary>The plan, then its apply with the plan's token.</summary>
+    private static JsonObject Apply(ClaudeScheduledSync sync, Fixture fixture, ClaudeScheduledRequest request, DateTimeOffset now,
+        ClaudeShelfAccount? loaded = null)
+    {
+        var plan = Ask(sync, fixture, request, now, loaded);
+        Check(Status(plan) == "plan", "a plan comes first: " + plan.ToJsonString());
+        return Ask(sync, fixture, request with { Apply = true, Expect = Token(plan) }, now, loaded);
+    }
+
+    private static ClaudeScheduledRequest Mirror(string task, ClaudeShelfAccount from, params string[] replaces) =>
+        new("mirror", task, From(from), Replaces: replaces);
+
+    private static string From(ClaudeShelfAccount account) => account.AccountUuid + ":" + account.OrgUuid;
+
+    private static ClaudeScheduledPass Pass(ClaudeScheduledSync sync, Fixture fixture, DateTimeOffset now, ClaudeShelfAccount? loaded = null) =>
+        sync.Pass(Scene(sync, fixture, loaded), Leaving(loaded), now);
+
+    private static string? Status(JsonObject? answer) => answer?["status"]?.GetValue<string>();
+    private static string? Token(JsonObject answer) => answer["token"]?.GetValue<string>();
+    private static string? Text(JsonNode? node) => node is JsonValue value && value.TryGetValue<string>(out var text) ? text : null;
+
+    private static JsonObject Target(JsonObject answer, ClaudeShelfAccount account) =>
+        answer["targets"]!.AsArray().First(target => target!["key"]!.GetValue<string>() == account.Key)!.AsObject();
+
+    private static string? Action(JsonObject answer, ClaudeShelfAccount account) => Text(Target(answer, account)["action"]);
+
+    private static string[] Fields(JsonObject answer, ClaudeShelfAccount account) =>
+        Target(answer, account)["fields"] is JsonArray fields ? fields.Select(field => field!["name"]!.GetValue<string>()).ToArray() : [];
 
     private static string Cron(Fixture fixture, ClaudeShelfAccount account, string id) =>
         fixture.Task(account, id)?["cronExpression"]?.GetValue<string>() ?? "";
 
-    private static bool Are(IEnumerable<string>? items, params string[] expected) => (items ?? []).SequenceEqual(expected);
-
-    // Sorted: accounts are listed in the order of their (random) keys.
-    private static string[] Strings(JsonNode? node) =>
-        node is JsonArray items ? items.Select(item => item!.GetValue<string>()).Order(StringComparer.Ordinal).ToArray() : [];
-
-    private static string[] Ids(JsonNode? node) => node is JsonArray items ? items.Select(item => item!["id"]!.GetValue<string>()).ToArray() : [];
-
-    private static string? Status(JsonObject? answer) => answer?["status"]?.GetValue<string>();
-
-    private static string? Skipped(JsonObject answer, string id) =>
-        answer["skipped"]!.AsArray().FirstOrDefault(item => item!["id"]!.GetValue<string>() == id)?["reason"]?.GetValue<string>();
+    private static bool Are(IEnumerable<string?>? items, params string[] expected) => (items ?? []).SequenceEqual(expected);
 
     private static bool Throws<T>(Action action) where T : Exception
     {
@@ -102,808 +113,751 @@ internal static class ClaudeScheduledTasksTests
         catch (T) { return true; }
     }
 
-    /// <summary>Stands for the widget stopping where a test hook throws it.</summary>
-    private sealed class Stopped : Exception;
-
-    private static void TestFirstPassTakesStartingPointOnly()
-    {
-        using var fixture = new Fixture("A", "B");
-        var (a, b) = (fixture[0], fixture[1]);
-        fixture.Define("only-a");
-        fixture.Write(a, List(Entry("only-a")));
-        fixture.Write(b, List());
-        var before = fixture.Bytes(b);
-        var sync = fixture.Sync();
-        var first = Pass(sync, fixture, T0);
-        Check(first.First && first.Written == 0 && fixture.Bytes(b).SequenceEqual(before) && File.Exists(fixture.StatePath),
-            "the first pass only takes what is there as the starting point");
-        var second = Pass(sync, fixture, T0.AddMinutes(1));
-        Check(!second.First && second.Written == 0 && fixture.Bytes(b).SequenceEqual(before),
-            "a task one account held before the starting point is not spread by the next pass either");
-        var kept = File.ReadAllBytes(fixture.StatePath);
-        Pass(sync, fixture, T0.AddMinutes(2));
-        Check(File.ReadAllBytes(fixture.StatePath).SequenceEqual(kept), "a pass that finds nothing new leaves the kept state as it is");
-        Pass(sync, fixture, T0.AddMinutes(40));
-        Check(!File.ReadAllBytes(fixture.StatePath).SequenceEqual(kept), "until the times it keeps get old");
-    }
-
-    private static void TestCreationSpreads()
+    // D1, review P0-1: no automatic adoption. A difference in any account holds the whole task until a person mirrors
+    // again; between mirrors nothing that is there is changed.
+    private static void TestNoAdoptionHoldsDifferences()
     {
         using var fixture = new Fixture("A", "B", "C");
         var (a, b, c) = (fixture[0], fixture[1], fixture[2]);
-        fixture.Define("brief", "kept-c");
-        fixture.Write(a, List()); fixture.Write(b, List()); fixture.Write(c, List(Entry("kept-c")));
-        var sync = fixture.Sync();
-        Pass(sync, fixture, T0);
-        fixture.Write(a, List(Entry("brief")));
-        var pass = Pass(sync, fixture, T0.AddMinutes(1));
-        Check(pass.Written == 2 && fixture.Task(b, "brief") is not null && Are(fixture.Ids(c), "kept-c", "brief")
-              && Cron(fixture, b, "brief") == "0 9 * * *",
-            "a task made in A after the starting point reaches B and C, and C keeps its own task");
-        Check(Pass(sync, fixture, T0.AddMinutes(2)).Written == 0, "the lists written are not taken for changes of their own");
-    }
-
-    private static void TestUnreadableListsNeitherWrittenNorCounted()
-    {
-        using var fixture = new Fixture("A", "B", "C");
-        var (a, b, c) = (fixture[0], fixture[1], fixture[2]);
-        fixture.Define("brief", "other");
-        fixture.Write(a, List(Entry("other"))); fixture.Write(b, List(Entry("other"))); fixture.Write(c, List(Entry("other")));
-        var sync = fixture.Sync();
-        Pass(sync, fixture, T0);
-        // One entry the app would refuse fails the whole list for it: that list is neither written nor read for changes.
-        File.WriteAllText(fixture.PathOf(c), "{\"scheduledTasks\":[{\"id\":\"other\",\"enabled\":\"yes\",\"filePath\":\"x\",\"createdAt\":1}]}");
-        var broken = fixture.Bytes(c);
-        fixture.Write(a, List(Entry("other"), Entry("brief")));
-        var pass = Pass(sync, fixture, T0.AddMinutes(1));
-        Check(Are(pass.Unreadable, "C") && fixture.Bytes(c).SequenceEqual(broken) && fixture.Task(b, "brief") is not null
-              && fixture.Task(a, "other") is not null && fixture.Task(b, "other") is not null,
-            "a list that does not read is not written, and what it lacks is not taken for removed");
-        foreach (var text in new[] { "{\"scheduledTasks\":[]", "\uFEFF{\"scheduledTasks\":[]}", "{\"scheduledTasks\":[{\"id\":\"x\",\"enabled\":true,\"filePath\":\"x\",\"createdAt\":1,\"cwd\":null}]}",
-                     "{\"scheduledTasks\":[{\"id\":\"x\",\"enabled\":true,\"filePath\":\"x\",\"createdAt\":1,\"permissionMode\":\"yolo\"}]}",
-                     "{\"scheduledTasks\":[{\"id\":\"x\",\"enabled\":true,\"filePath\":\"x\",\"createdAt\":1},{\"id\":\"x\",\"enabled\":true,\"filePath\":\"x\",\"createdAt\":1}]}" })
-            Check(ClaudeScheduledRegistry.Parse("k", "p", Encoding.UTF8.GetBytes(text), null).Status == ClaudeScheduledReadStatus.Unreadable,
-                "unreadable for the app as well (or which entry it keeps is not ours to guess): " + text[..Math.Min(40, text.Length)]);
-        Check(ClaudeScheduledRegistry.Parse("k", "p", Encoding.UTF8.GetBytes(
-                "{\"scheduledTasks\":[{\"id\":\"x\",\"enabled\":true,\"filePath\":\"x\",\"createdAt\":1,\"place\":5,\"importedFrom\":null}],\"runRetries\":7}"), null)
-                  .Status == ClaudeScheduledReadStatus.Ok, "fields the app lets fall back to nothing do not fail the list");
-        fixture.Write(c, List(Entry("other")));
-        Pass(sync, fixture, T0.AddMinutes(2));
-        Check(Are(fixture.Ids(c), "other", "brief"), "once it reads again it gets what it missed");
-    }
-
-    // P0-3: a list that cannot be read for now, or is gone, is no removal of its tasks.
-    private static void TestLockedOrVanishedListIsNoDeletion()
-    {
-        using var fixture = new Fixture("A", "B");
-        var (a, b) = (fixture[0], fixture[1]);
-        fixture.Define("brief", "later");
-        fixture.Write(a, List(Entry("brief"))); fixture.Write(b, List(Entry("brief")));
-        var sync = fixture.Sync();
-        Pass(sync, fixture, T0);
-        ClaudeScheduledPass pass;
-        // The app is writing the list: it cannot be read now.
-        using (new FileStream(fixture.PathOf(a), FileMode.Open, FileAccess.ReadWrite, FileShare.None))
-            pass = Pass(sync, fixture, T0.AddMinutes(1));
-        Check(Are(pass.Unreadable, "A") && fixture.Task(b, "brief") is not null, "a list that cannot be read now removes nothing");
-        Check(Pass(sync, fixture, T0.AddMinutes(2)) is { Written: 0, Unreadable.Count: 0 } && fixture.Task(b, "brief") is not null,
-            "and the next pass reads it again as it was");
-        fixture.Write(a, List(Entry("brief"), Entry("later")));
-        using (new FileStream(fixture.PathOf(a), FileMode.Open, FileAccess.ReadWrite, FileShare.None))
-            Pass(sync, fixture, T0.AddMinutes(3));
-        Pass(sync, fixture, T0.AddMinutes(4));
-        Check(fixture.Task(b, "later") is not null, "a read that failed for now keeps the starting point: a task A made meanwhile still spreads");
-        File.Delete(fixture.PathOf(a));
-        pass = Pass(sync, fixture, T0.AddMinutes(5));
-        Check(Are(pass.Unreadable, "A") && Are(fixture.Ids(b), "brief", "later") && !File.Exists(fixture.PathOf(a)),
-            "a list that was there and is gone is not taken for its tasks removed, and is not made again");
-    }
-
-    private static void TestWritesAreAtomic()
-    {
-        using var fixture = new Fixture("A", "B");
-        var (a, b) = (fixture[0], fixture[1]);
         fixture.Define("brief");
-        fixture.Write(a, List()); fixture.Write(b, List());
-        var sync = fixture.Sync();
-        Pass(sync, fixture, T0);
         fixture.Write(a, List(Entry("brief")));
-        var before = fixture.Bytes(b);
-        var asked = 0; var besideFirst = false;
-        bool Leaves(string key)
+        fixture.Write(b, List(Entry("brief", "0 7 * * *", entry => entry["displayName"] = "Old name")));
+        fixture.Write(c, List());
+        var before = fixture.Accounts.Select(fixture.Bytes).ToArray();
+        var sync = fixture.Sync();
+        var plan = Ask(sync, fixture, Mirror("brief", a), T0);
+        Check(Status(plan) == "plan" && Action(plan, a) == "source" && Action(plan, b) == "fix" && Action(plan, c) == "insert"
+              && Are(Fields(plan, b), "displayName", "cronExpression") && plan["raises"]!.GetValue<int>() == 0 && Token(plan) is { Length: 16 },
+            "a mirror's plan shows each account's action and the fields that would change, with a token");
+        Check(fixture.Accounts.Select(fixture.Bytes).Zip(before).All(pair => pair.First.SequenceEqual(pair.Second)) && !File.Exists(fixture.StatePath),
+            "a plan writes nothing, and keeps nothing");
+        var applied = Ask(sync, fixture, Mirror("brief", a) with { Apply = true, Expect = Token(plan) }, T0);
+        Check(Status(applied) == "mirrored" && Cron(fixture, b, "brief") == "0 9 * * *"
+              && fixture.Task(b, "brief")!["displayName"]!.GetValue<string>() == "Task brief" && fixture.Task(c, "brief") is not null,
+            "its apply writes that plan");
+        // The app saves an old copy into B, and C loses the task: the mirror is held, nothing is written anywhere.
+        fixture.Edit(b, "brief", Bypass);
+        fixture.Write(c, List());
+        var (aHeld, bHeld) = (fixture.Bytes(a), fixture.Bytes(b));
+        var pass = Pass(sync, fixture, T0.AddMinutes(1));
+        Check(pass.Notice is { Kind: ClaudeScheduledProblemKind.Differs, Detail: "brief: B permissionMode/permissionModeCarried" }
+              && pass.Written == 0 && fixture.Ids(c).Length == 0 && fixture.Bytes(a).SequenceEqual(aHeld) && fixture.Bytes(b).SequenceEqual(bHeld),
+            "an account that differs is reported by account and field, and the task is held everywhere: B's mode is not taken, nor undone, and C is not filled");
+        fixture.Edit(b, "brief", entry => { entry.Remove("permissionMode"); entry.Remove("permissionModeCarried"); });
+        pass = Pass(sync, fixture, T0.AddMinutes(2));
+        Check(pass.Notice?.Kind == ClaudeScheduledProblemKind.Differs && fixture.Ids(c).Length == 0,
+            "the hold lasts until a person mirrors again, even once the accounts agree again");
+        applied = Apply(sync, fixture, Mirror("brief", a), T0.AddMinutes(3));
+        pass = Pass(sync, fixture, T0.AddMinutes(4));
+        Check(Status(applied) == "mirrored" && fixture.Task(c, "brief") is not null && pass.Notice is null, "mirroring again lifts it");
+    }
+
+    // D2, review P0-2: the start's mode as the app decides it, with the kill switch on and off, and the import rules.
+    private static void TestPermissionByEffect()
+    {
+        static ClaudeScheduledAccess Of(string? mode, bool carried = false, bool imported = false) => new(mode, carried, imported);
+        static bool Raises(ClaudeScheduledAccess before, ClaudeScheduledAccess after) => ClaudeScheduledPermission.Raises(before, after);
+        Check(Raises(Of("plan"), Of("default")), "plan to default raises, though default is the lowest of the rest");
+        Check(Raises(Of("auto", carried: true), Of("auto")), "auto losing its carried mark raises: the kill switch no longer starts it in default");
+        Check(Raises(Of("bypassPermissions", carried: true), Of("bypassPermissions")), "so does bypass");
+        Check(!Raises(Of("bypassPermissions", carried: true), Of("default")) && !Raises(Of("auto"), Of("auto", carried: true)),
+            "lowering the mode, or adding the carried mark, does not");
+        Check(Raises(Of(null), Of("default")) && Raises(Of("default"), Of(null)) && !Raises(Of(null), Of(null)),
+            "a mode set where none was, or none where one was, may raise: the session's own mode is not known");
+        Check(Raises(Of("auto", carried: true, imported: true), Of("auto", carried: true)) && Raises(Of(null, imported: true), Of(null)),
+            "a copy of an imported task raises: the import rules do not hold for it");
+        Check(ClaudeScheduledPermission.StartName(Of("bypassPermissions", carried: true), killSwitch: true) == "default"
+              && ClaudeScheduledPermission.StartName(Of("bypassPermissions", carried: true), killSwitch: false) == "bypassPermissions"
+              && ClaudeScheduledPermission.StartName(Of(null), killSwitch: false) == "(the session's own)",
+            "a plan shows the mode a run starts in either way");
+    }
+
+    // D2, review P0-2: each target is weighed by its own effect; an allowance is bound to the targets the plan read.
+    private static void TestPlanPermissionPerTarget()
+    {
+        using var fixture = new Fixture("A", "B", "C", "D");
+        var (a, b, c, d) = (fixture[0], fixture[1], fixture[2], fixture[3]);
+        fixture.Define("brief");
+        var imported = Entry("brief", extra: entry =>
         {
-            if (key != b.Key) return true;
-            if (++asked == 2)
-                besideFirst = Directory.GetFiles(fixture.FolderOf(b), ".scheduled-tasks.*.widget-sync.partial").Length == 1;
-            return asked < 2;
-        }
-        var refused = Pass(sync, fixture, T0.AddMinutes(1), Leaves);
-        Check(refused.Written == 0 && Are(refused.Waiting, "B") && besideFirst && fixture.Bytes(b).SequenceEqual(before)
-              && Directory.GetFiles(fixture.FolderOf(b)).Length == 1,
-            "the new list is written beside the old one and moved over it only while writing is still allowed; refused, the old one stays and no partial is left");
-        File.WriteAllText(fixture.PathOf(b), "{\"scheduledTasks\":[]}");
-        var changed = 0;
-        var raced = Pass(sync, fixture, T0.AddMinutes(2), key =>
-        {
-            if (key == b.Key && ++changed == 2) File.WriteAllText(fixture.PathOf(b), "{\"scheduledTasks\":[],\"x\":1}");
-            return true;
+            entry["importedFrom"] = new JsonObject { ["kind"] = "made-up" };
+            entry["permissionMode"] = "auto"; entry["permissionModeCarried"] = true;
         });
-        Check(raced.Written == 0 && fixture.Read(b)["x"]!.GetValue<int>() == 1, "a list that changed after it was read is left as the app wrote it");
-        Pass(sync, fixture, T0.AddMinutes(3));
-        Check(fixture.Task(b, "brief") is not null && Directory.GetFiles(fixture.FolderOf(b)).Length == 1,
-            "the next pass writes it, leaving only the list");
+        fixture.Write(a, List(imported));
+        fixture.Write(b, List());
+        File.WriteAllText(fixture.PathOf(c), "not json");
+        fixture.Write(d, List(Entry("brief", extra: entry => { entry["permissionMode"] = "plan"; })));
+        var sync = fixture.Sync();
+        var plan = Ask(sync, fixture, Mirror("brief", a), T0);
+        Check(Target(plan, b)["permission"]?["raise"]?.GetValue<bool>() == true && Target(plan, d)["permission"]?["raise"]?.GetValue<bool>() == true
+              && Action(plan, c) == "unreadable" && plan["raises"]!.GetValue<int>() == 2,
+            "a copy of an imported auto task, and plan made auto, both raise; a list not read is left out");
+        var refused = Ask(sync, fixture, Mirror("brief", a) with { Apply = true, Expect = Token(plan) }, T0);
+        Check(Status(refused) == "raise_needs_allow" && fixture.Ids(b).Length == 0 && !File.Exists(fixture.StatePath),
+            "without --allow-raise an apply that raises writes nothing");
+        var allowed = Ask(sync, fixture, Mirror("brief", a) with { Apply = true, Expect = Token(plan), AllowRaise = true }, T0);
+        Check(Status(allowed) == "mirrored" && fixture.Task(b, "brief") is { } copy && copy["permissionMode"]?.GetValue<string>() == "auto"
+              && copy["permissionModeCarried"]?.GetValue<bool>() == true && !copy.ContainsKey("importedFrom")
+              && fixture.Task(d, "brief")?["permissionMode"]?.GetValue<string>() == "auto",
+            "with it, the plan's targets are written as the plan showed them");
+        // C reads now: the allowance did not cover it, so it is not filled.
+        fixture.Write(c, List());
+        var pass = Pass(sync, fixture, T0.AddMinutes(1));
+        Check(fixture.Ids(c).Length == 0 && pass.Notice is { Kind: ClaudeScheduledProblemKind.Held, Detail: "brief" },
+            "a list the plan did not read is not filled with a copy that raises; it is reported held");
+        // B loses its copy: the allowance was given for B, so the pass makes it again.
+        fixture.Write(b, List());
+        Pass(sync, fixture, T0.AddMinutes(2));
+        Check(fixture.Task(b, "brief") is not null, "a list the allowance covered gets its copy back");
+        // Switching a switched-off import back on is no update the app's own tool makes: it counts as a raise.
+        using var other = new Fixture("E", "F");
+        var (e, f) = (other[0], other[1]);
+        other.Define("brief");
+        other.Write(e, List(Entry("brief")));
+        other.Write(f, List(Entry("brief", extra: entry => { entry["enabled"] = false; entry["importedFrom"] = new JsonObject(); })));
+        var on = Ask(other.Sync(), other, Mirror("brief", e), T0);
+        Check(Action(on, f) == "fix" && Target(on, f)["permission"]?["raise"]?.GetValue<bool>() == true
+              && Target(on, f)["permission"]?["switchesOnImport"]?.GetValue<bool>() == true,
+            "a fix that switches an imported task back on needs --allow-raise");
     }
 
-    private static void TestBackupsKept()
+    // D3, review P0-3: the list is read again just before it is replaced; a list changed since it was read stops the round.
+    private static void TestChangedListStopsTheRound()
     {
-        using var fixture = new Fixture("A", "B");
-        var (a, b) = (fixture[0], fixture[1]);
+        using var fixture = new Fixture("A", "B", "C");
+        var (a, b, c) = (fixture[0], fixture[1], fixture[2]);
         fixture.Define("brief");
-        fixture.Write(a, List(Entry("brief"))); fixture.Write(b, List(Entry("brief")));
+        fixture.Write(a, List(Entry("brief")));
+        fixture.Write(b, List(Entry("brief")));
+        fixture.Write(c, List(Entry("brief")));
         var sync = fixture.Sync();
-        Pass(sync, fixture, T0);
-        byte[] last = [];
-        for (var round = 1; round <= 7; round++)
+        Apply(sync, fixture, Mirror("brief", a), T0);
+        fixture.Write(b, List()); fixture.Write(c, List());
+        string? first = null;
+        sync.BeforeMoveForTest = path =>
         {
-            fixture.Write(a, List(Entry("brief", $"0 {round} * * *")));
-            last = fixture.Bytes(b);
-            Pass(sync, fixture, T0.AddMinutes(round));
-        }
-        var backups = Directory.GetFiles(sync.BackupFolder(b.Key)).Order(StringComparer.Ordinal).ToArray();
-        Check(backups.Length == 5 && File.ReadAllBytes(backups[^1]).SequenceEqual(last) && Cron(fixture, b, "brief") == "0 7 * * *",
-            "each list's previous content is kept before it is replaced, the newest five");
+            if (first is not null) return;
+            first = path;
+            File.WriteAllText(path, "{\"scheduledTasks\":[],\"saved\":1}");
+        };
+        var pass = Pass(sync, fixture, T0.AddMinutes(1));
+        sync.BeforeMoveForTest = null;
+        var (changed, other) = first == fixture.PathOf(b) ? (b, c) : (c, b);
+        Check(pass.Written == 0 && fixture.Read(changed)["saved"]?.GetValue<int>() == 1 && fixture.Ids(changed).Length == 0
+              && fixture.Ids(other).Length == 0 && pass.Waiting.Count == 2,
+            "a list the app saved after it was read is left as the app saved it, and the round stops there");
+        Pass(sync, fixture, T0.AddMinutes(2));
+        Check(fixture.Task(b, "brief") is not null && fixture.Task(c, "brief") is not null && fixture.Read(changed)["saved"]?.GetValue<int>() == 1,
+            "the next pass reads it again and fills both, keeping what the app saved");
     }
 
-    private static void TestMissingDefinitionNotCopied()
+    // D3, review P0-3/P0-4: while the app runs only a list other than the one its log shows loaded is written, and none
+    // from a reset until a load a few seconds old.
+    private static void TestServiceWritesOnlyListsTheAppLeft()
     {
-        using var fixture = new Fixture("A", "B");
-        var (a, b) = (fixture[0], fixture[1]);
-        fixture.Write(a, List()); fixture.Write(b, List());
-        var sync = fixture.Sync();
-        Pass(sync, fixture, T0);
-        fixture.Write(a, List(Entry("undefined")));
-        Check(Pass(sync, fixture, T0.AddMinutes(1)).Written == 0 && fixture.Ids(b).Length == 0,
-            "a task whose definition folder is missing is not copied");
-        Check(!new ClaudeScheduledSync(fixture.Sessions, fixture.Store, null, () => new MemoryStream()).HasDefinition("undefined"),
-            "without a definitions folder nothing counts as defined");
+        using var fixture = new Fixture("G", "H");
+        var (g, h) = (fixture[0], fixture[1]);
+        var u = fixture.Folder("U");
+        fixture.Define("brief");
+        fixture.Write(g, List(Entry("brief"))); fixture.Write(h, List()); fixture.Write(u, List());
+        using var app = new FakeApp(fixture);
+        // The app shows U, an account the widget does not know.
+        app.After(TimeSpan.Zero, app.Loads(u));
+        app.After(TimeSpan.FromSeconds(7));
+        var plan = JsonNode.Parse(app.Ask(Mirror("brief", g)) ?? "{}")!.AsObject();
+        Check(Status(plan) == "plan" && Action(plan, u) == "insert" && Target(plan, u)["loaded"]?.GetValue<bool>() == true
+              && plan["reviewed"]?.GetValue<bool>() == true,
+            "the widget answers a plan, marking the list the app has loaded");
+        var applied = JsonNode.Parse(app.Ask(Mirror("brief", g) with { Apply = true, Expect = Token(plan) }) ?? "{}")!.AsObject();
+        Check(Status(applied) == "mirrored" && fixture.Task(h, "brief") is not null && fixture.Ids(u).Length == 0
+              && Text(Target(applied, u)["result"]) == "not written now",
+            "an apply writes the lists the app has not loaded, and leaves the loaded one, registered or not");
+        // The app lets the list go: from the reset until its next load is a few seconds old, nothing is written.
+        app.After(TimeSpan.Zero, app.Reset());
+        app.After(TimeSpan.FromSeconds(7));
+        app.After(TimeSpan.FromSeconds(61));
+        Check(fixture.Ids(u).Length == 0, "between a reset and the next load nothing is written");
+        app.After(TimeSpan.Zero, app.Initialized(g));
+        app.After(TimeSpan.FromSeconds(3));
+        Check(fixture.Ids(u).Length == 0, "nor in the seconds after the load");
+        app.After(TimeSpan.FromSeconds(4));
+        Check(fixture.Task(u, "brief") is not null, "then the list it left gets the task");
+        // G, loaded now, loses the task: it is made there only once the app has been closed for a moment.
+        fixture.Write(g, List());
+        app.After(TimeSpan.FromSeconds(3));
+        Check(fixture.Ids(g).Length == 0, "the loaded list is not written");
+        app.Runtime = new ClaudeDesktopRuntime(ClaudeDesktopRunState.Closed, null);
+        app.After(TimeSpan.FromSeconds(2));
+        Check(fixture.Ids(g).Length == 0, "nor in the moment the app is closing");
+        app.After(TimeSpan.FromSeconds(6));
+        Check(fixture.Task(g, "brief") is not null, "once the app has been closed for a moment, that list gets it too");
     }
 
-    private static void TestPlanWritesNothing()
+    // D4, review P0-4: nothing is written unless the installed version reads as reviewed and the app running is that
+    // installation; a plan is still answered.
+    private static void TestServiceNeedsReviewedRunningApp()
+    {
+        using var fixture = new Fixture("G", "H");
+        var (g, h) = (fixture[0], fixture[1]);
+        fixture.Define("brief");
+        fixture.Write(g, List(Entry("brief"))); fixture.Write(h, List());
+        Apply(fixture.Sync(), fixture, Mirror("brief", g), T0, loaded: h);
+        Check(fixture.Ids(h).Length == 0, "the mirror is chosen, H not filled yet");
+        using var app = new FakeApp(fixture) { Scheduled = ClaudeDesktopContract.Unreviewed };
+        app.Runtime = new ClaudeDesktopRuntime(ClaudeDesktopRunState.Closed, null);
+        app.After(TimeSpan.Zero);
+        var status = app.After(TimeSpan.FromSeconds(6));
+        Check(status.Scheduled?.Kind == ClaudeScheduledProblemKind.Unreviewed && fixture.Ids(h).Length == 0
+              && ClaudeAccountPanel.ShelfFooter(status, null, DateTimeOffset.Now).Warning,
+            "an app version whose way of keeping the lists is not reviewed stops the mirror, and says so in the status line");
+        var plan = JsonNode.Parse(app.Ask(Mirror("brief", g)) ?? "{}")!.AsObject();
+        var apply = JsonNode.Parse(app.Ask(Mirror("brief", g) with { Apply = true, Expect = Token(plan) }) ?? "{}")!.AsObject();
+        Check(Status(plan) == "plan" && plan["reviewed"]?.GetValue<bool>() == false && Status(apply) == "unreviewed_app_version"
+              && fixture.Ids(h).Length == 0,
+            "a plan is answered, and its apply refused");
+        // Reviewed, but the app running is another installation than the one read.
+        app.Scheduled = ClaudeDesktopContract.Reviewed;
+        app.Runtime = app.Running([@"X:\made-up\other-install\claude.exe"]);
+        app.After(TimeSpan.Zero, app.Loads(g));
+        status = app.After(TimeSpan.FromSeconds(7));
+        app.After(TimeSpan.FromMinutes(11));
+        Check(status.Scheduled?.Kind == ClaudeScheduledProblemKind.Unreviewed && fixture.Ids(h).Length == 0,
+            "an app running from another installation than the one reviewed is not written for");
+        app.Runtime = app.Running();
+        app.After(TimeSpan.FromMinutes(11));
+        Check(fixture.Task(h, "brief") is not null && app.After(TimeSpan.FromSeconds(3)).Scheduled is null,
+            "the reviewed installation running, the mirror resumes");
+    }
+
+    // D5, review P0-5: a list is changed whole as read; only the mirrored entries change. Numbers the app reads as
+    // infinite fail the file, as in the app.
+    private static void TestWholeListKept()
+    {
+        using var fixture = new Fixture("A", "B", "C");
+        var (a, b, c) = (fixture[0], fixture[1], fixture[2]);
+        fixture.Define("brief");
+        fixture.Write(a, List(Entry("brief")));
+        var kept = List(Entry("other", "30 8 * * 1", entry =>
+        {
+            entry["approvedPermissions"] = new JsonArray(new JsonObject { ["toolName"] = "made-up", ["ruleContent"] = "x" });
+            entry["watcherless"] = new JsonObject { ["nested"] = new JsonArray(1, 2.5, "three", null) };
+            entry["lastRunAt"] = "2026-11-19T23:30:00.000Z";
+        }));
+        kept["runRetries"] = new JsonObject { ["other"] = new JsonObject { ["attempt"] = 1 } };
+        kept["recordedSkips"] = new JsonObject { ["other"] = new JsonArray("2026-11-18T23:30:00.000Z") };
+        kept["sundayAliasBoundaryStamped"] = true;
+        kept["dayFieldsOrBoundaryStamped"] = true;
+        kept["unknownTopLevel"] = new JsonObject { ["x"] = 12345678901234567890.0 };
+        fixture.Write(b, kept);
+        File.WriteAllText(fixture.PathOf(c), "{\"scheduledTasks\":[{\"id\":\"x\",\"enabled\":true,\"filePath\":\"x\",\"createdAt\":1,\"fireAt\":1e400}]}");
+        Check(ClaudeScheduledRegistry.Read(c.Key, fixture.PathOf(c)) is { Status: ClaudeScheduledReadStatus.Unreadable, Problem: "schema" },
+            "a number the app reads as infinite fails the list, as the app's schema does");
+        var cBefore = fixture.Bytes(c);
+        var sync = fixture.Sync();
+        var applied = Apply(sync, fixture, Mirror("brief", a), T0);
+        var after = fixture.Read(b);
+        var rest = after.DeepClone().AsObject();
+        ClaudeScheduledRegistry.Drop(rest, entry => ClaudeScheduledRegistry.Text(entry, "id") == "brief");
+        Check(Status(applied) == "mirrored" && fixture.Task(b, "brief") is not null
+              && ClaudeScheduledRegistry.Hash(rest) == ClaudeScheduledRegistry.Hash(JsonNode.Parse(kept.ToJsonString())),
+            "every other entry, nested value, file-level map, stamp and unknown field stays as it was");
+        Check(fixture.Bytes(c).SequenceEqual(cBefore) && Action(applied, c) == "unreadable", "a list that does not read is not written");
+    }
+
+    // D5: a list the change would make longer than the app reads is held and reported.
+    private static void TestTooLargeHeld()
+    {
+        using var fixture = new Fixture("A", "B", "C");
+        var (a, b, c) = (fixture[0], fixture[1], fixture[2]);
+        fixture.Define("brief");
+        fixture.Write(a, List(Entry("brief", extra: entry => entry["displayName"] = new string('y', 100_000))));
+        File.WriteAllText(fixture.PathOf(b), "{\"scheduledTasks\":[],\"padding\":\"" + new string('x', 10_400_000) + "\"}");
+        fixture.Write(c, List());
+        var before = fixture.Bytes(b);
+        var sync = fixture.Sync();
+        var applied = Apply(sync, fixture, Mirror("brief", a), T0);
+        Check(Text(Target(applied, b)["reason"]) == "too_large" && fixture.Bytes(b).SequenceEqual(before) && fixture.Task(c, "brief") is not null,
+            "the apply leaves a list it would make too long, and writes the others");
+        var pass = Pass(sync, fixture, T0.AddMinutes(1));
+        Check(pass.Notice is { Kind: ClaudeScheduledProblemKind.TooLarge, Detail: "B" } && fixture.Bytes(b).SequenceEqual(before),
+            "the pass reports it");
+    }
+
+    // D6, review P0-6: another task under the mirrored id holds the mirror; mirroring again replaces it, its approvals
+    // not taken.
+    private static void TestIdentityHolds()
+    {
+        using var fixture = new Fixture("A", "B", "C");
+        var (a, b, c) = (fixture[0], fixture[1], fixture[2]);
+        fixture.Define("brief");
+        fixture.Write(a, List(Entry("brief")));
+        fixture.Write(b, List()); fixture.Write(c, List());
+        var sync = fixture.Sync();
+        Apply(sync, fixture, Mirror("brief", a), T0);
+        Check(fixture.Task(b, "brief")?["createdAt"]?.ToJsonString() == "1763600000000", "a copy takes the source's createdAt");
+        // A new task made in B under the same id, with approvals of its own.
+        fixture.Write(b, List(Entry("brief", extra: entry =>
+        {
+            entry["createdAt"] = 1763700000000;
+            entry["approvedPermissions"] = new JsonArray(new JsonObject { ["toolName"] = "made-up" });
+        })));
+        fixture.Write(c, List());
+        var pass = Pass(sync, fixture, T0.AddMinutes(1));
+        Check(pass.Notice is { Kind: ClaudeScheduledProblemKind.Stopped, Detail: "brief: B createdAt" } && fixture.Ids(c).Length == 0,
+            "another task under the id holds the mirror everywhere");
+        var plan = Ask(sync, fixture, Mirror("brief", a), T0.AddMinutes(2));
+        Check(Action(plan, b) == "replace" && Target(plan, b)["replacing"]?["createdAt"]?.ToJsonString() == "1763700000000",
+            "mirroring again shows that task replaced");
+        Ask(sync, fixture, Mirror("brief", a) with { Apply = true, Expect = Token(plan) }, T0.AddMinutes(2));
+        Check(fixture.Task(b, "brief") is { } copy && copy["createdAt"]!.ToJsonString() == "1763600000000" && !copy.ContainsKey("approvedPermissions")
+              && fixture.Task(c, "brief") is not null,
+            "and replaces it with the copy, whose approvals are not the other task's");
+    }
+
+    // D6, review P0-6: a definition gone, or gone and back, holds the mirror until it is mirrored again.
+    private static void TestDefinitionIdentityHolds()
     {
         using var fixture = new Fixture("A", "B");
         var (a, b) = (fixture[0], fixture[1]);
         fixture.Define("brief");
         fixture.Write(a, List(Entry("brief"))); fixture.Write(b, List());
         var sync = fixture.Sync();
-        var (kept, exists) = sync.LoadState();
-        var plan = ClaudeScheduledCommand.Describe(sync, fixture.Accounts, kept, exists, T0);
-        Check(plan["firstPass"]!.GetValue<bool>() && plan["notSpreadByFirstPass"]![0]!["id"]!.GetValue<string>() == "brief"
-              && plan["seed"]!["fill"]![0]!["into"]![0]!.GetValue<string>() == "B" && !Directory.Exists(fixture.Store),
-            "before the first pass the plan lists the tasks it would leave where they are, and what a seed fills, writing nothing");
-        Pass(sync, fixture, T0);
-        var state = File.ReadAllBytes(fixture.StatePath);
-        (kept, exists) = sync.LoadState();
-        plan = ClaudeScheduledCommand.Describe(sync, fixture.Accounts, kept, exists, T0.AddMinutes(1));
-        Check(!plan["firstPass"]!.GetValue<bool>() && plan["changes"]!.AsArray().Count == 0 && plan["writes"]!.AsArray().Count == 0
-              && plan["seedWrites"]![0]!["create"]![0]!.GetValue<string>() == "brief" && plan["seedWrites"]![0]!["account"]!.GetValue<string>() == "B",
-            "after it, with nothing changed, the next pass would write nothing and a seed would make the task in B");
-        fixture.Write(a, List(Entry("brief", "0 3 * * *")));
-        plan = ClaudeScheduledCommand.Describe(sync, fixture.Accounts, kept, exists, T0.AddMinutes(2));
-        Check(plan["changes"]![0]!["by"]!.GetValue<string>() == "A" && plan["writes"]![0]!["create"]![0]!.GetValue<string>() == "brief"
-              && File.ReadAllBytes(fixture.StatePath).SequenceEqual(state) && fixture.Ids(b).Length == 0,
-            "a change in A shows as A's, with what the next pass would write, and the plan still writes nothing");
-        Check(Status(ClaudeScheduledCommand.Describe(sync, fixture.Accounts, null, true, T0.AddMinutes(3))) == "store_unreadable",
-            "a kept state that does not read is said so");
-    }
-
-    // P0-1: the app reads a list of at most 10 MiB; a longer one loads as nothing.
-    private static void TestTooLargeIsNeitherWrittenNorRead()
-    {
-        using var fixture = new Fixture("A", "B", "C");
-        var (a, b, c) = (fixture[0], fixture[1], fixture[2]);
-        fixture.Define("big");
-        fixture.Write(a, List()); fixture.Write(c, List());
-        // B's list is one the app reads, a little under the limit.
-        File.WriteAllText(fixture.PathOf(b), "{\"scheduledTasks\":[],\"padding\":\"" + new string('x', 10_400_000) + "\"}");
-        var before = fixture.Bytes(b);
-        var sync = fixture.Sync();
-        Pass(sync, fixture, T0);
-        fixture.Write(a, List(Entry("big", extra: entry => entry["displayName"] = new string('y', 100_000))));
+        Apply(sync, fixture, Mirror("brief", a), T0);
+        fixture.Undefine("brief");
+        fixture.Write(b, List());
         var pass = Pass(sync, fixture, T0.AddMinutes(1));
-        Check(Are(pass.TooLarge, "B") && fixture.Bytes(b).SequenceEqual(before) && fixture.Task(c, "big") is not null && pass.Written == 1,
-            "a list the merge would make longer than the app reads is left as it is and reported; the others are written");
-        var empty = "{\"scheduledTasks\":[],\"padding\":\"\"}".Length;
-        File.WriteAllText(fixture.PathOf(c), "{\"scheduledTasks\":[],\"padding\":\""
-            + new string('x', (int)ClaudeScheduledRegistry.MaxBytes - empty + 1) + "\"}");
-        Check(new FileInfo(fixture.PathOf(c)).Length == ClaudeScheduledRegistry.MaxBytes + 1
-              && ClaudeScheduledRegistry.Read(c.Key, fixture.PathOf(c)) is { Status: ClaudeScheduledReadStatus.Unreadable, Problem: "large" },
-            "a list one byte over 10 MiB reads as unreadable");
-        var large = Pass(sync, fixture, T0.AddMinutes(2));
-        Check(large.Unreadable.Contains("C") && fixture.Task(a, "big") is not null && fixture.Task(b, "big") is null,
-            "and what it lacks is not taken for removed");
-    }
-
-    // P0-2: a seed only adds, and only what the accounts holding a task agree on.
-    private static void TestSeedOnlyAdds()
-    {
-        using var fixture = new Fixture("A", "B", "C");
-        var (a, b, c) = (fixture[0], fixture[1], fixture[2]);
-        fixture.Define("fill", "mixed", "gone", "edited");
-        fixture.Write(a, List(Entry("fill"), Entry("mixed", "0 1 * * *"), Entry("gone"), Entry("edited")));
-        fixture.Write(b, List(Entry("fill"), Entry("mixed", "0 1 * * *"), Entry("gone"), Entry("edited")));
-        fixture.Write(c, List(Entry("edited")));
-        var sync = fixture.Sync();
-        Pass(sync, fixture, T0);
-        // While nothing may be written: A changes two tasks, and a third is deleted (its definition folder goes).
-        fixture.Write(a, List(Entry("fill"), Entry("mixed", "0 5 * * *"), Entry("gone"), Entry("edited", "0 3 * * *")));
-        fixture.Undefine("gone");
-        Pass(sync, fixture, T0.AddMinutes(1), _ => false);
-        var seeded = Pass(sync, fixture, T0.AddMinutes(2), request: new("seed", []));
-        var answer = seeded.Answer!;
-        Check(Status(answer) == "ok" && Are(Ids(answer["fill"]), "fill") && Are(Strings(answer["fill"]![0]!["into"]), "C")
-              && Ids(answer["conflicts"]).Contains("mixed") && Skipped(answer, "gone") == "deleted",
-            "the seed fills the task the accounts agree on, lists the one they hold differently, and skips the one deleted");
-        Check(Are(fixture.Ids(a), "fill", "mixed", "gone", "edited") && Are(fixture.Ids(b), "fill", "mixed", "gone", "edited")
-              && Are(fixture.Ids(c), "edited", "fill") && Cron(fixture, b, "mixed") == "0 1 * * *"
-              && Cron(fixture, b, "edited") == "0 9 * * *" && Cron(fixture, c, "edited") == "0 9 * * *" && seeded.Written == 1,
-            "and only adds: nothing is deleted (the deletion still to do) and nothing is changed (A's edits still to bring) by it");
-        Check(Status(Pass(sync, fixture, T0.AddMinutes(3), request: new("seed", ["mixed"])).Answer) == "incomplete"
-              && Pass(sync, fixture, T0.AddMinutes(4), request: new("seed", ["fill"])).Answer is { } filled
-              && Status(filled) == "ok" && Are(Strings(filled["alreadyEverywhere"]), "fill"),
-            "a task asked for by --task that cannot be filled makes the answer incomplete; one every account holds is ok");
-        Pass(sync, fixture, T0.AddMinutes(5));
-        Check(Are(fixture.Ids(a), "fill", "mixed", "edited") && !fixture.Ids(b).Contains("gone")
-              && Cron(fixture, b, "mixed") == "0 5 * * *" && Cron(fixture, c, "mixed") == "0 5 * * *"
-              && Cron(fixture, b, "edited") == "0 3 * * *" && Cron(fixture, c, "edited") == "0 3 * * *",
-            "the next pass does what the seed left: the deletion and A's edits");
-    }
-
-    // P0-3 and the removals: a task gone from one list is removed there alone.
-    private static void TestLoadFailureIsNoDeletion()
-    {
-        using (var fixture = new Fixture("A", "B", "C"))
-        {
-            var (a, b, c) = (fixture[0], fixture[1], fixture[2]);
-            fixture.Define("brief", "other", "later");
-            foreach (var account in fixture.Accounts) fixture.Write(account, List(Entry("brief"), Entry("other")));
-            var sync = fixture.Sync();
-            Pass(sync, fixture, T0);
-            // The app could not load A's list: it held nothing, and its next save there keeps only what is made after.
-            // Whether this widget saw the failure or not, the tasks gone from A are A's alone.
-            fixture.Write(a, List(Entry("later")));
-            var pass = Pass(sync, fixture, T0.AddMinutes(1));
-            Check(Are(fixture.Ids(b), "brief", "other", "later") && Are(fixture.Ids(c), "brief", "other", "later")
-                  && Are(fixture.Ids(a), "later") && Are(pass.RemovedHere, "brief", "other"),
-                "tasks gone from one list are removed there only, and the task made there still spreads");
-            Pass(sync, fixture, T0.AddMinutes(2));
-            Check(Are(fixture.Ids(a), "later"), "a removal stays: the tasks are not made there again");
-            var (kept, exists) = sync.LoadState();
-            var removed = ClaudeScheduledCommand.Describe(sync, fixture.Accounts, kept, exists, T0.AddMinutes(3))["removedInOneAccountOnly"]!.AsArray();
-            Check(removed.Count == 2 && removed.All(item => Are(Strings(item!["removedIn"]), "A") && Are(Strings(item!["stillIn"]), "B", "C")),
-                "the plan lists them as removed in one account only, with where they still are");
-            var seed = Pass(sync, fixture, T0.AddMinutes(3), request: new("seed", [])).Answer!;
-            Check(Skipped(seed, "brief") == "removed_in_one_account" && seed["removedInOneAccountOnly"]!.AsArray().Count == 2
-                  && Are(fixture.Ids(a), "later"),
-                "so does the seed, which does not fill them back");
-            var status = ClaudeShelfStatus.Initial with { MappedAccounts = 3, Scheduled = new(ClaudeScheduledProblemKind.RemovedHere, "brief, other") };
-            var footer = ClaudeAccountPanel.ShelfFooter(status, null, DateTimeOffset.Now);
-            Check(footer.Warning && footer.Text.Contains("brief, other"), "and the status line names them");
-            // Made there again, the task is A's again.
-            fixture.Write(a, List(Entry("later"), Entry("brief")));
-            Check(Are(Pass(sync, fixture, T0.AddMinutes(4)).RemovedHere, "other"), "a task made again where it was removed is no longer listed");
-        }
-        // The app writing A's list as it is read: cut short, then whole with an edit.
-        using (var fixture = new Fixture("A", "B"))
-        {
-            var (a, b) = (fixture[0], fixture[1]);
-            fixture.Define("brief");
-            fixture.Write(a, List(Entry("brief"))); fixture.Write(b, List(Entry("brief")));
-            var sync = fixture.Sync();
-            Pass(sync, fixture, T0);
-            File.WriteAllText(fixture.PathOf(a), "{\"scheduledTasks\":[{\"id\":\"brief\",");
-            Check(Are(Pass(sync, fixture, T0.AddMinutes(1)).Unreadable, "A"), "a list read cut short does not read");
-            fixture.Write(a, List(Entry("brief", "0 7 * * *")));
-            Pass(sync, fixture, T0.AddMinutes(2));
-            Pass(sync, fixture, T0.AddMinutes(3));
-            Check(Cron(fixture, b, "brief") == "0 7 * * *" && Cron(fixture, a, "brief") == "0 7 * * *",
-                "the edit the whole list then holds is A's change: it spreads, and nothing takes it back");
-        }
-    }
-
-    // A task is deleted from every account when its definition folder goes (the app's delete takes it with it).
-    private static void TestDefinitionDeletionSpreads()
-    {
-        using var fixture = new Fixture("A", "B", "C");
-        var (a, b, c) = (fixture[0], fixture[1], fixture[2]);
-        fixture.Define("old", "brief", "keep");
-        foreach (var account in fixture.Accounts) fixture.Write(account, List(Entry("old"), Entry("brief"), Entry("keep")));
-        var sync = fixture.Sync();
-        Pass(sync, fixture, T0);
-        fixture.Write(b, List(Entry("brief"), Entry("keep")));
-        fixture.Undefine("old");
-        var pass = Pass(sync, fixture, T0.AddMinutes(1), key => key != a.Key);
-        Check(Are(fixture.Ids(b), "brief", "keep") && Are(fixture.Ids(c), "brief", "keep") && Are(fixture.Ids(a), "old", "brief", "keep")
-              && Are(pass.Waiting, "A") && Are(pass.RemovedHere),
-            "a task whose definition folder went is deleted from every account (the one not written now waits)");
+        Check(pass.Notice is { Kind: ClaudeScheduledProblemKind.Stopped, Detail: "brief: definition" } && fixture.Ids(b).Length == 0,
+            "a definition gone holds the mirror");
+        fixture.Define("brief");
         Pass(sync, fixture, T0.AddMinutes(2));
-        Check(Are(fixture.Ids(a), "brief", "keep"), "and from that one once it may be written");
-        // A copy made before the deletion turns up in C (the app saving a list it read before): removed there too.
-        fixture.Define("old");
-        fixture.Write(c, List(Entry("brief"), Entry("keep"), Entry("old", "0 5 * * *")));
-        Pass(sync, fixture, T0.AddMinutes(3));
-        Check(fixture.Task(a, "old") is null && fixture.Task(b, "old") is null && fixture.Task(c, "old") is null,
-            "a copy of a deleted task that turns up is removed again, and filled nowhere");
-        // Every definition folder going at once is the folder replaced (another config folder, a restore): none is deleted.
-        foreach (var id in new[] { "old", "brief", "keep" }) fixture.Undefine(id);
-        Pass(sync, fixture, T0.AddMinutes(4));
-        Check(Are(fixture.Ids(a), "brief", "keep") && Are(fixture.Ids(b), "brief", "keep"), "while every definition folder going at once deletes nothing");
-        Directory.Delete(fixture.Definitions, recursive: true);
-        Pass(sync, fixture, T0.AddMinutes(5));
-        Check(Are(fixture.Ids(a), "brief", "keep"), "nor does the definitions folder going");
+        Check(fixture.Ids(b).Length == 0, "and it stays held when a definition comes back");
+        Apply(sync, fixture, Mirror("brief", a), T0.AddMinutes(3));
+        Check(fixture.Task(b, "brief") is not null, "until it is mirrored again");
+        // Made again between two passes: another folder.
+        fixture.Undefine("brief");
+        fixture.Define("brief");
+        fixture.Write(b, List());
+        pass = Pass(sync, fixture, T0.AddMinutes(4));
+        Check(pass.Notice?.Kind == ClaudeScheduledProblemKind.Stopped && fixture.Ids(b).Length == 0,
+            "a definition made again, unseen in between, holds it too");
     }
 
-    // --claude-scheduled-remove: deleted from every account, the loaded one once the app closes, never filled again.
-    private static void TestRemoveCommand()
-    {
-        using var fixture = new Fixture("A", "B", "C");
-        var (a, b, c) = (fixture[0], fixture[1], fixture[2]);
-        fixture.Define("old", "brief");
-        foreach (var account in fixture.Accounts) fixture.Write(account, List(Entry("old"), Entry("brief")));
-        var sync = fixture.Sync();
-        Pass(sync, fixture, T0);
-        var before = fixture.Bytes(b);
-        var pass = Pass(sync, fixture, T0.AddMinutes(1), key => key != a.Key, request: new("remove", ["old", "never-was"]));
-        var answer = pass.Answer!;
-        Check(Are(fixture.Ids(b), "brief") && Are(fixture.Ids(c), "brief") && Are(fixture.Ids(a), "old", "brief")
-              && Status(answer) == "incomplete" && Are(Ids(answer["removed"]), "old") && Are(Strings(answer["removed"]![0]!["from"]), "A", "B", "C")
-              && Skipped(answer, "never-was") == "not_found" && Are(Strings(answer["waiting"]), "A") && answer["written"]!.GetValue<int>() == 2,
-            "remove deletes a task from every account but the one the app has loaded, and says what it did");
-        Check(Directory.GetFiles(sync.BackupFolder(b.Key)).Any(path => File.ReadAllBytes(path).SequenceEqual(before)),
-            "keeping each list's previous content");
-        Pass(sync, fixture, T0.AddMinutes(2));
-        Check(Are(fixture.Ids(a), "brief"), "the loaded list is done once it may be written");
-        // A copy made before the removal turns up in C.
-        fixture.Write(c, List(Entry("brief"), Entry("old", "0 4 * * *")));
-        var seed = Pass(sync, fixture, T0.AddMinutes(3), request: new("seed", [])).Answer!;
-        Check(Skipped(seed, "old") == "deleted" && Are(fixture.Ids(a), "brief") && Are(fixture.Ids(b), "brief"),
-            "a seed of every task skips a removed one");
-        Pass(sync, fixture, T0.AddMinutes(4));
-        Check(Are(fixture.Ids(a), "brief") && Are(fixture.Ids(b), "brief") && Are(fixture.Ids(c), "brief"),
-            "and the next pass removes the copy again: a removed task is never filled again");
-        Check(Status(Pass(sync, fixture, T0.AddMinutes(5), request: new("remove", ["brief"])).Answer) == "ok"
-              && fixture.Ids(a).Length == 0 && fixture.Ids(b).Length == 0 && fixture.Ids(c).Length == 0,
-            "a removal that does all it was asked is ok");
-    }
-
-    // A list the app lost (it loaded none, and saved only what came after): the tasks gone from it are removed there
-    // alone, until `seed --task` names one.
-    private static void TestNamedSeedRestores()
-    {
-        using var fixture = new Fixture("A", "B", "C");
-        var (a, b, c) = (fixture[0], fixture[1], fixture[2]);
-        fixture.Define("brief", "other", "raised");
-        foreach (var account in fixture.Accounts) fixture.Write(account, List(Entry("brief"), Entry("other"), Entry("raised", extra: Bypass)));
-        var sync = fixture.Sync();
-        Pass(sync, fixture, T0);
-        fixture.Write(a, List());
-        Check(Are(Pass(sync, fixture, T0.AddMinutes(1)).RemovedHere, "brief", "other", "raised") && fixture.Ids(a).Length == 0,
-            "the tasks gone from the lost list are removed there alone");
-        var all = Pass(sync, fixture, T0.AddMinutes(2), request: new("seed", [])).Answer!;
-        Check(Skipped(all, "brief") == "removed_in_one_account" && all["cleared"]!.AsArray().Count == 0 && fixture.Ids(a).Length == 0,
-            "a seed of every task keeps the removals");
-        var named = Pass(sync, fixture, T0.AddMinutes(3), request: new("seed", ["brief", "raised"]));
-        var answer = named.Answer!;
-        var cleared = answer["cleared"]!.AsArray();
-        Check(Are(fixture.Ids(a), "brief") && Are(Ids(answer["fill"]), "brief") && Are(Strings(answer["fill"]![0]!["into"]), "A")
-              && Are(Ids(cleared), "brief", "raised") && cleared.All(item => Are(Strings(item!["removedIn"]), "A") && item!["deletion"] is null)
-              && Skipped(answer, "raised") == "raises_permission" && Status(answer) == "incomplete" && Are(named.RemovedHere, "other"),
-            "a seed naming tasks clears their removals in every account and fills them as usual (not one running with more than asking)");
-        Check(Are(Pass(sync, fixture, T0.AddMinutes(4)).RemovedHere, "other") && Are(fixture.Ids(a), "brief")
-              && Are(fixture.Ids(b), "brief", "other", "raised") && Are(fixture.Ids(c), "brief", "other", "raised"),
-            "and a task not named stays removed there");
-    }
-
-    // A deleted task's id that turns up: made after the deletion (createdAt), a new task; made before, a copy of the
-    // task deleted. `seed --task` brings back a task removed by command while its definition is there.
-    private static void TestDeletedIdMadeAgain()
-    {
-        using var fixture = new Fixture("A", "B", "C");
-        var (a, b, c) = (fixture[0], fixture[1], fixture[2]);
-        fixture.Define("brief", "other");
-        foreach (var account in fixture.Accounts) fixture.Write(account, List(Entry("brief"), Entry("other")));
-        var sync = fixture.Sync();
-        Pass(sync, fixture, T0);
-        Pass(sync, fixture, T0.AddMinutes(1), request: new("remove", ["brief"]));
-        Check(fixture.Accounts.All(account => Are(fixture.Ids(account), "other")), "removed from every account");
-        // B's app saves the list it read before the removal.
-        fixture.Write(b, List(Entry("brief"), Entry("other")));
-        Pass(sync, fixture, T0.AddMinutes(2));
-        Check(fixture.Accounts.All(account => Are(fixture.Ids(account), "other")), "a copy of the task deleted is removed again, and filled nowhere");
-        // The user makes a task with that id in C after the removal.
-        var made = T0.AddMinutes(3).ToUnixTimeMilliseconds();
-        fixture.Write(c, List(Entry("other"), Entry("brief", "0 6 * * *", entry => entry["createdAt"] = made)));
-        Pass(sync, fixture, T0.AddMinutes(4));
-        Check(fixture.Accounts.All(account => Cron(fixture, account, "brief") == "0 6 * * *"
-                  && fixture.Task(account, "brief")!["createdAt"]!.GetValue<long>() == made),
-            "a task made with the id after the deletion is a new task, made in every account");
-        fixture.Edit(a, "brief", entry => entry["cronExpression"] = "0 7 * * *");
-        Pass(sync, fixture, T0.AddMinutes(5));
-        Check(fixture.Accounts.All(account => Cron(fixture, account, "brief") == "0 7 * * *"), "the deletion is over: its edits go too");
-        // Removed by command while A may not be written: A keeps it, and a seed naming it brings it back.
-        Pass(sync, fixture, T0.AddMinutes(6), key => key != a.Key, request: new("remove", ["other"]));
-        Check(Are(fixture.Ids(a), "other", "brief") && Are(fixture.Ids(b), "brief") && Are(fixture.Ids(c), "brief"),
-            "removed but from the list not written");
-        var restored = Pass(sync, fixture, T0.AddMinutes(7), key => key != a.Key, request: new("seed", ["other"])).Answer!;
-        var cleared = restored["cleared"]!.AsArray();
-        Check(cleared.Count == 1 && cleared[0]!["deletion"]!.GetValue<string>() == "command" && Status(restored) == "ok"
-              && Are(Strings(restored["fill"]![0]!["into"]), "B", "C") && Are(fixture.Ids(b), "brief", "other") && Are(fixture.Ids(c), "brief", "other"),
-            "a seed naming a task removed by command ends the deletion and fills it from the account still holding it");
-        Pass(sync, fixture, T0.AddMinutes(8));
-        Check(Are(fixture.Ids(a), "other", "brief") && Are(fixture.Ids(b), "brief", "other"), "and nothing removes it after");
-    }
-
-    // A list seen for the first time holding a deleted task's id: a copy (made at or before the deletion) is removed
-    // there too, the loaded list once it may be written, its previous content kept; one made after is a new task.
-    private static void TestDeletedIdInFirstSeenList()
+    // D7, review P0-7: the kept mirror verifies against its fingerprint; one that does not is frozen. The first
+    // version's state is never taken.
+    private static void TestStateVerified()
     {
         using var fixture = new Fixture("A", "B");
         var (a, b) = (fixture[0], fixture[1]);
-        fixture.Define("old", "brief", "keep");
-        foreach (var account in fixture.Accounts) fixture.Write(account, List(Entry("old"), Entry("brief"), Entry("keep")));
+        fixture.Define("brief");
+        fixture.Write(a, List(Entry("brief", extra: entry => { entry["permissionMode"] = "auto"; entry["permissionModeCarried"] = true; })));
+        fixture.Write(b, List());
         var sync = fixture.Sync();
-        Pass(sync, fixture, T0);
-        Pass(sync, fixture, T0.AddMinutes(1), request: new("remove", ["old", "brief"]));
-        // Two lists not seen before: D with a copy, E (the one the app has loaded) with a copy and a "brief" made after
-        // the removal, running with more than asking.
-        var (d, e) = (fixture.Folder("D"), fixture.Folder("E"));
-        var made = T0.AddMinutes(2).ToUnixTimeMilliseconds();
-        fixture.Write(d, List(Entry("old"), Entry("keep")));
-        fixture.Write(e, List(Entry("old"), Entry("brief", "0 6 * * *", entry => { entry["createdAt"] = made; Bypass(entry); })));
-        var before = fixture.Bytes(d);
-        Pass(sync, fixture, T0.AddMinutes(3), key => key != e.Key);
-        Check(Are(fixture.Ids(d), "keep") && Are(fixture.Ids(e), "old", "brief")
-              && Directory.GetFiles(sync.BackupFolder(d.Key)).Any(path => File.ReadAllBytes(path).SequenceEqual(before)),
-            "a copy of a deleted task in a list seen for the first time is removed there, its previous content kept");
-        Pass(sync, fixture, T0.AddMinutes(4));
-        Check(Are(fixture.Ids(e), "brief") && Are(fixture.Ids(a), "keep") && Are(fixture.Ids(b), "keep") && Are(fixture.Ids(d), "keep"),
-            "and from the loaded one once it may be written; the task made after stays, and a first look spreads nothing");
-        fixture.Edit(e, "brief", entry => entry["cronExpression"] = "0 7 * * *");
-        var pass = Pass(sync, fixture, T0.AddMinutes(5));
-        var seed = Pass(sync, fixture, T0.AddMinutes(6), request: new("seed", [])).Answer!;
-        Check(Are(pass.Held, "brief") && Skipped(seed, "brief") == "raises_permission" && Are(fixture.Ids(a), "keep") && Are(fixture.Ids(d), "keep"),
-            "the task made after is a new task, its deletion over, though first seen: its edit does not carry what it was not seen choosing");
+        Apply(sync, fixture, Mirror("brief", a), T0);
+        var state = JsonNode.Parse(File.ReadAllText(fixture.StatePath))!.AsObject();
+        Check(state["format"]?.GetValue<string>() == "gfs-scheduled-mirror/2"
+              && state["mirrors"]!["brief"]!["body"]!["settings"]!["permissionModeCarried"]?.GetValue<bool>() == true,
+            "the mirror keeps its settings, the carried mark included, under a fingerprint");
+        state["mirrors"]!["brief"]!["body"]!["settings"]!.AsObject().Remove("permissionModeCarried");
+        File.WriteAllText(fixture.StatePath, state.ToJsonString());
+        fixture.Write(b, List());
+        var pass = Pass(sync, fixture, T0.AddMinutes(1));
+        Check(pass.Notice is { Kind: ClaudeScheduledProblemKind.Stopped, Detail: "brief: record" } && fixture.Ids(b).Length == 0,
+            "a body that does not match its fingerprint freezes the task: nothing is written for it");
+        Check(Status(Ask(sync, fixture, new("remove", "brief"), T0)) == "refused", "nor is it removed while frozen");
+        Check(Status(Ask(sync, fixture, new("unmirror", "brief"), T0)) == "ok" && Pass(sync, fixture, T0.AddMinutes(2)).Notice is null,
+            "stopping the mirror clears it");
+        // A state of the first version stays where it is and is not read.
+        File.Delete(fixture.StatePath);
+        File.WriteAllText(Path.Combine(fixture.Store, "state.json"), "{\"version\":1,\"tasks\":{\"brief\":{}},\"seeds\":{\"brief\":[\"x\"]}}");
+        pass = Pass(sync, fixture, T0.AddMinutes(3));
+        Check(pass.Failure is null && pass.Report!.Count == 0 && fixture.Ids(b).Length == 0, "the first version's state is not taken");
+        File.WriteAllText(fixture.StatePath, "{\"format\":\"gfs-scheduled-mirror/3\",\"mirrors\":{}}");
+        pass = Pass(sync, fixture, T0.AddMinutes(4));
+        Check(pass.Failure == "store_unreadable" && Status(Ask(sync, fixture, Mirror("brief", a), T0)) == "refused",
+            "a state of another format stops the mirror");
     }
 
-    // P0-5: a task back to what it held before this widget's write is not spread, nor written again.
-    private static void TestRevertIsNoChange()
-    {
-        var wrote = T0.AddMinutes(1).AddSeconds(30);
-        using (var fixture = new Fixture("A", "B"))
-        {
-            var (a, b) = (fixture[0], fixture[1]);
-            fixture.Define("brief", "fresh");
-            fixture.Write(a, List(Entry("brief"))); fixture.Write(b, List(Entry("brief")));
-            var sync = fixture.Sync(() => wrote);
-            Pass(sync, fixture, T0);
-            // A's user raises the task's mode there, and makes another task.
-            fixture.Write(a, List(Entry("brief", extra: Bypass), Entry("fresh")));
-            Pass(sync, fixture, T0.AddMinutes(1));
-            Check(fixture.Task(b, "brief") is { } raised && raised["permissionMode"]!.GetValue<string>() == "bypassPermissions"
-                  && fixture.Task(b, "fresh") is not null, "a mode chosen in A, and a task made there, reach B");
-            // B goes back to what it held before the write, and the app's load of B began within a second of it: the user
-            // undoing it, or the app saving a copy it read before. Neither is spread, and nothing is written again.
-            fixture.Write(b, List(Entry("brief")));
-            var pass = Pass(sync, fixture, T0.AddMinutes(2), log: Loads((b.Key, wrote.AddMilliseconds(500))));
-            Pass(sync, fixture, T0.AddMinutes(3));
-            Check(Are(pass.Conflicts, "brief") && Are(pass.RemovedHere, "fresh") && fixture.Task(b, "brief") is { } lowered
-                  && !lowered.ContainsKey("permissionMode") && fixture.Task(b, "fresh") is null
-                  && fixture.Task(a, "brief")!["permissionMode"]!.GetValue<string>() == "bypassPermissions" && fixture.Task(a, "fresh") is not null,
-                "a changed task back as it was is in conflict, a made one removed there alone, and B keeps the lower mode");
-            // The next edit in one account settles it, without raising B again: the mode was not chosen in that edit.
-            fixture.Edit(a, "brief", entry => entry["cronExpression"] = "0 6 * * *");
-            var settled = Pass(sync, fixture, T0.AddMinutes(4));
-            Check(Cron(fixture, b, "brief") == "0 6 * * *" && !fixture.Task(b, "brief")!.ContainsKey("permissionMode") && Are(settled.Conflicts)
-                  && Pass(sync, fixture, T0.AddMinutes(5)).Written == 0,
-                "the next edit wins, each account keeping the mode it has");
-        }
-        // Once the app's log shows its load of B begin after the write, what B holds then is B's own.
-        using (var fixture = new Fixture("A", "B"))
-        {
-            var (a, b) = (fixture[0], fixture[1]);
-            fixture.Define("brief");
-            fixture.Write(a, List(Entry("brief"))); fixture.Write(b, List(Entry("brief")));
-            var sync = fixture.Sync(() => wrote);
-            Pass(sync, fixture, T0);
-            fixture.Write(a, List(Entry("brief", extra: Bypass)));
-            Pass(sync, fixture, T0.AddMinutes(1));
-            var loaded = Loads((b.Key, wrote.AddSeconds(5)));
-            Pass(sync, fixture, T0.AddMinutes(2), log: loaded);
-            fixture.Write(b, List(Entry("brief")));
-            var lowered = Pass(sync, fixture, T0.AddMinutes(3), log: loaded);
-            Check(Are(lowered.Conflicts) && !fixture.Task(a, "brief")!.ContainsKey("permissionMode") && !fixture.Task(a, "brief")!.ContainsKey("permissionModeCarried"),
-                "a mode lowered after the app loaded the list written is the user's choice, and goes to A");
-        }
-    }
-
-    // P0-6: two accounts changing one task in one pass, in an order the files cannot tell, is a conflict.
-    private static void TestUnorderedChangesConflict()
+    // D8, review P1-1/P1-2: the scan floor rises just past the newest slot an account consumed of the task itself, on
+    // its cron, switched on; a run started by hand is no slot. The widget never writes run times or retries.
+    private static void TestFloorFromConsumedSlots()
     {
         using var fixture = new Fixture("A", "B", "C");
         var (a, b, c) = (fixture[0], fixture[1], fixture[2]);
-        fixture.Define("brief", "other");
-        foreach (var account in fixture.Accounts) fixture.Write(account, List(Entry("brief"), Entry("other")), T0.AddMinutes(-1));
+        fixture.Define("brief");
+        fixture.Write(a, List(Entry("brief"))); fixture.Write(b, List()); fixture.Write(c, List());
         var sync = fixture.Sync();
-        Pass(sync, fixture, T0);
-        // While the widget is off: A edits the brief at 09:00, B edits it again at 10:00 (another model), and at 11:00
-        // another task runs in A, which writes A's whole list again.
-        var ran = T0.AddHours(3).UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'", CultureInfo.InvariantCulture);
-        fixture.Write(b, List(Entry("brief", "0 8 * * *", entry => entry["model"] = "made-up-model-b"), Entry("other")), T0.AddHours(2));
-        fixture.Write(a, List(Entry("brief", "0 7 * * *"), Entry("other", extra: entry => entry["lastRunAt"] = ran)), T0.AddHours(3));
-        var pass = Pass(sync, fixture, T0.AddHours(4));
-        Check(Are(pass.Conflicts, "brief") && Cron(fixture, a, "brief") == "0 7 * * *" && Cron(fixture, b, "brief") == "0 8 * * *"
-              && Cron(fixture, c, "brief") == "0 9 * * *" && fixture.Task(b, "brief")!["model"]!.GetValue<string>() == "made-up-model-b",
-            "the task is in conflict and written nowhere");
-        Check(fixture.Task(b, "other")?["lastRunAt"]?.GetValue<string>() == ran && fixture.Task(c, "other")?["lastRunAt"]?.GetValue<string>() == ran,
-            "the other task's run still goes");
-        fixture.Edit(b, "brief", entry => entry["cronExpression"] = "0 6 * * *", T0.AddHours(5));
-        var settled = Pass(sync, fixture, T0.AddHours(6));
-        Check(new[] { a, b, c }.All(account => Cron(fixture, account, "brief") == "0 6 * * *" && fixture.Task(account, "brief")!["model"]?.GetValue<string>() == "made-up-model-b")
-              && Are(settled.Conflicts),
-            "the next edit, in one account, wins");
+        Apply(sync, fixture, Mirror("brief", a), T0);
+        Check(fixture.Task(b, "brief")?["missedRunScanFloor"]?.GetValue<string>() == ClaudeScheduledRegistry.Iso(T0),
+            "a copy's floor is when it was made");
+        var now = new DateTimeOffset(2026, 11, 20, 9, 5, 0, TimeSpan.Zero);
+        fixture.Edit(a, "brief", entry => { entry["lastScheduledFor"] = "2026-11-20T09:00:00.000Z"; entry["lastRunAt"] = "2026-11-20T09:00:04.000Z"; });
+        var pass = Pass(sync, fixture, now);
+        Check(new[] { b, c }.All(account => fixture.Task(account, "brief") is { } copy
+                  && copy["missedRunScanFloor"]?.GetValue<string>() == "2026-11-20T09:00:00.001Z"
+                  && !copy.ContainsKey("lastRunAt") && !copy.ContainsKey("lastScheduledFor"))
+              && !fixture.Task(a, "brief")!.ContainsKey("missedRunScanFloor") && pass.Written == 2,
+            "the floor goes just past the slot A ran, not its start time; A, which ran it, is left alone; no run time is written");
+        // A run by hand in B, later: no slot.
+        fixture.Edit(b, "brief", entry => entry["lastRunAt"] = "2026-11-20T10:00:00.000Z");
+        var (aHand, cHand) = (fixture.Bytes(a), fixture.Bytes(c));
+        pass = Pass(sync, fixture, now.AddHours(1));
+        Check(pass.Written == 0 && fixture.Bytes(a).SequenceEqual(aHand) && fixture.Bytes(c).SequenceEqual(cHand), "a run started by hand moves no floor");
+        // A slot recorded ahead of now (a clock gone forward) is not taken.
+        fixture.Edit(a, "brief", entry => entry["lastScheduledFor"] = "2026-11-21T18:00:00.000Z");
+        var (bAhead, cAhead) = (fixture.Bytes(b), fixture.Bytes(c));
+        pass = Pass(sync, fixture, now.AddHours(2));
+        Check(pass.Written == 0 && fixture.Bytes(b).SequenceEqual(bAhead) && fixture.Bytes(c).SequenceEqual(cAhead), "a slot ahead of now counts for nothing");
+        // A floor already past the newest slot is not lowered.
+        fixture.Edit(a, "brief", entry => entry["lastScheduledFor"] = "2026-11-20T11:00:00.000Z");
+        fixture.Edit(c, "brief", entry => entry["missedRunScanFloor"] = "2026-11-20T12:00:00.000Z");
+        cAhead = fixture.Bytes(c);
+        pass = Pass(sync, fixture, now.AddHours(2));
+        Check(pass.Written == 1 && fixture.Task(b, "brief")?["missedRunScanFloor"]?.GetValue<string>() == "2026-11-20T11:00:00.001Z"
+              && fixture.Bytes(c).SequenceEqual(cAhead),
+            "a floor is only ever raised");
+        // Retries and skips the lists keep stay theirs.
+        var listed = fixture.Read(b);
+        listed["runRetries"] = new JsonObject { ["brief"] = new JsonObject { ["attempt"] = 1 } };
+        fixture.Write(b, listed);
+        fixture.Edit(a, "brief", entry => entry["lastScheduledFor"] = "2026-11-20T18:00:00.000Z");
+        Pass(sync, fixture, new DateTimeOffset(2026, 11, 20, 18, 10, 0, TimeSpan.Zero));
+        Check(fixture.Read(b)["runRetries"]?["brief"]?["attempt"]?.GetValue<int>() == 1
+              && fixture.Task(b, "brief")?["missedRunScanFloor"]?.GetValue<string>() == "2026-11-20T18:00:00.001Z",
+            "a retry the list keeps is left to the app");
     }
 
-    // P0-7: a change is applied to the entry each account holds, field by field.
-    private static void TestUpdateKeepsTargetFields()
+    // D8, review P1-3: an apply that changes the cron or switches a task on raises that list's floor to the apply's time,
+    // and a slot of the old cron is no candidate.
+    private static void TestApplyRaisesFloor()
     {
-        using var fixture = new Fixture("A", "B", "C");
-        var (a, b, c) = (fixture[0], fixture[1], fixture[2]);
-        fixture.Define("brief", "made");
-        fixture.Write(a, List(Entry("brief", extra: entry => entry["laterField"] = new JsonObject { ["x"] = 2 })));
-        fixture.Write(b, List(Entry("brief", extra: entry =>
+        using var fixture = new Fixture("A", "B");
+        var (a, b) = (fixture[0], fixture[1]);
+        fixture.Define("brief");
+        fixture.Write(a, List(Entry("brief", "0 11 * * *")));
+        fixture.Write(b, List(Entry("brief", "0 11 * * *", entry =>
         {
-            entry["laterField"] = new JsonObject { ["x"] = 1, ["nested"] = new JsonArray(1, 2) };
-            entry["importedFrom"] = "made-up-origin";
-            entry["observedToolUse"] = new JsonObject { ["promptHash"] = "b" };
-            entry["permissionMode"] = "acceptEdits";
+            entry["missedRunScanFloor"] = "2026-11-19T00:00:00.000Z"; entry["lastScheduledFor"] = "2026-11-19T11:00:00.000Z";
         })));
-        var skips = new JsonObject { ["brief"] = new JsonArray(new JsonObject { ["at"] = 1, ["reason"] = "per_task_limit" }) };
-        fixture.Write(c, new JsonObject
-        {
-            ["scheduledTasks"] = new JsonArray(Entry("brief")), ["recordedSkips"] = skips.DeepClone(),
-            ["runRetries"] = new JsonObject { ["brief"] = new JsonObject { ["slot"] = "s", ["attempts"] = 1, ["notBefore"] = null } },
-            ["laterTopLevel"] = new JsonArray(1, 2)
-        });
         var sync = fixture.Sync();
-        Pass(sync, fixture, T0);
-        fixture.Edit(a, "brief", entry => entry["cronExpression"] = "0 4 * * *");
-        Pass(sync, fixture, T0.AddMinutes(1));
-        var brief = fixture.Task(b, "brief")!;
-        Check(brief["cronExpression"]!.GetValue<string>() == "0 4 * * *" && brief["laterField"]!["x"]!.GetValue<int>() == 1
-              && brief["laterField"]!["nested"]!.AsArray().Count == 2 && brief["importedFrom"]!.GetValue<string>() == "made-up-origin"
-              && brief["observedToolUse"]!["promptHash"]!.GetValue<string>() == "b" && brief["permissionMode"]!.GetValue<string>() == "acceptEdits",
-            "a change brings what it changed to the entry each account holds: its unknown and own fields, and a mode not chosen in that change, stay");
-        var listC = fixture.Read(c);
-        Check(Cron(fixture, c, "brief") == "0 4 * * *" && JsonNode.DeepEquals(listC["recordedSkips"], skips)
-              && listC["runRetries"]!["brief"]!["slot"]!.GetValue<string>() == "s" && listC["laterTopLevel"]!.AsArray().Count == 2,
-            "the list's own fields stay with it");
-        Check(Pass(sync, fixture, T0.AddMinutes(2)).Written == 0 && Pass(sync, fixture, T0.AddMinutes(3)).Written == 0,
-            "and what each account keeps of its own is not written over again and again");
-        fixture.Write(a, new JsonObject
-        {
-            ["scheduledTasks"] = new JsonArray(fixture.Task(a, "brief")!.DeepClone(), Entry("made", extra: entry =>
-            {
-                entry["newerEntryField"] = "kept"; entry["importedFrom"] = "a-origin"; entry["observedToolUse"] = new JsonObject { ["promptHash"] = "a" };
-            })),
-            ["runRetries"] = new JsonObject { ["made"] = new JsonObject { ["slot"] = "x", ["attempts"] = 2, ["notBefore"] = null } }
-        });
-        Pass(sync, fixture, T0.AddMinutes(4));
-        var made = fixture.Task(b, "made")!;
-        Check(made["newerEntryField"]!.GetValue<string>() == "kept" && !made.ContainsKey("importedFrom") && !made.ContainsKey("observedToolUse")
-              && !fixture.Read(b).ContainsKey("runRetries"),
-            "a task made in a list brings the fields this widget does not know, not the account's own fields or its retries");
+        Apply(sync, fixture, Mirror("brief", a), T0);
+        fixture.Edit(a, "brief", entry => entry["cronExpression"] = "0 9 * * *");
+        var at = new DateTimeOffset(2026, 11, 20, 8, 0, 0, TimeSpan.Zero);
+        var plan = Ask(sync, fixture, Mirror("brief", a), at);
+        Ask(sync, fixture, Mirror("brief", a) with { Apply = true, Expect = Token(plan) }, at);
+        Check(Text(Target(plan, b)["floor"]) is not null && Cron(fixture, b, "brief") == "0 9 * * *"
+              && fixture.Task(b, "brief")?["missedRunScanFloor"]?.GetValue<string>() == ClaudeScheduledRegistry.Iso(at)
+              && fixture.Task(b, "brief")?["lastScheduledFor"]?.GetValue<string>() == "2026-11-19T11:00:00.000Z",
+            "a changed cron raises the floor to the apply's time, the run times left");
+        // B ran 11:00 on the old cron; A has no slot of the new one: B's slot is no candidate for A.
+        var aBefore = fixture.Bytes(a);
+        Pass(sync, fixture, new DateTimeOffset(2026, 11, 20, 8, 30, 0, TimeSpan.Zero));
+        Check(fixture.Bytes(a).SequenceEqual(aBefore), "a slot of the old cron is no candidate");
+        fixture.Edit(a, "brief", entry => entry["enabled"] = false);
+        Apply(sync, fixture, Mirror("brief", a), at.AddHours(1));
+        fixture.Edit(a, "brief", entry => entry["enabled"] = true);
+        var on = at.AddHours(5);
+        Apply(sync, fixture, Mirror("brief", a), on);
+        Check(fixture.Task(b, "brief")?["missedRunScanFloor"]?.GetValue<string>() == ClaudeScheduledRegistry.Iso(on),
+            "switching a task on raises it too");
     }
 
-    // A Chrome mode with fewer checks, a site and an approval are raises: each reaches another account only from an edit
-    // seen choosing it. Lowering and removals go as any change.
-    private static void TestChromeAndApprovalsRaise()
+    // D9, review P1-4: recurring cron tasks run here, in a folder, only.
+    private static void TestRecurringLocalOnly()
     {
-        static JsonObject Approval(string tool, string? rule = null)
+        using var fixture = new Fixture("A", "B");
+        var (a, b) = (fixture[0], fixture[1]);
+        fixture.Define("brief");
+        var sync = fixture.Sync();
+        string? Refusal(JsonObject source, JsonObject? target = null)
         {
-            var approval = new JsonObject { ["toolName"] = tool };
-            if (rule is not null) approval["ruleContent"] = rule;
-            return approval;
+            fixture.Write(a, List(source)); fixture.Write(b, target is null ? List() : List(target));
+            var plan = Ask(sync, fixture, Mirror("brief", a), T0);
+            return Status(plan) == "refused" ? Text(plan["reason"]) + ":" + Text(plan["detail"]) : null;
         }
-        static string[] Tools(JsonObject? entry) => entry?["approvedPermissions"] is JsonArray items
-            ? items.Select(item => item!["toolName"]!.GetValue<string>() + (item["ruleContent"] is { } rule ? "(" + rule.GetValue<string>() + ")" : "")).ToArray()
-            : [];
-        static string? Chrome(JsonObject? entry) => entry?["chromePermissionMode"]?.GetValue<string>();
+        Check(Refusal(Entry("brief", extra: entry => entry["fireAt"] = 1763700000000)) == "not_recurring_local:one_time"
+              && Refusal(Entry("brief", extra: entry => entry["place"] = new JsonObject { ["cwd"] = "made-up" })) == "not_recurring_local:remote"
+              && Refusal(Entry("brief", extra: entry => entry.Remove("cwd"))) == "not_recurring_local:no_folder"
+              && Refusal(Entry("brief"), Entry("brief", extra: entry => entry["place"] = new JsonObject())) == "target_not_recurring_local:B: remote",
+            "a one-time task, a remote one or one without a folder is not mirrored, nor one an account holds as such");
+        fixture.Write(a, List(Entry("brief"))); fixture.Write(b, List(Entry("brief")));
+        Apply(sync, fixture, Mirror("brief", a), T0);
+        fixture.Edit(b, "brief", entry => entry["fireAt"] = 1763700000000);
+        var pass = Pass(sync, fixture, T0.AddMinutes(1));
+        Check(pass.Notice is { Kind: ClaudeScheduledProblemKind.Stopped, Detail: "brief: B one_time" }, "a mirrored task turned one-time holds the mirror");
+    }
+
+    // D10, review P1-5: a list still keeping retries or skips of a task under the id gets no copy; those of an entry
+    // there are only shown.
+    private static void TestRetryMapsHoldInserts()
+    {
         using var fixture = new Fixture("A", "B", "C");
         var (a, b, c) = (fixture[0], fixture[1], fixture[2]);
-        fixture.Define("brief", "made");
-        var made = Entry("made", extra: entry => entry["approvedPermissions"] = new JsonArray(Approval("Read")));
-        // At the starting point A's copy allows more than B's: Chrome without checks, a site, and another approval.
+        fixture.Define("brief");
+        fixture.Write(a, List(Entry("brief")));
+        var retries = List();
+        retries["runRetries"] = new JsonObject { ["brief"] = new JsonObject { ["attempt"] = 2 } };
+        fixture.Write(b, retries);
+        var skips = List(Entry("brief"));
+        skips["recordedSkips"] = new JsonObject { ["brief"] = new JsonArray("2026-11-19T09:00:00.000Z") };
+        fixture.Write(c, skips);
+        var sync = fixture.Sync();
+        var plan = Ask(sync, fixture, Mirror("brief", a), T0);
+        Check(Action(plan, b) == "held" && Text(Target(plan, b)["reason"]) == "retries_or_skips_left"
+              && Are(Target(plan, c)["pending"]!.AsArray().Select(Text)!, "recordedSkips"),
+            "the plan holds a copy where retries of a task under the id are kept, and shows those of an entry there");
+        Ask(sync, fixture, Mirror("brief", a) with { Apply = true, Expect = Token(plan) }, T0);
+        var pass = Pass(sync, fixture, T0.AddMinutes(1));
+        Check(fixture.Ids(b).Length == 0 && pass.Notice is { Kind: ClaudeScheduledProblemKind.Unfilled, Detail: "brief: B" },
+            "nor does a pass make it there");
+    }
+
+    // D11, review P1-6: no deferred removal. A removal removes the entries its plan showed from the lists the app has not
+    // loaded, says where the task remains, and is safe to run again; a mirrored task is refused until it is unmirrored.
+    private static void TestRemoveAndUnmirror()
+    {
+        using var fixture = new Fixture("A", "B", "C");
+        var (a, b, c) = (fixture[0], fixture[1], fixture[2]);
+        fixture.Define("brief", "old");
+        fixture.Write(a, List(Entry("old"), Entry("brief"))); fixture.Write(b, List(Entry("old"))); fixture.Write(c, List(Entry("old")));
+        var sync = fixture.Sync();
+        var (aBefore, bBefore) = (fixture.Bytes(a), fixture.Bytes(b));
+        var removed = Apply(sync, fixture, new("remove", "old"), T0, loaded: c);
+        Check(Status(removed) == "removed" && Are(fixture.Ids(a), "brief") && fixture.Ids(b).Length == 0 && Are(fixture.Ids(c), "old")
+              && Are(removed["remains"]!.AsArray().Select(Text)!, "C"),
+            "a removal removes it from the lists the app has not loaded and says where it remains");
+        Check(Directory.GetFiles(sync.BackupFolder(a.Key)).Any(path => File.ReadAllBytes(path).SequenceEqual(aBefore))
+              && Directory.GetFiles(sync.BackupFolder(b.Key)).Any(path => File.ReadAllBytes(path).SequenceEqual(bBefore)),
+            "keeping what each held");
+        removed = Apply(sync, fixture, new("remove", "old"), T0.AddMinutes(1));
+        Check(Status(removed) == "removed" && fixture.Ids(c).Length == 0 && removed["remains"]!.AsArray().Count == 0, "run again, it finishes");
+        removed = Apply(sync, fixture, new("remove", "old"), T0.AddMinutes(2));
+        Check(Status(removed) == "removed" && removed["targets"]!.AsArray().Count == 0, "and again changes nothing");
+        // Only the task the plan showed: another made under the id after the plan is not removed.
+        fixture.Write(b, List(Entry("old")));
+        var plan = Ask(sync, fixture, new("remove", "old"), T0.AddMinutes(3));
+        fixture.Write(b, List(Entry("old", extra: entry => entry["createdAt"] = 1763700000000)));
+        var stale = Ask(sync, fixture, new ClaudeScheduledRequest("remove", "old", Apply: true, Expect: Token(plan)), T0.AddMinutes(3));
+        Check(Status(stale) == "token_mismatch" && Are(fixture.Ids(b), "old"), "a removal applies only to the entries its plan showed");
+        Apply(sync, fixture, Mirror("brief", a), T0.AddMinutes(4));
+        var mirrored = Ask(sync, fixture, new("remove", "brief"), T0.AddMinutes(4));
+        Check(Status(mirrored) == "refused" && Text(mirrored["reason"]) == "mirrored", "a mirrored task is not removed");
+        Check(Status(Ask(sync, fixture, new("unmirror", "brief"), T0.AddMinutes(5))) == "ok"
+              && Status(Ask(sync, fixture, new("unmirror", "brief"), T0.AddMinutes(5))) == "not_mirrored",
+            "unmirror forgets the mirror first");
+        removed = Apply(sync, fixture, new("remove", "brief"), T0.AddMinutes(6));
+        Check(Status(removed) == "removed" && fixture.Accounts.All(account => !fixture.Ids(account).Contains("brief")), "then it can be removed");
+        fixture.Write(b, List());
+        Pass(sync, fixture, T0.AddMinutes(7));
+        Check(fixture.Accounts.All(account => !fixture.Ids(account).Contains("brief")), "and nothing brings it back");
+    }
+
+    // D12, review P1-7: the tasks a mirror replaces are removed in the same write that gives a list the mirror.
+    private static void TestReplaces()
+    {
+        using var fixture = new Fixture("A", "B", "C");
+        var (a, b, c) = (fixture[0], fixture[1], fixture[2]);
+        fixture.Define("brief-1", "brief-2", "brief-3");
+        fixture.Write(a, List(Entry("brief-1")));
+        fixture.Write(b, List(Entry("brief-2", extra: Bypass)));
+        fixture.Write(c, List(Entry("brief-1"), Entry("brief-3")));
+        var sync = fixture.Sync();
+        Check(Text(Ask(sync, fixture, Mirror("brief-1", a, "brief-1"), T0)["reason"]) == "invalid_replaces", "a mirror does not replace itself");
+        var plan = Ask(sync, fixture, Mirror("brief-1", a, "brief-2", "brief-3"), T0);
+        var removes = Target(plan, b)["removes"]!.AsArray();
+        Check(Action(plan, b) == "insert" && removes.Count == 1 && Text(removes[0]!["id"]) == "brief-2"
+              && Text(removes[0]!["permission"]!["mode"]) == "bypassPermissions"
+              && Action(plan, c) == "same" && Text(Target(plan, c)["removes"]![0]!["id"]) == "brief-3",
+            "the plan shows what each list's mirror replaces, with its mode");
+        var aBefore = fixture.Bytes(a);
+        var applied = Ask(sync, fixture, Mirror("brief-1", a, "brief-2", "brief-3") with { Apply = true, Expect = Token(plan) }, T0);
+        Check(Status(applied) == "mirrored" && Are(fixture.Ids(b), "brief-1") && Are(fixture.Ids(c), "brief-1") && fixture.Bytes(a).SequenceEqual(aBefore),
+            "the apply gives each list the mirror and removes what it replaces, in one write");
+        // B gets an older save back: the pass makes the mirror there again and removes what it replaces with it.
+        fixture.Write(b, List(Entry("brief-2", extra: Bypass)));
+        Pass(sync, fixture, T0.AddMinutes(1));
+        Check(Are(fixture.Ids(b), "brief-1"), "a copy made again replaces in the same write");
+        Check(Text(Ask(sync, fixture, Mirror("brief-2", b, "brief-1"), T0)["reason"]) == "replaces_mirrored", "a mirrored task is not replaced");
+    }
+
+    // D13, review P1-8: a list not made yet is reported, the definitions have to be where the app reads them, and
+    // SKILL.md a file that reads.
+    private static void TestPreparation()
+    {
+        using var fixture = new Fixture("A", "B", "D");
+        var (a, b, d) = (fixture[0], fixture[1], fixture[2]);
+        fixture.Define("brief");
+        fixture.Write(a, List(Entry("brief"))); fixture.Write(b, List());
+        var sync = fixture.Sync();
+        var plan = Ask(sync, fixture, Mirror("brief", a), T0);
+        Check(Action(plan, d) == "no_list" && Text(Target(plan, d)["note"])!.Contains("open this account"), "a registered account without a list is shown");
+        Ask(sync, fixture, Mirror("brief", a) with { Apply = true, Expect = Token(plan) }, T0);
+        var pass = Pass(sync, fixture, T0.AddMinutes(1));
+        Check(pass.Notice is { Kind: ClaudeScheduledProblemKind.Unfilled, Detail: "brief: D" } && !File.Exists(fixture.PathOf(d)),
+            "and reported: no list is made for it");
+        fixture.Write(d, List());
+        Pass(sync, fixture, T0.AddMinutes(2));
+        Check(fixture.Task(d, "brief") is not null, "once the app has made it, it is filled");
+        // The app reads the definitions elsewhere.
+        var elsewhere = new ClaudeScheduledSync(fixture.Sessions, fixture.Store, fixture.Definitions, Path.Combine(fixture.Root, "other"), () => new MemoryStream());
+        fixture.Write(b, List());
+        Check(Text(Ask(elsewhere, fixture, Mirror("brief", a), T0)["reason"]) == "definition_root"
+              && Pass(elsewhere, fixture, T0.AddMinutes(3)).Notice is { Kind: ClaudeScheduledProblemKind.Stopped, Detail: "brief: definition_root" }
+              && fixture.Ids(b).Length == 0,
+            "while the app reads the definitions from another folder, nothing is written");
+        string? Problem() => Text(Ask(sync, fixture, Mirror("brief", a), T0)["reason"]);
+        var skill = Path.Combine(fixture.Definitions, "brief", "SKILL.md");
+        File.Delete(skill);
+        var missing = Problem();
+        Directory.CreateDirectory(skill);
+        var folder = Problem();
+        Directory.Delete(skill);
+        Directory.Delete(Path.Combine(fixture.Definitions, "brief"));
+        var real = Directory.CreateDirectory(Path.Combine(fixture.Root, "real-brief")).FullName;
+        File.WriteAllText(Path.Combine(real, "SKILL.md"), "---\nname: brief\n---\nMade up.\n");
+        Link("/J", Path.Combine(fixture.Definitions, "brief"), real);
+        var junction = Problem();
+        Check(missing == "definition_unready" && folder == "definition_unready" && junction == "definition_unready",
+            "a definition folder without SKILL.md, with a folder in its place, or behind a junction is not ready");
+    }
+
+    // D14, review P1-9: an apply writes only the plan whose token it names; --from names one list.
+    private static void TestTokenBindsPlan()
+    {
+        var org = Guid.NewGuid().ToString("D");
+        using var fixture = new Fixture(new ClaudeShelfAccount[]
+        {
+            new(Guid.NewGuid().ToString("D"), org, "A"), new(Guid.NewGuid().ToString("D"), org, "Same"),
+            new(Guid.NewGuid().ToString("D"), Guid.NewGuid().ToString("D"), "Same")
+        });
+        var (a, s1, s2) = (fixture[0], fixture[1], fixture[2]);
+        fixture.Define("brief");
+        fixture.Write(a, List(Entry("brief"))); fixture.Write(s1, List(Entry("brief", extra: entry => entry["enabled"] = false))); fixture.Write(s2, List());
+        var sync = fixture.Sync();
+        var plan = Ask(sync, fixture, new("mirror", "brief", "loaded"), T0, loaded: a);
+        Check(Status(plan) == "plan" && Text(plan["from"]!["key"]) == a.Key, "--from loaded takes the list the app shows");
+        // The source is switched off before the apply: the plan is not the one shown.
+        fixture.Edit(a, "brief", entry => entry["enabled"] = false);
+        var stale = Ask(sync, fixture, new ClaudeScheduledRequest("mirror", "brief", "loaded", Apply: true, Expect: Token(plan)), T0, loaded: a);
+        Check(Status(stale) == "token_mismatch" && Token(stale) != Token(plan) && fixture.Ids(s2).Length == 0 && !File.Exists(fixture.StatePath),
+            "an apply whose plan changed shows the new plan and writes nothing");
+        Check(Text(Ask(sync, fixture, new("mirror", "brief", "Same"), T0)["reason"]) == "from_ambiguous"
+              && Text(Ask(sync, fixture, new("mirror", "brief", "Nobody"), T0)["reason"]) == "from_unknown"
+              && Text(Ask(sync, fixture, new("mirror", "brief", "loaded"), T0)["reason"]) == "app_closed"
+              && Status(Ask(sync, fixture, new("mirror", "brief", "a"), T0, loaded: a)) == "plan",
+            "a label naming two lists is refused, an unknown one too; a label naming one is taken, whatever its case");
+        var unknown = sync.Serve(new("mirror", "brief", "loaded"), sync.Scene(fixture.Accounts,
+            new ClaudeScheduledLogView(false, null, false, null, 0), running: true)!, _ => false, T0, true);
+        Check(Text(unknown["reason"]) == "loaded_unknown", "--from loaded is refused while the loaded list is unknown");
+    }
+
+    // D15: what a mirror takes and leaves.
+    private static void TestFields()
+    {
+        using var fixture = new Fixture("A", "B", "C");
+        var (a, b, c) = (fixture[0], fixture[1], fixture[2]);
+        fixture.Define("brief");
         fixture.Write(a, List(Entry("brief", extra: entry =>
         {
-            entry["chromePermissionMode"] = "skip_all_permission_checks";
-            entry["chromeAllowedDomains"] = new JsonArray("example.org");
-            entry["approvedPermissions"] = new JsonArray(Approval("Read"), Approval("Bash", "npm test"));
-        }), (JsonObject)made.DeepClone()));
+            entry["useWorktree"] = true; entry["sourceBranch"] = "made-up-branch";
+            entry["promptFileHash"] = "made-up-hash-a"; entry["promptWrittenBy"] = new JsonArray("made-up-session");
+            entry["approvedPermissions"] = new JsonArray(new JsonObject { ["toolName"] = "made-up" });
+            entry["chromePermissionMode"] = "ask"; entry["chromeAllowedDomains"] = new JsonArray("example.invalid");
+            entry["observedToolUse"] = new JsonObject(); entry["notifySessionId"] = "made-up-session";
+            entry["madeByClaude"] = true; entry["lastRunAt"] = "2026-11-19T09:00:04.000Z";
+        })));
         fixture.Write(b, List(Entry("brief", extra: entry =>
         {
-            entry["chromePermissionMode"] = "ask";
-            entry["approvedPermissions"] = new JsonArray(Approval("Read"));
-        }), (JsonObject)made.DeepClone()));
+            entry["useWorktree"] = true; entry["sourceBranch"] = "made-up-branch";
+            entry["model"] = "made-up-model-x"; entry["displayName"] = "Old name"; entry["madeByClaude"] = false;
+            entry["promptFileHash"] = "made-up-hash-b"; entry["approvedPermissions"] = new JsonArray(new JsonObject { ["toolName"] = "kept" });
+        })));
         fixture.Write(c, List());
         var sync = fixture.Sync();
-        Pass(sync, fixture, T0);
-        // An edit in A that chose none of that: B gets the schedule, not A's permissions, and C, lacking the task, is not
-        // given it.
-        fixture.Edit(a, "brief", entry => entry["cronExpression"] = "0 5 * * *");
-        var pass = Pass(sync, fixture, T0.AddMinutes(1));
-        var kept = fixture.Task(b, "brief");
-        Check(Cron(fixture, b, "brief") == "0 5 * * *" && Chrome(kept) == "ask" && kept!["chromeAllowedDomains"] is null
-              && Are(Tools(kept), "Read") && fixture.Task(c, "brief") is null && Are(pass.Held, "brief"),
-            "a Chrome mode with fewer checks, a site and an approval no edit chose do not reach another account");
-        // A adds an approval: that one goes, the one A had before does not.
-        fixture.Edit(a, "brief", entry => entry["approvedPermissions"]!.AsArray().Add(Approval("Write")));
-        Pass(sync, fixture, T0.AddMinutes(2));
-        Check(Are(Tools(fixture.Task(b, "brief")), "Read", "Write") && Chrome(fixture.Task(b, "brief")) == "ask",
-            "an approval seen added reaches the others");
-        // An edit in B that chose nothing: A's Chrome mode is lowered to B's, and the site and approval B lacks go.
-        fixture.Edit(b, "brief", entry => entry["cronExpression"] = "0 6 * * *");
-        Pass(sync, fixture, T0.AddMinutes(3));
-        var lowered = fixture.Task(a, "brief");
-        Check(Cron(fixture, a, "brief") == "0 6 * * *" && Chrome(lowered) == "ask" && lowered!["chromeAllowedDomains"] is null
-              && Are(Tools(lowered), "Read", "Write"),
-            "lowering and removals go as any change");
-        // B chooses a Chrome mode with fewer checks: seen chosen, it goes.
-        fixture.Edit(b, "brief", entry => entry["chromePermissionMode"] = "follow_a_plan");
-        Pass(sync, fixture, T0.AddMinutes(4));
-        Check(Chrome(fixture.Task(a, "brief")) == "follow_a_plan" && Pass(sync, fixture, T0.AddMinutes(5)).Written == 0,
-            "a Chrome mode seen chosen reaches the others, and what each keeps of its own is not written again");
-        var seed = Pass(sync, fixture, T0.AddMinutes(6), request: new("seed", ["made"])).Answer!;
-        Check(Skipped(seed, "made") == "raises_permission" && fixture.Task(c, "made") is null, "a seed never makes a task with an approval");
+        var plan = Ask(sync, fixture, Mirror("brief", a), T0);
+        var model = Target(plan, b)["fields"]!.AsArray().First(field => Text(field!["name"]) == "model")!;
+        Check(Are(Fields(plan, b), "displayName", "model") && Text(model["before"]) == "made-up-model-x" && Text(model["after"]) == "(none: the definition's)"
+              && Text(plan["settings"]!["model"]) == "(none: the definition's)",
+            "a model set and none set (the definition's) are told apart; the prompt's hash is not compared");
+        Check(plan["notCopied"]!.AsArray().Select(Text).Order(StringComparer.Ordinal).SequenceEqual(new[]
+              { "approvedPermissions", "chromeAllowedDomains", "chromePermissionMode", "madeByClaude", "notifySessionId", "observedToolUse",
+                "promptFileHash", "promptWrittenBy" }),
+            "the plan lists what is not taken");
+        Ask(sync, fixture, Mirror("brief", a) with { Apply = true, Expect = Token(plan) }, T0);
+        var copy = fixture.Task(c, "brief")!;
+        Check(copy.Select(member => member.Key).Order(StringComparer.Ordinal).SequenceEqual(new[]
+              { "createdAt", "cronExpression", "cwd", "displayName", "enabled", "filePath", "id", "missedRunScanFloor", "sourceBranch", "useWorktree" })
+              && copy["filePath"]!.GetValue<string>() == Path.Combine(fixture.Definitions, "brief", "SKILL.md"),
+            "a copy has the settings, the source's createdAt, its definition and a floor: no prompt record, approval, Chrome site, session or origin");
+        var fixedEntry = fixture.Task(b, "brief")!;
+        Check(!fixedEntry.ContainsKey("model") && fixedEntry["displayName"]!.GetValue<string>() == "Task brief"
+              && fixedEntry["madeByClaude"]!.GetValue<bool>() == false && fixedEntry["promptFileHash"]!.GetValue<string>() == "made-up-hash-b"
+              && fixedEntry["approvedPermissions"]![0]!["toolName"]!.GetValue<string>() == "kept",
+            "a fixed entry gets the settings exactly, a model none set removed, and keeps its own record, approvals and origin");
     }
 
-    // P0-8: a list made where there was none never replaces one the app made meanwhile.
-    private static void TestCreateNeverOverwrites()
+    // D16: the commands go by a channel of their version; one on the first version's is refused.
+    private static void TestCommandChannel()
     {
         using var fixture = new Fixture("A", "B");
         var (a, b) = (fixture[0], fixture[1]);
-        fixture.Define("brief", "app-made");
-        fixture.Write(a, List());
-        var sync = fixture.Sync();
-        Pass(sync, fixture, T0);
-        fixture.Write(a, List(Entry("brief")));
-        var made = List(Entry("app-made")).ToJsonString();
-        sync.BeforeMoveForTest = path => { if (path == fixture.PathOf(b)) File.WriteAllText(path, made); };
-        var pass = Pass(sync, fixture, T0.AddMinutes(1));
-        sync.BeforeMoveForTest = null;
-        Check(pass.Written == 0 && Are(pass.Waiting, "B") && File.ReadAllText(fixture.PathOf(b)) == made
-              && Directory.GetFiles(fixture.FolderOf(b)).Length == 1,
-            "the app's first list, made between the last check and the move, stays");
-        Pass(sync, fixture, T0.AddMinutes(2));
-        Check(Are(fixture.Ids(b), "app-made", "brief") && fixture.Task(a, "app-made") is not null,
-            "the next pass reads it as B's and writes B then");
+        fixture.Define("brief");
+        fixture.Write(a, List(Entry("brief"))); fixture.Write(b, List());
+        using var app = new FakeApp(fixture);
+        app.Runtime = new ClaudeDesktopRuntime(ClaudeDesktopRunState.Closed, null);
+        app.After(TimeSpan.Zero);
+        var suffix = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(
+            Path.TrimEndingDirectorySeparator(Path.GetFullPath(fixture.Ledger)).ToLowerInvariant())))[..16];
+        using var requested = EventWaitHandle.OpenExisting(@"Local\CodexWeeklyUsageIndicator.ScheduledSeed." + suffix);
+        using var answered = EventWaitHandle.OpenExisting(@"Local\CodexWeeklyUsageIndicator.ScheduledSeeded." + suffix);
+        using var mailbox = MemoryMappedFile.OpenExisting(@"Local\CodexWeeklyUsageIndicator.ScheduledSeedMailbox." + suffix);
+        using var view = mailbox.CreateViewAccessor(0, 1024 * 1024);
+        ClaudeSessionSync.WriteSlot(view, 0, 65536, Encoding.UTF8.GetBytes("{\"id\":\"made-up-1\",\"op\":\"seed\",\"tasks\":[]}"));
+        answered.Reset();
+        requested.Set();
+        app.After(TimeSpan.FromSeconds(1));
+        var text = ClaudeSessionSync.ReadSlot(view, 65536, 1024 * 1024 - 65536) ?? "";
+        Check(text.StartsWith("made-up-1\n", StringComparison.Ordinal)
+              && JsonNode.Parse(text[10..])?["reason"]?.GetValue<string>() == "old_command_version" && fixture.Ids(b).Length == 0,
+            "a command of the first version is answered with a refusal, and does nothing");
+        Check(Status(JsonNode.Parse(app.Ask(Mirror("brief", a)) ?? "{}")!.AsObject()) == "plan", "this version's is answered");
+        Check(ClaudeScheduledChannel.Ask(Path.Combine(fixture.Root, "no-widget"), TimeSpan.FromSeconds(2), Mirror("brief", a)) is null,
+            "without a widget of this version a command gets no answer");
     }
 
-    // P0-9: a write is kept as begun before its list is moved into place, and settled at the next start.
-    private static void TestStoppedWriteSettles()
-    {
-        ClaudeScheduledSync Stopping(Fixture fixture, ClaudeShelfAccount a)
-        {
-            fixture.Define("brief");
-            fixture.Write(a, List()); fixture.Write(fixture[1], List());
-            var sync = fixture.Sync();
-            Pass(sync, fixture, T0);
-            fixture.Write(a, List(Entry("brief")));
-            return sync;
-        }
-        // Stopped right after the move: the next start finds the list as written.
-        using (var fixture = new Fixture("A", "B"))
-        {
-            var (a, b) = (fixture[0], fixture[1]);
-            var sync = Stopping(fixture, a);
-            sync.AfterMoveForTest = _ => throw new Stopped();
-            Check(Throws<Stopped>(() => Pass(sync, fixture, T0.AddMinutes(1))) && fixture.Task(b, "brief") is not null, "B written, then the widget stops");
-            var restarted = fixture.Sync();
-            Check(Pass(restarted, fixture, T0.AddMinutes(2)).Written == 0 && fixture.Task(b, "brief") is not null, "the next start counts it as written");
-            fixture.Write(b, List());
-            Pass(restarted, fixture, T0.AddMinutes(3));
-            Check(fixture.Task(b, "brief") is null && fixture.Task(a, "brief") is not null, "and a removal there after it is B's alone");
-        }
-        // Stopped right after the move, and the user removes the task from B before the widget starts again.
-        using (var fixture = new Fixture("A", "B"))
-        {
-            var (a, b) = (fixture[0], fixture[1]);
-            var sync = Stopping(fixture, a);
-            sync.AfterMoveForTest = _ => throw new Stopped();
-            Throws<Stopped>(() => Pass(sync, fixture, T0.AddMinutes(1)));
-            fixture.Write(b, List());
-            var restarted = fixture.Sync();
-            var pass = Pass(restarted, fixture, T0.AddMinutes(2));
-            Pass(restarted, fixture, T0.AddMinutes(3));
-            Check(fixture.Task(b, "brief") is null && fixture.Task(a, "brief") is not null && Are(pass.RemovedHere, "brief"),
-                "the task removed meanwhile is not made there again, nor deleted elsewhere");
-        }
-        // Stopped before the move: the new list is still beside the old one, so the write never happened.
-        using (var fixture = new Fixture("A", "B"))
-        {
-            var (a, b) = (fixture[0], fixture[1]);
-            var sync = Stopping(fixture, a);
-            sync.BeforeMoveForTest = _ => throw new Stopped();
-            Check(Throws<Stopped>(() => Pass(sync, fixture, T0.AddMinutes(1))) && fixture.Task(b, "brief") is null
-                  && Directory.GetFiles(fixture.FolderOf(b), "*.partial").Length == 1, "the widget stops before the move");
-            Pass(fixture.Sync(), fixture, T0.AddMinutes(2));
-            Check(fixture.Task(b, "brief") is not null && Directory.GetFiles(fixture.FolderOf(b)).Length == 1,
-                "the next start writes it again, leaving only the list");
-        }
-    }
-
-    // P0-10: a new profile folder is a new starting point.
-    private static void TestRootChangeTakesStartingPoint()
+    // D5, D17: the new list is written beside the old one and moved over it only while writing is still allowed; the
+    // old one is backed up first, the newest five kept.
+    private static void TestWritesAtomicAndBackedUp()
     {
         using var fixture = new Fixture("A", "B");
         var (a, b) = (fixture[0], fixture[1]);
-        fixture.Define("brief", "old");
-        fixture.Write(a, List(Entry("brief"), Entry("old"))); fixture.Write(b, List(Entry("brief"), Entry("old")));
+        fixture.Define("brief");
+        fixture.Write(a, List(Entry("brief"))); fixture.Write(b, List());
         var sync = fixture.Sync();
-        Pass(sync, fixture, T0);
-        // The app's profile folder moved, and its copy of A's list lacks the brief.
-        var moved = Path.Combine(fixture.Root, "moved-profile", "claude-code-sessions");
-        string MovedPath(ClaudeShelfAccount account) => Path.Combine(Directory.CreateDirectory(Path.Combine(moved, account.AccountUuid, account.OrgUuid)).FullName,
-            ClaudeScheduledRegistry.FileName);
-        File.WriteAllText(MovedPath(a), List(Entry("old")).ToJsonString());
-        File.WriteAllText(MovedPath(b), List(Entry("brief"), Entry("old")).ToJsonString());
-        var bBefore = File.ReadAllBytes(MovedPath(b));
-        var there = new ClaudeScheduledSync(moved, fixture.Store, fixture.Definitions, () => new MemoryStream());
-        var first = there.Pass(fixture.Accounts, null, _ => true, T0.AddMinutes(1));
-        var next = there.Pass(fixture.Accounts, null, _ => true, T0.AddMinutes(2));
-        Check(first.First && first.Written == 0 && next.Written == 0 && File.ReadAllBytes(MovedPath(b)).SequenceEqual(bBefore)
-              && Are(next.RemovedHere),
-            "what the lists of a new profile folder hold differently is taken as they are, not as changes or removals");
-        Check(sync.Pass(fixture.Accounts, null, _ => true, T0.AddMinutes(3)) is { First: true, Written: 0 },
-            "and going back is a new starting point again");
-    }
-
-    // P0-11: a kept state that does not read whole stops every write.
-    private static void TestMalformedStateStopsWrites()
-    {
-        using var fixture = new Fixture("A", "B");
-        var (a, b) = (fixture[0], fixture[1]);
-        fixture.Define("brief", "other");
-        fixture.Write(a, List(Entry("brief"), Entry("other"))); fixture.Write(b, List(Entry("brief"), Entry("other")));
-        var sync = fixture.Sync();
-        Pass(sync, fixture, T0);
-        fixture.Write(a, List(Entry("brief", "0 5 * * *"), Entry("other")));
-        var good = File.ReadAllText(fixture.StatePath);
-        var at = T0.ToString("O", CultureInfo.InvariantCulture);
-        foreach (var (what, damage) in new (string, Action<JsonObject>)[]
-                 {
-                     ("a deletion without its accounts", state => state["deleted"] = new JsonObject { ["other"] = new JsonObject { ["at"] = at, ["by"] = "definitions" } }),
-                     ("a deletion by an unknown cause", state => state["deleted"] = new JsonObject { ["other"] = new JsonObject { ["at"] = at, ["by"] = "guess", ["pending"] = new JsonArray() } }),
-                     ("an account's tasks as an array", state => state["accounts"]![a.Key]!["entries"] = new JsonArray()),
-                     ("an id the app does not keep", state => state["accounts"]![a.Key]!["removed"] = new JsonObject { ["Not An Id"] = at }),
-                     ("an account that is no account", state => state["accounts"]!["not-a-key"] = state["accounts"]![a.Key]!.DeepClone()),
-                     ("a record missing", state => state.Remove("conflicts")),
-                     ("another version", state => state["version"] = 3)
-                 })
+        var plan = Ask(sync, fixture, Mirror("brief", a), T0);
+        var before = fixture.Bytes(b);
+        var asked = 0; var besideFirst = false;
+        bool Leaves(string key)
         {
-            var state = JsonNode.Parse(good)!.AsObject();
-            damage(state);
-            File.WriteAllText(fixture.StatePath, state.ToJsonString());
-            var pass = Pass(sync, fixture, T0.AddMinutes(1));
-            var asked = Pass(sync, fixture, T0.AddMinutes(1), request: new("remove", ["brief"]));
-            Check(pass is { Failure: "store_unreadable", Written: 0 } && Status(asked.Answer) == "store_unreadable"
-                  && Are(fixture.Ids(b), "brief", "other") && Cron(fixture, b, "brief") == "0 9 * * *",
-                "a kept state with " + what + " stops every write");
+            if (key != b.Key) return true;
+            if (++asked == 2) besideFirst = Directory.GetFiles(fixture.FolderOf(b), ".scheduled-tasks.*.widget-mirror.partial").Length == 1;
+            return asked < 2;
         }
-        File.WriteAllText(fixture.StatePath, good);
-        Pass(sync, fixture, T0.AddMinutes(2));
-        Check(Cron(fixture, b, "brief") == "0 5 * * *" && fixture.Task(b, "other") is not null, "the whole state read again, the change goes");
+        var refused = sync.Serve(Mirror("brief", a) with { Apply = true, Expect = Token(plan) }, Scene(sync, fixture), Leaves, T0, true);
+        Check(Status(refused) == "mirrored" && Text(Target(refused, b)["result"]) == "not written now" && besideFirst
+              && fixture.Bytes(b).SequenceEqual(before) && Directory.GetFiles(fixture.FolderOf(b)).Length == 1,
+            "refused at the last moment, the old list stays and no partial is left");
+        Pass(sync, fixture, T0.AddMinutes(1));
+        Check(fixture.Task(b, "brief") is not null && Directory.GetFiles(sync.BackupFolder(b.Key)).Any(path => File.ReadAllBytes(path).SequenceEqual(before)),
+            "the next pass writes it, the old one kept");
+        for (var round = 1; round <= 6; round++)
+        {
+            fixture.Write(b, List(Entry("other", extra: entry => entry["displayName"] = "round " + round)));
+            Pass(sync, fixture, T0.AddMinutes(1 + round));
+        }
+        Check(Directory.GetFiles(sync.BackupFolder(b.Key)).Length == 5, "the newest five backups are kept");
     }
 
-    // P0-12: a list reached through a link, or by two names, is neither written nor read.
+    // D17 kept: a list reached through a link, or by two names, is neither written nor read.
     private static void TestRedirectedListsRefused()
     {
         var org = Guid.NewGuid().ToString("D");
@@ -912,31 +866,30 @@ internal static class ClaudeScheduledTasksTests
         {
             var (a, b, c) = (fixture[0], fixture[1], fixture[2]);
             fixture.Define("brief");
-            fixture.Write(a, List()); fixture.Write(c, List());
+            fixture.Write(a, List()); fixture.Write(c, List(Entry("brief")));
             // B's account folder is a junction to A's, of the same organization: B's list is A's file under another name.
             Directory.Delete(Path.Combine(fixture.Sessions, b.AccountUuid), recursive: true);
             Link("/J", Path.Combine(fixture.Sessions, b.AccountUuid), Path.Combine(fixture.Sessions, a.AccountUuid));
             var shown = fixture.Bytes(a);
             var sync = fixture.Sync();
-            Pass(sync, fixture, T0, key => key != a.Key);
-            fixture.Write(c, List(Entry("brief")));
-            var pass = Pass(sync, fixture, T0.AddMinutes(1), key => key != a.Key);
-            Check(fixture.Bytes(a).SequenceEqual(shown) && pass.Unreadable.Contains("A") && pass.Unreadable.Contains("B") && sync.SameFolder(b.Key, a.Key),
+            var applied = Apply(sync, fixture, Mirror("brief", c), T0);
+            var pass = Pass(sync, fixture, T0.AddMinutes(1));
+            Check(fixture.Bytes(a).SequenceEqual(shown) && Action(applied, a) == "unreadable" && Action(applied, b) == "unreadable"
+                  && pass.Unreadable.Contains("A") && pass.Unreadable.Contains("B") && sync.SameFolder(b.Key, a.Key),
                 "a list reached through an account folder that is a junction is neither written nor read, nor is the list it reaches");
         }
         using (var fixture = new Fixture("D", "E", "F", "G", "H"))
         {
             var (d, e, f, g, h) = (fixture[0], fixture[1], fixture[2], fixture[3], fixture[4]);
             fixture.Define("brief");
-            fixture.Write(d, List()); fixture.Write(f, List()); fixture.Write(h, List());
+            fixture.Write(d, List()); fixture.Write(f, List()); fixture.Write(h, List(Entry("brief")));
             // E's organization folder is a junction to D's; G's list is a second name of F's.
             Directory.Delete(fixture.FolderOf(e));
             Link("/J", fixture.FolderOf(e), fixture.FolderOf(d));
             Link("/H", fixture.PathOf(g), fixture.PathOf(f));
             var (dBefore, fBefore) = (fixture.Bytes(d), fixture.Bytes(f));
             var sync = fixture.Sync();
-            Pass(sync, fixture, T0);
-            fixture.Write(h, List(Entry("brief")));
+            Apply(sync, fixture, Mirror("brief", h), T0);
             var pass = Pass(sync, fixture, T0.AddMinutes(1));
             Check(pass.Unreadable.Order(StringComparer.Ordinal).SequenceEqual(["D", "E", "F", "G"]) && pass.Written == 0
                   && fixture.Bytes(d).SequenceEqual(dBefore) && fixture.Bytes(f).SequenceEqual(fBefore)
@@ -954,139 +907,7 @@ internal static class ClaudeScheduledTasksTests
         Check(process.ExitCode == 0 && (Directory.Exists(link) || File.Exists(link)), $"mklink {kind} made {link}");
     }
 
-    // P1-1: the run times go as a pair, from the account furthest on.
-    private static void TestRunPairCarried()
-    {
-        using var fixture = new Fixture("A", "B", "C");
-        var (a, b, c) = (fixture[0], fixture[1], fixture[2]);
-        fixture.Define("brief");
-        // A ran today's 09:00 slot, then once by hand at 09:05 (a run by hand clears the slot); B last ran yesterday's.
-        fixture.Write(a, List(Entry("brief", extra: entry => entry["lastRunAt"] = "2026-11-20T00:05:00.000Z")));
-        fixture.Write(b, List(Entry("brief", extra: entry => { entry["lastRunAt"] = "2026-11-19T00:00:04.000Z"; entry["lastScheduledFor"] = "2026-11-19T00:00:00.000Z"; })));
-        fixture.Write(c, List(Entry("brief")));
-        var sync = fixture.Sync();
-        Pass(sync, fixture, T0);
-        // Then A cannot be read: what it ran is kept.
-        ClaudeScheduledPass pass;
-        using (new FileStream(fixture.PathOf(a), FileMode.Open, FileAccess.ReadWrite, FileShare.None))
-            pass = Pass(sync, fixture, T0.AddMinutes(1));
-        Check(pass.Written == 2 && new[] { b, c }.All(account => fixture.Task(account, "brief") is { } entry
-                  && entry["lastRunAt"]?.GetValue<string>() == "2026-11-20T00:05:00.000Z" && !entry.ContainsKey("lastScheduledFor")),
-            "the run times go as the pair of the account the app would catch up from furthest on, from what was kept");
-    }
-
-    // P1-2: a one-time task given a new time runs then.
-    private static void TestNewDueTimeClearsRunTimes()
-    {
-        using var fixture = new Fixture("A", "B");
-        var (a, b) = (fixture[0], fixture[1]);
-        fixture.Define("once");
-        JsonObject Once(long fireAt, bool ran) => Entry("once", extra: entry =>
-        {
-            entry.Remove("cronExpression");
-            entry["fireAt"] = fireAt;
-            if (ran) entry["lastRunAt"] = "2026-11-19T03:00:02.000Z";
-        });
-        fixture.Write(a, List(Once(1763521200000, ran: true))); fixture.Write(b, List(Once(1763521200000, ran: true)));
-        var sync = fixture.Sync();
-        Pass(sync, fixture, T0);
-        // A sets a new time; the app clears the last run there.
-        fixture.Write(a, List(Once(1764000000000, ran: false)));
-        Pass(sync, fixture, T0.AddMinutes(1));
-        Pass(sync, fixture, T0.AddMinutes(2));
-        Check(fixture.Task(b, "once") is { } once && once["fireAt"]!.GetValue<long>() == 1764000000000 && !once.ContainsKey("lastRunAt")
-              && !fixture.Task(a, "once")!.ContainsKey("lastRunAt"),
-            "a new due time goes without the run times of the old one, and they never come back");
-    }
-
-    // P1-3: a list is marked as processed only as it was read or written.
-    private static void TestProcessedOnlyAsRead()
-    {
-        using var fixture = new Fixture("A", "B");
-        var (a, b) = (fixture[0], fixture[1]);
-        fixture.Define("brief");
-        fixture.Write(a, List(Entry("brief"))); fixture.Write(b, List(Entry("brief")));
-        var sync = fixture.Sync();
-        Pass(sync, fixture, T0);
-        fixture.Edit(a, "brief", entry => entry["cronExpression"] = "0 7 * * *");
-        // The brief runs in A while the pass writes B.
-        var pass = Pass(sync, fixture, T0.AddMinutes(1), key =>
-        {
-            if (key == b.Key) fixture.Edit(a, "brief", entry => entry["lastRunAt"] = "2026-11-21T00:00:01.000Z");
-            return true;
-        });
-        Check(pass.Processed![a.Key] != ClaudeScheduledRegistry.CheapStamp(fixture.PathOf(a))
-              && pass.Processed[b.Key] == ClaudeScheduledRegistry.CheapStamp(fixture.PathOf(b)) && Cron(fixture, b, "brief") == "0 7 * * *",
-            "a list changed after it was read is not marked as processed (the next look finds it changed); one written is, as written");
-        Pass(sync, fixture, T0.AddMinutes(2));
-        Check(fixture.Task(b, "brief")?["lastRunAt"]?.GetValue<string>() == "2026-11-21T00:00:01.000Z", "and the next pass brings that run");
-    }
-
-    // P1-4: a list made here gets the cron matcher stamps of the list its task came from.
-    private static void TestNewListStamped()
-    {
-        using var fixture = new Fixture("A", "B", "C");
-        var (a, b, c) = (fixture[0], fixture[1], fixture[2]);
-        fixture.Define("monthly");
-        JsonObject Stamped(params JsonObject[] entries) => new()
-        { ["scheduledTasks"] = new JsonArray(entries), ["sundayAliasBoundaryStamped"] = true, ["dayFieldsOrBoundaryStamped"] = true };
-        fixture.Write(a, Stamped());
-        fixture.Write(c, List());
-        var sync = fixture.Sync();
-        Pass(sync, fixture, T0);
-        fixture.Write(a, Stamped(Entry("monthly", "0 9 1 * 1")));
-        Pass(sync, fixture, T0.AddMinutes(1));
-        var made = fixture.Read(b);
-        Check(made["sundayAliasBoundaryStamped"]?.GetValue<bool>() == true && made["dayFieldsOrBoundaryStamped"]?.GetValue<bool>() == true
-              && fixture.Task(b, "monthly") is not null && fixture.Task(c, "monthly") is not null && !fixture.Read(c).ContainsKey("sundayAliasBoundaryStamped"),
-            "a list made where there was none is stamped as its task's list was; a list there keeps its own stamps");
-    }
-
-    // P1-5: a retry of a slot another account finished is dropped; one of a later slot stays.
-    private static void TestRetryOfFinishedSlotDropped()
-    {
-        using var fixture = new Fixture("A", "B", "C");
-        var (a, b, c) = (fixture[0], fixture[1], fixture[2]);
-        fixture.Define("brief");
-        JsonObject Retrying(string slot, JsonObject entry) => new()
-        {
-            ["scheduledTasks"] = new JsonArray(entry),
-            ["runRetries"] = new JsonObject { ["brief"] = new JsonObject { ["slot"] = slot, ["attempts"] = 1, ["notBefore"] = null } }
-        };
-        JsonObject Ran(string at, string slot) => Entry("brief", extra: entry => { entry["lastRunAt"] = at; entry["lastScheduledFor"] = slot; });
-        // A finished the 09:00 slot; B failed it and waits to retry it; C failed the 10:00 slot.
-        fixture.Write(a, List(Ran("2026-11-21T00:00:05.000Z", "2026-11-21T00:00:00.000Z")));
-        fixture.Write(b, Retrying("2026-11-21T00:00:00.000Z", Ran("2026-11-21T00:00:03.000Z", "2026-11-21T00:00:00.000Z")));
-        fixture.Write(c, Retrying("2026-11-21T01:00:00.000Z", Ran("2026-11-21T01:00:02.000Z", "2026-11-21T01:00:00.000Z")));
-        var sync = fixture.Sync();
-        Pass(sync, fixture, T0);
-        Pass(sync, fixture, T0.AddMinutes(1));
-        Check(!fixture.Read(b).ContainsKey("runRetries") && fixture.Read(c)["runRetries"]?["brief"]?["slot"]?.GetValue<string>() == "2026-11-21T01:00:00.000Z"
-              && new[] { a, b, c }.All(account => fixture.Task(account, "brief")!["lastScheduledFor"]!.GetValue<string>() == "2026-11-21T01:00:00.000Z"),
-            "B's retry of the slot A finished goes; C's of a slot no account finished stays");
-    }
-
-    // P1-7: every account folder holding a list is aligned, registered or not.
-    private static void TestUnregisteredFoldersAligned()
-    {
-        using var fixture = new Fixture("A", "B");
-        var (a, b) = (fixture[0], fixture[1]);
-        var used = fixture.Folder();
-        var empty = fixture.Folder();
-        var loaded = fixture.Folder();
-        fixture.Define("brief");
-        fixture.Write(a, List()); fixture.Write(b, List()); fixture.Write(used, List());
-        var log = Loads((loaded.Key, T0));
-        var sync = fixture.Sync();
-        Pass(sync, fixture, T0, log: log);
-        fixture.Write(a, List(Entry("brief")));
-        Pass(sync, fixture, T0.AddMinutes(1), log: log);
-        Check(fixture.Task(b, "brief") is not null && fixture.Task(used, "brief") is not null && fixture.Task(loaded, "brief") is not null
-              && !File.Exists(fixture.PathOf(empty)),
-            "a folder holding a list, or one the app's log shows loaded, is aligned without being registered; a folder with neither is not given a list");
-    }
-
-    // P1-8: the definitions folder is where the app keeps it.
+    // D13: the definitions as this process finds them, and as the app does.
     private static void TestDefinitionsFollowConfigDir()
     {
         var home = @"X:\made-up-home";
@@ -1104,39 +925,73 @@ internal static class ClaudeScheduledTasksTests
         {
             Environment.SetEnvironmentVariable("CLAUDE_CONFIG_DIR", Path.Combine(fixture.Root, "made-up-config"));
             var paths = ClaudeShelfPaths.CreateDefault(appRoot: Path.Combine(fixture.Root, "app"));
-            Environment.SetEnvironmentVariable("CLAUDE_CONFIG_DIR", "made-up-config");
-            var relative = ClaudeShelfPaths.CreateDefault(appRoot: Path.Combine(fixture.Root, "app"));
-            Check(paths.ScheduledTasksRoot == Path.Combine(fixture.Root, "made-up-config", "scheduled-tasks") && relative.ScheduledTasksRoot is null,
-                "the widget and its plan command look for the definitions there");
+            Check(paths.ScheduledTasksRoot == Path.Combine(fixture.Root, "made-up-config", "scheduled-tasks")
+                  && paths.AppScheduledTasksRoot == ClaudeScheduledSync.AppDefinitionsRoot(),
+                "this process looks where its own CLAUDE_CONFIG_DIR says, and takes the app's from the user's environment");
+            var explicitPaths = ClaudeShelfPaths.CreateDefault(Path.Combine(fixture.Root, "named"), Path.Combine(fixture.Root, "app"));
+            Check(explicitPaths.ScheduledTasksRoot == explicitPaths.AppScheduledTasksRoot, "a folder named for both is both");
         }
         finally { Environment.SetEnvironmentVariable("CLAUDE_CONFIG_DIR", saved); }
     }
 
-    // P1-9 and the command line: --task, repeatable; an exit code of 0 only for an answer that reads ok.
+    // The command line, and a plan made outside the widget, which cannot write.
     private static void TestCommandLine()
     {
-        Check(Are(ClaudeScheduledCommand.Tasks(["--task", "a", "--task", "b"], bare: false), "a", "b")
-              && Are(ClaudeScheduledCommand.Tasks(["a", "--task", "b"], bare: true), "a", "b")
-              && ClaudeScheduledCommand.Tasks(["a"], bare: false) is null && ClaudeScheduledCommand.Tasks(["--task"], bare: false) is null
-              && ClaudeScheduledCommand.Tasks(["--other"], bare: true) is null,
-            "--task names a task, repeatable; remove also takes bare ids");
-        Check(ClaudeScheduledCommand.Exit("{\"status\":\"ok\"}") == 0 && ClaudeScheduledCommand.Exit("{\"status\":\"incomplete\"}") == 1
-              && ClaudeScheduledCommand.Exit("{\"status\":\"store_unwritable\"}") == 1 && ClaudeScheduledCommand.Exit("{\"status\":1}") == 1
-              && ClaudeScheduledCommand.Exit("not json") == 1,
-            "the commands exit 0 only for an answer that reads ok");
+        Check(ClaudeScheduledCommand.Parse("mirror", ["brief", "--from", "a:b", "--replaces", "x", "y", "--apply", "--expect", "t", "--allow-raise"]) is
+              { Task: "brief", From: "a:b", Apply: true, Expect: "t", AllowRaise: true } mirror && Are(mirror.Replaces, "x", "y")
+              && ClaudeScheduledCommand.Parse("mirror", ["brief"]) is null && ClaudeScheduledCommand.Parse("mirror", ["brief", "--from", "a", "--apply"]) is null
+              && ClaudeScheduledCommand.Parse("remove", ["old", "--apply", "--expect", "t"]) is { Apply: true }
+              && ClaudeScheduledCommand.Parse("remove", ["old", "--from", "a"]) is null && ClaudeScheduledCommand.Parse("unmirror", ["brief", "--apply"]) is null
+              && ClaudeScheduledCommand.Parse("unmirror", []) is null,
+            "a mirror names its source; an apply needs its token; a removal and an unmirror take no source");
+        Check(ClaudeScheduledCommand.Exit("{\"status\":\"plan\"}") == 0 && ClaudeScheduledCommand.Exit("{\"status\":\"mirrored\"}") == 0
+              && ClaudeScheduledCommand.Exit("{\"status\":\"token_mismatch\"}") == 1 && ClaudeScheduledCommand.Exit("not json") == 1,
+            "the commands exit 0 for a plan or what was asked done");
+        // The widget is a window program, started with no console of its own: its answer must still reach a shell. Only
+        // the usage answer is asked for, which reads nothing.
+        foreach (var flag in new[] { ClaudeScheduledCommand.MirrorFlag, ClaudeScheduledCommand.RemoveFlag, ClaudeScheduledCommand.UnmirrorFlag })
+        {
+            var start = new ProcessStartInfo(Path.Combine(AppContext.BaseDirectory, "WeeklyUsageIndicator.exe"))
+            { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true };
+            start.ArgumentList.Add(flag);
+            using var process = Process.Start(start) ?? throw new InvalidOperationException("The widget did not start.");
+            var output = process.StandardOutput.ReadToEndAsync();
+            var errors = process.StandardError.ReadToEndAsync();
+            var ended = process.WaitForExit(60_000);
+            if (!ended) process.Kill(entireProcessTree: true);
+            var answer = ended && output.Result.TrimStart().StartsWith('{') ? JsonNode.Parse(output.Result) as JsonObject : null;
+            Check(ended && process.ExitCode == 2 && Text(answer?["status"]) == "usage" && errors.Result.Length == 0,
+                flag + " prints its usage to a shell from the window program");
+        }
         using var fixture = new Fixture("A", "B");
         var (a, b) = (fixture[0], fixture[1]);
         fixture.Define("brief");
         fixture.Write(a, List(Entry("brief"))); fixture.Write(b, List());
+        var readOnly = fixture.Sync(readOnly: true);
+        var calls = ClaudeScheduledSync.WriteCalls;
+        var plan = Ask(readOnly, fixture, Mirror("brief", a), T0);
+        Check(Status(plan) == "plan" && ClaudeScheduledSync.WriteCalls == calls && !Directory.Exists(fixture.Store),
+            "a plan made outside the widget enters nothing that writes");
+        Apply(fixture.Sync(), fixture, Mirror("brief", a), T0, loaded: b);
+        calls = ClaudeScheduledSync.WriteCalls;
+        var preview = readOnly.Pass(Scene(readOnly, fixture), _ => true, T0.AddMinutes(1), preview: true);
+        Check(preview.Report![0]!["accounts"]!.AsArray().Any(item => Text(item!["action"]) == "make") && ClaudeScheduledSync.WriteCalls == calls
+              && fixture.Ids(b).Length == 0,
+            "nor does a preview of the next pass, which shows what it would make");
+        Check(Throws<InvalidOperationException>(() => readOnly.Serve(Mirror("brief", a) with { Apply = true, Expect = Token(plan) },
+                  Scene(readOnly, fixture), _ => true, T0, true)) && fixture.Ids(b).Length == 0,
+            "an apply there throws before anything is written");
         // The store cannot be written: a folder stands where its state goes.
-        Directory.CreateDirectory(fixture.StatePath);
-        var pass = Pass(fixture.Sync(), fixture, T0, request: new("seed", ["brief"]));
-        Check(Status(pass.Answer) == "store_unwritable" && fixture.Ids(b).Length == 0 && pass.Written == 0
-              && ClaudeScheduledCommand.Exit(pass.Answer!.ToJsonString()) == 1,
-            "a seed that could not be kept says so, writes nothing, and its command exits non-zero");
+        using var stuck = new Fixture("C", "D");
+        var (c, d) = (stuck[0], stuck[1]);
+        stuck.Define("brief");
+        stuck.Write(c, List(Entry("brief"))); stuck.Write(d, List());
+        Directory.CreateDirectory(stuck.StatePath);
+        var unkept = Apply(stuck.Sync(), stuck, Mirror("brief", c), T0);
+        Check(Status(unkept) == "store_unwritable" && stuck.Ids(d).Length == 0, "a mirror that cannot be kept writes nothing");
     }
 
-    // The app's scheduled-task lines, as the log watcher reads them.
+    // D3: the app's scheduled-task lines, as the log watcher reads them.
     private static void TestLogLines()
     {
         var since = DateTime.Now.AddHours(-1);
@@ -1144,171 +999,78 @@ internal static class ClaudeScheduledTasksTests
         string Line(int second, string text) => since.AddSeconds(second).ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + " [info] " + text;
         var (account, org) = (Guid.NewGuid().ToString("D"), Guid.NewGuid().ToString("D"));
         var log = new ClaudeScheduledLog();
-        log.Start(new DateTimeOffset(since));
+        log.Start();
         void Read(params string[] lines) => ClaudeDesktopLogWatcher.Apply(ClaudeDesktopAccountState.Unknown, lines, since, [], null, log);
         Check(log.View(true) is { Loaded: null, Pending: true }, "at the start of a run no list is known loaded");
         Read(Line(1, "[CCDScheduledTasks] Reset"),
             Line(2, $"[CCDScheduledTasks] Initialized {{ accountId: '{account.ToUpperInvariant()}', orgId: '{org}' }}"));
         var view = log.View(true);
-        Check(view is { Loaded: { } loaded, Pending: false } && loaded == account + "/" + org && view.Loads[loaded] == new DateTimeOffset(since.AddSeconds(1))
-              && view.LastLine == new DateTimeOffset(since.AddSeconds(2)),
-            "the log names the list the manager loaded, whoever's it is, when that load began and when its last line was");
+        Check(view is { Loaded: { } loaded, Pending: false } && loaded == account + "/" + org && view.LastLine == new DateTimeOffset(since.AddSeconds(2)),
+            "the log names the list the manager loaded, whoever's it is, and when its last line was");
         Read(Line(3, "[CCDScheduledTasks] Reset"));
         Check(log.View(true) is { Loaded: null, Pending: true }, "after a reset no list is loaded until the next load");
         Read(Line(4, "[CCDScheduledTasks] Initialized { accountId: 'made-up', orgId: 'made-up' }"));
         Check(log.View(true) is { Loaded: null, Pending: true }, "a load line that does not read leaves it unknown, and nothing is written");
         log.Close();
-        Check(log.View(false) is { Known: false, Loaded: null, Pending: false } && log.View(false).Loads.ContainsKey(account + "/" + org),
-            "a closed app holds no list; the loads seen stay");
+        Check(log.View(false) is { Known: false, Loaded: null, Pending: false }, "a closed app holds no list");
     }
 
-    // P0-4: while the app runs, the list its log shows loaded is never written, registered or not.
-    private static void TestServiceLeavesLoadedListAlone()
-    {
-        using var fixture = new Fixture("G", "H");
-        var (g, h) = (fixture[0], fixture[1]);
-        var u = fixture.Folder("U");
-        fixture.Define("brief");
-        fixture.Write(g, List()); fixture.Write(h, List()); fixture.Write(u, List());
-        using var app = new FakeApp(fixture);
-        // The app shows U, an account the widget does not know.
-        app.After(TimeSpan.Zero, app.Loads(u));
-        app.After(TimeSpan.FromSeconds(7));
-        fixture.Write(h, List(Entry("brief")));
-        app.After(TimeSpan.FromSeconds(3));
-        Check(fixture.Task(g, "brief") is not null && fixture.Ids(u).Length == 0, "the list the app has loaded is left alone, registered or not");
-        app.Register(g, h, u);
-        fixture.Edit(h, "brief", entry => entry["cronExpression"] = "0 7 * * *");
-        app.After(TimeSpan.FromSeconds(3));
-        Check(Cron(fixture, g, "brief") == "0 7 * * *" && fixture.Ids(u).Length == 0, "registered later, it is still left alone");
-        // The app lets the list go: until its next load is a few seconds old, nothing is written.
-        app.After(TimeSpan.Zero, app.Reset());
-        fixture.Edit(h, "brief", entry => entry["cronExpression"] = "0 6 * * *");
-        app.After(TimeSpan.FromSeconds(7));
-        app.After(TimeSpan.FromSeconds(60));
-        Check(Cron(fixture, g, "brief") == "0 7 * * *" && fixture.Ids(u).Length == 0, "between a reset and the next load nothing is written");
-        app.After(TimeSpan.Zero, app.Initialized(g));
-        app.After(TimeSpan.FromSeconds(3));
-        Check(fixture.Ids(u).Length == 0, "nor in the seconds after the load");
-        app.After(TimeSpan.FromSeconds(4));
-        Check(Cron(fixture, u, "brief") == "0 6 * * *" && Cron(fixture, g, "brief") == "0 7 * * *",
-            "then the list it left gets what it lacks, and the one it loaded is left alone");
-        app.Runtime = new ClaudeDesktopRuntime(ClaudeDesktopRunState.Closed, null);
-        app.After(TimeSpan.FromSeconds(2));
-        Check(Cron(fixture, g, "brief") == "0 7 * * *", "nor in the moment the app is closing");
-        app.After(TimeSpan.FromSeconds(6));
-        Check(Cron(fixture, g, "brief") == "0 6 * * *", "once the app has been closed for a moment, that list gets it too");
-    }
-
-    // P1-3: the alignment runs a few seconds after the app's account changes, not minutes later.
-    private static void TestServiceRunsAfterSwitch()
-    {
-        using var fixture = new Fixture("G", "H");
-        var (g, h) = (fixture[0], fixture[1]);
-        fixture.Define("brief");
-        JsonObject Ran(string at) => Entry("brief", extra: entry => { entry["lastRunAt"] = at; entry["lastScheduledFor"] = at; });
-        fixture.Write(g, List(Ran("2026-11-20T00:00:00.000Z"))); fixture.Write(h, List(Ran("2026-11-20T00:00:00.000Z")));
-        using var app = new FakeApp(fixture);
-        app.After(TimeSpan.Zero, app.Loads(h));
-        app.After(TimeSpan.FromSeconds(7));
-        // The user goes to G just before nine; the brief runs there at nine.
-        app.After(TimeSpan.FromMinutes(5));
-        app.After(TimeSpan.Zero, app.Loads(g));
-        app.After(TimeSpan.FromSeconds(7));
-        fixture.Edit(g, "brief", entry => { entry["lastRunAt"] = "2026-11-21T00:00:04.000Z"; entry["lastScheduledFor"] = "2026-11-21T00:00:00.000Z"; });
-        app.After(TimeSpan.FromSeconds(3));
-        Check(fixture.Task(h, "brief")?["lastScheduledFor"]?.GetValue<string>() == "2026-11-21T00:00:00.000Z",
-            "a run in the account the app shows reaches the account it left at the next tick, before the user can go back");
-        // An edit in G, and at once a switch to H: H loads before it is written, and waits.
-        fixture.Edit(g, "brief", entry => entry["cronExpression"] = "0 7 * * *");
-        app.After(TimeSpan.Zero, app.Loads(h));
-        app.After(TimeSpan.FromSeconds(7));
-        app.After(TimeSpan.FromSeconds(10));
-        Check(Cron(fixture, h, "brief") == "0 9 * * *", "the list the app loaded meanwhile waits");
-        app.After(TimeSpan.Zero, app.Loads(g));
-        app.After(TimeSpan.FromSeconds(7));
-        Check(Cron(fixture, h, "brief") == "0 7 * * *", "and is written a few seconds after the app lets it go");
-    }
-
-    // The end-to-end case: five accounts, three briefs (two running with the mode carried), the app showing an empty list.
-    private static void TestServiceSeedAndRemoveFiveAccounts()
+    // The real use: five accounts, three briefs under three ids (two carrying bypassPermissions), the app showing one of
+    // the accounts lacking any. One brief is mirrored and replaces the other two; no account gets a mode it did not have.
+    private static void TestServiceFiveAccounts()
     {
         using var fixture = new Fixture("A", "B", "C", "D", "E");
         var (a, b, c, d, e) = (fixture[0], fixture[1], fixture[2], fixture[3], fixture[4]);
         // Each brief's model is in its definition's frontmatter (Define), none in the entries.
         fixture.Define("made-up-brief-1", "made-up-brief-2", "made-up-brief-3");
-        fixture.Write(a, List(Entry("made-up-brief-1", extra: Bypass)));
-        fixture.Write(b, List(Entry("made-up-brief-2", extra: Bypass)));
-        fixture.Write(c, List(Entry("made-up-brief-3")));
+        fixture.Write(a, List(Entry("made-up-brief-1", "0 9,18 * * *", Bypass)));
+        fixture.Write(b, List(Entry("made-up-brief-2", "0 9,18 * * *", Bypass)));
+        fixture.Write(c, List(Entry("made-up-brief-3", "0 9,18 * * *")));
         fixture.Write(d, List()); fixture.Write(e, List());
+        bool Raised(JsonObject entry) => entry.ContainsKey("permissionMode") || entry.ContainsKey("permissionModeCarried");
         var had = fixture.Accounts.ToDictionary(account => account.Key,
             account => fixture.Ids(account).Where(id => Raised(fixture.Task(account, id)!)).ToHashSet(StringComparer.Ordinal));
-        void NoNewRaised(string when) => Check(fixture.Accounts.All(account =>
+        void NoNewModes(string when) => Check(fixture.Accounts.All(account =>
                 fixture.Ids(account).Where(id => Raised(fixture.Task(account, id)!)).All(had[account.Key].Contains)),
-            "no account gets a task with a raised mode it did not have: " + when);
+            "no account gets a task with a mode it did not have: " + when);
         using var app = new FakeApp(fixture);
         app.After(TimeSpan.Zero, app.Loads(d));
         app.After(TimeSpan.FromSeconds(7));
-        NoNewRaised("after the starting point");
-        var seed = JsonNode.Parse(app.Ask(new("seed", ["made-up-brief-3"])) ?? "{}")!.AsObject();
-        Check(Status(seed) == "ok" && Are(Ids(seed["fill"]), "made-up-brief-3")
-              && Strings(seed["fill"]![0]!["into"]).Order(StringComparer.Ordinal).SequenceEqual(["A", "B", "D", "E"]) && Are(Strings(seed["waiting"]), "D"),
-            "seed --task fills that task alone into every account lacking it, the one the app shows waiting");
-        Check(new[] { a, b, e }.All(account => fixture.Task(account, "made-up-brief-3") is { } brief && !brief.ContainsKey("permissionMode")
-                  && !brief.ContainsKey("permissionModeCarried") && !brief.ContainsKey("model"))
-              && fixture.Ids(d).Length == 0 && Are(fixture.Ids(a), "made-up-brief-1", "made-up-brief-3") && Are(fixture.Ids(b), "made-up-brief-2", "made-up-brief-3"),
-            "with no permission field added, and nothing else filled");
-        NoNewRaised("after the seed");
-        var (aBefore, bBefore) = (fixture.Bytes(a), fixture.Bytes(b));
-        var removed = JsonNode.Parse(app.Ask(new("remove", ["made-up-brief-1", "made-up-brief-2"])) ?? "{}")!.AsObject();
-        Check(Status(removed) == "ok" && Are(Ids(removed["removed"]), "made-up-brief-1", "made-up-brief-2")
-              && Are(fixture.Ids(a), "made-up-brief-3") && Are(fixture.Ids(b), "made-up-brief-3"),
-            "remove clears the other two from the accounts that held them");
-        var sync = new ClaudeScheduledSync(fixture.Sessions, fixture.Store, fixture.Definitions, () => new MemoryStream());
-        Check(Directory.GetFiles(sync.BackupFolder(a.Key)).Any(path => File.ReadAllBytes(path).SequenceEqual(aBefore))
-              && Directory.GetFiles(sync.BackupFolder(b.Key)).Any(path => File.ReadAllBytes(path).SequenceEqual(bBefore)),
-            "keeping what they held");
-        app.After(TimeSpan.FromMinutes(11));
-        app.After(TimeSpan.FromSeconds(3));
+        NoNewModes("before anything is mirrored");
+        Check(fixture.Ids(e).Length == 0, "nothing is mirrored before a person chooses");
+        var request = Mirror("made-up-brief-3", c, "made-up-brief-1", "made-up-brief-2");
+        var plan = JsonNode.Parse(app.Ask(request) ?? "{}")!.AsObject();
+        Check(Status(plan) == "plan" && plan["raises"]!.GetValue<int>() == 0 && Action(plan, a) == "insert" && Action(plan, b) == "insert"
+              && Action(plan, d) == "insert" && Action(plan, e) == "insert" && Action(plan, c) == "source"
+              && Text(Target(plan, a)["removes"]![0]!["permission"]!["mode"]) == "bypassPermissions"
+              && Text(Target(plan, a)["removes"]![0]!["permission"]!["startsAs"]!["killSwitchOn"]) == "default",
+            "the plan fills four accounts with the chosen brief, replacing the two others, whose modes it shows");
+        var applied = JsonNode.Parse(app.Ask(request with { Apply = true, Expect = Token(plan) }) ?? "{}")!.AsObject();
+        Check(Status(applied) == "mirrored" && Are(fixture.Ids(a), "made-up-brief-3") && Are(fixture.Ids(b), "made-up-brief-3")
+              && Are(fixture.Ids(e), "made-up-brief-3") && fixture.Ids(d).Length == 0 && Text(applied["next"]) is not null,
+            "the apply writes the lists the app has not loaded, and says the loaded one comes later");
+        Check(new[] { a, b, e }.All(account => fixture.Task(account, "made-up-brief-3") is { } brief && !Raised(brief) && !brief.ContainsKey("model")),
+            "with no permission field and no model added");
+        NoNewModes("after the apply");
+        app.After(TimeSpan.Zero, app.Loads(e));
+        app.After(TimeSpan.FromSeconds(7));
+        Check(Are(fixture.Ids(d), "made-up-brief-3"), "the list the app showed gets it once the app leaves it");
         app.Runtime = new ClaudeDesktopRuntime(ClaudeDesktopRunState.Closed, null);
         app.After(TimeSpan.FromSeconds(2));
         app.After(TimeSpan.FromSeconds(6));
-        Check(fixture.Task(d, "made-up-brief-3") is { } shown && !shown.ContainsKey("permissionMode") && !shown.ContainsKey("permissionModeCarried")
-              && fixture.Accounts.All(account => Are(fixture.Ids(account), "made-up-brief-3")),
-            "the account the app showed gets the fill once it closes, and the removed two do not come back");
-        NoNewRaised("after the app closed");
         app.After(TimeSpan.FromMinutes(11));
-        Check(fixture.Accounts.All(account => Are(fixture.Ids(account), "made-up-brief-3")), "nor later");
+        Check(fixture.Accounts.All(account => Are(fixture.Ids(account), "made-up-brief-3")) && app.After(TimeSpan.FromSeconds(3)).Scheduled is null,
+            "every account holds the one brief, the two replaced do not come back, and nothing is reported");
+        NoNewModes("after the app closed");
     }
 
-    private static void TestServiceStopsOnUnreviewedVersion()
-    {
-        using var fixture = new Fixture("G", "H");
-        var (g, h) = (fixture[0], fixture[1]);
-        fixture.Define("brief");
-        fixture.Write(g, List()); fixture.Write(h, List());
-        using var app = new FakeApp(fixture) { Scheduled = ClaudeDesktopContract.Unreviewed };
-        app.Runtime = new ClaudeDesktopRuntime(ClaudeDesktopRunState.Closed, null);
-        app.After(TimeSpan.Zero);
-        app.After(TimeSpan.FromSeconds(6));
-        fixture.Write(h, List(Entry("brief")));
-        var status = app.After(TimeSpan.FromSeconds(3));
-        Check(status.Scheduled?.Kind == ClaudeScheduledProblemKind.Unreviewed && !File.Exists(fixture.StatePath)
-              && fixture.Ids(g).Length == 0 && ClaudeAccountPanel.ShelfFooter(status, null, DateTimeOffset.Now).Warning,
-            "an app version whose way of keeping the lists is not reviewed stops this feature alone, and says so in the status line");
-        app.Scheduled = ClaudeDesktopContract.Reviewed;
-        app.After(TimeSpan.FromMinutes(11));
-        Check(app.After(TimeSpan.FromSeconds(3)).Scheduled is null && File.Exists(fixture.StatePath),
-            "a reviewed version resumes it (with a new starting point)");
-    }
-
-    // P1-6: the probe reads every part of the app the alignment depends on, the nested schemas, the account hooks and
-    // the log lines included.
+    // D4: the probe reads every part of the app the mirror depends on, the nested schemas, the account hooks and the
+    // log lines included (the fixed points read by value are ClaudeScheduledProbeTests').
     private static void TestProbe()
     {
         var package = ClaudeDesktopProbe.FindPackage();
         var verdict = package is null ? (ClaudeDesktopContract?)null : ClaudeDesktopProbe.ScheduledContract(package.AsarPath);
-        // The version the alignment was reviewed against has to read as reviewed; another one may read either way.
+        // The version the mirror was reviewed against has to read as reviewed; another one may read either way.
         if (package?.Version == new Version(6, 28899, 6, 0))
             Check(verdict == ClaudeDesktopContract.Reviewed, $"6.28899.6.0 keeps its scheduled lists the reviewed way (read {verdict}: "
                 + string.Join(", ", ClaudeDesktopProbe.ScheduledUnmatched(File.ReadAllBytes(package.AsarPath))) + ")");
@@ -1358,10 +1120,11 @@ internal static class ClaudeScheduledTasksTests
         Check(ClaudeDesktopProbe.ScheduledContract(bundle) == ClaudeDesktopContract.Reviewed, "the copy reads as reviewed again once restored");
     }
 
-    /// <summary>The widget's service over a fake app: its run state, its log and the scheduled-list contract.</summary>
+    /// <summary>The widget's service over a fake app: its run state (running from the fixture's installation), its log
+    /// and the scheduled-list contract.</summary>
     private sealed class FakeApp : IDisposable
     {
-        private readonly string _log, _ledger;
+        private readonly string _log, _ledger, _image;
         private readonly DateTime _start;
         private DateTimeOffset _now;
         private readonly System.Windows.Forms.Control _owner;
@@ -1379,10 +1142,11 @@ internal static class ClaudeScheduledTasksTests
             var logs = Directory.CreateDirectory(Path.Combine(fixture.Root, "logs")).FullName;
             _log = Path.Combine(logs, "main.log");
             _ledger = fixture.Ledger;
+            _image = Path.Combine(fixture.Root, "app", "claude.exe");
             var start = DateTime.Now.AddHours(-1);
             _start = new DateTime(start.Year, start.Month, start.Day, start.Hour, start.Minute, start.Second);
             _now = new DateTimeOffset(_start).AddMinutes(1);
-            Runtime = new ClaudeDesktopRuntime(ClaudeDesktopRunState.Running, _start);
+            Runtime = Running();
             var package = new ClaudeDesktopPackage("Claude_9.9.9.9_x64__pzs8sxrjxfjjc", new Version(9, 9, 9, 9), fixture.Root, "Claude_pzs8sxrjxfjjc");
             var environment = new ClaudeShelfEnvironment(() => Runtime, () => package, _ => ClaudeDesktopContract.Reviewed, _ => { },
                 () => _now, _ => Scheduled);
@@ -1391,6 +1155,10 @@ internal static class ClaudeScheduledTasksTests
             _service = new ClaudeShelfService(_owner, () => [], fixture.Shelf(), environment, new ClaudeDesktopLogWatcher(logs), sources);
             _service.SetAccountsForTest(fixture.Accounts);
         }
+
+        /// <summary>The app running since this one's start, from the fixture's installation unless images are named.</summary>
+        internal ClaudeDesktopRuntime Running(IReadOnlyList<string>? images = null) =>
+            new(ClaudeDesktopRunState.Running, _start, images ?? [_image]);
 
         private string Line(string text) => _now.LocalDateTime.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + " [info] " + text;
 
@@ -1404,8 +1172,6 @@ internal static class ClaudeScheduledTasksTests
         /// <summary>The app coming to this account: a reset, then the load.</summary>
         internal string[] Loads(ClaudeShelfAccount account) => [Reset(), Initialized(account)];
 
-        internal void Register(params ClaudeShelfAccount[] accounts) => _service.SetAccountsForTest(accounts);
-
         internal ClaudeShelfStatus After(TimeSpan wait, params string[] lines)
         {
             File.AppendAllLines(_log, lines);
@@ -1417,7 +1183,7 @@ internal static class ClaudeScheduledTasksTests
         /// <summary>Asks the widget through its channel, as the commands do, while it runs a tick every (fake) second.</summary>
         internal string? Ask(ClaudeScheduledRequest request)
         {
-            var asking = Task.Run(() => ClaudeScheduledSeedChannel.Ask(_ledger, TimeSpan.FromSeconds(30), request));
+            var asking = Task.Run(() => ClaudeScheduledChannel.Ask(_ledger, TimeSpan.FromSeconds(30), request));
             for (var round = 0; round < 400 && !asking.IsCompleted; round++) { Thread.Sleep(25); After(TimeSpan.FromSeconds(1)); }
             return asking.Result;
         }
@@ -1435,8 +1201,8 @@ internal static class ClaudeScheduledTasksTests
         internal string Projects => Path.Combine(Root, "projects");
         internal string Ledger => Path.Combine(Root, "ledger");
         internal string Store => Path.Combine(Ledger, ClaudeScheduledSync.StoreFolder);
-        internal string StatePath => Path.Combine(Store, "state.json");
-        // Accounts of their own: a running widget listens on per-account names and must not hear a test.
+        internal string StatePath => Path.Combine(Store, ClaudeScheduledSync.StateFile);
+        // Accounts of their own: a running widget listens on names of its own ledger and must not hear a test.
         internal ClaudeShelfAccount[] Accounts { get; }
 
         internal Fixture(params string[] labels) : this(labels.Select(label =>
@@ -1448,6 +1214,7 @@ internal static class ClaudeScheduledTasksTests
             Accounts = accounts;
             foreach (var account in Accounts) Directory.CreateDirectory(FolderOf(account));
             Directory.CreateDirectory(Projects);
+            Directory.CreateDirectory(Definitions);
         }
 
         internal ClaudeShelfAccount this[int index] => Accounts[index];
@@ -1473,18 +1240,15 @@ internal static class ClaudeScheduledTasksTests
 
         internal void Undefine(string id) => Directory.Delete(Path.Combine(Definitions, id), recursive: true);
 
-        internal void Write(ClaudeShelfAccount account, JsonObject list, DateTimeOffset? at = null)
-        {
+        internal void Write(ClaudeShelfAccount account, JsonObject list) =>
             File.WriteAllText(PathOf(account), list.ToJsonString(new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
-            if (at is { } time) File.SetLastWriteTimeUtc(PathOf(account), time.UtcDateTime);
-        }
 
         /// <summary>Changes one entry of a list, as the app saves it.</summary>
-        internal void Edit(ClaudeShelfAccount account, string id, Action<JsonObject> change, DateTimeOffset? at = null)
+        internal void Edit(ClaudeShelfAccount account, string id, Action<JsonObject> change)
         {
             var list = Read(account);
             change(list["scheduledTasks"]!.AsArray().First(entry => entry!["id"]!.GetValue<string>() == id)!.AsObject());
-            Write(account, list, at);
+            Write(account, list);
         }
 
         internal byte[] Bytes(ClaudeShelfAccount account) => File.ReadAllBytes(PathOf(account));
@@ -1492,9 +1256,9 @@ internal static class ClaudeScheduledTasksTests
         internal string[] Ids(ClaudeShelfAccount account) => Read(account)["scheduledTasks"]!.AsArray().Select(entry => entry!["id"]!.GetValue<string>()).ToArray();
         internal JsonObject? Task(ClaudeShelfAccount account, string id) =>
             Read(account)["scheduledTasks"]!.AsArray().FirstOrDefault(entry => entry!["id"]!.GetValue<string>() == id)?.AsObject();
-        internal ClaudeScheduledSync Sync(Func<DateTimeOffset>? clock = null) => new(Sessions, Store, Definitions, () => new MemoryStream(), clock);
+        internal ClaudeScheduledSync Sync(bool readOnly = false) => new(Sessions, Store, Definitions, Definitions, () => new MemoryStream(), readOnly);
         internal ClaudeSessionShelf Shelf() => new(new ClaudeShelfPaths(Sessions, Projects, Path.Combine(Root, "scratch-workspaces"), [], Ledger,
-                ScheduledTasksRoot: Definitions),
+                ScheduledTasksRoot: Definitions, AppScheduledTasksRoot: Definitions),
             () => new ClaudeLiveSessionScan(new HashSet<string>(), false), () => new MemoryStream());
         public void Dispose() { try { Directory.Delete(Root, recursive: true); } catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { } }
     }

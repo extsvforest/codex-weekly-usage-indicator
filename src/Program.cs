@@ -15,13 +15,16 @@ internal static class Program
         // A read-only planning command for the claude-session-sync skill: no window, no single-instance claim.
         if (args.Length > 0 && args[0].Equals(ClaudeSessionSync.CommandFlag, StringComparison.OrdinalIgnoreCase))
             return ClaudeSessionSync.RunCommand(args[1..]);
-        // Read-only too: what aligning the accounts' scheduled tasks would do. A seed or a removal asks the running widget.
+        // Scheduled tasks: what the next mirror pass would do, and a mirror's or a removal's plan, are read-only; an apply
+        // (and stopping a mirror) asks the running widget.
         if (args.Length > 0 && args[0].Equals(ClaudeScheduledCommand.PlanFlag, StringComparison.OrdinalIgnoreCase))
             return ClaudeScheduledCommand.RunPlan();
-        if (args.Length > 0 && args[0].Equals(ClaudeScheduledCommand.SeedFlag, StringComparison.OrdinalIgnoreCase))
-            return ClaudeScheduledCommand.RunSeed(args[1..]);
+        if (args.Length > 0 && args[0].Equals(ClaudeScheduledCommand.MirrorFlag, StringComparison.OrdinalIgnoreCase))
+            return ClaudeScheduledCommand.Run("mirror", args[1..]);
+        if (args.Length > 0 && args[0].Equals(ClaudeScheduledCommand.UnmirrorFlag, StringComparison.OrdinalIgnoreCase))
+            return ClaudeScheduledCommand.Run("unmirror", args[1..]);
         if (args.Length > 0 && args[0].Equals(ClaudeScheduledCommand.RemoveFlag, StringComparison.OrdinalIgnoreCase))
-            return ClaudeScheduledCommand.RunRemove(args[1..]);
+            return ClaudeScheduledCommand.Run("remove", args[1..]);
         // Read-only as well: which Claude profile folder the widget uses, for checking a new PC.
         if (args.Length > 0 && args[0].Equals(ClaudeAppData.CommandFlag, StringComparison.OrdinalIgnoreCase))
             return ClaudeAppData.RunCommand();

@@ -13,9 +13,12 @@ internal sealed record ClaudeShelfAccount(string AccountUuid, string OrgUuid, st
     internal string Key => AccountUuid.ToLowerInvariant() + "/" + OrgUuid.ToLowerInvariant();
 }
 
+/// <param name="ScheduledTasksRoot">The scheduled tasks' definitions as this process finds them.</param>
+/// <param name="AppScheduledTasksRoot">Where the app, started by the user, keeps them: scheduled tasks are mirrored only
+/// while the two are one.</param>
 internal sealed record ClaudeShelfPaths(string SessionsRoot, string ProjectsRoot, string ScratchRoot,
     IReadOnlyList<string> RegistryDirectories, string LedgerDirectory, string? DesktopConfig = null,
-    string? ScheduledTasksRoot = null)
+    string? ScheduledTasksRoot = null, string? AppScheduledTasksRoot = null)
 {
     /// <summary>The lists, scratch folders and stores in the app's profile folder (<see cref="ClaudeAppData"/>, found
     /// now unless <paramref name="appRoot"/> names it).</summary>
@@ -38,9 +41,12 @@ internal sealed record ClaudeShelfPaths(string SessionsRoot, string ProjectsRoot
             // fail to open it and recreate it. Writes run only as a controlled step (see ClaudeLocalStorage).
             DesktopConfig: null,
             // The scheduled tasks' definitions, which every account shares (ClaudeScheduledSync only checks they are
-            // there), where the app keeps them.
+            // there): as this process finds them, and as the app does (the user's CLAUDE_CONFIG_DIR, which this process
+            // may have been started without, or with another).
             ScheduledTasksRoot: (claudeConfigDirectory ?? AppConfigDirectory()) is { } definitions
-                ? Path.Combine(definitions, "scheduled-tasks") : null);
+                ? Path.Combine(definitions, "scheduled-tasks") : null,
+            AppScheduledTasksRoot: claudeConfigDirectory is not null ? Path.Combine(claudeConfigDirectory, "scheduled-tasks")
+                : ClaudeScheduledSync.AppDefinitionsRoot());
     }
 
     /// <summary>The folder the app keeps its scheduled tasks' definitions under (6.28899): CLAUDE_CONFIG_DIR, where
