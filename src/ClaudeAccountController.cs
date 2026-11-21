@@ -35,6 +35,8 @@ internal sealed class ClaudeAccountController : IDisposable
     private readonly object _observationGate = new();
     private readonly Dictionary<string, SemaphoreSlim> _profileGates = new(StringComparer.Ordinal);
     private readonly SemaphoreSlim _readSlots = new(ReadConcurrency, ReadConcurrency);
+    // Locked on itself: the profiles holding a read slot now.
+    private readonly HashSet<string> _reading = new(StringComparer.Ordinal);
     private readonly HashSet<string> _linksChecked = new(StringComparer.Ordinal);
     private readonly CancellationTokenSource _lifetime = new();
     private readonly TimeProvider _timeProvider;
@@ -43,6 +45,9 @@ internal sealed class ClaudeAccountController : IDisposable
     private volatile bool _disposed;
     internal event EventHandler? SelectionChanged;
     internal event EventHandler<ClaudeUsageObservedEventArgs>? UsageChanged;
+    /// <summary>An account started or stopped being read: it took or gave back one of the
+    /// <see cref="ReadConcurrency"/> read slots. Raised on the thread that runs the read.</summary>
+    internal event EventHandler<ClaudeUsageObservedEventArgs>? ReadStateChanged;
     internal ClaudeProfile SelectedProfile => Store.SelectedProfile ?? Store.DefaultProfile;
     internal string SelectionKey => SelectedProfile.Id;
 
@@ -61,6 +66,19 @@ internal sealed class ClaudeAccountController : IDisposable
             return new ClaudeUsageClient(new ClaudeCodeUsageSource(runner, _timeProvider), _timeProvider,
                 _usageCache.For(key), key, ClaudeUsageRequestThrottle.Shared, accountKey);
         });
+    }
+
+    /// <summary>The account is being read now: it holds a read slot, not only a place in the queue.</summary>
+    internal bool IsReading(string profileId)
+    {
+        lock (_reading) return _reading.Contains(profileId);
+    }
+
+    private void SetReading(string profileId, bool reading)
+    {
+        lock (_reading)
+            if (reading ? !_reading.Add(profileId) : !_reading.Remove(profileId)) return;
+        if (!_disposed) ReadStateChanged?.Invoke(this, new ClaudeUsageObservedEventArgs(profileId));
     }
 
     internal ClaudeUsageResult? LastUsage(string profileId)
@@ -220,6 +238,7 @@ internal sealed class ClaudeAccountController : IDisposable
             RetireLinksOnce(profile);
             await _readSlots.WaitAsync(operation.Token);
             reading = true;
+            SetReading(profile.Id, true);
             var identity = await Runtime.VerifyAsync(profile, operation.Token, safeMode: true);
             if (profile.Identity is not null && profile.Identity.Key != identity.Key)
                 throw new ClaudeIdentityChangedException();
@@ -258,7 +277,11 @@ internal sealed class ClaudeAccountController : IDisposable
         catch (FileNotFoundException ex) { Forget(requestedProfile.Id, ex); throw; }
         finally
         {
-            if (reading) _readSlots.Release();
+            if (reading)
+            {
+                _readSlots.Release();
+                SetReading(requestedProfile.Id, false);
+            }
             if (entered) gate.Release();
         }
     }

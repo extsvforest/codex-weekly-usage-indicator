@@ -15,7 +15,7 @@ Codex + Claude Usage Indicator uses your installed official Codex and Claude Cod
 
 Claude profile metadata contains names, directory paths, selected profile, a hashed identity, masked account hint, subscription type and verification time. The official Claude CLI can store its own credentials and account-specific configuration inside each profile directory. **This application does not read, print, log, copy, persist or transmit Claude authentication tokens.**
 
-There is no usage timeline or per-person attribution. Saved Codex accounts retain their latest successful observation, and each Claude account keeps only its last one. The combined Codex observation set and per-profile Claude observations live in memory, separately from the widget's active-account polling.
+There is no usage timeline or per-person attribution. Saved Codex accounts retain their latest successful observation, and each Claude account keeps only its last one. The account manager makes no request when it opens or when you change tabs: it shows each account's last saved value with its check time, and asks the official clients only when you press a check. The combined Codex observation set and per-profile Claude observations live in memory, separately from the widget's active-account polling.
 
 The Windows startup task stores the local executable path and Windows user SID. It uses normal user privileges and no stored password.
 

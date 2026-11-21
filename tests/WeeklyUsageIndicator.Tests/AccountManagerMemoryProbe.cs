@@ -39,7 +39,7 @@ internal static class AccountManagerMemoryProbe
                 Report("start");
                 for (var cycle = 1; cycle <= cycles; cycle++)
                 {
-                    var form = new AccountManagerForm(store, () => Task.CompletedTask, () => { }, refreshAllOnOpen: false, claudeAccounts: claude);
+                    var form = new AccountManagerForm(store, () => Task.CompletedTask, () => { }, claudeAccounts: claude);
                     Report($"{cycle} made");
                     form.Show();
                     Pump(1500);

@@ -137,6 +137,8 @@ internal static class ClaudeControllerTests
             .Select(index => fixture.AddAccount("Account " + index, $"account{index}@example.test")).ToArray();
         fixture.SourceHold = new(TaskCreationOptions.RunContinuationsAsynchronously);
         var ended = new ConcurrentQueue<string>();
+        var readStates = new ConcurrentQueue<string>();
+        fixture.Controller.ReadStateChanged += (_, e) => readStates.Enqueue(e.ProfileId);
         var batch = fixture.Controller.ReadUsageManyAsync(null, CancellationToken.None,
             outcome => ended.Enqueue(outcome.ProfileId));
         await WaitUntilAsync(() => fixture.InFlight == ClaudeAccountController.ReadConcurrency, "three reads in flight");
@@ -144,8 +146,14 @@ internal static class ClaudeControllerTests
         Check(fixture.InFlight == 3 && fixture.SourceCalls == 3 && ended.IsEmpty
               && fixture.Started.First() == fixture.Store.SelectedProfileId,
             "three accounts are read at once, the selected one first, and the others wait for a free slot");
+        var everyId = fixture.Store.ListProfiles().Select(profile => profile.Id).ToArray();
+        Check(everyId.Count(fixture.Controller.IsReading) == 3 && fixture.Controller.IsReading(fixture.Store.SelectedProfileId!)
+              && readStates.Distinct().Count() == 3,
+            "only the accounts holding a read slot count as being read; the queued ones wait");
         fixture.SourceHold.SetResult();
         var outcomes = await batch.WaitAsync(TimeSpan.FromSeconds(10));
+        Check(!everyId.Any(fixture.Controller.IsReading) && readStates.Count == 10,
+            "every account reports when its read starts and ends");
         Check(outcomes.Count == 5 && outcomes.All(outcome => outcome.Failure is null && outcome.Result is { IsStale: false })
               && ended.Count == 5 && ended.Distinct().Count() == 5 && fixture.MaxInFlight == 3 && fixture.SourceCalls == 5,
             "each account is read once, never more than three at a time, and reports as soon as it ends");

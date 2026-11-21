@@ -44,14 +44,14 @@ internal static class ClaudeAccountMenuSmoke
                 AccountUiTheme.SetForm(form);
                 // Never started: no real Desktop observation or fill runs inside this fixture.
                 using var shelf = new ClaudeShelfService(form, () => store.ListProfiles());
-                using var panel = new ClaudeAccountPanel(controller, shelf) { Dock = DockStyle.Fill };
+                using var panel = new ClaudeAccountPanel(controller, shelf, Path.Combine(root, "lease")) { Dock = DockStyle.Fill };
                 form.Controls.Add(panel); form.Show(); Application.DoEvents();
 
                 ContextMenuStrip OpenMenu(string id)
                 {
                     Find<Button>(panel, "ClaudeMore-" + id).PerformClick();
                     var menu = (ContextMenuStrip)typeof(ClaudeAccountPanel)
-                        .GetField("_profileMenu", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(panel)!;
+                        .GetField("_menu", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(panel)!;
                     Check(menu.Visible, "the real account overflow menu opens");
                     return menu;
                 }
@@ -66,7 +66,7 @@ internal static class ClaudeAccountMenuSmoke
                 {
                     var label = live ? profile.Label : profile.Label + " renamed";
                     var menu = OpenMenu(profile.Id);
-                    var rename = menu.Items.Cast<ToolStripItem>().Single(item => item.Text == UiText.T("이름 변경"));
+                    var rename = menu.Items.Cast<ToolStripItem>().Single(item => item.Name == "ClaudeRenameMenuItem");
                     menu.Close(ToolStripDropDownCloseReason.ItemClicked);
                     RespondToDialog(rename.PerformClick, dialog =>
                     {
@@ -83,7 +83,7 @@ internal static class ClaudeAccountMenuSmoke
                 {
                     var unchanged = store.ListProfiles().Single(p => p.Id == main.Id);
                     var menu = OpenMenu(main.Id);
-                    var rename = menu.Items.Cast<ToolStripItem>().Single(item => item.Text == UiText.T("이름 변경"));
+                    var rename = menu.Items.Cast<ToolStripItem>().Single(item => item.Name == "ClaudeRenameMenuItem");
                     menu.Close(ToolStripDropDownCloseReason.ItemClicked);
                     RespondToDialog(rename.PerformClick, dialog =>
                     {
@@ -94,7 +94,7 @@ internal static class ClaudeAccountMenuSmoke
                     using (File.Open(Path.Combine(store.RootPath, "profiles.json"), FileMode.Open, FileAccess.Read, FileShare.Read))
                     {
                         menu = OpenMenu(main.Id);
-                        rename = menu.Items.Cast<ToolStripItem>().Single(item => item.Text == UiText.T("이름 변경"));
+                        rename = menu.Items.Cast<ToolStripItem>().Single(item => item.Name == "ClaudeRenameMenuItem");
                         menu.Close(ToolStripDropDownCloseReason.ItemClicked);
                         RespondToDialog(rename.PerformClick, dialog =>
                         {
@@ -107,7 +107,7 @@ internal static class ClaudeAccountMenuSmoke
                 }
 
                 var queryMenu = OpenMenu(second.Id);
-                var query = queryMenu.Items.Cast<ToolStripItem>().Single(item => item.Text == UiText.T("사용량 갱신"));
+                var query = queryMenu.Items.Cast<ToolStripItem>().Single(item => item.Name == "ClaudeReadMenuItem");
                 queryMenu.Close(ToolStripDropDownCloseReason.ItemClicked); query.PerformClick();
                 var deadline = DateTime.UtcNow.AddSeconds(35);
                 while (panel.IsBusy && DateTime.UtcNow < deadline) { Application.DoEvents(); Thread.Sleep(15); }
@@ -133,11 +133,11 @@ internal static class ClaudeAccountMenuSmoke
                     Check(all.IsCompletedSuccessfully && !panel.IsBusy, "the refresh of every account completes");
                     Check(sourceCalls.SequenceEqual(new[] { main.Id }), "an account checked within ten minutes reuses its observation");
                     Check(Find<Label>(panel, "ClaudeSelectedWeeklyRemainingLabel").Text == "128%"
-                          && Find<Label>(panel, "ClaudeSelectedProfileLabel").Text == UiText.F($"{2}개 계정 합계"),
+                          && Find<Label>(panel, "ClaudeSelectedCapacityLabel").Text == "/ 200%" && Find<Label>(panel, "ClaudeSelectedProfileLabel").Text.Length == 0,
                         "the summary totals both accounts' weekly balance");
-                    var oldest = new[] { main, second }.Min(profile => controller.LastUsage(profile.Id)!.LastUpdatedAt);
-                    Check(panel.CheckedAtText == AccountUsageText.LastUpdated(oldest, DateTimeOffset.Now),
-                        "a complete total shows when its oldest observation was made");
+                    var latest = new[] { main, second }.Max(profile => controller.LastUsage(profile.Id)!.LastUpdatedAt);
+                    Check(panel.CheckedAtText == AccountUsageText.CheckedOn(latest, AccountUsageText.Now),
+                        "the page shows when it was last read");
                     TestNoReference(root, store, controller, second);
                 }
                 shelf.SetStatusForTest(ClaudeShelfStatus.Initial with
@@ -191,11 +191,11 @@ internal static class ClaudeAccountMenuSmoke
         using var shelf = new ClaudeShelfService(form, () => store.ListProfiles(), new ClaudeSessionShelf(paths));
         const string account = "4a4a4a4a-0000-4000-8000-00000000004a", org = "4b4b4b4b-0000-4000-8000-00000000004b";
         shelf.SetAccountsForTest([new ClaudeShelfAccount(account, org, second.Label, second.Id)]);
-        using var panel = new ClaudeAccountPanel(controller, shelf) { Dock = DockStyle.Fill };
+        using var panel = new ClaudeAccountPanel(controller, shelf, Path.Combine(root, "lease")) { Dock = DockStyle.Fill };
         form.Controls.Add(panel); form.Show(); Application.DoEvents();
         Find<Button>(panel, "ClaudeMore-" + second.Id).PerformClick();
         var menu = (ContextMenuStrip)typeof(ClaudeAccountPanel)
-            .GetField("_profileMenu", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(panel)!;
+            .GetField("_menu", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(panel)!;
         Check(menu.Items.Count > 0 && menu.Items.Cast<ToolStripItem>().All(entry => entry.Name?.StartsWith("ClaudeSessionReference-", StringComparison.Ordinal) != true),
             "the row menu has no reference to choose");
         menu.Close(ToolStripDropDownCloseReason.ItemClicked); Application.DoEvents();

@@ -26,7 +26,7 @@ internal static class LiveAccountUsageSmoke
                 var original = File.ReadAllBytes(authPath);
                 var startedAt = DateTimeOffset.UtcNow;
                 var suspendCount = 0;
-                using var form = new AccountManagerForm(store, () => { suspendCount++; return Task.CompletedTask; }, () => suspendCount++, refreshAllOnOpen: false);
+                using var form = new AccountManagerForm(store, () => { suspendCount++; return Task.CompletedTask; }, () => suspendCount++);
                 form.Shown += async (_, _) =>
                 {
                     try
@@ -41,7 +41,7 @@ internal static class LiveAccountUsageSmoke
                         var queried = after.Single(a => a.Id == target[0].Id);
                         if (queried.Usage is null || queried.ObservedAt < startedAt || queried.ObservedAt is null)
                             throw new InvalidOperationException("Live query did not produce a new observation. " +
-                                ((Label)form.Controls.Find("StatusLabel", true).Single()).Text);
+                                form.StatusText);
                         if (!File.ReadAllBytes(authPath).SequenceEqual(original) || suspendCount != 0 ||
                             after.Single(a => a.IsActive).Id != before.Single(a => a.IsActive).Id ||
                             after.Single(a => a.IsActive).Usage != before.Single(a => a.IsActive).Usage ||

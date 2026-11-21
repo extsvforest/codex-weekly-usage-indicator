@@ -1,3 +1,7 @@
+using System.Drawing.Drawing2D;
+using System.Globalization;
+using System.Runtime.InteropServices;
+
 namespace WeeklyUsageIndicator;
 
 /// <summary>The widget's size as the user chose it, in percent of the 272 × 64 design. It does not follow the display's
@@ -27,20 +31,25 @@ internal static class WidgetScale
     }
 }
 
-/// <summary>Sets the widget's size in 1 % steps. Every valid value shows on the widget at once; OK keeps it, and Cancel,
-/// Escape or closing the window puts back the size it had when the window opened.</summary>
+/// <summary>Sets the widget's size in 1 % steps (design screen F): − and + either side of the number, and under them a
+/// slider from 50 % to 200 % marked at 100 %, with the widget's size in pixels over it. Every valid value shows on the
+/// widget at once; OK keeps it, and Cancel, Escape or closing the window puts back the size it had when the window
+/// opened.</summary>
 internal sealed class WidgetScaleDialog : Form
 {
     private readonly TextBox _input = new()
     {
-        Name = "WidgetScaleInput", Dock = DockStyle.Fill, MaxLength = 3, TextAlign = HorizontalAlignment.Right
+        Name = "WidgetScaleInput", MaxLength = 3, TextAlign = HorizontalAlignment.Right, BorderStyle = BorderStyle.None
     };
-    private readonly Label _error = AccountUiTheme.Label("", color: AccountUiTheme.Error);
+    private readonly AccountText _error = new(11.5f, AccountWeight.SemiBold, AccountUiTheme.ErrorInk) { Name = "WidgetScaleError" };
+    private readonly Slider _slider = new() { Name = "WidgetScaleSlider" };
+    private readonly Sheet _sheet;
     private readonly Action<int> _apply;
     private readonly Action<int> _keep;
     private readonly int _original;
     private bool _kept;
     private bool _writing;
+    private bool _fresh;
 
     /// <summary>The size shown on the widget now.</summary>
     internal int Percent { get; private set; }
@@ -56,91 +65,74 @@ internal sealed class WidgetScaleDialog : Form
         StartPosition = FormStartPosition.Manual;
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MinimizeBox = false; MaximizeBox = false; ShowInTaskbar = false; TopMost = true;
-        ClientSize = new Size(440, 286);
-        var stack = AccountUiTheme.Stack(5);
-        stack.Padding = new Padding(28, 24, 28, 24);
-        stack.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
-        stack.RowStyles.Add(new RowStyle(SizeType.Absolute, 50));
-        stack.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
-        stack.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        stack.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
-        stack.Controls.Add(AccountUiTheme.Label(Text, 17, true), 0, 0);
-        var description = AccountUiTheme.Label(UiText.T("1% 단위로 맞춥니다. 100%가 처음 크기입니다.\n바꾸는 대로 위젯에 바로 보입니다."),
-            color: AccountUiTheme.Muted);
-        description.Dock = DockStyle.Fill; description.AutoSize = false;
-        stack.Controls.Add(description, 0, 1);
+        ClientSize = new Size(368, (int)Math.Ceiling(Sheet.LogicalHeight));
 
-        var row = new FlowLayoutPanel
-        {
-            Dock = DockStyle.Fill, FlowDirection = FlowDirection.LeftToRight, WrapContents = false, Margin = new Padding(0),
-            BackColor = Color.Transparent
-        };
-        var smaller = Step("WidgetScaleSmaller", "−", UiText.T("1% 작게"), -1);
-        var larger = Step("WidgetScaleLarger", "+", UiText.T("1% 크게"), +1);
+        var smaller = new StepButton("WidgetScaleSmaller", AccountIcon.Minus, UiText.T("1% 작게"));
+        var larger = new StepButton("WidgetScaleLarger", AccountIcon.Plus, UiText.T("1% 크게"));
+        smaller.Click += (_, _) => StepBy(-1);
+        larger.Click += (_, _) => StepBy(+1);
+
         _input.AccessibleName = UiText.T("위젯 크기(%)");
-        _input.BackColor = AccountUiTheme.Raised; _input.ForeColor = AccountUiTheme.Text;
-        _input.Text = current.ToString(System.Globalization.CultureInfo.InvariantCulture);
-        _input.KeyPress += (_, e) => { if (!char.IsControl(e.KeyChar) && !char.IsAsciiDigit(e.KeyChar)) e.Handled = true; };
+        _input.Font = AccountUiTheme.Type(22, AccountWeight.Bold);
+        _input.BackColor = AccountUiTheme.Surface; _input.ForeColor = AccountUiTheme.Ink1;
+        _input.Text = current.ToString(CultureInfo.InvariantCulture);
+        // The box opens without a selection (design screen F). The first click into it takes the whole number, and so
+        // does the first digit typed before anything else, so a new number replaces it.
+        _input.Enter += (_, _) => _fresh = true;
+        _input.MouseUp += (_, _) => { if (_fresh && _input.SelectionLength == 0) _input.SelectAll(); _fresh = false; };
+        _input.KeyPress += (_, e) =>
+        {
+            if (!char.IsControl(e.KeyChar) && !char.IsAsciiDigit(e.KeyChar)) { e.Handled = true; return; }
+            if (_fresh && char.IsAsciiDigit(e.KeyChar) && _input.SelectionLength == 0) _input.SelectAll();
+            _fresh = false;
+        };
         _input.KeyDown += (_, e) =>
         {
+            if (e.KeyCode is Keys.Left or Keys.Right or Keys.Home or Keys.End or Keys.Delete) _fresh = false;
             if (e.KeyCode is not (Keys.Up or Keys.Down)) return;
             e.Handled = true; e.SuppressKeyPress = true;
             StepBy(e.KeyCode == Keys.Up ? 1 : -1);
         };
-        _input.TextChanged += (_, _) => { if (!_writing) Typed(); };
-        var frame = new AccountInputFrame(_input) { Dock = DockStyle.None, Size = new Size(74, 38), Margin = new Padding(8, 0, 4, 0) };
-        var unit = AccountUiTheme.Label("%", 11, true);
-        unit.AutoSize = false; unit.Size = new Size(22, 38); unit.TextAlign = ContentAlignment.MiddleLeft;
-        unit.Margin = new Padding(0, 0, 4, 0);
-        var reset = AccountUiTheme.Button("WidgetScaleReset", UiText.T("100%로"));
-        reset.Margin = new Padding(16, 0, 0, 0);
-        reset.Click += (_, _) => Set(WidgetScale.Default);
-        row.Controls.AddRange([smaller, frame, unit, larger, reset]);
-        stack.Controls.Add(row, 0, 2);
+        _input.TextChanged += (_, _) => { if (!_writing) Typed(); _sheet?.Follow(); };
+        _input.HandleCreated += (_, _) => Tighten();
+        _input.FontChanged += (_, _) => Tighten();
+        _error.TextChanged += (_, _) => _sheet?.Invalidate();
 
-        _error.Name = "WidgetScaleError";
-        _error.Dock = DockStyle.Fill;
-        _error.Margin = new Padding(0, 6, 0, 0);
-        stack.Controls.Add(_error, 0, 3);
-        var actions = new FlowLayoutPanel
-        {
-            Dock = DockStyle.Fill, FlowDirection = FlowDirection.RightToLeft, WrapContents = false, Margin = new Padding(0)
-        };
-        var ok = AccountUiTheme.Button("WidgetScaleOk", UiText.T("확인"), true);
-        var cancel = AccountUiTheme.Button("WidgetScaleCancel", UiText.T("취소"));
-        cancel.Margin = new Padding(0, 0, 10, 0);
+        _slider.AccessibleName = UiText.T("위젯 크기");
+        _slider.Value = current;
+        _slider.Moved += Set;
+
+        var reset = AccountUiTheme.Action("WidgetScaleReset", UiText.T("100%로"), AccountButtonKind.Ghost);
+        reset.LeadPadding = 4;
+        reset.Click += (_, _) => Set(WidgetScale.Default);
+        var cancel = AccountUiTheme.Action("WidgetScaleCancel", UiText.T("취소"), AccountButtonKind.Secondary, compact: true);
+        var ok = AccountUiTheme.Action("WidgetScaleOk", UiText.T("확인"), AccountButtonKind.Primary, compact: true);
+        cancel.MinLogicalWidth = ok.MinLogicalWidth = 62;
         // The window is modeless, where a button's DialogResult does not close it.
         cancel.Click += (_, _) => { DialogResult = DialogResult.Cancel; Close(); };
         ok.Click += (_, _) => Keep();
-        actions.Controls.Add(ok); actions.Controls.Add(cancel);
-        stack.Controls.Add(actions, 0, 4);
-        Controls.Add(stack);
+
+        _sheet = new Sheet(this, smaller, larger, new AccountDialogFooter(reset, cancel, ok), UiText.T("값을 바꾸면 작업 표시줄의 위젯에 바로 반영됩니다."))
+        {
+            Dock = DockStyle.Fill
+        };
+        Controls.Add(_sheet);
         AcceptButton = ok; CancelButton = cancel;
-        Shown += (_, _) => { _input.Focus(); _input.SelectAll(); };
+        Shown += (_, _) => { _input.Focus(); _input.Select(_input.TextLength, 0); };
         // Whatever closes the window without OK, the widget goes back to the size it had.
         FormClosed += (_, _) => { if (!_kept && Percent != _original) _apply(_original); };
         ResumeLayout(true);
     }
 
-    private Button Step(string name, string text, string accessibleName, int step)
-    {
-        var button = AccountUiTheme.Button(name, text);
-        button.MinimumSize = new Size(44, 38);
-        button.AccessibleName = accessibleName;
-        button.Font = AccountFonts.Create(12f, semibold: true);
-        button.Click += (_, _) => StepBy(step);
-        return button;
-    }
-
     /// <summary>One step from the size shown now; at the ends of the range it stays.</summary>
     internal void StepBy(int step) => Set(Math.Clamp(Percent + step, WidgetScale.Minimum, WidgetScale.Maximum));
 
-    /// <summary>Shows a size on the widget and in the box.</summary>
+    /// <summary>Shows a size on the widget, in the box and on the slider.</summary>
     internal void Set(int scale)
     {
         if (!WidgetScale.IsValid(scale)) throw new ArgumentOutOfRangeException(nameof(scale));
         _writing = true;
-        try { _input.Text = scale.ToString(System.Globalization.CultureInfo.InvariantCulture); }
+        try { _input.Text = scale.ToString(CultureInfo.InvariantCulture); }
         finally { _writing = false; }
         _input.SelectionStart = _input.TextLength;
         _error.Text = "";
@@ -154,13 +146,15 @@ internal sealed class WidgetScaleDialog : Form
         if (Parse() is { } scale) Preview(scale);
     }
 
-    private int? Parse() => int.TryParse(_input.Text.Trim(), System.Globalization.NumberStyles.None,
-        System.Globalization.CultureInfo.InvariantCulture, out var scale) && WidgetScale.IsValid(scale) ? scale : null;
+    private int? Parse() => int.TryParse(_input.Text.Trim(), NumberStyles.None, CultureInfo.InvariantCulture, out var scale)
+        && WidgetScale.IsValid(scale) ? scale : null;
 
     private void Preview(int scale)
     {
+        _slider.Value = scale;
         if (scale == Percent) return;
         Percent = scale;
+        _sheet.Invalidate();
         _apply(scale);
     }
 
@@ -179,5 +173,306 @@ internal sealed class WidgetScaleDialog : Form
         DialogResult = DialogResult.OK;
         Close();
         return true;
+    }
+
+    // The box's own margins would push the number off the centre the window measures for it; 2 px stay on the right for
+    // the caret.
+    private void Tighten()
+    {
+        if (!_input.IsHandleCreated) return;
+        SendMessage(_input.Handle, EmSetMargins, (IntPtr)(EcLeftMargin | EcRightMargin), (IntPtr)(Sheet.CaretRoom(_input) << 16));
+        _sheet?.Follow();
+    }
+
+    private const int EmSetMargins = 0xD3, EcLeftMargin = 1, EcRightMargin = 2;
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr SendMessage(IntPtr window, int message, IntPtr wParam, IntPtr lParam);
+
+    /// <summary>The window's face (CSS .f-dialog-body, padding 16 22 18): the 17px title, 3px, the 12px line; 16px; the
+    /// 46px row of −, the number and +; 14px; the size in pixels, 8px, the slider, 7px, its marks; the foot.</summary>
+    private sealed class Sheet : Control
+    {
+        private const float Side = 22, TitleTop = 16, Title = 24, SubTop = TitleTop + Title + 3, Sub = 17, RowTop = SubTop + Sub + 16,
+            Row = 46, MetaTop = RowTop + Row + 14, Meta = 16, TrackTop = MetaTop + Meta + 8, Track = 4, TicksTop = TrackTop + Track + 7,
+            Ticks = 15, FooterTop = TicksTop + Ticks;
+        internal const float LogicalHeight = FooterTop + AccountDialogFooter.LogicalHeight + 18;
+
+        private readonly WidgetScaleDialog _owner;
+        private readonly StepButton _smaller, _larger;
+        private readonly AccountDialogFooter _footer;
+        private readonly string _about;
+
+        internal Sheet(WidgetScaleDialog owner, StepButton smaller, StepButton larger, AccountDialogFooter footer, string about)
+        {
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer
+                | ControlStyles.ResizeRedraw, true);
+            Name = "WidgetScaleSheet"; BackColor = AccountUiTheme.Canvas; TabStop = false;
+            _owner = owner; _smaller = smaller; _larger = larger; _footer = footer; _about = about;
+            Controls.AddRange(new Control[] { smaller, owner._input, larger, owner._slider, owner._error, footer });
+        }
+
+        internal static int CaretRoom(Control control) => Math.Max(1, AccountUiTheme.Px(control, 2));
+
+        private static Font ValueFont => AccountUiTheme.Type(22, AccountWeight.Bold);
+        private static Font UnitFont => AccountUiTheme.Type(14, AccountWeight.SemiBold);
+        private static Font MetaFont => AccountUiTheme.Type(11.5f, AccountWeight.SemiBold);
+        private int Y(float logical) => (int)Math.Round(logical * DeviceDpi / 96f);
+        private Rectangle Content => new(Y(Side), 0, Math.Max(0, Width - 2 * Y(Side)), Height);
+
+        /// <summary>The number's box (CSS .step-input): between − and +, 8px from each.</summary>
+        private Rectangle Field
+        {
+            get
+            {
+                var content = Content; var left = content.Left + Y(Row + 8);
+                return new Rectangle(left, Y(RowTop), Math.Max(0, content.Right - Y(Row + 8) - left), Y(Row));
+            }
+        }
+
+        private string SizeText
+        {
+            get
+            {
+                var size = WidgetFace.SizeAt(_owner.Percent);
+                return string.Create(CultureInfo.InvariantCulture, $"{size.Width} × {size.Height} px");
+            }
+        }
+
+        /// <summary>The number and its % centred together in the box, 3px apart: where the number ends and the % begins.</summary>
+        private (int ValueRight, int UnitLeft) Number()
+        {
+            var field = Field;
+            var value = Math.Max(Y(2), AccountUiTheme.Measure(_owner._input.Text, ValueFont).Width);
+            var unit = AccountUiTheme.Measure("%", UnitFont).Width;
+            var left = field.Left + (field.Width - (value + Y(3) + unit)) / 2;
+            return (left + value, left + value + Y(3));
+        }
+
+        /// <summary>The number changed: its % moves with it.</summary>
+        internal void Follow() { PerformLayout(); Invalidate(); }
+
+        protected override void OnLayout(LayoutEventArgs e)
+        {
+            base.OnLayout(e);
+            var content = Content;
+            AccountUiTheme.Place(_smaller, content.Left, Y(RowTop), Y(Row), Y(Row));
+            AccountUiTheme.Place(_larger, content.Right - Y(Row), Y(RowTop), Y(Row), Y(Row));
+            // The number sits right-aligned in its box, which ends where the centred group puts the number's end.
+            var field = Field; var input = _owner._input; var height = input.PreferredHeight;
+            var left = field.Left + Y(10); var right = Number().ValueRight + CaretRoom(this);
+            AccountUiTheme.Place(input, left, field.Top + (field.Height - height) / 2, Math.Max(1, right - left), height);
+            var inset = Y(Slider.Inset);
+            AccountUiTheme.Place(_owner._slider, content.Left - inset, Y(TrackTop + Track / 2) - inset, content.Width + 2 * inset, 2 * inset);
+            var meta = AccountUiTheme.Measure(SizeText, MetaFont).Width;
+            AccountUiTheme.PlaceLine(_owner._error, content.Left, Y(MetaTop), Y(Meta), Math.Max(0, content.Width - meta - Y(12)));
+            AccountUiTheme.Place(_footer, content.Left, Y(FooterTop), content.Width, (int)Math.Round(AccountDialogFooter.LogicalHeight * DeviceDpi / 96f));
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            var g = e.Graphics; var s = DeviceDpi / 96f; var content = Content;
+            const TextFormatFlags line = AccountUiTheme.Flat | TextFormatFlags.VerticalCenter;
+            TextRenderer.DrawText(g, _owner.Text, AccountUiTheme.Type(17, AccountWeight.Bold),
+                new Rectangle(content.Left, Y(TitleTop), content.Width, Y(Title)), AccountUiTheme.Ink1, line | TextFormatFlags.EndEllipsis);
+            TextRenderer.DrawText(g, _about, AccountUiTheme.Type(12),
+                new Rectangle(content.Left, Y(SubTop), content.Width, Y(Sub)), AccountUiTheme.Ink3, line | TextFormatFlags.EndEllipsis);
+
+            // The number's box takes the action colour, or the error's while the typed number is not a size.
+            var field = Field;
+            AccountUiTheme.FillBox(g, field, 9 * s, AccountUiTheme.Surface,
+                _owner._error.Text.Length > 0 ? AccountUiTheme.ErrorInk : AccountUiTheme.ActionBackground, s, 1.5f);
+            // CSS .step-unit: 14px, 3px lower than the number's middle.
+            var unit = UnitFont; var unitHeight = unit.Height; var unitTop = field.Top + field.Height / 2f + 1.5f * s - unitHeight / 2f;
+            TextRenderer.DrawText(g, "%", unit, new Rectangle(Number().UnitLeft, (int)Math.Round(unitTop), AccountUiTheme.Measure("%", unit).Width + Y(2), unitHeight),
+                AccountUiTheme.Ink3, AccountUiTheme.Flat);
+
+            TextRenderer.DrawText(g, SizeText, MetaFont, new Rectangle(content.Left, Y(MetaTop), content.Width, Y(Meta)), AccountUiTheme.Ink2,
+                line | TextFormatFlags.Right);
+            var ticks = new Rectangle(content.Left, Y(TicksTop), content.Width, Y(Ticks));
+            var tick = AccountUiTheme.Type(11);
+            TextRenderer.DrawText(g, Mark(WidgetScale.Minimum), tick, ticks, AccountUiTheme.Ink4, line);
+            TextRenderer.DrawText(g, Mark(WidgetScale.Maximum), tick, ticks, AccountUiTheme.Ink4, line | TextFormatFlags.Right);
+            var middle = Mark(WidgetScale.Default); var strong = AccountUiTheme.Type(11, AccountWeight.SemiBold);
+            var width = AccountUiTheme.Measure(middle, strong).Width;
+            var x = content.Left + content.Width * Slider.Fraction(WidgetScale.Default);
+            TextRenderer.DrawText(g, middle, strong, new Rectangle((int)Math.Round(x - width / 2f), ticks.Top, width + 1, ticks.Height), AccountUiTheme.Ink3, line);
+        }
+
+        private static string Mark(int scale) => scale.ToString(CultureInfo.InvariantCulture) + "%";
+
+        // The box is wider than the number in it: a press anywhere in it goes to the number.
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            base.OnMouseDown(e);
+            if (e.Button != MouseButtons.Left || !Field.Contains(e.Location)) return;
+            _owner._input.Focus(); _owner._input.SelectionStart = _owner._input.TextLength;
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            base.OnMouseMove(e);
+            Cursor = Field.Contains(e.Location) ? Cursors.IBeam : Cursors.Default;
+        }
+    }
+
+    /// <summary>The slider under the number (CSS .slider-track): a 4px track filled up to a 16px thumb, with a mark at
+    /// 100 %. It moves in 1 % steps by pointer and arrow keys, 10 % by Page Up and Page Down, and to the ends by Home and
+    /// End.</summary>
+    private sealed class Slider : Control
+    {
+        /// <summary>Room around the track for the thumb, its shadow and its focus ring.</summary>
+        internal const float Inset = 12;
+        private int _value = WidgetScale.Default;
+        private bool _dragging;
+
+        /// <summary>The user moved it to this size.</summary>
+        internal event Action<int>? Moved;
+
+        internal Slider()
+        {
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer
+                | ControlStyles.SupportsTransparentBackColor | ControlStyles.ResizeRedraw | ControlStyles.Selectable, true);
+            BackColor = Color.Transparent; TabStop = true; Cursor = Cursors.Hand; AccessibleRole = AccessibleRole.Slider;
+        }
+
+        internal static float Fraction(int scale) => (scale - WidgetScale.Minimum) / (float)(WidgetScale.Maximum - WidgetScale.Minimum);
+
+        internal int Value
+        {
+            get => _value;
+            set
+            {
+                var scale = Math.Clamp(value, WidgetScale.Minimum, WidgetScale.Maximum);
+                if (scale == _value) return;
+                _value = scale; Invalidate();
+                AccessibilityNotifyClients(AccessibleEvents.ValueChange, -1);
+            }
+        }
+
+        private RectangleF Track
+        {
+            get
+            {
+                var s = DeviceDpi / 96f; var inset = Inset * s;
+                return new RectangleF(inset, Height / 2f - 2 * s, Math.Max(0, Width - 2 * inset), 4 * s);
+            }
+        }
+
+        private void MoveTo(int scale)
+        {
+            scale = Math.Clamp(scale, WidgetScale.Minimum, WidgetScale.Maximum);
+            if (scale == _value) return;
+            Value = scale;
+            Moved?.Invoke(scale);
+        }
+
+        private int At(int x)
+        {
+            var track = Track;
+            if (track.Width <= 0) return _value;
+            var along = Math.Clamp((x - track.Left) / track.Width, 0f, 1f);
+            return WidgetScale.Minimum + (int)Math.Round(along * (WidgetScale.Maximum - WidgetScale.Minimum));
+        }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            base.OnMouseDown(e);
+            if (e.Button != MouseButtons.Left) return;
+            Focus(); Capture = true; _dragging = true;
+            MoveTo(At(e.X));
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e) { base.OnMouseMove(e); if (_dragging) MoveTo(At(e.X)); }
+        protected override void OnMouseUp(MouseEventArgs e) { base.OnMouseUp(e); _dragging = false; Capture = false; }
+        protected override void OnMouseCaptureChanged(EventArgs e) { base.OnMouseCaptureChanged(e); if (!Capture) _dragging = false; }
+
+        protected override bool IsInputKey(Keys keyData) => (keyData & Keys.KeyCode) is Keys.Left or Keys.Right or Keys.Up or Keys.Down
+            or Keys.Home or Keys.End or Keys.PageUp or Keys.PageDown || base.IsInputKey(keyData);
+
+        protected override void OnKeyDown(KeyEventArgs e)
+        {
+            base.OnKeyDown(e);
+            int? to = e.KeyCode switch
+            {
+                Keys.Left or Keys.Down => _value - 1,
+                Keys.Right or Keys.Up => _value + 1,
+                Keys.PageDown => _value - 10,
+                Keys.PageUp => _value + 10,
+                Keys.Home => WidgetScale.Minimum,
+                Keys.End => WidgetScale.Maximum,
+                _ => null
+            };
+            if (to is not { } scale) return;
+            e.Handled = true;
+            MoveTo(scale);
+        }
+
+        protected override void OnGotFocus(EventArgs e) { base.OnGotFocus(e); Invalidate(); }
+        protected override void OnLostFocus(EventArgs e) { base.OnLostFocus(e); _dragging = false; Invalidate(); }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            var g = e.Graphics; var s = DeviceDpi / 96f; var track = Track;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            AccountUiTheme.FillBox(g, track, 2 * s, AccountUiTheme.SliderTrack, null, s);
+            var x = track.Left + track.Width * Fraction(_value);
+            if (x - track.Left >= 1) AccountUiTheme.FillBox(g, track with { Width = x - track.Left }, 2 * s, AccountUiTheme.ActionBackground, null, s);
+            // The mark at 100 %: 1.5 × 10, 3px over the track and 3px under it.
+            var mark = track.Left + track.Width * Fraction(WidgetScale.Default);
+            AccountUiTheme.FillBox(g, new RectangleF(mark - .75f * s, track.Top - 3 * s, 1.5f * s, 10 * s), .75f * s, AccountUiTheme.Ink4, null, s);
+            // The thumb (CSS 16px, surface, 2px action edge, shadow 0 1px 3px at 16 %).
+            var radius = 8 * s; var middle = track.Top + track.Height / 2f;
+            using (var far = new SolidBrush(Color.FromArgb(14, 0, 0, 0)))
+                g.FillEllipse(far, x - radius - 1.5f * s, middle - radius - .5f * s, 2 * radius + 3 * s, 2 * radius + 3 * s);
+            using (var near = new SolidBrush(Color.FromArgb(22, 0, 0, 0)))
+                g.FillEllipse(near, x - radius - .5f * s, middle - radius + .5f * s, 2 * radius + s, 2 * radius + s);
+            AccountUiTheme.FillBox(g, new RectangleF(x - radius, middle - radius, 2 * radius, 2 * radius), radius, AccountUiTheme.Surface,
+                AccountUiTheme.ActionBackground, s, 2);
+            if (Focused && ShowFocusCues)
+            {
+                using var ring = new Pen(AccountUiTheme.Ink1, 1.5f * s);
+                var outer = radius + 3 * s;
+                g.DrawEllipse(ring, x - outer, middle - outer, 2 * outer, 2 * outer);
+            }
+        }
+    }
+
+    /// <summary>− or + beside the number (CSS .step-btn): a 46px square on the surface with a quiet edge.</summary>
+    private sealed class StepButton : Button
+    {
+        private readonly AccountIcon _icon;
+        private bool _hover, _pressed;
+
+        internal StepButton(string name, AccountIcon icon, string accessibleName)
+        {
+            SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw | ControlStyles.UserPaint
+                | ControlStyles.AllPaintingInWmPaint | ControlStyles.SupportsTransparentBackColor, true);
+            FlatStyle = FlatStyle.Flat; FlatAppearance.BorderSize = 0; UseVisualStyleBackColor = false; BackColor = Color.Transparent;
+            Margin = Padding.Empty; Cursor = Cursors.Hand; Name = name; AccessibleName = accessibleName; Text = ""; _icon = icon;
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            var g = e.Graphics; var s = DeviceDpi / 96f;
+            var under = AccountUiTheme.SurfaceColor(Parent);
+            using (var ground = new SolidBrush(under)) g.FillRectangle(ground, ClientRectangle);
+            var fill = _pressed ? AccountUiTheme.PressedBackground : _hover ? AccountUiTheme.HoverBackground : AccountUiTheme.Surface;
+            AccountUiTheme.FillBox(g, new RectangleF(0, 0, Width, Height), 9 * s, fill, AccountUiTheme.ControlBorder, s);
+            if (Focused && ShowFocusCues)
+            {
+                using var ring = AccountUiTheme.Rounded(new RectangleF(1.5f * s, 1.5f * s, Width - 3 * s, Height - 3 * s), 7.5f * s);
+                using var pen = new Pen(AccountUiTheme.Ink1, 1.5f * s); g.DrawPath(pen, ring);
+            }
+            var size = 16 * s;
+            AccountIcons.Draw(g, _icon, new RectangleF((Width - size) / 2f, (Height - size) / 2f, size, size), AccountUiTheme.Ink1, 1.8f * s);
+        }
+
+        protected override void OnMouseEnter(EventArgs e) { _hover = true; Invalidate(); base.OnMouseEnter(e); }
+        protected override void OnMouseLeave(EventArgs e) { _hover = _pressed = false; Invalidate(); base.OnMouseLeave(e); }
+        protected override void OnMouseDown(MouseEventArgs e) { if (e.Button == MouseButtons.Left) _pressed = true; Invalidate(); base.OnMouseDown(e); }
+        protected override void OnMouseUp(MouseEventArgs e) { _pressed = false; Invalidate(); base.OnMouseUp(e); }
+        protected override void OnGotFocus(EventArgs e) { Invalidate(); base.OnGotFocus(e); }
+        protected override void OnLostFocus(EventArgs e) { _pressed = false; Invalidate(); base.OnLostFocus(e); }
     }
 }

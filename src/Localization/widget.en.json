@@ -11,7 +11,7 @@
   "닫기": "Close",
   "크기…": "Size…",
   "위젯 크기": "Widget size",
-  "1% 단위로 맞춥니다. 100%가 처음 크기입니다.\n바꾸는 대로 위젯에 바로 보입니다.": "Set it in 1% steps. 100% is the original size.\nEach change shows on the widget right away.",
+  "값을 바꾸면 작업 표시줄의 위젯에 바로 반영됩니다.": "Each change shows on the taskbar widget right away.",
   "1% 작게": "1% smaller",
   "1% 크게": "1% larger",
   "위젯 크기(%)": "Widget size (%)",

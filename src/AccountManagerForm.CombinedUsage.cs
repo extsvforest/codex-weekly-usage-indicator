@@ -12,7 +12,7 @@ internal sealed partial class AccountManagerForm
             _combined.Initialize(original, batch: true);
             _batchQuerying = true; _batchCompleted = 0;
             using var cancellation = new CancellationTokenSource();
-            _loginCancellation = cancellation; _cancel.Text = UiText.T("전체 조회 취소"); _cancel.Visible = true; _cancel.Enabled = true;
+            _loginCancellation = cancellation;
             UpdateActions();
             try
             {
@@ -20,26 +20,27 @@ internal sealed partial class AccountManagerForm
                 {
                     await Task.Run(_store.RetryUsageCleanup);
                     if (_store.GetUsageQueryStatus().State != UsageQueryState.None)
-                        throw new InvalidOperationException("임시 파일 정리를 완료한 뒤 전체 갱신해 주세요.");
+                        throw new InvalidOperationException("임시 파일 정리를 완료한 뒤 전체 조회해 주세요.");
                 }
                 foreach (var member in original.OrderByDescending(a => a.IsActive))
                 {
                     cancellation.Token.ThrowIfCancellationRequested();
                     var fresh = _store.ListAccounts();
                     if (!_combined.Reconcile(fresh) || fresh.SingleOrDefault(a => a.IsActive)?.Id != activeId)
-                        throw new InvalidOperationException("조회 중 계정 구성이 바뀌었습니다. 목록을 확인한 뒤 전체 갱신해 주세요.");
+                        throw new InvalidOperationException("조회 중 계정 구성이 바뀌었습니다. 목록을 확인한 뒤 전체 조회해 주세요.");
                     if (_store.HasPendingRecovery || HasLinkedRecovery || _store.GetUsageQueryStatus().State == UsageQueryState.RecoveryRequired)
-                        throw new InvalidOperationException("중단된 계정 작업을 복구한 뒤 전체 갱신해 주세요.");
+                        throw new InvalidOperationException("중단된 계정 작업을 복구한 뒤 전체 조회해 주세요.");
                     var target = fresh.Single(a => a.Id == member.Id);
                     using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
                     using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellation.Token, timeout.Token);
+                    _batchReadingId = target.Id; UpdateActions();
                     try
                     {
                         var requestedAt = DateTimeOffset.UtcNow;
                         await QueryBatchMemberAsync(target, linked.Token);
                         var observed = _store.ListAccounts().Single(a => a.Id == target.Id);
                         if (observed.ObservedAt is null || observed.ObservedAt < requestedAt)
-                            throw new InvalidOperationException("새 확인값을 저장하지 못했습니다. 다시 갱신해 주세요.");
+                            throw new InvalidOperationException("새 확인값을 저장하지 못했습니다. 다시 조회해 주세요.");
                         _combined.SetResult(target.Id, observed, CombinedReadState.Success);
                     }
                     catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
@@ -54,29 +55,29 @@ internal sealed partial class AccountManagerForm
                         if (ex is UsageHelperShutdownException || _store.HasPendingRecovery ||
                             _store.GetUsageQueryStatus().State == UsageQueryState.RecoveryRequired) throw;
                     }
-                    _batchCompleted++;
+                    _batchCompleted++; _batchReadingId = null;
                     UpdateActions();
                     if (_store.GetUsageQueryStatus().State == UsageQueryState.CleanupPending)
-                        throw new InvalidOperationException("로그인 정보는 저장됐지만 임시 파일 정리가 남아 전체 조회를 멈췄습니다. ‘임시 파일 정리’ 후 다시 갱신하세요.");
+                        throw new InvalidOperationException("로그인 정보는 저장됐지만 임시 파일 정리가 남아 전체 조회를 멈췄습니다. ‘임시 파일 정리’ 후 다시 조회하세요.");
                 }
                 cancellation.Token.ThrowIfCancellationRequested();
                 var final = _store.ListAccounts();
                 if (!_combined.Reconcile(final) || final.SingleOrDefault(a => a.IsActive)?.Id != activeId)
-                    throw new InvalidOperationException("조회 중 계정 구성이 바뀌었습니다. 전체 갱신이 필요합니다.");
+                    throw new InvalidOperationException("조회 중 계정 구성이 바뀌었습니다. 전체 조회가 필요합니다.");
                 _combined.CompletedAt = DateTimeOffset.UtcNow;
                 var complete = _combined.IsComplete(DateTimeOffset.UtcNow);
                 SetStatus(complete ? UiText.F($"{original.Count}개 계정의 주간 잔여량을 확인했습니다.")
-                    : UiText.T("일부 계정의 확인이 필요합니다. 계정별 상태를 확인하고 다시 갱신하세요."), success: complete);
+                    : UiText.T("일부 계정의 확인이 필요합니다. 계정별 상태를 확인하고 다시 조회하세요."), success: complete);
             }
             catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
             { _combined.WasCanceled = true; throw; }
             catch { _combined.Interrupted = true; throw; }
             finally
             {
-                _batchQuerying = false; _loginCancellation = null;
+                _batchQuerying = false; _batchReadingId = null; _loginCancellation = null;
                 _combined.CompletedAt ??= DateTimeOffset.UtcNow;
             }
-        }, acquireGate: false, canceledMessage: UiText.T("전체 조회를 취소했습니다. 확인된 값과 이전 값은 보존했습니다."));
+        }, acquireGate: false, canceledMessage: UiText.T("전체 조회를 취소했습니다. 확인된 값과 이전 값은 보존했습니다."), query: true);
     }
 
     private async Task QueryBatchMemberAsync(SavedCodexAccount account, CancellationToken token)

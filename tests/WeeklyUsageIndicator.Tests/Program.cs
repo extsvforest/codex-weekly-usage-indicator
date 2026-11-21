@@ -28,6 +28,8 @@ if (args.Contains("--live-claude-menu-smoke")) { await ClaudeAccountMenuSmoke.Ru
 if (args.Contains("--language-ui-smoke")) { await LanguageUiSmoke.RunAsync(); return; }
 if (args.Contains("--localization-tests")) { await LocalizationTests.RunAsync(); return; }
 if (args.Contains("--account-style-preview")) { await AccountStylePreview.RunAsync(args.Contains("--hold"), args.Contains("--standard-dpi")); return; }
+// The same window without pictures: opening reads nothing, one row's read, three at a time, the Antigravity states, closing.
+if (args.Contains("--account-window-tests")) { await AccountStylePreview.RunAsync(false); return; }
 if (args.Contains("--account-opening-smoke")) { await AccountOpeningSmoke.RunAsync(args.Contains("--trace-only")); return; }
 
 if (args.Contains("--live-account-usage-smoke"))
@@ -42,6 +44,13 @@ if (args.Contains("--live-usage-cleanup-smoke"))
 }
 
 if (args.Contains("--combined-ui-smoke")) { await CombinedUsageUiSmoke.RunAsync(); return; }
+if (args.Contains("--account-ui-smoke"))
+{
+    // The account window's own checks, on their own: registration and renaming, then the row's manual query.
+    await AccountUiSmoke.RunAsync(); Console.WriteLine("PASS: account manager registration, rename, cancellation and input focus");
+    await AccountUsageUiSmoke.RunAsync(); Console.WriteLine("PASS: manual usage buttons, async failure and cancellation");
+    return;
+}
 
 if (args.Contains("--live-combined-usage-smoke")) { await LiveCombinedUsageSmoke.RunAsync(); return; }
 
@@ -76,6 +85,8 @@ var tests = new (string Name, Func<Task> Run)[]
     ("manual usage buttons, async failure and cancellation", AccountUsageUiSmoke.RunAsync),
     ("combined weekly snapshot coverage and reset boundaries", CombinedUsageTests.RunAsync),
     ("combined manager opening, refresh, cancellation and cleanup", CombinedUsageUiSmoke.RunAsync),
+    ("account window: no read on opening, one row's read, three at a time, Antigravity states and closing during a query",
+        () => AccountStylePreview.RunAsync(false)),
     ("account manager first paint and stable partial updates", () => AccountOpeningSmoke.RunAsync()),
     ("multi-account tooltip observations and refresh boundaries", UsageTooltipTests.RunAsync),
     ("supervisor retries abnormal exits but respects normal Quit", TestSupervisorAsync),

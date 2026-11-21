@@ -691,18 +691,21 @@ internal sealed class UsageIndicatorForm : Form
         }
     }
 
+    // Opening the window reads nothing; its pages show the values last seen until a query is asked for.
     private void ShowAccountManager()
     {
         if (_previewMode) return;
         if (_accountManager is null || _accountManager.IsDisposed)
-            _accountManager = CreateAccountManager(refreshAllOnOpen: true);
+            _accountManager = CreateAccountManager();
         _accountManager.Show();
         _accountManager.Activate();
     }
 
-    private AccountManagerForm CreateAccountManager(bool refreshAllOnOpen) => new(_accountStore, SuspendAccountsAsync, ResumeAccounts,
-        queryUsage: QueryAccountUsageAsync, combined: _combinedUsage, usageChanged: UpdateToolTip, refreshAllOnOpen: refreshAllOnOpen, claudeAccounts: _claudeAccounts,
-        claudeShelf: _claudeShelf);
+    private AntigravitySession? _antigravityAccounts;
+
+    private AccountManagerForm CreateAccountManager() => new(_accountStore, SuspendAccountsAsync, ResumeAccounts,
+        queryUsage: QueryAccountUsageAsync, combined: _combinedUsage, usageChanged: UpdateToolTip, claudeAccounts: _claudeAccounts,
+        claudeShelf: _claudeShelf, antigravity: _antigravityAccounts ??= new AntigravitySession(new AntigravityAccountStore()));
 
     private async Task QueryAccountUsageAsync(SavedCodexAccount account, CancellationToken token)
     {

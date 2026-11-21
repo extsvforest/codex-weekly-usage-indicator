@@ -44,6 +44,14 @@ internal static class AccountUsageText
         _ => UiText.F($"{at.ToLocalTime().ToString("MM.dd", CultureInfo.InvariantCulture)} {Time(at)} 조회")
     };
 
+    /// <summary>The top bar's reading time where the full one does not fit: "13:05" today, "어제 23:10", "11.18".</summary>
+    internal static string CheckedShort(DateTimeOffset at, DateTimeOffset now) => DaysBefore(at, now) switch
+    {
+        <= 0 => Time(at),
+        1 => UiText.F($"어제 {Time(at)}"),
+        _ => at.ToLocalTime().ToString("MM.dd", CultureInfo.InvariantCulture)
+    };
+
     /// <summary>"11.21(토) 17:59"; with <paramref name="today"/>, today's date reads "오늘 17:59".</summary>
     internal static string ResetOn(DateTimeOffset at, DateTimeOffset now, bool weekday = true, bool today = false)
     {

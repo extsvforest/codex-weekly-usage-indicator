@@ -45,6 +45,8 @@ internal abstract class AccountSummaryStrip : UserControl
         Total.Text = confirmed > 0 ? $"{remaining}%" : "—";
         Capacity.Text = confirmed > 0 ? $"/ {confirmed * 100}%" : "";
         Bar.Capacity = Math.Max(100, confirmed * 100); Bar.Remaining = confirmed > 0 ? remaining : null; Bar.Shares = confirmed;
+        // While a query runs the total is the one before it (design: the bar at .72).
+        Bar.FillOpacity = progress is null ? 1 : .72f;
         if (progress is { } running)
             Note.SetText(UiText.F($"· 조회 중 {running.Done}/{running.Total}"), AccountUiTheme.Ink3, AccountUiTheme.Type(11.5f));
         else if (confirmed < accounts)
@@ -123,19 +125,20 @@ internal sealed class CombinedUsagePanel : AccountSummaryStrip
         var accounts = snapshot.Accounts.Count; var confirmed = snapshot.ConfirmedCount(now);
         ShowTotal(accounts, confirmed, snapshot.ConfirmedRemaining(now), querying ? (completed, accounts) : null);
         var dated = snapshot.ByReset().Where(row => row.IsCurrent(now)).ToArray(); var next = dated.FirstOrDefault();
-        // The design names the next reset among confirmed accounts; the note already says how many those are.
-        var uncertain = snapshot.ByReset().FirstOrDefault(row => !row.IsCurrent(now));
+        // An unconfirmed account whose (previous) reset may come first leaves the next reset uncertain.
+        var uncertain = snapshot.ByReset().FirstOrDefault(row => !row.IsCurrent(now) &&
+            (row.Account.Usage?.ResetsAt is null || next?.Account.Usage?.ResetsAt is not { } first || row.Account.Usage.ResetsAt <= first));
         if (accounts == 0) { Next.Text = "—"; NextSub.Text = ""; }
-        else if (next?.Account.Usage?.ResetsAt is { } reset)
-        {
-            Next.Text = TimeUntil(reset, now); NextSub.Text = AccountUsageText.Refills(next.Account.Label, reset, now);
-        }
         else if (uncertain is not null)
         {
             Next.Text = UiText.T("확인 필요");
             NextSub.Text = uncertain.Account.Usage?.ResetsAt is { } previous
                 ? UiText.F($"{uncertain.Account.Label} · 이전 일정 {AccountUsageText.ResetOn(previous, now)}")
                 : UiText.F($"{uncertain.Account.Label} · 초기화 시각 미확인");
+        }
+        else if (next?.Account.Usage?.ResetsAt is { } reset)
+        {
+            Next.Text = TimeUntil(reset, now); NextSub.Text = AccountUsageText.Refills(next.Account.Label, reset, now);
         }
         else { Next.Text = UiText.T("초기화 미확인"); NextSub.Text = ""; }
         Latest.Text = dated.LastOrDefault() is { Account.Usage.ResetsAt: { } latest } last

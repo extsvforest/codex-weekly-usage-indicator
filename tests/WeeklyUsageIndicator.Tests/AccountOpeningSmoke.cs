@@ -55,7 +55,7 @@ internal static class AccountOpeningSmoke
                     Dictionary<string, Rectangle>? firstGeometry = null;
                     AccountTable Table() => form.Controls.Find("AccountList", true).OfType<AccountTable>().Single();
                     Dictionary<string, Rectangle> Geometry() => Descendants(form)
-                        .Where(c => c.Visible && (c.Name.StartsWith("AccountRow-", StringComparison.Ordinal) || c.Name is "AccountList" or "CombinedUsagePanel" or "RefreshAllUsageButton"))
+                        .Where(c => c.Visible && (c.Name.StartsWith("AccountRow-", StringComparison.Ordinal) || c.Name is "AccountList" or "CombinedUsagePanel"))
                         .ToDictionary(c => c.Name, c => new Rectangle(form.PointToClient(c.PointToScreen(Point.Empty)), c.Size));
                     void Record(string kind) => trace.Add(new { cached, kind, ms = clock.ElapsedMilliseconds, calls, form.DeviceDpi,
                         geometry = Geometry().ToDictionary(p => p.Key, p => p.Value.ToString()) });
@@ -88,6 +88,11 @@ internal static class AccountOpeningSmoke
                             await Task.Delay(100);
                             var opening = Geometry(); Record("opening-waiting");
                             Check(firstGeometry is not null && Same(firstGeometry, opening), "initial account positions must be ready before first paint");
+                            // Opening reads nothing: the rows keep the values last seen until a query is asked for.
+                            Check(calls == 0 && !form.IsOperationInProgress, "opening the window reads nothing");
+                            form.Controls.Find("RefreshAllUsageButton", true).OfType<Button>().Single().PerformClick();
+                            await Until(() => calls >= 1);
+                            Check(Same(opening, Geometry()), "starting the query keeps every row where it was");
                             for (var i = 0; i < 3; i++)
                             {
                                 gates[i].TrySetResult();

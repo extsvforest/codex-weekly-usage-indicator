@@ -31,7 +31,7 @@ internal abstract class AccountListRow : Control, IAccountSurface
 {
     private bool _active, _last, _menuOpen;
     protected readonly AccountText Title = new(14.5f, AccountWeight.SemiBold);
-    protected readonly AccountText Tag = new(11, AccountWeight.SemiBold, AccountUiTheme.Claude.Ink) { Visible = false };
+    protected readonly AccountText Remark = new(11, AccountWeight.SemiBold, AccountUiTheme.Claude.Ink) { Visible = false };
     protected readonly AccountPill Pill = new() { Visible = false };
     protected readonly AccountText State = new(11.5f, AccountWeight.Regular, AccountUiTheme.Ink3);
     protected readonly List<Control> ActionControls = new();
@@ -41,9 +41,11 @@ internal abstract class AccountListRow : Control, IAccountSurface
         SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer
             | ControlStyles.ResizeRedraw | ControlStyles.SupportsTransparentBackColor, true);
         Name = name; Provider = provider; LogicalHeight = logicalHeight; Grid = grid; BackColor = Color.Transparent; TabStop = false;
-        Controls.AddRange(new Control[] { Title, Tag, Pill, State });
+        Controls.AddRange(new Control[] { Title, Remark, Pill, State });
     }
 
+    // A layout made while the window was hidden saw every child as hidden; lay out again once shown.
+    protected override void OnVisibleChanged(EventArgs e) { base.OnVisibleChanged(e); if (Visible) PerformLayout(); }
     internal AccountProviderColors Provider { get; }
     internal float LogicalHeight { get; set; }
     internal float[] Grid { get; }
@@ -73,11 +75,11 @@ internal abstract class AccountListRow : Control, IAccountSurface
         // Name line (14.5 × 1.4), 4px, then the state line (11.5 × 1.4, or a 20px pill).
         var stateLine = (Pill.Visible ? 20 : 16.1f) * s;
         var top = (height - (20.3f + 4) * s - stateLine) / 2;
-        var tagWidth = Tag.Visible ? Tag.ContentWidth + 1 : 0;
+        var tagWidth = Remark.Visible ? Remark.ContentWidth + 1 : 0;
         var nameWidth = Math.Max(0, Math.Min(Title.ContentWidth + 1, width[0] - (tagWidth > 0 ? tagWidth + 7 * s : 0)));
         AccountUiTheme.PlaceLine(Title, left[0], top, 20.3f * s, nameWidth);
-        if (Tag.Visible)
-            AccountUiTheme.PlaceLine(Tag, Title.Right + 7 * s, top, 20.3f * s, Math.Max(0, Math.Min(tagWidth, left[0] + width[0] - Title.Right - 7 * s)));
+        if (Remark.Visible)
+            AccountUiTheme.PlaceLine(Remark, Title.Right + 7 * s, top, 20.3f * s, Math.Max(0, Math.Min(tagWidth, left[0] + width[0] - Title.Right - 7 * s)));
         var stateTop = top + 24.3f * s; var x = left[0];
         if (Pill.Visible)
         {
@@ -170,7 +172,11 @@ internal sealed class AccountListBar : Control
         Heading.Text = heading; Sort.Text = UiText.T("초기화가 가까운 순"); Sort.Icon = sortIcon ? AccountIcon.Sort : AccountIcon.None;
         Heading.Name = name + "Heading"; Count.Name = name + "Count";
         Controls.AddRange(new Control[] { Heading, Count, Sort });
+        // A count that grows ("9" to "10") needs a wider place, and the sort label moves with it.
+        Count.TextChanged += (_, _) => PerformLayout();
     }
+    // A layout made while the window was hidden saw every child as hidden; lay out again once shown.
+    protected override void OnVisibleChanged(EventArgs e) { base.OnVisibleChanged(e); if (Visible) PerformLayout(); }
     internal void SetActions(params Control[] actions)
     {
         foreach (var action in _actions.Except(actions).ToArray()) Controls.Remove(action);
@@ -192,7 +198,8 @@ internal sealed class AccountListBar : Control
         }
         var line = 13.5f * 1.4f * s; var top = (height - line) / 2;
         var x = AccountUiTheme.PlaceLine(Heading, 0, top, line, Math.Min(Heading.ContentWidth + 1, right));
-        x = AccountUiTheme.PlaceLine(Count, x + 3 * s, top, line, Math.Max(0, Math.Min(Count.ContentWidth + 1, right - x - 3 * s)));
+        // "계정 5": a space of the heading face (0.23em) and the count's 3px margin.
+        x = AccountUiTheme.PlaceLine(Count, x + 6 * s, top, line, Math.Max(0, Math.Min(Count.ContentWidth + 1, right - x - 6 * s)));
         AccountUiTheme.PlaceLine(Sort, x + 10 * s, (height - 16.1f * s) / 2, 16.1f * s, Math.Max(0, Math.Min(Sort.ContentWidth + 1, right - x - 18 * s)));
     }
 }
@@ -323,6 +330,13 @@ internal sealed class AccountTable : AccountRowList
     }
 
     private void SelectId(string id) => SelectedIndex = Items.FindIndex(a => a.Id == id);
+
+    /// <summary>Keeps a row and its ⋯ pressed while that row's menu shows.</summary>
+    internal void MenuShown(string id, bool open)
+    {
+        if (!_controls.TryGetValue(id, out var row)) return;
+        row.MenuOpen = open; row.Manage.MenuOpen = open;
+    }
     protected override void Dispose(bool disposing) { if (disposing) _details.Dispose(); base.Dispose(disposing); }
 
     private sealed class CodexRow : AccountListRow
@@ -373,7 +387,10 @@ internal sealed class AccountTable : AccountRowList
             else if (failed)
             {
                 Pill.Text = UiText.T("조회 실패"); Pill.Visible = true;
-                ShowState(false, (value.Error is { } error ? UiText.Message(error) : "", AccountUiTheme.ErrorInk, false));
+                // The label already says the check failed; the line beside it keeps only why.
+                var reason = value.Error is { } error ? UiText.Message(error) : "";
+                var lead = Pill.Text + " · ";
+                ShowState(false, (reason.StartsWith(lead, StringComparison.Ordinal) ? reason[lead.Length..] : reason, AccountUiTheme.ErrorInk, false));
             }
             else if (value.State == CombinedReadState.Waiting)
                 ShowState(false, (observed.Length > 0 ? UiText.F($"{observed} · 조회 대기") : UiText.T("조회 대기"), ink3, false));
@@ -408,12 +425,10 @@ internal sealed class AccountTable : AccountRowList
             Switch.Enabled = !busy && mutationsAllowed && hasActive && !a.IsActive;
             Switch.AccessibleName = a.IsActive ? UiText.F($"{a.Label} 사용 중") : UiText.F($"{a.Label} 계정으로 전환");
             Read.Spinning = reading; Read.Enabled = !busy && mutationsAllowed; Read.Bordered = failed && !reading;
-            Read.AccessibleName = failed ? UiText.T("다시 조회") : UiText.F($"{a.Label} 조회");
+            Read.AccessibleName = failed ? UiText.T("다시 조회") : UiText.F($"{a.Label} 사용량 조회");
             _details.SetToolTip(Read, reading ? UiText.T("조회 중") : failed ? UiText.T("다시 조회") : UiText.T("이 계정만 조회"));
             Manage.Enabled = !busy; Manage.AccessibleName = UiText.F($"{a.Label} 계정 관리 메뉴");
-            var details = a.Label + "
-" + value.Status(now) + (a.ObservedAt is { } savedAt ? "
-" + AccountUsageText.LastUpdated(savedAt, now) : "");
+            var details = a.Label + "\n" + value.Status(now) + (a.ObservedAt is { } savedAt ? "\n" + AccountUsageText.LastUpdated(savedAt, now) : "");
             foreach (var label in new Control[] { Title, State, _percent }) { _details.SetToolTip(label, details); label.AccessibleDescription = details; }
             _details.SetToolTip(Pill, State.Text);
             PerformLayout(); Invalidate(true);

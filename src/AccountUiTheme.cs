@@ -92,7 +92,7 @@ internal static class AccountUiTheme
         return Canvas;
     }
 
-    internal static Label Label(string text, float size = 9.5f, bool bold = false, Color? color = null) => new()
+    internal static Label Label(string text, float size = 9.5f, bool bold = false, Color? color = null) => new AccountLabel
     {
         Text = text, AutoSize = true, ForeColor = color ?? Ink1,
         Font = AccountFonts.Create(size, bold), BackColor = Color.Transparent,
@@ -213,6 +213,30 @@ internal static class AccountUiTheme
         }
         var bounds = new Rectangle(x, y, width, height);
         if (control.Bounds != bounds) control.Bounds = bounds;
+    }
+}
+
+/// <summary>A dialog's wrapped text, drawn without GDI's side padding so that it lines up with the title above it.</summary>
+internal sealed class AccountLabel : Label
+{
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        var flags = TextFormatFlags.NoPadding | TextFormatFlags.WordBreak | TextFormatFlags.NoPrefix;
+        flags |= TextAlign switch
+        {
+            ContentAlignment.MiddleLeft or ContentAlignment.MiddleCenter or ContentAlignment.MiddleRight => TextFormatFlags.VerticalCenter,
+            ContentAlignment.BottomLeft or ContentAlignment.BottomCenter or ContentAlignment.BottomRight => TextFormatFlags.Bottom,
+            _ => TextFormatFlags.Top
+        };
+        flags |= TextAlign switch
+        {
+            ContentAlignment.TopCenter or ContentAlignment.MiddleCenter or ContentAlignment.BottomCenter => TextFormatFlags.HorizontalCenter,
+            ContentAlignment.TopRight or ContentAlignment.MiddleRight or ContentAlignment.BottomRight => TextFormatFlags.Right,
+            _ => TextFormatFlags.Left
+        };
+        var bounds = new Rectangle(Padding.Left, Padding.Top, Math.Max(0, ClientSize.Width - Padding.Horizontal),
+            Math.Max(0, ClientSize.Height - Padding.Vertical));
+        TextRenderer.DrawText(e.Graphics, Text, Font, bounds, Enabled ? ForeColor : AccountUiTheme.Ink4, flags);
     }
 }
 
@@ -378,10 +402,12 @@ internal class AccountText : Label
     internal HorizontalAlignment Align { get; set; }
     /// <summary>True when the last paint had to shorten the text.</summary>
     internal bool Truncated { get; private set; }
+    /// <summary>A shorter wording painted when the full one does not fit; new text clears it.</summary>
+    internal AccountRun[]? Compact { get; set; }
 
     internal void SetText(string text, Color? color = null, Font? font = null)
     {
-        _runs = null;
+        _runs = null; Compact = null;
         if (font is not null) Font = font;
         if (color is { } ink) ForeColor = ink;
         Text = text; Invalidate();
@@ -389,7 +415,7 @@ internal class AccountText : Label
 
     internal void SetRuns(params AccountRun[] runs)
     {
-        _runs = runs.Where(run => run.Text.Length > 0).ToArray();
+        _runs = runs.Where(run => run.Text.Length > 0).ToArray(); Compact = null;
         _settingRuns = true;
         try
         {
@@ -432,9 +458,10 @@ internal class AccountText : Label
     protected override void OnPaint(PaintEventArgs e)
     {
         var g = e.Graphics; var s = DeviceDpi / 96f;
-        var runs = Runs();
-        var widths = runs.Select(run => TextRenderer.MeasureText(g, run.Text, run.Font, new Size(int.MaxValue, int.MaxValue),
-            AccountUiTheme.Flat).Width + run.Gap * s).ToArray();
+        float[] Widths(AccountRun[] parts) => parts.Select(run => TextRenderer.MeasureText(g, run.Text, run.Font,
+            new Size(int.MaxValue, int.MaxValue), AccountUiTheme.Flat).Width + run.Gap * s).ToArray();
+        var runs = Runs(); var widths = Widths(runs);
+        if (Compact is { Length: > 0 } compact && IconWidth + widths.Sum() > ClientSize.Width + .5f) { runs = compact; widths = Widths(runs); }
         var total = IconWidth + widths.Sum();
         var x = Align switch
         {
@@ -509,11 +536,14 @@ internal sealed class AccountMetricLabel : AccountText
         var parts = System.Text.RegularExpressions.Regex.Matches(Text, @"[0-9.,]+|[^0-9.,]+");
         if (!parts.Any(part => char.IsDigit(part.Value[0]))) return new[] { new AccountRun(Text, WordFont ?? UnitFont, WordColor ?? UnitColor) };
         var runs = new List<AccountRun>(); var afterUnit = false;
-        foreach (System.Text.RegularExpressions.Match part in parts)
+        for (var i = 0; i < parts.Count; i++)
         {
-            var number = char.IsDigit(part.Value[0]) || (part.Value[0] is '.' or ',' && part.Value.Length > 1);
-            runs.Add(number ? new AccountRun(part.Value, NumberFont, ForeColor, afterUnit ? UnitTrail : 0)
-                : new AccountRun(part.Value, UnitFont, UnitColor, runs.Count > 0 ? UnitLead : 0));
+            var value = parts[i].Value;
+            var number = char.IsDigit(value[0]) || (value[0] is '.' or ',' && value.Length > 1);
+            // A unit with a figure after it ends at its margin ("4시간 29분"): the design sets no space there.
+            if (!number && UnitTrail > 0 && i + 1 < parts.Count) value = value.TrimEnd();
+            runs.Add(number ? new AccountRun(value, NumberFont, ForeColor, afterUnit ? UnitTrail : 0)
+                : new AccountRun(value, UnitFont, UnitColor, runs.Count > 0 ? UnitLead : 0));
             afterUnit = !number;
         }
         return runs.ToArray();
@@ -713,6 +743,9 @@ internal sealed class AccountButton : Button
     internal Color BadgeInk { get; set; } = AccountUiTheme.Claude.Ink;
     /// <summary>The least width in CSS pixels (the design's min-width), scaled at the control's DPI.</summary>
     internal float MinLogicalWidth { get; set; }
+    /// <summary>A left padding of its own in CSS pixels (the design's padding-left on a quiet action): the text starts
+    /// there instead of in the middle.</summary>
+    internal float? LeadPadding { get; set; }
 
     // The older names, kept for callers that only know a primary or a quiet button.
     internal bool Primary { get => _kind == AccountButtonKind.Primary; set => Kind = value ? AccountButtonKind.Primary : AccountButtonKind.Secondary; }
@@ -750,7 +783,7 @@ internal sealed class AccountButton : Button
         var s = DeviceDpi / 96f;
         var text = AccountUiTheme.Measure(Text, Font).Width;
         var icon = _icon == AccountIcon.None && _kind != AccountButtonKind.Badge ? 0 : IconPx + (text > 0 ? IconGap : 0);
-        var width = (int)Math.Ceiling(text + (icon + 2 * PaddingX) * s) + (_kind == AccountButtonKind.Badge ? 0 : 1);
+        var width = (int)Math.Ceiling(text + (icon + (LeadPadding ?? PaddingX) + PaddingX) * s) + (_kind == AccountButtonKind.Badge ? 0 : 1);
         return new Size(Math.Max(Math.Max(width, (int)Math.Ceiling(MinLogicalWidth * s)), MinimumSize.Width),
             Math.Max((int)Math.Round(LogicalHeight * s), MinimumSize.Height));
     }
@@ -803,7 +836,7 @@ internal sealed class AccountButton : Button
         var text = AccountUiTheme.Measure(Text, Font);
         var icon = _icon != AccountIcon.None ? _icon : _kind == AccountButtonKind.Badge ? AccountIcon.Check : AccountIcon.None;
         var iconWidth = icon == AccountIcon.None ? 0 : (IconPx + (text.Width > 0 ? IconGap : 0)) * s;
-        var x = (Width - iconWidth - text.Width) / 2f;
+        var x = LeadPadding is { } lead ? lead * s : (Width - iconWidth - text.Width) / 2f;
         if (icon != AccountIcon.None)
         {
             var size = IconPx * s;
@@ -895,6 +928,8 @@ internal sealed class AccountTabBar : Control
             | ControlStyles.SupportsTransparentBackColor | ControlStyles.ResizeRedraw, true);
         BackColor = Color.Transparent; TabStop = false; Name = "ProviderTabs";
     }
+    // A layout made while the window was hidden saw every child as hidden; lay out again once shown.
+    protected override void OnVisibleChanged(EventArgs e) { base.OnVisibleChanged(e); if (Visible) PerformLayout(); }
     internal IEnumerable<AccountTab> Tabs => Controls.OfType<AccountTab>();
     internal Size Preferred
     {
@@ -999,6 +1034,8 @@ internal sealed class AccountMenu : ContextMenuStrip
         Renderer = new AccountMenuRenderer(); ShowImageMargin = false; ShowCheckMargin = false;
         BackColor = AccountUiTheme.Surface; ForeColor = AccountUiTheme.Ink1;
         Font = AccountUiTheme.Type(12.5f);
+        // The menu's own stacking would size the window from the labels alone; Fit sets the size instead.
+        AutoSize = false;
     }
     internal ToolStripMenuItem Item(string name, string text, AccountIcon icon, EventHandler click, bool danger = false, string? shortcut = null)
     {
@@ -1008,30 +1045,73 @@ internal sealed class AccountMenu : ContextMenuStrip
     }
     internal void Separator() => Items.Add(new ToolStripSeparator { AutoSize = false });
 
-    protected override void OnOpening(System.ComponentModel.CancelEventArgs e)
+    // The shortcut a menu item shows works while the menu is open, as in the design's menu.
+    protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
     {
-        var s = _owner.DeviceDpi / 96f;
-        Padding = new Padding((int)Math.Round(5 * s));
+        if (keyData == Keys.F2 && Items.OfType<ToolStripMenuItem>().FirstOrDefault(item => item.ShortcutKeyDisplayString == "F2") is { Enabled: true } rename)
+        {
+            Close(ToolStripDropDownCloseReason.Keyboard);
+            rename.PerformClick();
+            return true;
+        }
+        return base.ProcessCmdKey(ref msg, keyData);
+    }
+
+    // CSS: 176px items (wider when a label needs it) in 5px of padding, 31px rows and 9px separators.
+    private int Fit()
+    {
+        var s = _owner.DeviceDpi / 96f; var inset = (int)Math.Round(5 * s);
+        var font = AccountUiTheme.Type(12.5f); var small = AccountUiTheme.Type(11);
+        var widest = Items.OfType<ToolStripMenuItem>().Where(item => item.Available).Select(item => (9 + 14 + 8 + 9 + 2) * s
+            + AccountUiTheme.Measure(item.Text ?? "", font).Width
+            + (item.ShortcutKeyDisplayString is { Length: > 0 } key ? 14 * s + AccountUiTheme.Measure(key, small).Width : 0)).DefaultIfEmpty(0).Max();
+        var width = (int)Math.Ceiling(Math.Max(176 * s, widest)) + 2 * inset; var height = 0;
+        Inset = inset;
+        // Items span the window; the renderer keeps their content and hover 5px in from its edges.
         foreach (ToolStripItem item in Items)
         {
             item.Margin = Padding.Empty;
-            item.Size = new Size((int)Math.Round(176 * s), (int)Math.Round((item is ToolStripSeparator ? 9 : 31) * s));
+            item.Size = new Size(width, (int)Math.Round((item is ToolStripSeparator ? 9 : 31) * s));
+            if (item.Available) height += item.Height;
         }
+        Size = new Size(width, height + 2 * inset);
+        return width;
+    }
+    /// <summary>The design's 5px padding inside the menu, in device pixels.</summary>
+    internal int Inset { get; private set; }
+    // The menu resets its padding from this on each layout; the top one places the first item.
+    protected override Padding DefaultPadding => Inset > 0 ? new Padding(Inset) : base.DefaultPadding;
+
+    protected override void OnOpening(System.ComponentModel.CancelEventArgs e)
+    {
+        Fit();
         base.OnOpening(e);
     }
 
+    /// <summary>Opens the menu 7px under a ⋯ button, its right edge on the button's (design screen E).</summary>
+    internal void ShowBelow(Control anchor)
+    {
+        var width = Fit(); var s = _owner.DeviceDpi / 96f;
+        Show(anchor, new Point(anchor.Width - width, anchor.Height + (int)Math.Round(7 * s)));
+    }
+
+    // Windows 11 rounds the menu with its small radius and gives it the system shadow, its edge in the renderer's
+    // border colour (DWMWA_WINDOW_CORNER_PREFERENCE: DWMWCP_ROUNDSMALL, DWMWA_BORDER_COLOR). Windows 10 keeps square
+    // corners; there the renderer's border alone makes the card.
     protected override void OnHandleCreated(EventArgs e)
     {
         base.OnHandleCreated(e);
         try
         {
-            var round = 2; DwmSetWindowAttribute(Handle, 33, ref round, sizeof(int));
+            var corner = 3; Rounded = DwmSetWindowAttribute(Handle, 33, ref corner, sizeof(int)) == 0;
             var edge = AccountUiTheme.ControlBorder; var colorRef = edge.R | (edge.G << 8) | (edge.B << 16);
-            Rounded = DwmSetWindowAttribute(Handle, 34, ref colorRef, sizeof(int)) == 0;
+            DwmSetWindowAttribute(Handle, 34, ref colorRef, sizeof(int));
         }
         catch (DllNotFoundException) { }
         catch (EntryPointNotFoundException) { }
     }
+    /// <summary>Whether Windows took the small rounded corners. A picture the menu draws of itself cannot show them, so
+    /// the design preview checks this.</summary>
     internal bool Rounded { get; private set; }
 
     [DllImport("dwmapi.dll")]
@@ -1046,23 +1126,32 @@ internal sealed class AccountMenuRenderer : ToolStripRenderer
     {
         using var brush = new SolidBrush(AccountUiTheme.Surface); e.Graphics.FillRectangle(brush, e.AffectedBounds);
     }
+    // CSS: a 1px border of the control-border colour around the card.
     protected override void OnRenderToolStripBorder(ToolStripRenderEventArgs e)
     {
-        if (e.ToolStrip is AccountMenu { Rounded: true }) return;
-        using var pen = new Pen(AccountUiTheme.ControlBorder);
-        e.Graphics.DrawRectangle(pen, 0, 0, e.ToolStrip.Width - 1, e.ToolStrip.Height - 1);
+        var width = Math.Max(1, (int)Math.Round(e.ToolStrip.DeviceDpi / 96f));
+        using var brush = new SolidBrush(AccountUiTheme.ControlBorder);
+        var (w, h) = (e.ToolStrip.Width, e.ToolStrip.Height);
+        e.Graphics.FillRectangle(brush, 0, 0, w, width); e.Graphics.FillRectangle(brush, 0, h - width, w, width);
+        e.Graphics.FillRectangle(brush, 0, 0, width, h); e.Graphics.FillRectangle(brush, w - width, 0, width, h);
+    }
+    // The menu's content box in the item's coordinates: 5px in from the window's edges, wherever the item stands.
+    private static (float Left, float Right) Content(ToolStripItem item, ToolStrip? strip)
+    {
+        var inset = (strip as AccountMenu)?.Inset ?? 0; var width = strip?.Width ?? item.Width;
+        return (inset - item.Bounds.X, width - inset - item.Bounds.X);
     }
     protected override void OnRenderMenuItemBackground(ToolStripItemRenderEventArgs e)
     {
         if (!e.Item.Selected || !e.Item.Enabled) return;
-        var s = e.ToolStrip?.DeviceDpi / 96f ?? 1;
-        AccountUiTheme.FillBox(e.Graphics, new RectangleF(0, 0, e.Item.Width, e.Item.Height), 6 * s, AccountUiTheme.HoverBackground, null, s);
+        var s = e.ToolStrip?.DeviceDpi / 96f ?? 1; var (left, right) = Content(e.Item, e.ToolStrip);
+        AccountUiTheme.FillBox(e.Graphics, new RectangleF(left, 0, right - left, e.Item.Height), 6 * s, AccountUiTheme.HoverBackground, null, s);
     }
     protected override void OnRenderSeparator(ToolStripSeparatorRenderEventArgs e)
     {
-        var s = e.ToolStrip?.DeviceDpi / 96f ?? 1;
+        var s = e.ToolStrip?.DeviceDpi / 96f ?? 1; var (left, right) = Content(e.Item, e.ToolStrip);
         using var brush = new SolidBrush(AccountUiTheme.RuleSubtle);
-        e.Graphics.FillRectangle(brush, 6 * s, (e.Item.Height - s) / 2f, e.Item.Width - 12 * s, Math.Max(1, s));
+        e.Graphics.FillRectangle(brush, left + 6 * s, (e.Item.Height - s) / 2f, right - left - 12 * s, Math.Max(1, s));
     }
     protected override void OnRenderItemText(ToolStripItemTextRenderEventArgs e)
     {
@@ -1072,20 +1161,22 @@ internal sealed class AccountMenuRenderer : ToolStripRenderer
         var mark = item.Tag as AccountMenuMark;
         var ink = !item.Enabled ? AccountUiTheme.Ink4 : mark?.Danger == true ? AccountUiTheme.ErrorInk : AccountUiTheme.Ink1;
         var iconInk = !item.Enabled ? AccountUiTheme.Ink4 : mark?.Danger == true ? AccountUiTheme.ErrorInk : AccountUiTheme.Ink3;
-        var x = 9 * s;
+        var (left, right) = Content(item, e.ToolStrip);
+        var x = left + 9 * s;
         if (mark is { Icon: not AccountIcon.None })
         {
             var size = 14 * s;
-            AccountIcons.Draw(g, mark.Icon, new RectangleF(x, (item.Height - size) / 2f, size, size), iconInk, 1.6f * s);
+            // CSS: a 1.35 stroke in a 16-unit box drawn at 14px.
+            AccountIcons.Draw(g, mark.Icon, new RectangleF(x, (item.Height - size) / 2f, size, size), iconInk, 1.2f * s);
             x += size + 8 * s;
         }
         var font = AccountUiTheme.Type(12.5f);
-        TextRenderer.DrawText(g, item.Text, font, new Rectangle((int)Math.Round(x), 0, item.Width - (int)Math.Round(x), item.Height), ink,
+        TextRenderer.DrawText(g, item.Text, font, new Rectangle((int)Math.Round(x), 0, (int)Math.Round(right - 9 * s - x), item.Height), ink,
             AccountUiTheme.Flat | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
         if (item is ToolStripMenuItem { ShortcutKeyDisplayString: { Length: > 0 } shortcut })
         {
             var small = AccountUiTheme.Type(11);
-            TextRenderer.DrawText(g, shortcut, small, new Rectangle(0, 0, item.Width - (int)Math.Round(9 * s), item.Height), AccountUiTheme.Ink4,
+            TextRenderer.DrawText(g, shortcut, small, new Rectangle(0, 0, (int)Math.Round(right - 9 * s), item.Height), AccountUiTheme.Ink4,
                 AccountUiTheme.Flat | TextFormatFlags.VerticalCenter | TextFormatFlags.Right);
         }
     }
@@ -1134,6 +1225,8 @@ internal sealed class AccountNotice : Control, IAccountSurface
         Kind = kind;
     }
 
+    // A layout made while the window was hidden saw every child as hidden; lay out again once shown.
+    protected override void OnVisibleChanged(EventArgs e) { base.OnVisibleChanged(e); if (Visible) PerformLayout(); }
     internal AccountRichText Body => _body;
     internal IReadOnlyList<Control> Actions => _actions;
     private bool Quiet => _kind is AccountNoticeKind.Info or AccountNoticeKind.Progress;
@@ -1269,15 +1362,19 @@ internal sealed class AccountFooter : Control
         Controls.Add(Status);
     }
     internal AccountText Status { get; } = new(12, AccountWeight.Regular, AccountUiTheme.Ink3) { IconSize = 14, IconGap = 7, IconStroke = 1.3f };
+    // A layout made while the window was hidden saw every child as hidden; lay out again once shown.
+    protected override void OnVisibleChanged(EventArgs e) { base.OnVisibleChanged(e); if (Visible) PerformLayout(); }
     /// <summary>The hairline above; a footer that holds only an action has none.</summary>
     internal bool Rule { get; set; } = true;
     internal int PreferredHeight => AccountUiTheme.Px(this, Rule ? 39 : 38);
 
-    internal void SetStatus(string text, bool warning)
+    /// <param name="icon">The mark before the text; by default the warning sign or the session-list layers.</param>
+    internal void SetStatus(string text, bool warning, AccountIcon? icon = null)
     {
-        Status.Icon = text.Length == 0 ? AccountIcon.None : warning ? AccountIcon.Warning : AccountIcon.Layers;
-        Status.IconColor = warning ? AccountUiTheme.WarnInk : AccountUiTheme.Ink3;
-        Status.IconStroke = warning ? 1.4f : 1.3f;
+        var mark = icon ?? (warning ? AccountIcon.Warning : AccountIcon.Layers);
+        Status.Icon = text.Length == 0 ? AccountIcon.None : mark;
+        Status.IconColor = mark == AccountIcon.Check ? AccountUiTheme.OkInk : warning ? AccountUiTheme.WarnInk : AccountUiTheme.Ink3;
+        Status.IconStroke = mark == AccountIcon.Check ? 1.9f : warning ? 1.4f : 1.3f;
         Status.SetText(text, warning ? AccountUiTheme.WarnInk : AccountUiTheme.Ink3,
             AccountUiTheme.Type(12, warning ? AccountWeight.SemiBold : AccountWeight.Regular));
         PerformLayout();

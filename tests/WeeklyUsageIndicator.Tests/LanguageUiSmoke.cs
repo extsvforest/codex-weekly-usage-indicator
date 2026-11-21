@@ -30,7 +30,7 @@ internal static class LanguageUiSmoke
                 using var widget = new UsageIndicatorForm(previewMode: true);
                 using var manager = new AccountManagerForm(store, () => Task.CompletedTask, () => { },
                     queryUsage: (_, _) => { queryCount++; throw new InvalidOperationException("Language changes must never query."); },
-                    refreshAllOnOpen: false, combined: combined);
+                    combined: combined);
                 Set(widget, "_accountManager", manager); manager.Show(); Application.DoEvents();
                 var bounds = manager.Bounds;
                 Set(manager, "_busy", true);
