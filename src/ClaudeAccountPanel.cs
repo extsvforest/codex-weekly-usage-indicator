@@ -136,7 +136,8 @@ internal sealed class ClaudeAccountPanel : UserControl
         using var layout = AccountUiTheme.DeferLayout(_layout);
         var profiles = _controller.Store.ListProfiles(); var selectedId = _controller.SelectedProfile.Id;
         _count.Text = UiText.F($"내 계정  {profiles.Count}");
-        _register.Visible = !profiles.Any(p => p.IsDefault);
+        // Once the default-home account has moved to its own profile, connecting that shared home again is not offered.
+        _register.Visible = !profiles.Any(p => p.IsDefault) && !_controller.Store.DefaultHomeRetired;
         var ids = profiles.Select(profile => profile.Id).ToHashSet(StringComparer.Ordinal);
         foreach (var removed in _profileRows.Keys.Where(id => !ids.Contains(id)).ToArray())
         { _profileRows[removed].Dispose(); _profileRows.Remove(removed); }
@@ -219,35 +220,29 @@ internal sealed class ClaudeAccountPanel : UserControl
     internal Task RefreshSelectedUsageAsync() => RegisteredSelection is { } selected ? ReadUsageAsync(selected.Id) : Task.CompletedTask;
 
     /// <summary>
-    /// Checks every signed-in account once, the in-use one first, as the Codex tab does when it opens. Each account
-    /// keeps its own ten-minute interval, so one checked recently reuses its observation instead of a new command.
-    /// A failure stays on its row and the remaining accounts continue. Accounts that need a sign-in are skipped.
+    /// Checks every signed-in account once, up to three at a time and the in-use one first, as the Codex tab does when
+    /// it opens. Each account keeps its own ten-minute interval, so one checked recently reuses its observation instead
+    /// of a new command. A failure stays on its row and the remaining accounts continue. Accounts that need a sign-in
+    /// are skipped.
     /// </summary>
     internal Task RefreshAllUsageAsync() => RunAsync(UiText.T("전체 계정의 주간 사용량을 확인하고 있습니다…"), async token =>
     {
-        var selectedId = _controller.SelectedProfile.Id;
-        var targets = _controller.Store.ListProfiles()
-            .Where(profile => profile.IsVerified
-                && _controller.LastFailure(profile.Id) is not (ClaudeLoginRequiredException or ClaudeIdentityChangedException))
-            .OrderByDescending(profile => profile.Id == selectedId)
-            .DistinctBy(profile => profile.Identity!.Key, StringComparer.Ordinal).ToArray();
-        if (targets.Length == 0) throw new InvalidOperationException("확인할 수 있는 Claude 계정이 없습니다. 로그인이 필요한 계정은 다시 로그인하세요.");
+        var targets = _controller.ReadableProfiles();
+        if (targets.Count == 0) throw new InvalidOperationException("확인할 수 있는 Claude 계정이 없습니다. 로그인이 필요한 계정은 다시 로그인하세요.");
         var failed = 0;
-        _batchProgress = (0, targets.Length); DisplaySummary();
+        _batchProgress = (0, targets.Count); DisplaySummary();
         try
         {
-            foreach (var profile in targets)
+            // Each account's row updates through UsageChanged as soon as it ends; this only counts them.
+            await _controller.ReadUsageManyAsync(targets.Select(profile => profile.Id), token, outcome =>
             {
-                token.ThrowIfCancellationRequested();
-                try { await _controller.ReadUsageAsync(profile.Id, token); }
-                catch (OperationCanceledException) when (token.IsCancellationRequested) { throw; }
-                catch (Exception) { failed++; }
-                _batchProgress = (_batchProgress!.Value.Done + 1, targets.Length); DisplaySummary();
-            }
+                if (outcome.Failure is not null) failed++;
+                if (_batchProgress is { } progress) { _batchProgress = (progress.Done + 1, progress.Total); DisplaySummary(); }
+            });
         }
         finally { _batchProgress = null; }
         if (failed > 0) throw new InvalidOperationException("일부 계정의 확인이 필요합니다. 계정별 상태를 확인하고 다시 갱신하세요.");
-        return UiText.F($"{targets.Length}개 계정의 주간 잔여량을 확인했습니다.");
+        return UiText.F($"{targets.Count}개 계정의 주간 잔여량을 확인했습니다.");
     });
     private Task ReadUsageAsync(string profileId) => RunAsync(UiText.T("Claude 사용량을 확인하고 있습니다…"), async token =>
     {

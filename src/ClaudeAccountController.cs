@@ -3,24 +3,43 @@ namespace WeeklyUsageIndicator;
 internal sealed class ClaudeUsageObservedEventArgs(string profileId) : EventArgs
 { internal string ProfileId { get; } = profileId; }
 
-// One profile selection owns both new interactive launches and widget reads.
-// Credentials remain entirely inside the unmodified official Claude CLI.
+/// <summary>An account's last usage kept on disk, for a page that opens without a query: its windows (any of them may
+/// have reset since) and when they were observed. Never a fresh observation, a recovery value or part of a total.</summary>
+internal sealed record ClaudeSavedUsage(ClaudeUsageSnapshot Snapshot, DateTimeOffset ObservedAt);
+
+/// <summary>How one account's read in <see cref="ClaudeAccountController.ReadUsageManyAsync"/> ended: its result, or
+/// the failure, which also stays on that account (<see cref="ClaudeAccountController.LastFailure"/>).</summary>
+internal sealed record ClaudeUsageReadOutcome(string ProfileId, ClaudeUsageResult? Result, Exception? Failure);
+
+/// <summary>Moving the default-home account (<see cref="ClaudeAccountController.MoveDefaultHomeAccountAsync"/>) ended
+/// in another account's sign-in. Nothing was changed.</summary>
+internal sealed class ClaudeMoveSignedInAnotherAccountException()
+    : InvalidOperationException("다른 Claude 계정으로 로그인했습니다. 옮길 계정으로 다시 로그인하세요.");
+
+// Verified profile identity binds each account's usage. Operations on one profile (sign-in, selection, sign-out, a read)
+// hold that profile's gate and run one at a time; reads of different profiles run side by side, at most
+// ReadConcurrency at once. Credentials remain entirely inside the unmodified official Claude CLI.
 internal sealed class ClaudeAccountController : IDisposable
 {
+    internal const int ReadConcurrency = 3;
     private static readonly TimeSpan ObservationLifetime = TimeSpan.FromHours(24);
     private static readonly TimeSpan StatusRetryDelay = TimeSpan.FromMinutes(1);
+    private static readonly TimeSpan CleanupTimeout = TimeSpan.FromSeconds(30);
     internal ClaudeProfileStore Store { get; }
     internal ClaudeProfileRuntime Runtime { get; }
+    // Locked on itself. The clients of one profile are made, used and replaced only under that profile's gate.
     private readonly Dictionary<string, ClaudeUsageClient> _clients = new(StringComparer.Ordinal);
     private readonly Dictionary<string, ClaudeUsageResult> _observations = new(StringComparer.Ordinal);
     private readonly Dictionary<string, Exception> _failures = new(StringComparer.Ordinal);
     private readonly Dictionary<string, ObservationBinding> _observationBindings = new(StringComparer.Ordinal);
     private readonly object _observationGate = new();
-    private readonly SemaphoreSlim _gate = new(1, 1);
+    private readonly Dictionary<string, SemaphoreSlim> _profileGates = new(StringComparer.Ordinal);
+    private readonly SemaphoreSlim _readSlots = new(ReadConcurrency, ReadConcurrency);
+    private readonly HashSet<string> _linksChecked = new(StringComparer.Ordinal);
     private readonly CancellationTokenSource _lifetime = new();
     private readonly TimeProvider _timeProvider;
     private readonly Func<ClaudeProfile, string, string, ClaudeUsageClient> _clientFactory;
-    private readonly Action _clearRecoveryCache;
+    private readonly ClaudeUsageFileCacheStore _usageCache;
     private volatile bool _disposed;
     internal event EventHandler? SelectionChanged;
     internal event EventHandler<ClaudeUsageObservedEventArgs>? UsageChanged;
@@ -29,18 +48,19 @@ internal sealed class ClaudeAccountController : IDisposable
 
     internal ClaudeAccountController(ClaudeProfileStore? store = null, ClaudeProfileRuntime? runtime = null,
         TimeProvider? timeProvider = null, Func<ClaudeProfile, string, string, ClaudeUsageClient>? clientFactory = null,
-        Action? clearRecoveryCache = null)
+        ClaudeUsageFileCacheStore? usageCache = null)
     {
         Store = store ?? new();
         Runtime = runtime ?? new(Store);
         _timeProvider = timeProvider ?? TimeProvider.System;
+        _usageCache = usageCache ?? ClaudeUsageFileCacheStore.CreateDefault(_timeProvider);
         _clientFactory = clientFactory ?? ((profile, key, accountKey) =>
         {
             var runner = new ClaudeCodeProcessRunner(configureProcess: start =>
                 ClaudeProfileRuntime.ApplyProfileEnvironment(start, profile));
-            return new ClaudeUsageClient(new ClaudeCodeUsageSource(runner, _timeProvider), key, accountKey);
+            return new ClaudeUsageClient(new ClaudeCodeUsageSource(runner, _timeProvider), _timeProvider,
+                _usageCache.For(key), key, ClaudeUsageRequestThrottle.Shared, accountKey);
         });
-        _clearRecoveryCache = clearRecoveryCache ?? (() => ClaudeUsageFileCacheStore.CreateDefault().Clear());
     }
 
     internal ClaudeUsageResult? LastUsage(string profileId)
@@ -55,10 +75,35 @@ internal sealed class ClaudeAccountController : IDisposable
         lock (_observationGate) return _failures.GetValueOrDefault(profileId);
     }
 
+    /// <summary>The account's last usage kept on disk, read without a query: only its own verified identity's value,
+    /// for up to <see cref="ClaudeUsageFileCacheStore.HistoryLifetime"/>. A page shows it with its check time as an
+    /// earlier value; it never becomes <see cref="LastUsage"/>, a recovery value or part of a total.</summary>
+    internal ClaudeSavedUsage? SavedUsage(string profileId)
+    {
+        var profile = Store.ListProfiles().SingleOrDefault(saved => saved.Id == profileId);
+        if (profile?.Identity is not { } identity) return null;
+        return _usageCache.Last(profile.Id + ":" + identity.Key) is { } entry
+            ? new ClaudeSavedUsage(entry.Snapshot, entry.LastUpdatedAt) : null;
+    }
+
+    /// <summary>The accounts a full refresh reads: each verified identity once, leaving out those that need a sign-in
+    /// or show another account. The selected profile comes first; of two profiles for one account, the one with its
+    /// own folder is read rather than the default home.</summary>
+    internal IReadOnlyList<ClaudeProfile> ReadableProfiles()
+    {
+        var selectedId = SelectedProfile.Id;
+        return Store.ListProfiles()
+            .Where(profile => profile.IsVerified
+                && LastFailure(profile.Id) is not (ClaudeLoginRequiredException or ClaudeIdentityChangedException))
+            .OrderByDescending(profile => profile.Id == selectedId).ThenBy(profile => profile.IsDefault)
+            .DistinctBy(profile => profile.Identity!.Key, StringComparer.Ordinal).ToArray();
+    }
+
     internal async Task<ClaudeProfile> RegisterDefaultAsync(CancellationToken token)
     {
         using var operation = BeginOperation(token);
-        await _gate.WaitAsync(operation.Token);
+        var gate = ProfileGate(Store.DefaultProfile.Id);
+        await gate.WaitAsync(operation.Token);
         try
         {
             var profile = Store.DefaultProfile;
@@ -79,31 +124,34 @@ internal sealed class ClaudeAccountController : IDisposable
         }
         catch (Exception exception) when (exception is UnauthorizedAccessException or InvalidDataException)
         { Forget(Store.DefaultProfile.Id, exception); throw; }
-        finally { _gate.Release(); }
+        finally { gate.Release(); }
     }
 
     internal async Task<ClaudeProfile> AddAsync(string label, CancellationToken token)
     {
         using var operation = BeginOperation(token);
-        await _gate.WaitAsync(operation.Token);
+        operation.Token.ThrowIfCancellationRequested();
+        var profile = Store.CreateProfile(label);
+        var gate = ProfileGate(profile.Id);
+        await gate.WaitAsync(operation.Token);
         try
         {
-            var profile = Store.CreateProfile(label);
             var identity = await Runtime.LoginAsync(profile, operation.Token);
             return Store.RecordVerifiedIdentity(profile.Id, identity);
         }
-        finally { _gate.Release(); }
+        finally { gate.Release(); }
     }
 
     internal async Task LoginAsync(ClaudeProfile profile, CancellationToken token)
     {
         using var operation = BeginOperation(token);
-        await _gate.WaitAsync(operation.Token);
+        var gate = ProfileGate(profile.Id);
+        await gate.WaitAsync(operation.Token);
         var previousFailure = LastFailure(profile.Id);
         try
         {
-            // This profile's login is about to change. Other profiles may continue displaying their
-            // previously verified usage while the official login terminal is waiting for the user.
+            // This profile's login is about to change. Other profiles go on reading and displaying their
+            // usage while the official login terminal is waiting for the user.
             Forget(profile.Id);
             var identity = await Runtime.LoginAsync(profile, operation.Token);
             Store.RecordVerifiedIdentity(profile.Id, identity);
@@ -116,7 +164,7 @@ internal sealed class ClaudeAccountController : IDisposable
             else if (exception is not OperationCanceledException) PublishFailure(profile.Id, exception);
             throw;
         }
-        finally { _gate.Release(); }
+        finally { gate.Release(); }
     }
 
     /// <summary>Selects the profile whose usage the widget shows. <paramref name="stillWanted"/> is checked right
@@ -125,7 +173,8 @@ internal sealed class ClaudeAccountController : IDisposable
     internal async Task SelectAsync(ClaudeProfile profile, CancellationToken token, Func<bool>? stillWanted = null)
     {
         using var operation = BeginOperation(token);
-        await _gate.WaitAsync(operation.Token);
+        var gate = ProfileGate(profile.Id);
+        await gate.WaitAsync(operation.Token);
         try
         {
             var identity = await Runtime.VerifyAsync(profile, operation.Token);
@@ -141,7 +190,7 @@ internal sealed class ClaudeAccountController : IDisposable
         }
         catch (Exception exception) when (exception is UnauthorizedAccessException or InvalidDataException)
         { Forget(profile.Id, exception); throw; }
-        finally { _gate.Release(); }
+        finally { gate.Release(); }
         if (!_disposed) SelectionChanged?.Invoke(this, EventArgs.Empty);
     }
 
@@ -154,15 +203,23 @@ internal sealed class ClaudeAccountController : IDisposable
         var requestedProfile = ResolveProfile(profileId);
         using var deadline = timeout is { } duration ? new CancellationTokenSource(duration, _timeProvider) : null;
         using var operation = BeginOperation(token, deadline?.Token ?? CancellationToken.None);
+        var gate = ProfileGate(requestedProfile.Id);
         var entered = false;
+        var reading = false;
         try
         {
-            await _gate.WaitAsync(operation.Token);
+            await gate.WaitAsync(operation.Token);
             entered = true;
             var profile = ResolveProfile(profileId);
             if (profile.Id != requestedProfile.Id)
                 throw new OperationCanceledException("Claude account selection changed during the request.");
             requestedProfile = profile;
+            // The account on the default home moved to its own profile. The terminal and the app keep that home;
+            // the widget runs nothing there, not even a status check, until an account is selected again.
+            if (profile.IsDefault && Store.DefaultHomeRetired) throw new ClaudeLoginRequiredException();
+            RetireLinksOnce(profile);
+            await _readSlots.WaitAsync(operation.Token);
+            reading = true;
             var identity = await Runtime.VerifyAsync(profile, operation.Token, safeMode: true);
             if (profile.Identity is not null && profile.Identity.Key != identity.Key)
                 throw new ClaudeIdentityChangedException();
@@ -174,14 +231,7 @@ internal sealed class ClaudeAccountController : IDisposable
                 changedIdentity = _observationBindings.TryGetValue(profile.Id, out var binding)
                     && !binding.Matches(profile, identity.Key);
             if (changedIdentity) Forget(profile.Id);
-            foreach (var previous in _clients.Keys.Where(value => value.StartsWith(profile.Id + ":", StringComparison.Ordinal)
-                         && value != key).ToArray())
-            { _clients[previous].Dispose(); _clients.Remove(previous); }
-            if (!_clients.TryGetValue(key, out var client))
-            {
-                client = _clientFactory(profile, key, identity.Key);
-                _clients.Add(key, client);
-            }
+            var client = Client(profile, key, identity.Key);
             var result = UsableObservation(await client.GetUsageAsync(operation.Token), _timeProvider.GetUtcNow())
                 ?? throw new InvalidDataException("Claude Code did not return a usable usage limit.");
             Publish(profile, identity.Key, result);
@@ -206,13 +256,42 @@ internal sealed class ClaudeAccountController : IDisposable
             throw failure;
         }
         catch (FileNotFoundException ex) { Forget(requestedProfile.Id, ex); throw; }
-        finally { if (entered) _gate.Release(); }
+        finally
+        {
+            if (reading) _readSlots.Release();
+            if (entered) gate.Release();
+        }
+    }
+
+    /// <summary>Reads several accounts side by side, at most <see cref="ReadConcurrency"/> at a time, each as
+    /// <see cref="ReadUsageAsync"/> does: through its own profile gate and ten-minute interval. Each account's result
+    /// or failure is published (<see cref="UsageChanged"/>) and handed to <paramref name="completed"/> as soon as that
+    /// account ends, on the caller's context; a failure stays with its account while the others go on. Null reads
+    /// <see cref="ReadableProfiles"/>. Cancellation by the caller, or disposal, ends the whole batch.</summary>
+    internal async Task<IReadOnlyList<ClaudeUsageReadOutcome>> ReadUsageManyAsync(IEnumerable<string>? profileIds,
+        CancellationToken token, Action<ClaudeUsageReadOutcome>? completed = null)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        var ids = (profileIds ?? ReadableProfiles().Select(profile => profile.Id))
+            .Distinct(StringComparer.Ordinal).ToArray();
+        async Task<ClaudeUsageReadOutcome> ReadOne(string id)
+        {
+            ClaudeUsageReadOutcome outcome;
+            try { outcome = new(id, await ReadUsageAsync(id, token), null); }
+            catch (Exception exception) when (exception is OperationCanceledException && token.IsCancellationRequested
+                                              || _lifetime.IsCancellationRequested) { throw; }
+            catch (Exception exception) { outcome = new(id, null, exception); }
+            completed?.Invoke(outcome);
+            return outcome;
+        }
+        return await Task.WhenAll(ids.Select(ReadOne).ToArray());
     }
 
     internal async Task LogoutAsync(ClaudeProfile profile, CancellationToken token)
     {
         using var operation = BeginOperation(token);
-        await _gate.WaitAsync(operation.Token);
+        var gate = ProfileGate(profile.Id);
+        await gate.WaitAsync(operation.Token);
         var wasSelected = false;
         try
         {
@@ -222,16 +301,129 @@ internal sealed class ClaudeAccountController : IDisposable
             Store.MarkLoggedOut(profile.Id);
             PublishFailure(profile.Id, new ClaudeLoginRequiredException());
         }
-        finally { _gate.Release(); }
+        finally { gate.Release(); }
         if (wasSelected && !_disposed) SelectionChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    /// <summary>
+    /// Moves the account registered on the default Claude home into a profile of its own, so the widget no longer
+    /// shares that home's sign-in with the terminal CLI and the Desktop app. The official login opens as it does for a
+    /// new account. Signed in to the same account, the row keeps its name, place and selection and takes the new
+    /// profile, its saved usage goes with it, and nothing runs against the default home afterwards. Signed in to
+    /// another account, nothing changes: that new login is signed out again and
+    /// <see cref="ClaudeMoveSignedInAnotherAccountException"/> is thrown. The default home itself is never modified,
+    /// and a folder left by a move that did not complete stays in place, out of the list.
+    /// </summary>
+    internal async Task<ClaudeProfile> MoveDefaultHomeAccountAsync(CancellationToken token)
+    {
+        using var operation = BeginOperation(token);
+        var source = Store.ListProfiles().SingleOrDefault(profile => profile.IsDefault);
+        if (source?.Identity is not { } expected) throw new InvalidOperationException("옮길 기존 Claude 계정이 없습니다.");
+        var target = Store.NewDetachedProfile(source.Label);
+        var targetGate = ProfileGate(target.Id);
+        await targetGate.WaitAsync(operation.Token);
+        ClaudeProfile moved;
+        var loginStarted = false;
+        var kept = false;
+        try
+        {
+            loginStarted = true;
+            var identity = await Runtime.LoginAsync(target, operation.Token);
+            if (identity.Key != expected.Key) throw new ClaudeMoveSignedInAnotherAccountException();
+            // As when selecting: both modes must identify the same subscription before the selection carries over.
+            var usageIdentity = await Runtime.VerifyAsync(target, operation.Token, safeMode: true);
+            if (usageIdentity.Key != identity.Key)
+                throw new InvalidOperationException("Claude 실행과 사용량 조회의 계정이 다릅니다. 로그인 설정을 확인해 주세요.");
+            var sourceGate = ProfileGate(source.Id);
+            await sourceGate.WaitAsync(operation.Token);
+            try
+            {
+                moved = Store.AdoptDefault(target, identity);
+                kept = true;
+                _usageCache.Move(source.Id + ":" + identity.Key, moved.Id + ":" + identity.Key);
+                // The default row's observation and clients belong to the default home, which is no longer used.
+                Forget(source.Id);
+            }
+            finally { sourceGate.Release(); }
+        }
+        finally
+        {
+            // A login that was started but not kept may have finished in the official terminal even when its check
+            // failed or the request was canceled afterwards.
+            if (loginStarted && !kept) await SignOutUnusedAsync(target);
+            targetGate.Release();
+        }
+        if (!_disposed) SelectionChanged?.Invoke(this, EventArgs.Empty);
+        return moved;
+    }
+
+    private SemaphoreSlim ProfileGate(string profileId)
+    {
+        lock (_profileGates)
+        {
+            if (!_profileGates.TryGetValue(profileId, out var gate)) _profileGates.Add(profileId, gate = new(1, 1));
+            return gate;
+        }
+    }
+
+    // The client of this profile and verified account, replacing one bound to another account. Under the profile's gate.
+    private ClaudeUsageClient Client(ClaudeProfile profile, string key, string accountKey)
+    {
+        ClaudeUsageClient? client;
+        ClaudeUsageClient[] replaced;
+        lock (_clients)
+        {
+            var previous = _clients.Keys.Where(value => value.StartsWith(profile.Id + ":", StringComparison.Ordinal)
+                && value != key).ToArray();
+            replaced = previous.Select(value => _clients[value]).ToArray();
+            foreach (var value in previous) _clients.Remove(value);
+            _clients.TryGetValue(key, out client);
+        }
+        foreach (var old in replaced) old.Dispose();
+        if (client is not null) return client;
+        client = _clientFactory(profile, key, accountKey);
+        lock (_clients) _clients[key] = client;
+        return client;
+    }
+
+    // Links an earlier build left in this profile go before its first read in this process (see
+    // ClaudeProfileRuntime.RetireSharedLinks). One that cannot go now is tried again at the next sign-in or start.
+    private void RetireLinksOnce(ClaudeProfile profile)
+    {
+        if (profile.IsDefault) return;
+        lock (_linksChecked)
+        {
+            if (!_linksChecked.Add(profile.Id)) return;
+        }
+        // Stopped when a folder was not where its link pointed: reads go on, and nothing else is removed.
+        try { Runtime.RetireSharedLinks(profile); }
+        catch (IOException) { }
+    }
+
+    // Ends, through the official CLI, a login the move did not keep, so the left folder holds no live sign-in. Best
+    // effort and bounded; the folder itself is not deleted.
+    private async Task SignOutUnusedAsync(ClaudeProfile profile)
+    {
+        if (_lifetime.IsCancellationRequested) return;
+        using var cleanup = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
+        cleanup.CancelAfter(CleanupTimeout);
+        try { await Runtime.LogoutAsync(profile, cleanup.Token); }
+        catch (Exception) { }
     }
 
     private void Forget(string id, Exception? failure = null)
     {
         InvalidateObservation(id, failure);
-        foreach (var key in _clients.Keys.Where(key => key.StartsWith(id + ":", StringComparison.Ordinal)).ToArray())
-        { _clients[key].Dispose(); _clients.Remove(key); }
-        _clearRecoveryCache();
+        ClaudeUsageClient[] removed;
+        lock (_clients)
+        {
+            var keys = _clients.Keys.Where(key => key.StartsWith(id + ":", StringComparison.Ordinal)).ToArray();
+            removed = keys.Select(key => _clients[key]).ToArray();
+            foreach (var key in keys) _clients.Remove(key);
+        }
+        foreach (var client in removed) client.Dispose();
+        // Its saved values stay for display; they no longer recover the widget.
+        _usageCache.EndRecovery(id);
     }
 
     private void InvalidateObservation(string id, Exception? failure = null)
@@ -349,14 +541,18 @@ internal sealed class ClaudeAccountController : IDisposable
 
     private async Task DisposeClientsWhenIdleAsync()
     {
-        // An auth/login/usage command may still be unwinding cancellation. Do not dispose a semaphore
-        // or a client underneath its waiter/finally block. The small gate is collected with this owner.
-        await _gate.WaitAsync().ConfigureAwait(false);
-        try
+        // An auth/login/usage command may still be unwinding cancellation. Wait until every profile's operation has
+        // left its gate, then keep the gates: nothing new can enter (its wait is already canceled), and no semaphore or
+        // client is disposed underneath a waiter or finally block. The small gates are collected with this owner.
+        SemaphoreSlim[] gates;
+        lock (_profileGates) gates = _profileGates.Values.ToArray();
+        foreach (var gate in gates) await gate.WaitAsync().ConfigureAwait(false);
+        ClaudeUsageClient[] clients;
+        lock (_clients)
         {
-            foreach (var client in _clients.Values) client.Dispose();
+            clients = _clients.Values.ToArray();
             _clients.Clear();
         }
-        finally { _gate.Release(); }
+        foreach (var client in clients) client.Dispose();
     }
 }

@@ -26,7 +26,7 @@ Choose **Claude display → All models · weekly remaining / Fable · weekly rem
 
 Codex refreshes every minute while active. Claude usage requests are at least ten minutes apart per account, including manual refreshes and failed attempts. Checking one account does not delay another; duplicate profiles for the same verified account share the interval. This is the widget's conservative polling interval, not a published provider requirement. The tooltip lists the selected Claude window first, followed by the other weekly window and the five-hour limit. Overall and Fable percentages are separate limits; they are not added together.
 
-Temporary Claude failures can keep a recent, unexpired value visible with its last check time and retry time. Each window expires independently, and no recovery value is used after 24 hours. Missing reset times stay unknown. Account verification or response-format failures clear the affected cached value.
+Temporary Claude failures can keep a recent, unexpired value visible with its last check time and retry time. Each window expires independently, and no recovery value is used after 24 hours. Missing reset times stay unknown. Account verification or response-format failures end the affected value's recovery use.
 
 ## Codex accounts
 
@@ -152,7 +152,7 @@ Uninstall removes the app and scheduled task. It **preserves saved Codex account
 
 The WinForms widget reads `account/rateLimits/read` through the official local Codex app-server and selects the window closest to seven days. Claude usage comes from the official CLI's built-in `/usage`, run in safe mode without a shell, browser integration or persistent session and with `--max-turns 0`. Responses reporting a model turn or nonzero cost are rejected. The app does not read Claude tokens or implement its own OAuth flow.
 
-One local Claude recovery snapshot holds percentages, reset times, its check time and an opaque profile/account key. It cannot be reused for a different verified account. A new process attempts a live request first; temporary failures may use the matching snapshot for up to 24 hours, with each expired window withheld independently. Claude's own last-known output is not relabeled as a fresh check.
+Each Claude account's last usage is kept locally for up to 30 days: percentages, reset times, its check time and an opaque profile/account key. It is never shown as a fresh check or reused for a different verified account. A new process attempts a live request first; temporary failures may use the matching value for up to 24 hours, with each expired window withheld independently. Claude's own last-known output is not relabeled as a fresh check.
 
 Account changes are manual. There is no quota-based rotation, request proxy, pooled subscription quota, usage timeline or per-person attribution. This convenience tool does not establish that any particular multi-account usage pattern is permitted by the service terms.
 

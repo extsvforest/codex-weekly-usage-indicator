@@ -10,6 +10,7 @@ if (args.Contains("--claude-layout-dry-run")) { ClaudeSessionShelfTests.LayoutDr
 if (args.Contains("--claude-older-states")) { ClaudeOlderStatesProbe.Run(args); return; }
 if (args.Contains("--claude-sidebar-store-shape")) { ClaudeSessionShelfTests.SidebarStoreShape(); return; }
 if (args.Contains("--claude-layout-diff")) { ClaudeSessionShelfTests.LayoutDiff(args[Array.IndexOf(args, "--claude-layout-diff") + 1], args[Array.IndexOf(args, "--claude-layout-diff") + 2]); return; }
+if (args.Contains("--claude-profile-tests")) { await ClaudeProfileTests.RunAsync(); Console.WriteLine("PASS: Claude profiles"); return; }
 if (args.Contains("--claude-app-data-tests")) { await ClaudeAppDataTests.RunAsync(); Console.WriteLine("PASS: Claude profile folder"); return; }
 if (args.Contains("--claude-shelf-tests")) { await ClaudeSessionShelfTests.RunAsync(); Console.WriteLine("PASS: Claude session shelf"); return; }
 if (args.Contains("--claude-sync-tests")) { await ClaudeSessionSyncTests.RunAsync(); Console.WriteLine("PASS: Claude session sync"); return; }
@@ -48,11 +49,11 @@ var tests = new (string Name, Func<Task> Run)[]
     ("stable light tooltip hover, placement and focus", UsageTooltipHoverSmoke.RunAsync),
     ("widget face: gauges, grounds and states", WidgetFaceTests.RunAsync),
     ("Claude weekly metric, independent expiry and profile cache", ClaudeMetricTests.RunAll),
-    ("Claude official profile identity and shared local work", ClaudeProfileTests.RunAsync),
+    ("Claude official profile identity, link-free profiles and junction-only retirement", ClaudeProfileTests.RunAsync),
     ("Claude profile folder: legacy roaming, moved out of the package, inside it", ClaudeAppDataTests.RunAsync),
     ("Claude session shelf: fill by adding and advancing, closed- and running-app writes, account mapping and log observation", ClaudeSessionShelfTests.RunAsync),
     ("Claude combined weekly total and session-layout plan", ClaudeSessionSyncTests.RunAsync),
-    ("Claude login waits, transient observation and identity invalidation", ClaudeControllerTests.RunAsync),
+    ("Claude per-account reads, saved values, moving the default-home account and identity invalidation", ClaudeControllerTests.RunAsync),
     ("Claude account menu actions and inactive-profile usage", () => ClaudeAccountMenuSmoke.RunAsync()),
     ("account operation lease blocks lifecycle replacement across awaits", AccountOperationLeaseTests.RunAsync),
     ("WSL native targets, independent login and joint recovery", WslCodexTests.RunAsync),
@@ -98,7 +99,7 @@ if (args.Contains("--claude-usage-tests"))
     foreach (var test in new (string Name, Func<Task> Run)[]
              {
                  ("Claude weekly metric, independent expiry and profile cache", ClaudeMetricTests.RunAll),
-                 ("Claude login waits, transient observation and identity invalidation", ClaudeControllerTests.RunAsync)
+                 ("Claude per-account reads, saved values, moving the default-home account and identity invalidation", ClaudeControllerTests.RunAsync)
              }.Concat(tests[first..]))
     {
         await test.Run();
@@ -564,20 +565,24 @@ static Task TestFileCacheAsync()
     {
         var cachePath = Path.Combine(temporaryDirectory, ClaudeUsageFileCacheStore.CacheFileName);
         var now = new DateTimeOffset(2026, 9, 1, 4, 0, 0, TimeSpan.Zero);
-        var entry = new ClaudeUsageCacheEntry(Snapshot(30, now), now);
-        var store = new ClaudeUsageFileCacheStore(cachePath);
+        var entry = new ClaudeUsageCacheEntry(Snapshot(30, now), now, "profile:digest");
+        var store = new ClaudeUsageFileCacheStore(cachePath, new ManualTimeProvider(now));
 
-        store.Save(entry);
+        store.For(entry.ProfileKey).Save(entry);
         using (var document = JsonDocument.Parse(File.ReadAllText(cachePath)))
         {
             var fields = document.RootElement.EnumerateObject().Select(property => property.Name).ToArray();
-            Assert(fields.SequenceEqual(["Snapshot", "LastUpdatedAt", "ProfileKey"]),
-                "the cache contains only sanitized usage and a nonsecret attribution key");
+            var entryFields = document.RootElement.GetProperty("Entries").EnumerateArray().Single()
+                .EnumerateObject().Select(property => property.Name).ToArray();
+            Assert(fields.SequenceEqual(["Version", "Entries"])
+                   && entryFields.SequenceEqual(["ProfileKey", "Snapshot", "LastUpdatedAt", "Recovery"]),
+                "the cache contains only sanitized usage under a nonsecret attribution key per account");
         }
-        Assert(store.Load() == entry, "the file cache should round-trip the sanitized snapshot");
+        Assert(store.For(entry.ProfileKey).Load() == entry && store.Last(entry.ProfileKey) == entry,
+            "the file cache should round-trip the sanitized snapshot");
 
         File.WriteAllText(cachePath, "not-json");
-        Assert(store.Load() is null && !File.Exists(cachePath), "a corrupt cache should be ignored and deleted");
+        Assert(store.For(entry.ProfileKey).Load() is null && !File.Exists(cachePath), "a corrupt cache should be ignored and deleted");
     }
     finally
     {

@@ -79,7 +79,7 @@ internal sealed class ClaudeUsageClient : IDisposable
     }
 
     internal ClaudeUsageClient(IClaudeUsageSource usageSource, string profileKey, string accountKey)
-        : this(usageSource, TimeProvider.System, ClaudeUsageFileCacheStore.CreateDefault(),
+        : this(usageSource, TimeProvider.System, ClaudeUsageFileCacheStore.CreateDefault().For(profileKey),
             profileKey, ClaudeUsageRequestThrottle.Shared, accountKey)
     {
     }

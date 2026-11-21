@@ -538,7 +538,23 @@ internal static class ClaudeSessionShelfTests
         WriteConfig("{" + Section(AccountA, OrgA, "main@example.test") + "," + Section(AccountB, OrgA, "main@example.test") + "}");
         Check(ClaudeShelfAccounts.ReadAccount(Path.Combine(home, ".claude.json"), key) is null,
             "conflicting account sections leave the mapping unresolved");
-        store.Remove(main.Id);
+        // The main account moves off the default home: the official sign-in in its own profile writes the same
+        // account there, and the moved row stays that account's target even if the default home is connected again.
+        WriteConfig("{" + Section(AccountA, OrgA, "main@example.test") + "}");
+        var target = store.NewDetachedProfile("Main");
+        Directory.CreateDirectory(target.ConfigDirectory);
+        File.WriteAllText(Path.Combine(target.ConfigDirectory, ".claude.json"),
+            "{" + Section(AccountA, OrgA, "main@example.test") + "}");
+        var moved = store.AdoptDefault(target, main.Identity!);
+        var afterMove = ClaudeShelfAccounts.Resolve(store.ListProfiles(), fixture.Ledger, home);
+        Check(afterMove.Single().Key == A.Key && afterMove.Single().ProfileId == moved.Id && afterMove.Single().Label == "Main",
+            "the moved account keeps its account/organization pair through its own profile");
+        var again = store.RegisterDefault("Terminal", main.Identity!);
+        Check(store.ListProfiles()[0].Id == again.Id
+              && ClaudeShelfAccounts.Resolve(store.ListProfiles(), fixture.Ledger, home).Single().ProfileId == moved.Id,
+            "a default home connected again for the same account does not take the moved profile's place");
+        store.Remove(again.Id);
+        store.Remove(moved.Id);
         Check(ClaudeShelfAccounts.Resolve(store.ListProfiles(), fixture.Ledger, home).Count == 0
               && !File.ReadAllText(Path.Combine(fixture.Ledger, "accounts.json")).Contains(AccountA),
             "a removed profile never returns as a fill target");

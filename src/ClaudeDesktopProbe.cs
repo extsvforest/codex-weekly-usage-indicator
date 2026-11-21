@@ -572,7 +572,9 @@ internal static class ClaudeShelfAccounts
         var cache = ReadCache(cachePath);
         var accounts = new List<ClaudeShelfAccount>();
         var current = new Dictionary<string, CacheEntry>(StringComparer.Ordinal);
-        foreach (var profile in profiles.Where(profile => profile.IsVerified))
+        // When a profile of its own and the default home both map to one account, the profile of its own is the
+        // account's target: the default home follows whatever the terminal signs in to.
+        foreach (var profile in profiles.Where(profile => profile.IsVerified).OrderBy(profile => profile.IsDefault))
         {
             var configPath = GlobalConfigPath(profile, homeDirectory);
             var entry = ReadAccount(configPath, profile.Identity!.Key) is { } read
