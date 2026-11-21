@@ -283,12 +283,49 @@ internal static class LocalizationTests
             using (var saved = JsonDocument.Parse(File.ReadAllText(legacy)))
                 Check(saved.RootElement.GetProperty("Language").GetString() == "ko", "selected language is persisted in the fixture file");
 
+            // The widget's scale: settings from before there was one read as 100 %, and it is kept beside the others.
+            Check(IndicatorSettingsStore.LoadScale(legacy) == WidgetScale.Default, "settings from before the widget scale read as 100 %");
+            IndicatorSettingsStore.SaveScale(87, legacy);
+            Check(IndicatorSettingsStore.LoadScale(legacy) == 87 && IndicatorSettingsStore.LoadLanguage(legacy) == "ko" &&
+                IndicatorSettingsStore.LoadShowClaude(legacy) && IndicatorSettingsStore.LoadPosition(legacy) == new Point(620, -40),
+                "saving the scale preserves language, visibility and position");
+            IndicatorSettingsStore.SavePosition(new Point(620, -40), legacy);
+            IndicatorSettingsStore.SaveShowClaude(true, legacy);
+            IndicatorSettingsStore.SaveLanguage("ko", legacy);
+            Check(IndicatorSettingsStore.LoadScale(legacy) == 87, "saving the other settings keeps the scale");
+            using (var saved = JsonDocument.Parse(File.ReadAllText(legacy)))
+                Check(saved.RootElement.GetProperty("ScalePercent").GetInt32() == 87, "the scale is persisted in the fixture file");
+            foreach (var scale in new[] { 50, 105, 200 })
+            {
+                IndicatorSettingsStore.SaveScale(scale, legacy);
+                Check(IndicatorSettingsStore.LoadScale(legacy) == scale, $"a scale of {scale} % round-trips");
+            }
+            var kept = File.ReadAllText(legacy);
+            foreach (var outside in new[] { 49, 201, 0, -100 })
+            {
+                try
+                {
+                    IndicatorSettingsStore.SaveScale(outside, legacy);
+                    throw new InvalidOperationException($"Localization: a scale of {outside} % should be rejected");
+                }
+                catch (ArgumentOutOfRangeException) { }
+            }
+            Check(File.ReadAllText(legacy) == kept, "a scale out of range does not overwrite preferences");
+            var edited = Path.Combine(root, "edited.json");
+            File.WriteAllText(edited, "{\"X\":10,\"Y\":20,\"ShowClaude\":true,\"Language\":\"ko\",\"ScalePercent\":350}");
+            Check(IndicatorSettingsStore.LoadScale(edited) == WidgetScale.Default, "a scale out of range in the file reads as 100 %");
+            IndicatorSettingsStore.SaveShowClaude(false, edited);
+            using (var cleaned = JsonDocument.Parse(File.ReadAllText(edited)))
+                Check(cleaned.RootElement.GetProperty("ScalePercent").ValueKind == JsonValueKind.Null &&
+                    IndicatorSettingsStore.LoadPosition(edited) == new Point(10, 20), "the next save drops a scale out of range and keeps the rest");
+
             foreach (var (culture, expected) in new[] { ("ko-KR", "ko"), ("en-US", "en"), ("fr-FR", "en") })
             {
                 CultureInfo.CurrentUICulture = CultureInfo.GetCultureInfo(culture);
                 var fresh = Path.Combine(root, "fresh-" + culture + ".json");
                 Check(IndicatorSettingsStore.LoadLanguage(fresh) == expected &&
-                    IndicatorSettingsStore.LoadPosition(fresh) is null && IndicatorSettingsStore.LoadShowClaude(fresh),
+                    IndicatorSettingsStore.LoadPosition(fresh) is null && IndicatorSettingsStore.LoadShowClaude(fresh) &&
+                    IndicatorSettingsStore.LoadScale(fresh) == WidgetScale.Default,
                     $"fresh {culture} settings use the supported system language and standard defaults");
                 Check(!File.Exists(fresh), "loading default preferences does not create a settings file");
                 IndicatorSettingsStore.SavePosition(new Point(31, 47), fresh);

@@ -106,9 +106,13 @@ Actual capture and switching require WSL Codex processes, including app and IDE 
 
 Windows and WSL cannot be updated in one atomic filesystem operation. If a switch is interrupted, the manager keeps an encrypted recovery record and shows what still needs attention. **Recover account switch** completes verification where possible. **Stop WSL linking** instead leaves every environment's current login untouched, disables linked switching and archives the encrypted recovery record. It does not roll back or write authentication files.
 
+## Widget size
+
+Choose **Size… / 크기…** in the widget or tray menu to set the widget's size in 1% steps, from 50% to 200%; 100% is the original 272 × 64 size. Each value shows on the widget at once. **OK** keeps it and **Cancel** puts back the size it had. A new size keeps the widget's centre, settles again on the middle line of a taskbar it sits in and stays on the screen. The size is saved locally and does not follow the display's scale.
+
 ## Language
 
-Choose **Language / 언어 → 한국어 / English** in the widget or tray menu. Menus, account management, dialogs, usage details and known application errors change immediately. An idle manager keeps its size and latest observations. Finish or cancel a running account operation before changing language.
+Choose **Language / 언어 → 한국어 / English** in the widget or tray menu. Menus, account management, dialogs, usage details and known application errors change immediately. An idle manager keeps its size and latest observations. Finish or cancel a running account operation, and close the size window, before changing language.
 
 The choice is saved locally. Existing installations keep Korean; new installations use Korean on Korean Windows and English otherwise. Account names, identities and usage values are not translated. Windows dialogs and external diagnostic text can follow their own language settings.
 

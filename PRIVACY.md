@@ -1,15 +1,16 @@
 # Privacy
 
-Codex + Claude Usage Indicator uses your installed official Codex and Claude Code clients to check usage and manage explicitly selected accounts. It has no telemetry, request proxy or direct usage API connection. The official clients handle communication with their providers under their own terms and privacy practices.
+Codex + Claude Usage Indicator uses your installed official Codex and Claude Code clients to check usage and manage explicitly selected accounts, and the official Antigravity CLI to check Antigravity usage when you ask. It has no telemetry, request proxy or direct usage API connection. The official clients handle communication with their providers under their own terms and privacy practices.
 
 ## Local data
 
 | Location | Contents |
 | --- | --- |
-| `%LOCALAPPDATA%\CodexWeeklyUsageIndicator\settings.json` | Window position, Claude visibility, selected Claude usage metric and interface language |
+| `%LOCALAPPDATA%\CodexWeeklyUsageIndicator\settings.json` | Window position, widget size, Claude visibility, selected Claude usage metric and interface language |
 | `%LOCALAPPDATA%\CodexWeeklyUsageIndicator\claude-usage-cache.json` | At most one Claude recovery snapshot: percentages, reset times, check time and an opaque profile key containing a hash of the verified account identity |
 | `%LOCALAPPDATA%\CodexWeeklyUsageIndicator.Accounts` | Windows-user DPAPI encrypted Codex logins, latest account observations and recovery records; connected WSL login vaults and journals |
 | `%LOCALAPPDATA%\CodexWeeklyUsageIndicator.ClaudeProfiles` | Non-secret profile metadata and additional official Claude Code profile directories |
+| `%LOCALAPPDATA%\CodexWeeklyUsageIndicator.Antigravity` | Antigravity accounts read so far: an opaque key (a hash of the account's address), the name you gave it, a masked hint such as `a***@example.com`, and the last usage read with its time. During a check its `run` folder holds the official CLI's log for a few seconds |
 
 Claude profile metadata contains names, directory paths, selected profile, a hashed identity, masked account hint, subscription type and verification time. The official Claude CLI can store its own credentials and account-specific configuration inside each profile directory. **This application does not read, print, log, copy, persist or transmit Claude authentication tokens.**
 
@@ -45,9 +46,15 @@ Usage checks invoke Claude Code in safe mode without a shell, browser integratio
 
 The single recovery cache is bound to the verified profile and account. It cannot supply another account's values. A new process attempts a live usage request before using it for a transient failure. Each usage window is withheld after its own reset; the cache is invalid after 24 hours or when all windows expire. Authentication or response-format failures clear the affected cached data. Claude's own last-known usage output is treated as a delayed check rather than a new observation.
 
+## Antigravity usage
+
+Antigravity usage is checked only when you ask for it, never on a timer or at startup. The app runs the installed official Antigravity CLI (`agy`) once with its `/usage` command, started directly rather than through a shell, with the CLI's automatic update turned off for that run. A response that reports a model turn or used tokens is rejected.
+
+The CLI's answer does not say which account it belongs to, so the app has the CLI write its log to a private temporary file, reads the one line that names the signed-in account, and deletes the file as soon as the CLI has exited. The address becomes the opaque key and masked hint described above at once and is not stored, logged or shown. **The app never opens Antigravity's sign-in data (its Windows credential or token files) and never signs in, signs out or switches Antigravity accounts;** to use another account, sign in with `agy` yourself.
+
 ## Removal and bug reports
 
-Uninstall removes the widget, its settings/cache and scheduled task. It intentionally preserves the separate Codex account vault, WSL recovery records and Claude profile directories. Removing a Claude account from the list removes its registration only; its official CLI login and working files remain. Use the profile's **Sign out** action to end its login before removal when desired.
+Uninstall removes the widget, its settings/cache and scheduled task. It intentionally preserves the separate Codex account vault, WSL recovery records, Claude profile directories and Antigravity account list. Removing a Claude account from the list removes its registration only; its official CLI login and working files remain. Use the profile's **Sign out** action to end its login before removal when desired.
 
 Additional Claude profile directories contain links to original working data. Do not recursively delete the contents of linked conversation or skill folders when removing a profile. The original default Claude folder is not an application-owned cleanup target.
 

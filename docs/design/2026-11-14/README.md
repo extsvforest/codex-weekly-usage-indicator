@@ -29,7 +29,12 @@ dark, details in the hover tooltip.
 
 The window does not scale with the display, but its 13-point number did. At 200%
 the number stood 35 pixels tall in a 64-pixel window and sat on its bar. The new
-face is drawn in pixels of the window, so it reads the same at every scale.
+face is drawn in pixels of its 272 × 64 design, so it reads the same at every
+display scale.
+
+Since 2026-11-21 the user can set the widget's own scale, 100 % by default and
+50–200 % in 1 % steps (right-click → Size…): the same face drawn larger or smaller
+in a window of that size. It still does not follow the display's scale.
 
 ## Compared
 
