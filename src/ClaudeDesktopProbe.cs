@@ -305,11 +305,14 @@ internal static class ClaudeDesktopProbe
     // The scheduled-task alignment (ClaudeScheduledSync) depends on the app keeping each account's list the way 6.28899
     // does, apart from the session lists: a missing marker or a flow or schema that reads differently stops that
     // feature alone. (1) the list is userData\claude-code-sessions\account\org\scheduled-tasks.json, (2) for the Code
-    // tasks' manager, (3) read in one place, parsed whole with one schema, a failure loading none of it, (4) called only
-    // by initialize, which runs at start and after a reset (an account change), with the path it has just stored, (5) a
-    // save writes the whole list from memory, and only to the path loaded, while no reset came between, (6) which a reset
-    // stops. The list's own schema must read as reviewed too (ScheduledSchemaHash), since a list the widget writes has to
-    // pass it. Nothing else reads or writes that list (one call of the load, one of the writer).
+    // tasks' manager, whose definitions are CLAUDE_CONFIG_DIR (a leading ~ standing for the home folder) or ~\.claude,
+    // then scheduled-tasks (8-10), (3) read in one place, parsed whole with one schema, a failure loading none of it,
+    // (4) called only by initialize, which runs at start and after a reset (an account change), with the path it has just
+    // stored, and logs the list it loaded (7), (5) a save writes the whole list from memory, and only to the path loaded,
+    // while no reset came between, (6) which a reset stops, and logs. Only the account hooks reset and initialize the
+    // manager (ScheduledHooks). The list's own schema, with every schema it is made of, must read as reviewed too
+    // (ScheduledSchemaHash), since a list the widget writes has to pass it. Nothing else reads or writes that list (one
+    // call of the load, one of the writer).
     internal static readonly string[][] ScheduledMarkers =
     [
         ["\"scheduled-tasks.json\""],
@@ -324,10 +327,10 @@ internal static class ClaudeDesktopProbe
             RegexOptions.CultureInvariant)),
         ("=\"claude-code-sessions\"", 40, 30, new Regex(@"(?<![\w$.])(?<root>[\w$]+)=""claude-code-sessions""[,;]", RegexOptions.CultureInvariant)),
         ("logPrefix:\"[CCDScheduledTasks]\"", 120, 1600, new Regex(
-            @"(?<![\w$.])[\w$]+=new [\w$]+\(\{logPrefix:""\[CCDScheduledTasks\]"",[^;]{0,1600}?getStorageFilePath:(?<path>[\w$]+),",
+            @"(?<![\w$.])(?<manager>[\w$]+)=new [\w$]+\(\{logPrefix:""\[CCDScheduledTasks\]"",[^;]{0,1600}?getStorageFilePath:(?<path>[\w$]+),getTaskFilesDir:(?<defs>[\w$]+),",
             RegexOptions.CultureInvariant)),
         ("async loadScheduledTasksFromDisk(", 0, 600, new Regex(
-            @"^async loadScheduledTasksFromDisk\((?<p>[\w$]+)\)\{try\{let (?<t>[\w$]+)=await [\w$]+\(\k<p>,[\w$]+,\{walkRoot:\(0,[\w$]+\.dirname\)\(\k<p>\),lstatWalkRoot:!1\}\),(?<r>[\w$]+)=JSON\.parse\(\k<t>\);return (?<file>[\w$]+)\.parse\(\k<r>\)\}catch\((?<x>[\w$]+)\)\{return \k<x>\.code===""ENOENT""\?\{scheduledTasks:\[\]\}:\([^;]{0,200}?,\{scheduledTasks:\[\],loadFailed:!0\}\)\}\}",
+            @"^async loadScheduledTasksFromDisk\((?<p>[\w$]+)\)\{try\{let (?<t>[\w$]+)=await [\w$]+\(\k<p>,[\w$]+,\{walkRoot:\(0,[\w$]+\.dirname\)\(\k<p>\),lstatWalkRoot:!1\}\),(?<r>[\w$]+)=JSON\.parse\(\k<t>\);return (?<file>[\w$]+)\.parse\(\k<r>\)\}catch\((?<x>[\w$]+)\)\{return \k<x>\.code===""ENOENT""\?\{scheduledTasks:\[\]\}:\((?<log>[\w$]+)\.error\(`\$\{this\.config\.logPrefix\} Failed to load scheduled tasks:`,[\w$]+\(\k<x>\)\),\{scheduledTasks:\[\],loadFailed:!0\}\)\}\}",
             RegexOptions.CultureInvariant)),
         (".loadScheduledTasksFromDisk(", 1500, 40, new Regex(
             @"initialize\((?<a>[\w$]+),(?<o>[\w$]+)\)\{if\(this\._initializePromise\)\{[^;]{0,120}?Already initialized`\);return\}[^;]{0,160}?;let (?<p>[\w$]+)=this\.config\.getStorageFilePath\(\k<a>,\k<o>\);this\._scheduledTasksFilePath=\k<p>;(?:(?!this\._scheduledTasksFilePath=|(?<![\w$.])\k<p>=(?!=)).){0,1400}?this\.loadScheduledTasksFromDisk\(\k<p>\)",
@@ -336,14 +339,29 @@ internal static class ClaudeDesktopProbe
             @"^persistToDisk\(\)\{let (?<c>[\w$]+)=this\._initCounter,(?<p>[\w$]+)=this\._scheduledTasksFilePath;return this\._persistMutex\.runExclusive\(\(\(\)=>this\.writeSnapshotToDisk\(\k<c>,\k<p>\)\)\)\}async writeSnapshotToDisk\((?<c2>[\w$]+),(?<p2>[\w$]+)\)\{if\(!\k<p2>\)return!1;if\(\k<c2>!==this\._initCounter\)return [^;]{0,160}?,!1;try\{if\(await this\.ensureStorageDir\(\k<p2>\),\k<c2>!==this\._initCounter\|\|\k<p2>!==this\._scheduledTasksFilePath\)return [^;]{0,160}?,!1;(?:(?!this\._scheduledTasksFilePath|(?<![\w$.])\k<p2>=(?!=)).){0,800}?return await [\w$]+\(\k<p2>,\{scheduledTasks:Array\.from\(this\._scheduledTasks\.values\(\)\),recordedSkips:",
             RegexOptions.CultureInvariant | RegexOptions.Singleline)),
         ("reset(){this._initCounter++,", 0, 2200, new Regex(
-            @"^reset\(\)\{this\._initCounter\+\+,.{0,2000}?this\._scheduledTasksFilePath=null,this\._taskFilesDir=null,this\._initializePromise=null",
-            RegexOptions.CultureInvariant | RegexOptions.Singleline))
+            @"^reset\(\)\{this\._initCounter\+\+,.{0,2000}?this\._scheduledTasksFilePath=null,this\._taskFilesDir=null,this\._initializePromise=null(?:(?!this\._loadedFor=).){0,1800}?this\._loadedFor=null,(?<log>[\w$]+)\.info\(`\$\{this\.config\.logPrefix\} Reset`\)\}",
+            RegexOptions.CultureInvariant | RegexOptions.Singleline)),
+        // The line ClaudeDesktopLogWatcher reads for the list the manager loaded, logged by initialize with its arguments.
+        ("} Initialized`", 3600, 120, new Regex(
+            @"initialize\((?<a>[\w$]+),(?<o>[\w$]+)\)\{if\(this\._initializePromise\)\{(?:(?!initialize\(|reset\(\)\{).){0,3500}?(?<log>[\w$]+)\.info\(`\$\{this\.config\.logPrefix\} Initialized`,\{accountId:\k<a>,orgId:\k<o>\}\)",
+            RegexOptions.CultureInvariant | RegexOptions.Singleline)),
+        ("(),\"scheduled-tasks\")}", 120, 30, new Regex(
+            @"function (?<defs>[\w$]+)\(\)\{return\(0,[\w$]+\.join\)\((?<config>[\w$]+)\(\),""scheduled-tasks""\)\}",
+            RegexOptions.CultureInvariant)),
+        ("=process.env.CLAUDE_CONFIG_DIR;return ", 40, 140, new Regex(
+            @"function (?<config>[\w$]+)\(\)\{let (?<e>[\w$]+)=process\.env\.CLAUDE_CONFIG_DIR;return \k<e>\?(?<tilde>[\w$]+)\(\k<e>\):\(0,[\w$]+\.join\)\(\(0,[\w$]+\.homedir\)\(\),""\.claude""\)\}",
+            RegexOptions.CultureInvariant)),
+        ("===\"~\"?(0,", 40, 200, new Regex(
+            @"function (?<tilde>[\w$]+)\((?<e>[\w$]+)\)\{return \k<e>===""~""\?\(0,[\w$]+\.homedir\)\(\):\k<e>\.startsWith\(""~/""\)\|\|\k<e>\.startsWith\(""~\\\\""\)\?\(0,[\w$]+\.join\)\(\(0,[\w$]+\.homedir\)\(\),\k<e>\.slice\(2\)\):\k<e>\}",
+            RegexOptions.CultureInvariant))
     ];
-    private static readonly string[] ScheduledShared = ["path", "root", "file"];
+    private const int ScheduledManagerFlow = 2;
+    private static readonly string[] ScheduledShared = ["path", "root", "file", "log", "manager", "defs", "config", "tilde"];
     private static readonly Regex ScheduledFile = new(
         @"(?<![\w$.])(?<file>[\w$]+)=(?<k>[\w$]+)\(\{scheduledTasks:[\w$]+\((?<entry>[\w$]+)\),recordedSkips:", RegexOptions.CultureInvariant);
-    // The list's file and entry schemas as reviewed (6.28899), their minified names numbered in order (ScheduledSchema).
-    private const string ScheduledSchemaHash = "61F0946ABBAC532D940BBB2CB4D8BDF076C689E92B23465F81F4030BBE1D1596";
+    // The list's file and entry schemas as reviewed (6.28899) with the schemas they are made of, their minified names
+    // numbered in order (ScheduledSchema).
+    private const string ScheduledSchemaHash = "BAE3807C12AA3E25EC851E175490F4E09C9C53285233A4B105EEDA2172931ED6";
     private static (string Key, ClaudeDesktopContract Contract)? _scheduledContract;
 
     /// <summary>Whether the installed app keeps scheduled-task lists the way the alignment was designed for; cached per
@@ -373,11 +391,12 @@ internal static class ClaudeDesktopProbe
         return ScheduledUnmatched(bundle, firstOnly: true).Count == 0 ? ClaudeDesktopContract.Reviewed : ClaudeDesktopContract.Unreviewed;
     }
 
-    /// <summary>Which scheduled-list flows (by index), counts and the schema do not read as reviewed. Read-only.</summary>
+    /// <summary>Which scheduled-list flows (by index), counts, hooks and the schema do not read as reviewed. Read-only.</summary>
     internal static IReadOnlyList<string> ScheduledUnmatched(ReadOnlySpan<byte> bundle, bool firstOnly = false)
     {
         var failed = new List<string>();
         var shared = new Dictionary<string, string>(StringComparer.Ordinal);
+        var places = new int[ScheduledFlows.Length];
         for (var index = 0; index < ScheduledFlows.Length; index++)
         {
             var (anchor, before, after, flow) = ScheduledFlows[index];
@@ -395,6 +414,7 @@ internal static class ClaudeDesktopProbe
                         && shared.TryGetValue(name, out var known) && known != named.Value)) continue;
                 foreach (var name in ScheduledShared)
                     if (match.Groups[name] is { Success: true } named) shared[name] = named.Value;
+                places[index] = offset + found;
                 satisfied = true;
             }
             if (!satisfied) { failed.Add($"scheduled flow {index} ({anchor})"); if (firstOnly) return failed; }
@@ -402,6 +422,11 @@ internal static class ClaudeDesktopProbe
         if (Count(bundle, ".loadScheduledTasksFromDisk("u8) != 1 || Count(bundle, "writeSnapshotToDisk("u8) != 2)
         {
             failed.Add("scheduled readers or writers");
+            if (firstOnly) return failed;
+        }
+        if (!shared.TryGetValue("manager", out var manager) || !ScheduledHooks(bundle, manager, places[ScheduledManagerFlow]))
+        {
+            failed.Add("scheduled hooks");
             if (firstOnly) return failed;
         }
         var schema = shared.TryGetValue("file", out var file) ? ScheduledSchema(bundle, file) : null;
@@ -418,9 +443,171 @@ internal static class ClaudeDesktopProbe
         return count;
     }
 
-    /// <summary>The scheduled list's entry and file schemas as text, every name that is not a field or a member numbered
-    /// by first appearance, so renamed minified names read the same and any other change does not; null when they cannot
-    /// be found. <paramref name="file"/> is the file schema's name the load uses.</summary>
+    /// <summary>
+    /// Whether only the app's account hooks reset and load the scheduled-task manager the flows read (at
+    /// <paramref name="at"/>), so the list it holds changes only where its log says (Reset, Initialized). Its file
+    /// exports it once, as a defined property, and sets neither that export nor the manager again; the bundle calls its
+    /// reset and its initialize through that export once each, in one file that binds the manager's file to one name in
+    /// its header and never sets the export on it: reset in the account-change hook, initialize in the initialized hook
+    /// with that hook's own arguments, neither hook binding the name again before the call. The namespace object that
+    /// file also exports the manager in is read nowhere by the manager's name there.
+    /// </summary>
+    internal static bool ScheduledHooks(ReadOnlySpan<byte> bundle, string manager, int at)
+    {
+        if (FileAt(bundle, at) is not { Name: { } managerFile } managerSpan) return false;
+        var file = bundle[managerSpan.Start..managerSpan.End];
+        var getter = Encoding.UTF8.GetBytes(",{enumerable:!0,get:function(){return " + manager + "}})");
+        var exportAt = file.IndexOf(getter);
+        if (exportAt < 0 || file[(exportAt + getter.Length)..].IndexOf(getter) >= 0) return false;
+        var define = "Object.defineProperty(exports,\""u8;
+        var defineAt = file[..exportAt].LastIndexOf(define);
+        if (defineAt < 0) return false;
+        var quoted = Encoding.UTF8.GetString(file[(defineAt + define.Length)..exportAt]);
+        if (!Regex.IsMatch(quoted, @"^[\w$]+""$", RegexOptions.CultureInvariant)) return false;
+        var export = quoted[..^1];
+        if (Sets(file, "exports." + export, ownName: false) != 0 || Sets(file, "module.exports", ownName: false) != 0
+            || Sets(file, manager, ownName: true) != 1) return false;
+        if (Count(bundle, Encoding.UTF8.GetBytes("{ccdScheduledTasks:()=>" + manager + ",")) != 1
+            || Count(bundle, "{ccdScheduledTasks:"u8) != 1 || Count(bundle, ".ccdScheduledTasks"u8) != 0
+            || Count(bundle, ",ccdScheduledTasks:"u8) != 0 || Count(bundle, "ccdScheduledTasks}"u8) != 0
+            || Count(bundle, "\"ccdScheduledTasks\""u8) != 0) return false;
+        var reset = Encoding.UTF8.GetBytes("." + export + ".reset()");
+        var initialize = Encoding.UTF8.GetBytes("." + export + ".initialize(");
+        if (Count(bundle, reset) != 1 || Count(bundle, initialize) != 1) return false;
+        var (resetAt, initializeAt) = (bundle.IndexOf(reset), bundle.IndexOf(initialize));
+        if (FileAt(bundle, resetAt) is not { } hooks || FileAt(bundle, initializeAt)?.Start != hooks.Start) return false;
+        var name = Identifier(bundle, resetAt);
+        if (name is null || Identifier(bundle, initializeAt) != name) return false;
+        if (Hook(bundle, hooks.Start, resetAt - name.Length, @"onAccountOrgChanged\((?<a>[\w$]+)\)\{", name) is null
+            || Hook(bundle, hooks.Start, initializeAt - name.Length, @"async onInitialized\((?<a>[\w$]+),(?<o>[\w$]+)\)\{", name)
+                is not { } arguments
+            || !bundle[(initializeAt + initialize.Length)..].StartsWith(Encoding.UTF8.GetBytes(arguments + ")"))) return false;
+        var header = Encoding.UTF8.GetString(bundle.Slice(hooks.Start, Math.Min(HeaderBytes, hooks.End - hooks.Start)));
+        var required = Regex.Matches(header, @"(?<![\w$.])" + Regex.Escape(name) + @"=require\(""\./(?<file>[\w.-]+\.js)""\)",
+            RegexOptions.CultureInvariant);
+        return required.Count == 1 && required[0].Groups["file"].Value == managerFile
+            && Sets(bundle[hooks.Start..hooks.End], name + "." + export, ownName: true) == 0;
+    }
+
+    /// <summary>The bundled file around <paramref name="at"/>: from the end of the source map comment before it to its own,
+    /// and the file that comment names (null at the bundle's end).</summary>
+    private static (int Start, int End, string? Name)? FileAt(ReadOnlySpan<byte> bundle, int at)
+    {
+        if (at < 0 || at >= bundle.Length) return null;
+        var previous = bundle[..at].LastIndexOf(SourceMapTrailer);
+        var start = previous < 0 ? 0 : previous + SourceMapTrailer.Length;
+        var trailer = bundle[at..].IndexOf(SourceMapTrailer);
+        if (trailer < 0) return (start, bundle.Length, null);
+        var end = at + trailer;
+        var after = bundle[(end + SourceMapTrailer.Length)..];
+        var mapEnd = after.IndexOf(".map"u8);
+        return (start, end, mapEnd < 0 ? null : Encoding.UTF8.GetString(after[..mapEnd]));
+    }
+
+    /// <summary>The name ending just before <paramref name="at"/>; null when none does.</summary>
+    private static string? Identifier(ReadOnlySpan<byte> bundle, int at)
+    {
+        var start = at;
+        while (start > 0 && bundle[start - 1] is var c && (char.IsAsciiLetterOrDigit((char)c) || c is (byte)'_' or (byte)'$')) start--;
+        return start == at || char.IsAsciiDigit((char)bundle[start]) ? null : Encoding.UTF8.GetString(bundle[start..at]);
+    }
+
+    /// <summary>The arguments of the last method <paramref name="header"/> opens before <paramref name="call"/> (joined by
+    /// commas), when the call is in its body itself (not in a function or block within it, not inside parentheses), no
+    /// argument is <paramref name="name"/> and the body does not bind <paramref name="name"/> before the call (its own
+    /// statements, or a <c>var</c> anywhere in it; a loop's own <c>let</c> or <c>const</c> binds it only within the loop,
+    /// so one that ends before the call does not count); null otherwise.</summary>
+    private static string? Hook(ReadOnlySpan<byte> bundle, int fileStart, int call, string header, string name)
+    {
+        var from = Math.Max(fileStart, call - 200_000);
+        var text = Encoding.UTF8.GetString(bundle[from..call]);
+        var methods = Regex.Matches(text, header, RegexOptions.CultureInvariant);
+        if (methods.Count == 0) return null;
+        var method = methods[^1];
+        var arguments = new[] { "a", "o" }.Select(group => method.Groups[group]).Where(group => group.Success)
+            .Select(group => group.Value).ToArray();
+        if (arguments.Contains(name)) return null;
+        var body = text[(method.Index + method.Length)..];
+        // The body's own statements, without strings, each block within it shown as {}.
+        var own = new StringBuilder();
+        int braces = 1, parentheses = 0;
+        char? quote = null;
+        for (var index = 0; index < body.Length; index++)
+        {
+            var c = body[index];
+            if (quote is not null)
+            {
+                if (c == '\\') index++;
+                else if (c == quote) quote = null;
+                continue;
+            }
+            if (c is '"' or '\'' or '`') { quote = c; continue; }
+            if (c == '{') { if (braces++ == 1) own.Append("{}"); continue; }
+            if (c == '}') { if (--braces == 0) return null; continue; }
+            if (c == '(') parentheses++;
+            else if (c == ')') parentheses--;
+            if (braces == 1) own.Append(c);
+        }
+        var bound = Regex.Escape(name) + @"(?![\w$])";
+        if (braces != 1 || parentheses != 0
+            || Regex.IsMatch(WithoutEndedLoops(own.ToString(), name),
+                @"(?<![\w$.])(?:(?:let|const|var)\s+" + bound + "|" + Regex.Escape(name) + @"\s?=(?![=>]))", RegexOptions.CultureInvariant)
+            || Regex.IsMatch(body, @"(?<![\w$.])var\s+" + bound, RegexOptions.CultureInvariant)) return null;
+        return string.Join(",", arguments);
+    }
+
+    // A loop of a method body's own statements binding one name of its own (for(let name of ...), for(const name in ...)).
+    private static readonly Regex OwnLoop = new(@"(?<![\w$.])for\((?:let|const)\s+(?<name>[\w$]+)\s+(?:of|in)(?![\w$])",
+        RegexOptions.CultureInvariant);
+
+    /// <summary>A body's own statements (<see cref="Hook"/>) without the loops binding <paramref name="name"/> of their own
+    /// that end before the end of the text (the call): within them the name is the loop's.</summary>
+    private static string WithoutEndedLoops(string own, string name)
+    {
+        var kept = new StringBuilder();
+        var index = 0;
+        for (Match loop; (loop = OwnLoop.Match(own, index)).Success;)
+        {
+            var end = loop.Groups["name"].Value == name ? LoopEnd(own, loop.Index + "for".Length) : -1;
+            kept.Append(own, index, (end < 0 ? loop.Index + loop.Length : loop.Index) - index);
+            index = end < 0 ? loop.Index + loop.Length : end;
+        }
+        return kept.Append(own, index, own.Length - index).ToString();
+    }
+
+    /// <summary>Just past the loop whose head opens at <paramref name="open"/> in a body's own statements (blocks shown as
+    /// {}): its body a block, a loop of the same kind or one expression ended by <c>;</c>. -1 when it may not end there.</summary>
+    private static int LoopEnd(string own, int open)
+    {
+        var depth = 0;
+        var close = -1;
+        for (var index = open; index < own.Length && close < 0; index++)
+        {
+            if (own[index] == '(') depth++;
+            else if (own[index] == ')' && --depth == 0) close = index;
+        }
+        if (close < 0) return -1;
+        var at = close + 1;
+        if (own.AsSpan(at).StartsWith("{}")) return at + 2;
+        if (own.AsSpan(at).StartsWith("for(")) return LoopEnd(own, at + "for".Length);
+        if (Regex.IsMatch(own[at..], @"^(?:if|else|do|while|switch|try|with|function|class|let|const|var|return|throw)(?![\w$])",
+                RegexOptions.CultureInvariant)) return -1;
+        depth = 0;
+        for (var index = at; index < own.Length; index++)
+        {
+            var c = own[index];
+            if (c is '(' or '[') depth++;
+            else if (c is ')' or ']') depth--;
+            else if (c == ';' && depth == 0) return index + 1;
+        }
+        return -1;
+    }
+
+    /// <summary>The scheduled list's entry and file schemas as text, with every schema and constant they are made of in
+    /// their file (each defined as <c>name=</c>, the last definition before the entry schema or else the first after),
+    /// every name that is not a field or a member numbered by first appearance, so renamed minified names read the same
+    /// and any other change does not; null when they cannot be found. <paramref name="file"/> is the file schema's name
+    /// the load uses.</summary>
     internal static string? ScheduledSchema(ReadOnlySpan<byte> bundle, string file)
     {
         var anchor = "({scheduledTasks:"u8;
@@ -434,15 +621,69 @@ internal static class ClaudeDesktopProbe
                 if (candidate.Groups["file"].Value == file && start + Encoding.UTF8.GetByteCount(head.AsSpan(0, candidate.Index))
                         + Encoding.UTF8.GetByteCount(file + "=" + candidate.Groups["k"].Value) == at) match = candidate;
             if (match is null) continue;
-            var previous = bundle[..at].LastIndexOf(SourceMapTrailer);
-            var fileStart = previous < 0 ? 0 : previous + SourceMapTrailer.Length;
-            var declaration = Encoding.UTF8.GetBytes(match.Groups["entry"].Value + "=" + match.Groups["k"].Value + "({id:");
-            var entryAt = bundle[fileStart..at].LastIndexOf(declaration);
+            if (FileAt(bundle, at) is not { } span) return null;
+            var entry = match.Groups["entry"].Value;
+            var declaration = Encoding.UTF8.GetBytes(entry + "=" + match.Groups["k"].Value + "({id:");
+            var entryAt = bundle[span.Start..at].LastIndexOf(declaration);
             if (entryAt < 0) return null;
-            var entryStart = fileStart + entryAt + declaration.Length - "({id:".Length;
+            var entryStart = span.Start + entryAt + declaration.Length - "({id:".Length;
             if (Balanced(bundle, entryStart) is not { } entryText || Balanced(bundle, at) is not { } fileText) return null;
             var names = new Dictionary<string, string>(StringComparer.Ordinal);
-            return Renumber(entryText, names) + "\n" + Renumber(fileText, names);
+            var order = new List<string>();
+            var parts = new List<string> { Renumber(entryText, names, order), Renumber(fileText, names, order) };
+            var defined = new HashSet<string>(StringComparer.Ordinal) { entry, file };
+            for (var index = 0; index < order.Count; index++)
+            {
+                var name = order[index];
+                if (name.Length < 2 || !defined.Add(name)) continue;
+                if (Definition(bundle, span.Start, span.End, entryStart, name) is { } definition)
+                    parts.Add(names[name] + "=" + Renumber(definition, names, order));
+            }
+            return string.Join("\n", parts);
+        }
+        return null;
+    }
+
+    /// <summary>What <paramref name="name"/> is defined as in its file (<c>name=</c> not part of a longer name or a
+    /// member, not a comparison or an arrow): the last definition before <paramref name="anchor"/>, else the first after;
+    /// null when there is none or it does not end within 16 KB.</summary>
+    private static string? Definition(ReadOnlySpan<byte> bundle, int fileStart, int fileEnd, int anchor, string name)
+    {
+        var needle = Encoding.UTF8.GetBytes(name + "=");
+        var file = bundle[fileStart..fileEnd];
+        int? before = null, after = null;
+        for (int offset = 0, found; (found = file[offset..].IndexOf(needle)) >= 0; offset += found + needle.Length)
+        {
+            var at = offset + found;
+            var end = at + needle.Length;
+            if (at > 0 && file[at - 1] is var previous && (char.IsAsciiLetterOrDigit((char)previous) || previous is (byte)'_' or (byte)'$' or (byte)'.'))
+                continue;
+            if (end < file.Length && file[end] is (byte)'=' or (byte)'>') continue;
+            if (fileStart + at < anchor) before = fileStart + at;
+            else { after = fileStart + at; break; }
+        }
+        return (before ?? after) is { } place ? Expression(bundle, place + needle.Length) : null;
+    }
+
+    /// <summary>The expression starting at <paramref name="start"/>, up to the comma or semicolon that ends it, or the
+    /// bracket that closes around it; strings skipped. Null when it does not end within 16 KB.</summary>
+    private static string? Expression(ReadOnlySpan<byte> bundle, int start)
+    {
+        var text = Encoding.UTF8.GetString(bundle.Slice(start, Math.Min(16384, bundle.Length - start)));
+        var depth = 0;
+        char? quote = null;
+        for (var index = 0; index < text.Length; index++)
+        {
+            var c = text[index];
+            if (quote is not null)
+            {
+                if (c == '\\') { index++; continue; }
+                if (c == quote) quote = null;
+            }
+            else if (c is '"' or '\'' or '`') quote = c;
+            else if (c is '(' or '[' or '{') depth++;
+            else if (c is ')' or ']' or '}') { if (--depth < 0) return text[..index]; }
+            else if (c is ',' or ';' && depth == 0) return text[..index];
         }
         return null;
     }
@@ -471,7 +712,9 @@ internal static class ClaudeDesktopProbe
 
     private static bool IsWord(char c) => char.IsAsciiLetterOrDigit(c) || c is '_' or '$';
 
-    private static string Renumber(string text, Dictionary<string, string> names)
+    /// <summary>The text with every name that is not a field or a member numbered by first appearance (<paramref name="names"/>,
+    /// shared across texts); names met for the first time are added to <paramref name="order"/>.</summary>
+    private static string Renumber(string text, Dictionary<string, string> names, List<string>? order = null)
     {
         var result = new StringBuilder(text.Length);
         char? quote = null;
@@ -496,7 +739,11 @@ internal static class ClaudeDesktopProbe
                 if (member || end < text.Length && text[end] == ':') result.Append(word);
                 else
                 {
-                    if (!names.TryGetValue(word, out var number)) names[word] = number = "$" + names.Count.ToString(CultureInfo.InvariantCulture);
+                    if (!names.TryGetValue(word, out var number))
+                    {
+                        names[word] = number = "$" + names.Count.ToString(CultureInfo.InvariantCulture);
+                        order?.Add(word);
+                    }
                     result.Append(number);
                 }
                 index = end;
@@ -629,7 +876,14 @@ internal sealed class ClaudeDesktopLogWatcher(string? directory = null)
     private static readonly Regex Loaded = new(
         @"^(?<at>\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) \[info\] (?:Loaded (?<count>\d+) persisted sessions from|\[LocalSessionManager\] Session storage directory does not exist yet, skipping load:) (?<path>.+?claude-code-sessions[\\/](?<account>[0-9a-fA-F-]{36})[\\/](?<org>[0-9a-fA-F-]{36}))",
         RegexOptions.CultureInvariant);
+    // The scheduled-task manager's lines (ClaudeScheduledLog), whose format ScheduledFlows reviews.
+    private static readonly Regex ScheduledReset = new(
+        @"^(?<at>\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) \[info\] \[CCDScheduledTasks\] Reset\s*$", RegexOptions.CultureInvariant);
+    private static readonly Regex ScheduledInitialized = new(
+        @"^(?<at>\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) \[info\] \[CCDScheduledTasks\] Initialized \{ accountId: '(?<account>[0-9a-fA-F-]{36})', orgId: '(?<org>[0-9a-fA-F-]{36})' \}\s*$",
+        RegexOptions.CultureInvariant);
     private readonly string _directory = directory ?? ClaudeDesktopProbe.LogDirectory;
+    private readonly ClaudeScheduledLog _scheduled = new();
     private DateTime? _generation;
     private long _offset;
     // The file behind main.log, by volume and file index. Creation time cannot tell: on NTFS a file created under a
@@ -644,11 +898,17 @@ internal sealed class ClaudeDesktopLogWatcher(string? directory = null)
     /// another): it ends an account's Code sessions only once it shows the next one, so it still holds their lists. They
     /// come from the log itself, so a replay (a widget started meanwhile, or after a gap) knows them as well.</summary>
     internal IReadOnlyCollection<string> Held => _held;
+    /// <summary>What the lines read say of the app's scheduled-task manager: known while every line of this run was read.</summary>
+    internal ClaudeScheduledLogView Scheduled => _scheduled.View(_generation is not null);
 
     internal ClaudeDesktopAccountState Update(DateTime? hostStartedAt, IReadOnlyCollection<ClaudeShelfAccount> registered)
     {
         LostLines = false;
-        if (hostStartedAt is null) { _generation = null; _held.Clear(); return _state = ClaudeDesktopAccountState.Closed; }
+        if (hostStartedAt is null)
+        {
+            _generation = null; _held.Clear(); _scheduled.Close();
+            return _state = ClaudeDesktopAccountState.Closed;
+        }
         var main = Path.Combine(_directory, "main.log");
         var previous = Path.Combine(_directory, "main1.log");
         List<string> lines = [];
@@ -661,6 +921,7 @@ internal sealed class ClaudeDesktopLogWatcher(string? directory = null)
             // log files. An unfinished last line in main1.log may have been a sign-out or switch, so nothing before
             // it may confirm an account; only the complete lines of main.log count then.
             _state = ClaudeDesktopAccountState.Unknown;
+            _scheduled.Start(new DateTimeOffset(hostStartedAt.Value));
             result = File.Exists(previous) ? ReadFrom(previous, 0, null, true, lines, out _, out _) : LogRead.Ok;
             if (result == LogRead.Unfinished) result = LogRead.Ok;
             if (result == LogRead.Ok) result = ReadFrom(main, 0, null, false, lines, out end, out file);
@@ -681,12 +942,14 @@ internal sealed class ClaudeDesktopLogWatcher(string? directory = null)
         _generation = hostStartedAt; _offset = end; _file = file;
         // A replay reads the whole run again, the accounts it left included.
         if (replay) _held.Clear();
-        return _state = Apply(_state, lines, hostStartedAt.Value, registered, _held);
+        return _state = Apply(_state, lines, hostStartedAt.Value, registered, _held, _scheduled);
     }
 
     /// <param name="held">Collects the accounts the lines leave, until one confirms an account (see <see cref="Held"/>).</param>
+    /// <param name="scheduled">Collects what the lines say of the scheduled-task manager (see <see cref="Scheduled"/>).</param>
     internal static ClaudeDesktopAccountState Apply(ClaudeDesktopAccountState state, IEnumerable<string> lines,
-        DateTime since, IReadOnlyCollection<ClaudeShelfAccount> registered, ISet<string>? held = null)
+        DateTime since, IReadOnlyCollection<ClaudeShelfAccount> registered, ISet<string>? held = null,
+        ClaudeScheduledLog? scheduled = null)
     {
         var accounts = registered.Select(account => account.AccountUuid.ToLowerInvariant()).ToHashSet(StringComparer.Ordinal);
         var pairs = registered.Select(account => account.Key).ToHashSet(StringComparer.Ordinal);
@@ -694,6 +957,15 @@ internal sealed class ClaudeDesktopLogWatcher(string? directory = null)
         {
             if (line.Length < 20 || !DateTime.TryParseExact(line[..19], "yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture,
                     DateTimeStyles.AssumeLocal, out var at) || at < since - ClockSkew) continue;
+            if (line.Contains("[CCDScheduledTasks]", StringComparison.Ordinal))
+            {
+                // Whichever account it is, registered or not: the list loaded is the one not to write.
+                if (ScheduledReset.IsMatch(line)) scheduled?.Reset(new DateTimeOffset(at));
+                else if (ScheduledInitialized.Match(line) is { Success: true } began)
+                    scheduled?.Initialized(began.Groups["account"].Value.ToLowerInvariant() + "/"
+                        + began.Groups["org"].Value.ToLowerInvariant(), new DateTimeOffset(at));
+                continue;
+            }
             if (Transition.Match(line) is { Success: true } transition)
             {
                 // The line names the account left even when what came before it was not read.

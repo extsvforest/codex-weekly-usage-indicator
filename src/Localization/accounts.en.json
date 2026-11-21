@@ -181,5 +181,9 @@
   "예약 작업 맞추기 보류 · {0} 예약 목록을 읽을 수 없습니다.": "Scheduled-task alignment held · The scheduled-task list of {0} cannot be read.",
   "예약 작업 맞추기 실패 · {0}": "Scheduled-task alignment failed · {0}",
   "위젯의 예약 작업 기록을 읽을 수 없습니다.": "The widget's scheduled-task record cannot be read.",
-  "위젯의 예약 작업 기록을 저장할 수 없습니다.": "The widget's scheduled-task record cannot be saved."
+  "위젯의 예약 작업 기록을 저장할 수 없습니다.": "The widget's scheduled-task record cannot be saved.",
+  "예약 작업 맞추기 보류 · {0} 예약 목록이 Claude가 읽을 수 있는 크기를 넘게 됩니다.": "Scheduled-task alignment held · The scheduled-task list of {0} would grow beyond what Claude can read.",
+  "예약 작업 {0}은 여러 계정에서 따로 바뀌어 맞추지 않았습니다. 한 계정에서 다시 고치면 그 내용으로 맞춥니다.": "Scheduled task {0} was changed differently in several accounts and was not aligned. Edit it again in one account to align that version.",
+  "예약 작업 {0}은 한 계정에서만 지워져 다른 계정에는 남아 있습니다.": "Scheduled task {0} was deleted in one account only; other accounts still have it.",
+  "예약 작업 {0}은 권한이 넓어 다른 계정에 자동으로 만들지 않았습니다.": "Scheduled task {0} runs with wider permissions, so it was not made in other accounts automatically."
 }

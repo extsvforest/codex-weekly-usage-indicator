@@ -201,31 +201,40 @@ internal sealed class ClaudeAccountPanel : UserControl
             return (status.AppConfirmed && status.PendingForApp is > 0 and var waiting
                 ? UiText.F($"채울 세션 {waiting}개 · Claude를 종료하면 채운 뒤 다시 엽니다.")
                 : UiText.T("다시 열기 예약됨 · Claude를 종료하면 세션 목록을 채운 뒤 다시 엽니다."), false, UiText.T("다시 열기 취소"));
-        if (status.MappedAccounts < 2) return (UiText.T("Claude 계정을 두 개 이상 연결하면 세션 목록을 서로 채웁니다."), false, null);
+        // Scheduled tasks are aligned across every account on this PC, mapped or not.
+        if (status.MappedAccounts < 2)
+            return status.Scheduled is { } alone ? (ScheduledLine(alone), true, null)
+                : (UiText.T("Claude 계정을 두 개 이상 연결하면 세션 목록을 서로 채웁니다."), false, null);
         if (status.AppConfirmed && status.PendingForApp is > 0 and var pending)
             return (UiText.F($"{appLabel ?? ""} 목록에 채울 세션 {pending}개 · Claude를 종료하면 채웁니다."), false,
                 UiText.T("종료하면 다시 열기"));
         if (status.Problem == ClaudeShelfProblem.Failed)
             return (UiText.F($"세션 목록 채우기 실패 · {UiText.Message(status.ProblemDetail ?? "")}"), true, null);
-        // Scheduled tasks are aligned beside the session lists; a problem that lasts takes the same line.
-        if (status.Scheduled is { } scheduled)
-            return (scheduled.Kind switch
-            {
-                ClaudeScheduledProblemKind.Unreviewed => UiText.T("예약 작업 맞추기 멈춤 · 이 Claude 버전의 예약 작업 저장 방식은 아직 확인되지 않았습니다."),
-                ClaudeScheduledProblemKind.Unreadable => UiText.F($"예약 작업 맞추기 보류 · {scheduled.Detail ?? ""} 예약 목록을 읽을 수 없습니다."),
-                _ => UiText.F($"예약 작업 맞추기 실패 · {scheduled.Detail switch
-                {
-                    "store_unreadable" => UiText.T("위젯의 예약 작업 기록을 읽을 수 없습니다."),
-                    "store_unwritable" => UiText.T("위젯의 예약 작업 기록을 저장할 수 없습니다."),
-                    var detail => UiText.Message(detail ?? "")
-                }}")
-            }, true, null);
+        // Scheduled tasks are aligned beside the session lists; a problem that lasts, or what aligning left for the user
+        // to settle, takes the same line.
+        if (status.Scheduled is { } scheduled) return (ScheduledLine(scheduled), true, null);
         if (status.Problem == ClaudeShelfProblem.Held || !status.LastFillComplete)
             return (UiText.T("세션 목록 일부 보류 · 사용 중이거나 복구 중인 세션은 나중에 채웁니다."), false, null);
         if (status.LastFillAt is { } at)
             return (UiText.F($"세션 목록 · 모든 계정 채움 · {AccountUsageText.DateAndTime(at, now)}"), false, null);
         return (UiText.T("세션 목록 · 다른 계정은 켠 채로, 지금 계정은 Claude를 종료하면 채웁니다."), false, null);
     }
+
+    private static string ScheduledLine(ClaudeScheduledProblem scheduled) => scheduled.Kind switch
+    {
+        ClaudeScheduledProblemKind.Unreviewed => UiText.T("예약 작업 맞추기 멈춤 · 이 Claude 버전의 예약 작업 저장 방식은 아직 확인되지 않았습니다."),
+        ClaudeScheduledProblemKind.Unreadable => UiText.F($"예약 작업 맞추기 보류 · {scheduled.Detail ?? ""} 예약 목록을 읽을 수 없습니다."),
+        ClaudeScheduledProblemKind.TooLarge => UiText.F($"예약 작업 맞추기 보류 · {scheduled.Detail ?? ""} 예약 목록이 Claude가 읽을 수 있는 크기를 넘게 됩니다."),
+        ClaudeScheduledProblemKind.Conflict => UiText.F($"예약 작업 {scheduled.Detail ?? ""}은 여러 계정에서 따로 바뀌어 맞추지 않았습니다. 한 계정에서 다시 고치면 그 내용으로 맞춥니다."),
+        ClaudeScheduledProblemKind.RemovedHere => UiText.F($"예약 작업 {scheduled.Detail ?? ""}은 한 계정에서만 지워져 다른 계정에는 남아 있습니다."),
+        ClaudeScheduledProblemKind.Held => UiText.F($"예약 작업 {scheduled.Detail ?? ""}은 권한이 넓어 다른 계정에 자동으로 만들지 않았습니다."),
+        _ => UiText.F($"예약 작업 맞추기 실패 · {scheduled.Detail switch
+        {
+            "store_unreadable" => UiText.T("위젯의 예약 작업 기록을 읽을 수 없습니다."),
+            "store_unwritable" => UiText.T("위젯의 예약 작업 기록을 저장할 수 없습니다."),
+            var detail => UiText.Message(detail ?? "")
+        }}")
+    };
 
     private void DisplaySummary() => _summary.Display(_controller.Store.ListProfiles().Select(profile =>
         new ClaudeSummaryRow(profile, _controller.LastUsage(profile.Id), _controller.LastFailure(profile.Id))).ToArray(), _batchProgress);

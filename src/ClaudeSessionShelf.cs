@@ -37,8 +37,26 @@ internal sealed record ClaudeShelfPaths(string SessionsRoot, string ProjectsRoot
             // Automatic sidebar writes stay off: holding the web UI store's lock while Desktop starts can make Chromium
             // fail to open it and recreate it. Writes run only as a controlled step (see ClaudeLocalStorage).
             DesktopConfig: null,
-            // The scheduled tasks' definitions, which every account shares (ClaudeScheduledSync only checks they are there).
-            ScheduledTasksRoot: Path.Combine(config, "scheduled-tasks"));
+            // The scheduled tasks' definitions, which every account shares (ClaudeScheduledSync only checks they are
+            // there), where the app keeps them.
+            ScheduledTasksRoot: (claudeConfigDirectory ?? AppConfigDirectory()) is { } definitions
+                ? Path.Combine(definitions, "scheduled-tasks") : null);
+    }
+
+    /// <summary>The folder the app keeps its scheduled tasks' definitions under (6.28899): CLAUDE_CONFIG_DIR, where
+    /// <c>~</c> alone or before a separator stands for the home folder, else <c>~\.claude</c>. Null when it names a
+    /// folder relative to wherever the app was started.</summary>
+    internal static string? AppConfigDirectory() =>
+        AppConfigDirectory(Environment.GetEnvironmentVariable("CLAUDE_CONFIG_DIR"),
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile));
+
+    internal static string? AppConfigDirectory(string? configured, string home)
+    {
+        if (string.IsNullOrEmpty(configured)) return Path.Combine(home, ".claude");
+        var path = configured == "~" ? home
+            : configured.StartsWith("~/", StringComparison.Ordinal) || configured.StartsWith("~\\", StringComparison.Ordinal)
+                ? Path.Combine(home, configured[2..]) : configured;
+        return Path.IsPathFullyQualified(path) ? path : null;
     }
 }
 

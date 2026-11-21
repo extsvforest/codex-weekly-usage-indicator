@@ -61,7 +61,7 @@ var tests = new (string Name, Func<Task> Run)[]
     ("Claude profile folder: legacy roaming, moved out of the package, inside it", ClaudeAppDataTests.RunAsync),
     ("Claude session shelf: fill by adding and advancing, closed- and running-app writes, account mapping and log observation", ClaudeSessionShelfTests.RunAsync),
     ("Claude combined weekly total and session-layout plan", ClaudeSessionSyncTests.RunAsync),
-    ("Claude scheduled tasks: aligned across accounts, the shown list only once the app closes, seed and the app's contract", ClaudeScheduledTasksTests.RunAsync),
+    ("Claude scheduled tasks: aligned across accounts, the loaded list left alone, seed, remove and the app's contract", ClaudeScheduledTasksTests.RunAsync),
     ("Claude per-account reads, saved values, moving the default-home account and identity invalidation", ClaudeControllerTests.RunAsync),
     ("Claude account menu actions and inactive-profile usage", () => ClaudeAccountMenuSmoke.RunAsync()),
     ("account operation lease blocks lifecycle replacement across awaits", AccountOperationLeaseTests.RunAsync),
