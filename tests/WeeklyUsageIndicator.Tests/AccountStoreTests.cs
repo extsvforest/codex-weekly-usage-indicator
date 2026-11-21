@@ -23,6 +23,7 @@ internal static class AccountStoreTests
         TestPrivateAcl(fixture);
         TestReparsePaths(fixture);
         await TestConcurrentLockAsync(fixture);
+        await TestOwnTransactionLockAsync(fixture);
     }
 
     private static void TestOpaqueRoundTripAndRotation(Fixture fixture)
@@ -358,6 +359,49 @@ internal static class AccountStoreTests
         entered.Wait();
         try { AssertThrows(() => store.RegisterCurrent("A"), "installer/second-process mutex prevents store mutation"); }
         finally { release.Set(); await holder; }
+    }
+
+    // A test run takes a transaction lock of its own, named after its test root, so a widget running on the same desktop
+    // (holding the widget's lock) never makes a store operation of the tests busy.
+    private static async Task TestOwnTransactionLockAsync(Fixture fixture)
+    {
+        const string widget = @"Local\CodexWeeklyUsageIndicator.AccountTransaction";
+        Assert(CodexAccountStore.TransactionMutexFor(null) == widget && CodexAccountStore.TransactionMutexFor(" ") == widget,
+            "without a test root the lock is the widget's");
+        var root = Path.Combine(Path.GetTempPath(), "made-up-test-root");
+        var named = CodexAccountStore.TransactionMutexFor(root);
+        Assert(named.StartsWith(widget + ".", StringComparison.Ordinal) && named.Length == widget.Length + 17
+               && named == CodexAccountStore.TransactionMutexFor(root.ToUpperInvariant() + Path.DirectorySeparatorChar)
+               && named != CodexAccountStore.TransactionMutexFor(root + "-other"),
+            "a test root names a lock of its own, the same however the root is spelled");
+        var testRoot = Environment.GetEnvironmentVariable("GFS_ACCOUNT_TEST_ROOT");
+        if (string.IsNullOrWhiteSpace(testRoot))
+        {
+            Assert(CodexAccountStore.TransactionMutexName == widget, "a run without a test root shares the widget's lock");
+            return;
+        }
+        Assert(CodexAccountStore.TransactionMutexName == CodexAccountStore.TransactionMutexFor(testRoot)
+               && CodexAccountStore.TransactionMutexName != widget, "a run with a test root does not use the widget's lock");
+        var (store, home) = fixture.NewStore();
+        WriteAuth(home, Auth("own", "workspace", "own"));
+        using var entered = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        // On another thread, as another process would: a named mutex is reentrant on the thread that owns it.
+        var holder = Task.Run(() =>
+        {
+            using var mutex = new Mutex(false, widget);
+            bool owned;
+            try { owned = mutex.WaitOne(TimeSpan.FromSeconds(10)); }
+            catch (AbandonedMutexException) { owned = true; }
+            entered.Set();
+            release.Wait();
+            if (owned) mutex.ReleaseMutex();
+            return owned;
+        });
+        entered.Wait();
+        try { Assert(store.RegisterCurrent("own").Label == "own", "holding the widget's lock does not make the tests' store busy"); }
+        finally { release.Set(); }
+        Assert(await holder, "the widget's lock was held during the store operation");
     }
 
     private static byte[] Auth(string user, string account, string revision)

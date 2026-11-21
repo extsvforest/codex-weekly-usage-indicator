@@ -25,8 +25,10 @@ internal enum ClaudeDesktopRunState { Closed, Running, Unknown }
 /// <see cref="Incompatible"/>: a store or log line the widget follows is missing, and nothing is written.</summary>
 internal enum ClaudeDesktopContract { Reviewed, Unreviewed, Incompatible }
 
-/// <summary>Current process generation of the packaged app. The earliest host process start separates app runs.</summary>
-internal sealed record ClaudeDesktopRuntime(ClaudeDesktopRunState State, DateTime? HostStartedAt);
+/// <summary>Current process generation of the packaged app. The earliest host process start separates app runs.
+/// <see cref="HostImages"/> are the image paths of the Desktop host processes running (null: not observed).</summary>
+internal sealed record ClaudeDesktopRuntime(ClaudeDesktopRunState State, DateTime? HostStartedAt,
+    IReadOnlyList<string>? HostImages = null);
 
 internal enum ClaudeDesktopAccountStatus { Closed, Unknown, SignedOut, Unregistered, SignedIn }
 
@@ -159,6 +161,7 @@ internal static class ClaudeDesktopProbe
         // The app runs its Code CLIs from its profile folder, wherever that is (ClaudeAppData); found when first needed.
         IReadOnlyList<string>? cliRoots = null;
         var running = false; var unknown = false; DateTime? host = null;
+        var images = new List<string>();
         foreach (var process in Process.GetProcessesByName("claude"))
         {
             using (process)
@@ -169,6 +172,7 @@ internal static class ClaudeDesktopProbe
                 if (IsDesktopImage(path))
                 {
                     running = true;
+                    if (!images.Contains(path, StringComparer.OrdinalIgnoreCase)) images.Add(path);
                     if (created is { } start && (host is null || start < host)) host = start;
                 }
                 else if ((cliRoots ??= ClaudeAppData.CliRoots()).Any(root => path.StartsWith(root, StringComparison.OrdinalIgnoreCase)))
@@ -176,7 +180,25 @@ internal static class ClaudeDesktopProbe
             }
         }
         return new ClaudeDesktopRuntime(running ? ClaudeDesktopRunState.Running
-            : unknown ? ClaudeDesktopRunState.Unknown : ClaudeDesktopRunState.Closed, host);
+            : unknown ? ClaudeDesktopRunState.Unknown : ClaudeDesktopRunState.Closed, host, images);
+    }
+
+    /// <summary>Whether the app that runs now is <paramref name="package"/> (the one whose bundle was checked): always
+    /// when it is closed; while it runs, only when every Desktop host process runs from that package's folder. A running
+    /// app whose host images are not known (none observed, or only its Code CLIs seen) and an uninspectable state are
+    /// not that package.</summary>
+    internal static bool RunsFrom(ClaudeDesktopRuntime runtime, ClaudeDesktopPackage package)
+    {
+        if (runtime.State == ClaudeDesktopRunState.Closed) return true;
+        if (runtime.State != ClaudeDesktopRunState.Running || runtime.HostImages is not { Count: > 0 } images
+            || string.IsNullOrWhiteSpace(package.InstallDirectory)) return false;
+        try
+        {
+            var folder = Path.TrimEndingDirectorySeparator(Path.GetFullPath(package.InstallDirectory)) + Path.DirectorySeparatorChar;
+            return images.All(image => !string.IsNullOrWhiteSpace(image) && Path.IsPathFullyQualified(image)
+                && Path.GetFullPath(image).StartsWith(folder, StringComparison.OrdinalIgnoreCase));
+        }
+        catch (Exception exception) when (exception is ArgumentException or NotSupportedException or PathTooLongException) { return false; }
     }
 
     internal static bool IsDesktopImage(string path) =>
@@ -310,9 +332,12 @@ internal static class ClaudeDesktopProbe
     // (4) called only by initialize, which runs at start and after a reset (an account change), with the path it has just
     // stored, and logs the list it loaded (7), (5) a save writes the whole list from memory, and only to the path loaded,
     // while no reset came between, (6) which a reset stops, and logs. Only the account hooks reset and initialize the
-    // manager (ScheduledHooks). The list's own schema, with every schema it is made of, must read as reviewed too
-    // (ScheduledSchemaHash), since a list the widget writes has to pass it. Nothing else reads or writes that list (one
-    // call of the load, one of the writer).
+    // manager (ScheduledHooks). The list's own schema, with every schema it is made of and the kind each builder makes,
+    // must read as reviewed too (ScheduledSchemaHash), since a list the widget writes has to pass it. Nothing else reads
+    // or writes that list (one call of the load, one of the writer). The log the watcher reads marks lines it lost with
+    // an undated warning (11, 12). Beyond the flows, fixed points read by value (ScheduledPoints): the manager's path
+    // function and folder, the load's 10 MiB limit, a manager that never resets or loads itself, the floor of missed and
+    // due runs, and a scheduled run's start bringing a kept mode above Default back to Default.
     internal static readonly string[][] ScheduledMarkers =
     [
         ["\"scheduled-tasks.json\""],
@@ -327,10 +352,11 @@ internal static class ClaudeDesktopProbe
             RegexOptions.CultureInvariant)),
         ("=\"claude-code-sessions\"", 40, 30, new Regex(@"(?<![\w$.])(?<root>[\w$]+)=""claude-code-sessions""[,;]", RegexOptions.CultureInvariant)),
         ("logPrefix:\"[CCDScheduledTasks]\"", 120, 1600, new Regex(
-            @"(?<![\w$.])(?<manager>[\w$]+)=new [\w$]+\(\{logPrefix:""\[CCDScheduledTasks\]"",[^;]{0,1600}?getStorageFilePath:(?<path>[\w$]+),getTaskFilesDir:(?<defs>[\w$]+),",
+            @"(?<![\w$.])(?<manager>[\w$]+)=new (?<kind>[\w$]+)\(\{logPrefix:""\[CCDScheduledTasks\]"",[^;]{0,1600}?getStorageFilePath:(?<path>[\w$]+),getTaskFilesDir:(?<defs>[\w$]+),",
             RegexOptions.CultureInvariant)),
+        // The reader the load uses and the size limit it passes (ScheduledSizeLimit).
         ("async loadScheduledTasksFromDisk(", 0, 600, new Regex(
-            @"^async loadScheduledTasksFromDisk\((?<p>[\w$]+)\)\{try\{let (?<t>[\w$]+)=await [\w$]+\(\k<p>,[\w$]+,\{walkRoot:\(0,[\w$]+\.dirname\)\(\k<p>\),lstatWalkRoot:!1\}\),(?<r>[\w$]+)=JSON\.parse\(\k<t>\);return (?<file>[\w$]+)\.parse\(\k<r>\)\}catch\((?<x>[\w$]+)\)\{return \k<x>\.code===""ENOENT""\?\{scheduledTasks:\[\]\}:\((?<log>[\w$]+)\.error\(`\$\{this\.config\.logPrefix\} Failed to load scheduled tasks:`,[\w$]+\(\k<x>\)\),\{scheduledTasks:\[\],loadFailed:!0\}\)\}\}",
+            @"^async loadScheduledTasksFromDisk\((?<p>[\w$]+)\)\{try\{let (?<t>[\w$]+)=await (?<reader>[\w$]+)\(\k<p>,(?<limit>[\w$]+),\{walkRoot:\(0,[\w$]+\.dirname\)\(\k<p>\),lstatWalkRoot:!1\}\),(?<r>[\w$]+)=JSON\.parse\(\k<t>\);return (?<file>[\w$]+)\.parse\(\k<r>\)\}catch\((?<x>[\w$]+)\)\{return \k<x>\.code===""ENOENT""\?\{scheduledTasks:\[\]\}:\((?<log>[\w$]+)\.error\(`\$\{this\.config\.logPrefix\} Failed to load scheduled tasks:`,[\w$]+\(\k<x>\)\),\{scheduledTasks:\[\],loadFailed:!0\}\)\}\}",
             RegexOptions.CultureInvariant)),
         (".loadScheduledTasksFromDisk(", 1500, 40, new Regex(
             @"initialize\((?<a>[\w$]+),(?<o>[\w$]+)\)\{if\(this\._initializePromise\)\{[^;]{0,120}?Already initialized`\);return\}[^;]{0,160}?;let (?<p>[\w$]+)=this\.config\.getStorageFilePath\(\k<a>,\k<o>\);this\._scheduledTasksFilePath=\k<p>;(?:(?!this\._scheduledTasksFilePath=|(?<![\w$.])\k<p>=(?!=)).){0,1400}?this\.loadScheduledTasksFromDisk\(\k<p>\)",
@@ -353,15 +379,25 @@ internal static class ClaudeDesktopProbe
             RegexOptions.CultureInvariant)),
         ("===\"~\"?(0,", 40, 200, new Regex(
             @"function (?<tilde>[\w$]+)\((?<e>[\w$]+)\)\{return \k<e>===""~""\?\(0,[\w$]+\.homedir\)\(\):\k<e>\.startsWith\(""~/""\)\|\|\k<e>\.startsWith\(""~\\\\""\)\?\(0,[\w$]+\.join\)\(\(0,[\w$]+\.homedir\)\(\),\k<e>\.slice\(2\)\):\k<e>\}",
+            RegexOptions.CultureInvariant)),
+        // What the log watcher takes for lost lines (ClaudeDesktopLogWatcher.MissingLines): after a write it could not
+        // make, the logger writes this warning, undated and on a line of its own, before the next line it can write.
+        ("[warn] Lines are missing here: this log could not be written (", 900, 200, new Regex(
+            @"function (?<wrapper>[\w$]+)\([\w$]+\)\{(?:(?!function ).){0,900}?let (?<p>[\w$]+)=`\$\{(?<os>[\w$]+)\.default\.EOL\}\[warn\] Lines are missing here: this log could not be written \(\$\{[\w$]+\}\)\$\{\k<os>\.default\.EOL\}`;[\w$]+\.default\.write\([\w$]+,\k<p>,",
+            RegexOptions.CultureInvariant | RegexOptions.Singleline)),
+        // The log file that writer serves rotates by renaming (main.log to main1.log), the order the watcher follows.
+        ("tailable:!0,options:{", 200, 120, new Regex(
+            @"new [\w$]+\.transports\.File\(\{filename:[\w$]+,maxsize:[^,{}]{0,60},maxFiles:[^,{}]{0,60},tailable:!0,options:\{[^{}]{0,80}?fs:(?<wrapper>[\w$]+)\(",
             RegexOptions.CultureInvariant))
     ];
-    private const int ScheduledManagerFlow = 2;
-    private static readonly string[] ScheduledShared = ["path", "root", "file", "log", "manager", "defs", "config", "tilde"];
+    private const int ScheduledManagerFlow = 2, ScheduledLoaderFlow = 3;
+    private static readonly string[] ScheduledShared =
+        ["path", "root", "file", "log", "manager", "kind", "defs", "config", "tilde", "reader", "limit", "wrapper"];
     private static readonly Regex ScheduledFile = new(
         @"(?<![\w$.])(?<file>[\w$]+)=(?<k>[\w$]+)\(\{scheduledTasks:[\w$]+\((?<entry>[\w$]+)\),recordedSkips:", RegexOptions.CultureInvariant);
-    // The list's file and entry schemas as reviewed (6.28899) with the schemas they are made of, their minified names
-    // numbered in order (ScheduledSchema).
-    private const string ScheduledSchemaHash = "BAE3807C12AA3E25EC851E175490F4E09C9C53285233A4B105EEDA2172931ED6";
+    // The list's file and entry schemas as reviewed (6.28899) with the schemas they are made of and the kind each builder
+    // makes, their minified names numbered in order (ScheduledSchema).
+    private const string ScheduledSchemaHash = "058A6E8265C44BBBB8956A70F1B7C941E5762CD08D5D08B4934E9D89A62FA0CC";
     private static (string Key, ClaudeDesktopContract Contract)? _scheduledContract;
 
     /// <summary>Whether the installed app keeps scheduled-task lists the way the alignment was designed for; cached per
@@ -432,7 +468,25 @@ internal static class ClaudeDesktopProbe
         var schema = shared.TryGetValue("file", out var file) ? ScheduledSchema(bundle, file) : null;
         if (schema is null || !Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(schema)))
                 .Equals(ScheduledSchemaHash, StringComparison.OrdinalIgnoreCase))
+        {
             failed.Add("scheduled schema");
+            if (firstOnly) return failed;
+        }
+        for (var point = 0; point < ScheduledPoints.Length; point++)
+        {
+            // In the order of ScheduledPoints; null when the point reads as reviewed, else the part that does not ("" for all).
+            var failure = point switch
+            {
+                0 => ScheduledPathHolds(bundle, shared, places[ScheduledManagerFlow]) ? null : "",
+                1 => ScheduledSizeHolds(bundle, shared, places[ScheduledLoaderFlow]) ? null : "",
+                2 => ScheduledSelfCallsHold(bundle, shared, places[ScheduledManagerFlow]) ? null : "",
+                3 => ScheduledFloorHolds(bundle, places[ScheduledManagerFlow]) ? null : "",
+                _ => ScheduledStartFails(bundle, shared, places[ScheduledManagerFlow])
+            };
+            if (failure is null) continue;
+            failed.Add("scheduled " + ScheduledPoints[point] + (failure.Length > 0 ? " (" + failure + ")" : ""));
+            if (firstOnly) return failed;
+        }
         return failed;
     }
 
@@ -454,19 +508,8 @@ internal static class ClaudeDesktopProbe
     /// </summary>
     internal static bool ScheduledHooks(ReadOnlySpan<byte> bundle, string manager, int at)
     {
-        if (FileAt(bundle, at) is not { Name: { } managerFile } managerSpan) return false;
-        var file = bundle[managerSpan.Start..managerSpan.End];
-        var getter = Encoding.UTF8.GetBytes(",{enumerable:!0,get:function(){return " + manager + "}})");
-        var exportAt = file.IndexOf(getter);
-        if (exportAt < 0 || file[(exportAt + getter.Length)..].IndexOf(getter) >= 0) return false;
-        var define = "Object.defineProperty(exports,\""u8;
-        var defineAt = file[..exportAt].LastIndexOf(define);
-        if (defineAt < 0) return false;
-        var quoted = Encoding.UTF8.GetString(file[(defineAt + define.Length)..exportAt]);
-        if (!Regex.IsMatch(quoted, @"^[\w$]+""$", RegexOptions.CultureInvariant)) return false;
-        var export = quoted[..^1];
-        if (Sets(file, "exports." + export, ownName: false) != 0 || Sets(file, "module.exports", ownName: false) != 0
-            || Sets(file, manager, ownName: true) != 1) return false;
+        if (ManagerExport(bundle, manager, at) is not { } found) return false;
+        var (export, managerFile) = found;
         if (Count(bundle, Encoding.UTF8.GetBytes("{ccdScheduledTasks:()=>" + manager + ",")) != 1
             || Count(bundle, "{ccdScheduledTasks:"u8) != 1 || Count(bundle, ".ccdScheduledTasks"u8) != 0
             || Count(bundle, ",ccdScheduledTasks:"u8) != 0 || Count(bundle, "ccdScheduledTasks}"u8) != 0
@@ -488,6 +531,300 @@ internal static class ClaudeDesktopProbe
         return required.Count == 1 && required[0].Groups["file"].Value == managerFile
             && Sets(bundle[hooks.Start..hooks.End], name + "." + export, ownName: true) == 0;
     }
+
+    /// <summary>The name the manager's file (around <paramref name="at"/>) exports the manager under, and that file's
+    /// name: exported once, as a defined property, the file setting neither that export nor the manager again.</summary>
+    private static (string Export, string File)? ManagerExport(ReadOnlySpan<byte> bundle, string manager, int at)
+    {
+        if (FileAt(bundle, at) is not { Name: { } managerFile } managerSpan) return null;
+        var file = bundle[managerSpan.Start..managerSpan.End];
+        var getter = Encoding.UTF8.GetBytes(",{enumerable:!0,get:function(){return " + manager + "}})");
+        var exportAt = file.IndexOf(getter);
+        if (exportAt < 0 || file[(exportAt + getter.Length)..].IndexOf(getter) >= 0) return null;
+        var define = "Object.defineProperty(exports,\""u8;
+        var defineAt = file[..exportAt].LastIndexOf(define);
+        if (defineAt < 0) return null;
+        var quoted = Encoding.UTF8.GetString(file[(defineAt + define.Length)..exportAt]);
+        if (!Regex.IsMatch(quoted, @"^[\w$]+""$", RegexOptions.CultureInvariant)) return null;
+        var export = quoted[..^1];
+        if (Sets(file, "exports." + export, ownName: false) != 0 || Sets(file, "module.exports", ownName: false) != 0
+            || Sets(file, manager, ownName: true) != 1) return null;
+        return (export, managerFile);
+    }
+
+    // The fixed points the alignment rests on beyond the flows (6.28899), each read by value in the file that uses it,
+    // with back-references so renamed minified names still match and a changed meaning does not. No hash of the code
+    // is kept (the app updates often): a drift guard, not a proof, and what lies outside them is the residual risk.
+    private static readonly string[] ScheduledPoints =
+        ["storage path", "size limit", "own reset or load", "floor", "start of a scheduled run"];
+    // The list's path, by the manager's own function: userData\claude-code-sessions\account\org\scheduled-tasks.json.
+    private static readonly Regex ScheduledPath = new(
+        @"^function (?<path>[\w$]+)\((?<a>[\w$]+),(?<o>[\w$]+)\)\{return [\w$]+\.default\.join\([\w$]+\.app\.getPath\(""userData""\),(?<root>[\w$]+),\k<a>,\k<o>,""scheduled-tasks\.json""\)\}",
+        RegexOptions.CultureInvariant);
+    private const string ScheduledRoot = "\"claude-code-sessions\"";
+    // The limit the load passes its reader, by value (10 MiB), and the reader refusing a file over it.
+    private const string ScheduledSizeLimit = "10485760";
+    private static readonly Regex ScheduledReader = new(
+        @"^function (?<reader>[\w$]+)\((?<p>[\w$]+),(?<l>[\w$]+),(?<o>[\w$]+)\)\{(?:(?!function ).){0,1200}?let (?<s>[\w$]+)=await [\w$]+\.stat\(\{bigint:!0\}\);if\(!\k<s>\.isFile\(\)\|\|\k<s>\.size>\k<l>\)throw ",
+        RegexOptions.CultureInvariant | RegexOptions.Singleline);
+    // A missed run: the latest slot of the cron strictly after the latest of the last scheduled run (else the last run,
+    // else the creation), a week ago and missedRunScanFloor, scanned down from the minute before now.
+    private static readonly Regex ScheduledMissed = new(
+        @"^missedCronSlot\((?<e>[\w$]+)\)\{return \k<e>\.cronExpression\?(?<scan>[\w$]+)\(\k<e>\.cronExpression,\k<e>\.lastScheduledFor\?\?\k<e>\.lastRunAt,\k<e>\.createdAt,\k<e>\.missedRunScanFloor\):null\}",
+        RegexOptions.CultureInvariant);
+    private static readonly Regex ScheduledScan = new(
+        @"^function (?<scan>[\w$]+)\((?<cron>[\w$]+),(?<last>[\w$]+),(?<created>[\w$]+),(?<floor>[\w$]+)\)\{let (?<base>[\w$]+)=\k<last>\?new Date\(\k<last>\):\k<created>==null\?null:new Date\(\k<created>\);if\(!\k<base>\)return null;try\{let [\w$]+=[\w$]+\(\k<cron>\),(?<now>[\w$]+)=new Date,(?<f>[\w$]+)=\k<floor>\?new Date\(\k<floor>\)\.getTime\(\):NaN,(?<week>[\w$]+)=new Date\(\k<now>\.getTime\(\)-6048e5\),(?<low>[\w$]+)=new Date\(Math\.max\(\k<base>\.getTime\(\),\k<week>\.getTime\(\),Number\.isFinite\(\k<f>\)\?\k<f>:-1/0\)\),(?<slot>[\w$]+)=new Date\(\k<now>\);\k<slot>\.setUTCSeconds\(0,0\),\k<slot>\.setTime\(\k<slot>\.getTime\(\)-[\w$]+\);let [\w$]+=\k<last>\?[\w$]+\(new Date\(\k<last>\)\):null;for\(;\k<slot>>\k<low>;\)\{",
+        RegexOptions.CultureInvariant);
+    // A run due this minute counts only from the later of the creation and missedRunScanFloor; else the missed run.
+    private static readonly Regex ScheduledOwed = new(
+        @"^owedSlot\((?<e>[\w$]+)\)\{(?:(?!owedSlot\(|missedCronSlot\().){0,600}?if\([\w$]+\(\k<e>\.cronExpression,\k<e>\.lastRunAt\)\)\{let (?<t>[\w$]+)=new Date;\k<t>\.setUTCSeconds\(0,0\);let (?<n>[\w$]+)=Date\.parse\(\k<e>\.missedRunScanFloor\?\?""""\)\|\|0;if\(\+\k<t>>=Math\.max\(\k<e>\.createdAt,\k<n>\)\)return \k<t>\}return this\.missedCronSlot\(\k<e>\)\}",
+        RegexOptions.CultureInvariant | RegexOptions.Singleline);
+    // A session start normalizes its options last with the carried safeguard, then the import limit, given the manager:
+    // the two calls end the method's last statement (the statements before it ended by a semicolon of the body itself,
+    // blocks within them closed), so the brace after them closes the method.
+    private static readonly Regex ScheduledIngress = new(
+        @"^normalizeStartOptionsAtIngress\((?<e>[\w$]+)\)\{(?:(?:[^{}]|\{[^{}]*\})*?;)?(?<statement>(?:[^{};]|\{[^{};]*\})*?)(?<carried>[\w$]+)\(\k<e>,(?<m>[\w$]+)\.(?<store>[\w$]+)\),(?<import>[\w$]+)\(\k<e>,\k<m>\.\k<store>\)\}",
+        RegexOptions.CultureInvariant);
+    // The carried safeguard: unless switched off, a task keeping a mode above Default (or, not found, a start in auto or
+    // bypassPermissions) starts in Default.
+    private static readonly Regex ScheduledCarried = new(
+        @"^function (?<carried>[\w$]+)\((?<e>[\w$]+),(?<n>[\w$]+)\)\{if\(\k<e>\.scheduledTaskId===void 0\|\|!(?<kill>[\w$]+)\(\)\)return;let (?<r>[\w$]+)=\k<n>\.getSync\(\k<e>\.scheduledTaskId\);\(\k<r>\?\k<r>\.permissionModeCarried&&(?<above>[\w$]+)\(\k<e>\.permissionMode\):(?<m>[\w$]+)\.(?<high>[\w$]+)\(\k<e>\.permissionMode\)\)&&\(\k<m>\.[\w$]+\.info\(`[^`]*`\),\k<e>\.permissionMode=\k<m>\.(?<modes>[\w$]+)\.Default,\k<e>\.permissionModeProvisional=!1\)\}",
+        RegexOptions.CultureInvariant);
+    // Its switch: on unless the flags are loaded and gate 396417011 is off.
+    private static readonly Regex ScheduledKill = new(
+        @"^function (?<kill>[\w$]+)\(\)\{return!(?<m>[\w$]+)\.(?<loaded>[\w$]+)\(\)\|\|\k<m>\.(?<gate>[\w$]+)\(""396417011""\)\}",
+        RegexOptions.CultureInvariant);
+    // Above Default, by the app's mode order.
+    private static readonly Regex ScheduledAbove = new(
+        @"^(?<a>[\w$]+)=>(?<m>[\w$]+)\.(?<rank>[\w$]+)\(\k<a>,\k<m>\.(?<modes>[\w$]+)\.Default\)$", RegexOptions.CultureInvariant);
+    // The import limit: an imported task keeping Auto starts in nothing above Default but Auto.
+    private static readonly Regex ScheduledImport = new(
+        @"^function (?<import>[\w$]+)\((?<e>[\w$]+),(?<n>[\w$]+)\)\{let (?<r>[\w$]+)=\k<e>\.scheduledTaskId===void 0\?void 0:\k<n>\.getSync\(\k<e>\.scheduledTaskId\);!\k<r>\?\.permissionModeCarried\|\|\k<r>\.importedFrom===void 0\|\|\k<r>\.permissionMode!==(?<m>[\w$]+)\.(?<modes>[\w$]+)\.Auto\|\|\(\k<e>\.permissionModeProvisional=!1,\k<e>\.permissionMode!==\k<m>\.\k<modes>\.Auto&&(?<above>[\w$]+)\(\k<e>\.permissionMode\)&&\(\k<m>\.[\w$]+\.info\(`[^`]*`\),\k<e>\.permissionMode=\k<m>\.\k<modes>\.Default\)\)\}",
+        RegexOptions.CultureInvariant);
+    // The mode order (an unknown mode counting as above), and the modes a task not found may not start in.
+    private static readonly Regex ScheduledRank = new(
+        @"^function (?<rank>[\w$]+)\((?<a>[\w$]+),(?<b>[\w$]+)\)\{return!(?<known>[\w$]+)\(\k<a>\)\|\|!\k<known>\(\k<b>\)\|\|(?<order>[\w$]+)\[\k<a>\]>\k<order>\[\k<b>\]\}",
+        RegexOptions.CultureInvariant);
+    private static readonly Regex ScheduledKnown = new(
+        @"^function (?<known>[\w$]+)\((?<a>[\w$]+)\)\{return typeof \k<a>==""string""&&Object\.hasOwn\((?<order>[\w$]+),\k<a>\)\}",
+        RegexOptions.CultureInvariant);
+    private const string ScheduledModeOrder = "{plan:0,default:1,dontAsk:1,acceptEdits:2,auto:3,bypassPermissions:4}";
+    private static readonly Regex ScheduledHigh = new(
+        @"^function (?<high>[\w$]+)\((?<a>[\w$]+)\)\{return \k<a>===""auto""\|\|\k<a>===""bypassPermissions""\}", RegexOptions.CultureInvariant);
+    private static readonly Regex ScheduledModes = new(
+        @"^function\((?<x>[\w$]+)\)\{return (?:\k<x>\.[\w$]+=""[\w-]+"",)+\k<x>\}\(\{\}\)$", RegexOptions.CultureInvariant);
+
+    /// <summary>The manager's file declares the path function the manager is made with once, never sets its name, and
+    /// defines the folder it joins as "claude-code-sessions" by value.</summary>
+    private static bool ScheduledPathHolds(ReadOnlySpan<byte> bundle, Dictionary<string, string> shared, int at)
+    {
+        if (!shared.TryGetValue("path", out var path) || !shared.TryGetValue("root", out var root)
+            || FileAt(bundle, at) is not { } file || Read(bundle, file, path, ScheduledPath, 300) is not { } read) return false;
+        return read.Groups["root"].Value == root && Sets(bundle[file.Start..file.End], path, ownName: true) == 0
+            && Definition(bundle, file.Start, file.End, read.At, root) == ScheduledRoot;
+    }
+
+    /// <summary>The load's size limit is 10485760 by value (its definition in the load's file), and the reader it passes
+    /// that limit to refuses a file over it.</summary>
+    private static bool ScheduledSizeHolds(ReadOnlySpan<byte> bundle, Dictionary<string, string> shared, int at)
+    {
+        if (!shared.TryGetValue("reader", out var reader) || !shared.TryGetValue("limit", out var limit)
+            || FileAt(bundle, at) is not { } file
+            || Definition(bundle, file.Start, file.End, at, limit) != ScheduledSizeLimit) return false;
+        var declared = Declared(bundle, file.Start, file.End, reader);
+        return declared >= 0 && ScheduledReader.Match(Window(bundle, declared, 1500)) is { Success: true } read
+            && read.Groups["reader"].Value == reader;
+    }
+
+    /// <summary>The manager's class (from its declaration to the manager's creation) never resets or initializes itself,
+    /// and its file never calls reset or initialize on the manager's name: the list is read again only where the account
+    /// hooks call it (ScheduledHooks).</summary>
+    private static bool ScheduledSelfCallsHold(ReadOnlySpan<byte> bundle, Dictionary<string, string> shared, int at)
+    {
+        if (!shared.TryGetValue("manager", out var manager) || !shared.TryGetValue("kind", out var kind)
+            || FileAt(bundle, at) is not { } file) return false;
+        var span = bundle[file.Start..file.End];
+        var classAt = -1;
+        var declaration = Encoding.UTF8.GetBytes(kind + "=class");
+        for (int offset = 0, found; (found = span[offset..].IndexOf(declaration)) >= 0; offset += found + declaration.Length)
+        {
+            var place = offset + found;
+            var next = place + declaration.Length;
+            if (place > 0 && (IsWord((char)span[place - 1]) || span[place - 1] == (byte)'.')
+                || next < span.Length && span[next] is not ((byte)' ' or (byte)'{')) continue;
+            if (classAt >= 0) return false;
+            classAt = file.Start + place;
+        }
+        if (classAt < 0 || classAt >= at) return false;
+        var own = bundle[classAt..at];
+        return Count(own, "this.reset()"u8) == 0 && Count(own, "this.initialize("u8) == 0
+            && Count(span, Encoding.UTF8.GetBytes(manager + ".reset(")) == 0 && Count(span, Encoding.UTF8.GetBytes(manager + ".initialize(")) == 0;
+    }
+
+    /// <summary>The floor the manager decides missed and due runs by: its two methods once each in its file, and the scan
+    /// the missed run uses declared there once.</summary>
+    private static bool ScheduledFloorHolds(ReadOnlySpan<byte> bundle, int at)
+    {
+        if (FileAt(bundle, at) is not { } file
+            || Single(bundle, file.Start, file.End, "missedCronSlot("u8, ScheduledMissed, 400) is not { } missed
+            || Single(bundle, file.Start, file.End, "owedSlot("u8, ScheduledOwed, 900) is null) return false;
+        var scan = missed.Groups["scan"].Value;
+        var declared = Declared(bundle, file.Start, file.End, scan);
+        return declared >= 0 && ScheduledScan.Match(Window(bundle, declared, 1000)) is { Success: true } read
+            && read.Groups["scan"].Value == scan;
+    }
+
+    /// <summary>What a start of a scheduled run does with a kept permission mode: null when it reads as reviewed, else the
+    /// part that does not. The session start normalizes its options last, unconditionally, with the carried safeguard and
+    /// then the import limit, both given the manager's export; those, the safeguard's switch, "above Default", the mode
+    /// order, the modes a task not found may not keep and the modes' values read as reviewed; and the names they use are
+    /// the file's own (the manager's file required once in its header, its members never set).</summary>
+    private static string? ScheduledStartFails(ReadOnlySpan<byte> bundle, Dictionary<string, string> shared, int at)
+    {
+        if (!shared.TryGetValue("manager", out var manager) || ManagerExport(bundle, manager, at) is not { } export
+            || FileAt(bundle, at) is not { } managerFile) return "manager";
+        if (Single(bundle, 0, bundle.Length, "normalizeStartOptionsAtIngress("u8, ScheduledIngress, 1600) is not { } ingress
+            || FileAt(bundle, ingress.At) is not { } file) return "session start";
+        var (m, carried, import) = (ingress.Groups["m"].Value, ingress.Groups["carried"].Value, ingress.Groups["import"].Value);
+        if (ingress.Groups["store"].Value != export.Export || !Unconditional(ingress.Groups["statement"].Value)
+            || new[] { m, carried, import }.Any(name => name == ingress.Groups["e"].Value || Binds(ingress.Text, name))
+            || !Requires(bundle, file.Start, file.End, m, export.File)) return "session start";
+        if (Read(bundle, file, carried, ScheduledCarried, 900) is not { } safeguard || safeguard.Groups["m"].Value != m)
+            return "carried safeguard";
+        var (kill, above, modes) = (safeguard.Groups["kill"].Value, safeguard.Groups["above"].Value, safeguard.Groups["modes"].Value);
+        if (Parameters(safeguard).Any(name => name == m || name == kill || name == above)) return "carried safeguard";
+        if (Read(bundle, file, kill, ScheduledKill, 200) is not { } off || off.Groups["m"].Value != m) return "carried safeguard switch";
+        if (Read(bundle, file, import, ScheduledImport, 900) is not { } limit || limit.Groups["m"].Value != m
+            || limit.Groups["modes"].Value != modes || limit.Groups["above"].Value != above
+            || Parameters(limit).Any(name => name == m || name == above)) return "import limit";
+        var aboveText = Definition(bundle, file.Start, file.End, safeguard.At, above);
+        if (aboveText is null || ScheduledAbove.Match(aboveText) is not { Success: true } order
+            || order.Groups["m"].Value != m || order.Groups["modes"].Value != modes || order.Groups["a"].Value == m) return "above Default";
+        var startFile = bundle[file.Start..file.End];
+        foreach (var member in new[] { export.Export, order.Groups["rank"].Value, safeguard.Groups["high"].Value, modes,
+                     off.Groups["loaded"].Value, off.Groups["gate"].Value })
+            if (Sets(startFile, m + "." + member, ownName: true) != 0) return "imports";
+        var managerSpan = bundle[managerFile.Start..managerFile.End];
+        if (DefinedExport(managerSpan, order.Groups["rank"].Value) is not { } rank
+            || Read(bundle, managerFile, rank, ScheduledRank, 300) is not { } ranked
+            || Read(bundle, managerFile, ranked.Groups["known"].Value, ScheduledKnown, 300) is not { } known
+            || known.Groups["order"].Value != ranked.Groups["order"].Value
+            || Definition(bundle, managerFile.Start, managerFile.End, ranked.At, ranked.Groups["order"].Value) != ScheduledModeOrder)
+            return "mode order";
+        if (DefinedExport(managerSpan, safeguard.Groups["high"].Value) is not { } high
+            || Read(bundle, managerFile, high, ScheduledHigh, 200) is null) return "modes of a task not found";
+        if (DefinedExport(managerSpan, modes) is not { } values
+            || Definition(bundle, managerFile.Start, managerFile.End, managerFile.End, values) is not { } valuesText
+            || ScheduledModes.Match(valuesText) is not { Success: true } named
+            || !valuesText.Contains(named.Groups["x"].Value + ".Default=\"default\",", StringComparison.Ordinal)
+            || !valuesText.Contains(named.Groups["x"].Value + ".Auto=\"auto\",", StringComparison.Ordinal)) return "mode values";
+        return null;
+    }
+
+    /// <summary>A regex match at a place in the bundle: its groups, the text it read and where that text starts.</summary>
+    private sealed record Found(GroupCollection Groups, string Text, int At);
+
+    /// <summary>The one place, among the occurrences of <paramref name="anchor"/> between <paramref name="start"/> and
+    /// <paramref name="end"/>, where <paramref name="flow"/> matches the text starting there; null when none or more
+    /// than one does.</summary>
+    private static Found? Single(ReadOnlySpan<byte> bundle, int start, int end, ReadOnlySpan<byte> anchor, Regex flow, int window)
+    {
+        Found? found = null;
+        var span = bundle[start..end];
+        for (int offset = 0, hit; (hit = span[offset..].IndexOf(anchor)) >= 0; offset += hit + anchor.Length)
+        {
+            var at = start + offset + hit;
+            var text = Window(bundle, at, window);
+            if (flow.Match(text) is not { Success: true } match) continue;
+            if (found is not null) return null;
+            found = new(match.Groups, text[..(match.Index + match.Length)], at);
+        }
+        return found;
+    }
+
+    /// <summary>The function <paramref name="name"/> declared once in the file, read with <paramref name="flow"/> from its
+    /// declaration (each flow opens with <c>^function name(</c>); null otherwise.</summary>
+    private static Found? Read(ReadOnlySpan<byte> bundle, (int Start, int End, string? Name) file, string name, Regex flow, int window)
+    {
+        var at = Declared(bundle, file.Start, file.End, name);
+        if (at < 0) return null;
+        var text = Window(bundle, at, window);
+        return flow.Match(text) is { Success: true } match ? new(match.Groups, text[..(match.Index + match.Length)], at) : null;
+    }
+
+    /// <summary>Where <c>function name(</c> is declared in the file, when exactly once (not as a longer name or a member);
+    /// -1 otherwise.</summary>
+    private static int Declared(ReadOnlySpan<byte> bundle, int start, int end, string name)
+    {
+        var needle = Encoding.UTF8.GetBytes("function " + name + "(");
+        var span = bundle[start..end];
+        var at = -1;
+        for (int offset = 0, found; (found = span[offset..].IndexOf(needle)) >= 0; offset += found + needle.Length)
+        {
+            var place = offset + found;
+            if (place > 0 && (IsWord((char)span[place - 1]) || span[place - 1] == (byte)'.')) continue;
+            if (at >= 0) return -1;
+            at = start + place;
+        }
+        return at;
+    }
+
+    /// <summary>The local name a file exports under <paramref name="export"/>, as a defined property, once; null otherwise
+    /// or when the file sets that export another way.</summary>
+    private static string? DefinedExport(ReadOnlySpan<byte> file, string export)
+    {
+        var define = Encoding.UTF8.GetBytes("Object.defineProperty(exports,\"" + export + "\",{enumerable:!0,get:function(){return ");
+        var at = file.IndexOf(define);
+        if (at < 0 || file[(at + define.Length)..].IndexOf(define) >= 0
+            || Sets(file, "exports." + export, ownName: false) != 0 || Sets(file, "module.exports", ownName: false) != 0) return null;
+        var rest = Encoding.UTF8.GetString(file.Slice(at + define.Length, Math.Min(80, file.Length - at - define.Length)));
+        return Regex.Match(rest, @"^(?<name>[\w$]+)\}\}\)", RegexOptions.CultureInvariant) is { Success: true } local
+            ? local.Groups["name"].Value : null;
+    }
+
+    /// <summary>Whether the file's header binds <paramref name="name"/>, once, to the bundled file named <paramref name="target"/>.</summary>
+    private static bool Requires(ReadOnlySpan<byte> bundle, int start, int end, string name, string target)
+    {
+        var header = Encoding.UTF8.GetString(bundle.Slice(start, Math.Min(HeaderBytes, end - start)));
+        var required = Regex.Matches(header, @"(?<![\w$.])" + Regex.Escape(name) + @"=require\(""\./(?<file>[\w.-]+\.js)""\)",
+            RegexOptions.CultureInvariant);
+        return required.Count == 1 && required[0].Groups["file"].Value == target;
+    }
+
+    /// <summary>Whether the comma-separated expressions before the last ones of a statement leave them unconditional:
+    /// nothing but assignments, none of them a control statement.</summary>
+    private static bool Unconditional(string statement)
+    {
+        if (statement.Length == 0) return true;
+        if (!statement.EndsWith(',') || Regex.IsMatch(statement, @"^\s*(?:if|for|while|do|switch|return|throw|else|case)(?![\w$])",
+                RegexOptions.CultureInvariant)) return false;
+        var depth = 0;
+        var start = 0;
+        for (var index = 0; index < statement.Length; index++)
+        {
+            var c = statement[index];
+            if (c is '(' or '[' or '{') depth++;
+            else if (c is ')' or ']' or '}') depth--;
+            else if (c == ',' && depth == 0)
+            {
+                if (!Regex.IsMatch(statement[start..index], @"^[\w$.]+=(?![=>])", RegexOptions.CultureInvariant)) return false;
+                start = index + 1;
+            }
+        }
+        return depth == 0;
+    }
+
+    /// <summary>Whether a function's text binds <paramref name="name"/> of its own (a declaration or an assignment).</summary>
+    private static bool Binds(string text, string name) => Regex.IsMatch(text,
+        @"(?<![\w$.])(?:(?:let|const|var|function)\s+" + Regex.Escape(name) + @"(?![\w$])|" + Regex.Escape(name) + @"\s?=(?![=>]))",
+        RegexOptions.CultureInvariant);
+
+    /// <summary>A function's parameters as its flow read them (groups e and n).</summary>
+    private static IEnumerable<string> Parameters(Found function) =>
+        new[] { "e", "n" }.Select(group => function.Groups[group]).Where(group => group.Success).Select(group => group.Value);
+
+    private static string Window(ReadOnlySpan<byte> bundle, int at, int length) =>
+        Encoding.UTF8.GetString(bundle.Slice(at, Math.Min(length, bundle.Length - at)));
 
     /// <summary>The bundled file around <paramref name="at"/>: from the end of the source map comment before it to its own,
     /// and the file that comment names (null at the bundle's end).</summary>
@@ -604,10 +941,11 @@ internal static class ClaudeDesktopProbe
     }
 
     /// <summary>The scheduled list's entry and file schemas as text, with every schema and constant they are made of in
-    /// their file (each defined as <c>name=</c>, the last definition before the entry schema or else the first after),
-    /// every name that is not a field or a member numbered by first appearance, so renamed minified names read the same
-    /// and any other change does not; null when they cannot be found. <paramref name="file"/> is the file schema's name
-    /// the load uses.</summary>
+    /// their file (each defined as <c>name=</c>, the last definition before the entry schema or else the first after)
+    /// and the kind of schema each builder they call makes (a function of the file, <c>T()</c> a ZodString), every name
+    /// that is not a field or a member numbered by first appearance, so renamed minified names read the same and any
+    /// other change, a field's type included, does not; null when they cannot be found. <paramref name="file"/> is the
+    /// file schema's name the load uses.</summary>
     internal static string? ScheduledSchema(ReadOnlySpan<byte> bundle, string file)
     {
         var anchor = "({scheduledTasks:"u8;
@@ -635,9 +973,12 @@ internal static class ClaudeDesktopProbe
             for (var index = 0; index < order.Count; index++)
             {
                 var name = order[index];
-                if (name.Length < 2 || !defined.Add(name)) continue;
-                if (Definition(bundle, span.Start, span.End, entryStart, name) is { } definition)
+                if (!defined.Add(name)) continue;
+                if (name.Length >= 2 && Definition(bundle, span.Start, span.End, entryStart, name) is { } definition)
                     parts.Add(names[name] + "=" + Renumber(definition, names, order));
+                else if (parts.Any(part => part.Contains(names[name] + "(", StringComparison.Ordinal))
+                         && Builds(bundle, span, name) is { } kind)
+                    parts.Add(names[name] + ":" + kind);
             }
             return string.Join("\n", parts);
         }
@@ -647,7 +988,11 @@ internal static class ClaudeDesktopProbe
     /// <summary>What <paramref name="name"/> is defined as in its file (<c>name=</c> not part of a longer name or a
     /// member, not a comparison or an arrow): the last definition before <paramref name="anchor"/>, else the first after;
     /// null when there is none or it does not end within 16 KB.</summary>
-    private static string? Definition(ReadOnlySpan<byte> bundle, int fileStart, int fileEnd, int anchor, string name)
+    private static string? Definition(ReadOnlySpan<byte> bundle, int fileStart, int fileEnd, int anchor, string name) =>
+        DefinedAt(bundle, fileStart, fileEnd, anchor, name) is { } place ? Expression(bundle, place) : null;
+
+    /// <summary>Where the definition <see cref="Definition"/> reads starts (just after <c>name=</c>); null when none.</summary>
+    private static int? DefinedAt(ReadOnlySpan<byte> bundle, int fileStart, int fileEnd, int anchor, string name)
     {
         var needle = Encoding.UTF8.GetBytes(name + "=");
         var file = bundle[fileStart..fileEnd];
@@ -662,7 +1007,23 @@ internal static class ClaudeDesktopProbe
             if (fileStart + at < anchor) before = fileStart + at;
             else { after = fileStart + at; break; }
         }
-        return (before ?? after) is { } place ? Expression(bundle, place + needle.Length) : null;
+        return (before ?? after) is { } place ? place + needle.Length : null;
+    }
+
+    // A schema builder (zod's string(), object() ...): return new Kind(...) or return make(Kind, ...), Kind defined as
+    // en("ZodString", ...).
+    private static readonly Regex ScheduledBuilder = new(
+        @"^function [\w$]+\([\w$,]*\)\{return (?:new (?<kind>[\w$]+)\(|[\w$]+\((?<kind>[\w$]+),)", RegexOptions.CultureInvariant);
+    private static readonly Regex ScheduledKind = new(@"^[\w$]+\(""(?<kind>Zod\w+)"",", RegexOptions.CultureInvariant);
+
+    /// <summary>The kind of schema <paramref name="name"/> builds, when the file declares it once as a builder of one
+    /// zod class; null otherwise.</summary>
+    private static string? Builds(ReadOnlySpan<byte> bundle, (int Start, int End, string? Name) file, string name)
+    {
+        var at = Declared(bundle, file.Start, file.End, name);
+        if (at < 0 || ScheduledBuilder.Match(Window(bundle, at, 300)) is not { Success: true } builder
+            || DefinedAt(bundle, file.Start, file.End, at, builder.Groups["kind"].Value) is not { } made) return null;
+        return ScheduledKind.Match(Window(bundle, made, 120)) is { Success: true } kind ? kind.Groups["kind"].Value : null;
     }
 
     /// <summary>The expression starting at <paramref name="start"/>, up to the comma or semicolon that ends it, or the
@@ -882,6 +1243,10 @@ internal sealed class ClaudeDesktopLogWatcher(string? directory = null)
     private static readonly Regex ScheduledInitialized = new(
         @"^(?<at>\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) \[info\] \[CCDScheduledTasks\] Initialized \{ accountId: '(?<account>[0-9a-fA-F-]{36})', orgId: '(?<org>[0-9a-fA-F-]{36})' \}\s*$",
         RegexOptions.CultureInvariant);
+    /// <summary>How the app's logger marks lines it could not write (6.28899, ScheduledFlows): before the next line it
+    /// can write, on a line of its own and undated, <c>[warn] Lines are missing here: this log could not be written
+    /// (code)</c>.</summary>
+    internal const string MissingLines = "[warn] Lines are missing here: this log could not be written (";
     private readonly string _directory = directory ?? ClaudeDesktopProbe.LogDirectory;
     private readonly ClaudeScheduledLog _scheduled = new();
     private DateTime? _generation;
@@ -889,6 +1254,12 @@ internal sealed class ClaudeDesktopLogWatcher(string? directory = null)
     // The file behind main.log, by volume and file index. Creation time cannot tell: on NTFS a file created under a
     // name that was just renamed away inherits the old creation time, and the app's rotation does exactly that.
     private string? _file;
+    // When the last dated line of this run read was; and main.log's unfinished last line (file and where it starts)
+    // already taken for lines lost, so one such line counts once.
+    private DateTime? _lastDated;
+    private string? _cut;
+    /// <summary>Runs between reading main1.log and main.log (a rotation then hides the file in between).</summary>
+    internal Action? BetweenFilesForTest { get; set; }
     private ClaudeDesktopAccountState _state = ClaudeDesktopAccountState.Closed;
     private readonly HashSet<string> _held = new(StringComparer.Ordinal);
     internal ClaudeDesktopAccountState State => _state;
@@ -906,14 +1277,15 @@ internal sealed class ClaudeDesktopLogWatcher(string? directory = null)
         LostLines = false;
         if (hostStartedAt is null)
         {
-            _generation = null; _held.Clear(); _scheduled.Close();
+            _generation = null; _held.Clear(); _scheduled.Close(); _lastDated = null; _cut = null;
             return _state = ClaudeDesktopAccountState.Closed;
         }
         var main = Path.Combine(_directory, "main.log");
         var previous = Path.Combine(_directory, "main1.log");
         List<string> lines = [];
         LogRead result;
-        long end = 0; string? file = null;
+        long end = 0; string? file = null, finished = null;
+        var unfinished = false;
         var replay = _generation != hostStartedAt;
         if (replay)
         {
@@ -922,16 +1294,18 @@ internal sealed class ClaudeDesktopLogWatcher(string? directory = null)
             // it may confirm an account; only the complete lines of main.log count then.
             _state = ClaudeDesktopAccountState.Unknown;
             _scheduled.Start(new DateTimeOffset(hostStartedAt.Value));
-            result = File.Exists(previous) ? ReadFrom(previous, 0, null, true, lines, out _, out _) : LogRead.Ok;
+            _lastDated = null; _cut = null;
+            finished = "";
+            result = File.Exists(previous) ? ReadFrom(previous, 0, null, true, lines, out _, out finished, out _) : LogRead.Ok;
             if (result == LogRead.Unfinished) result = LogRead.Ok;
-            if (result == LogRead.Ok) result = ReadFrom(main, 0, null, false, lines, out end, out file);
+            if (result == LogRead.Ok) result = ReadAfter(main, previous, finished, lines, out end, out file, out unfinished);
         }
-        else if ((result = ReadFrom(main, _offset, _file, false, lines, out end, out file)) == LogRead.OtherFile)
+        else if ((result = ReadFrom(main, _offset, _file, false, lines, out end, out file, out unfinished)) == LogRead.OtherFile)
         {
             // Rotation renamed the file we were reading to main1.log. Finish it from where we stopped, then read the
             // new file. If main1.log is not that file, or its last line is unfinished, lines were lost.
-            result = ReadFrom(previous, _offset, _file, true, lines, out _, out _);
-            if (result == LogRead.Ok) result = ReadFrom(main, 0, null, false, lines, out end, out file);
+            result = ReadFrom(previous, _offset, _file, true, lines, out _, out finished, out _);
+            if (result == LogRead.Ok) result = ReadAfter(main, previous, finished, lines, out end, out file, out unfinished);
         }
         if (result != LogRead.Ok)
         {
@@ -942,7 +1316,26 @@ internal sealed class ClaudeDesktopLogWatcher(string? directory = null)
         _generation = hostStartedAt; _offset = end; _file = file;
         // A replay reads the whole run again, the accounts it left included.
         if (replay) _held.Clear();
-        return _state = Apply(_state, lines, hostStartedAt.Value, registered, _held, _scheduled);
+        _state = Apply(_state, lines, hostStartedAt.Value, registered, _held, _scheduled, ref _lastDated);
+        // main.log ending in a line not finished: the app may have failed to write a reset or a load there, so the list
+        // it holds is unknown until the next load (once per such line, dated as the last line before it).
+        var cut = unfinished ? file + "@" + end.ToString(CultureInfo.InvariantCulture) : null;
+        if (cut is not null && cut != _cut) _scheduled.Reset(new DateTimeOffset(_lastDated ?? hostStartedAt.Value));
+        _cut = cut;
+        return _state;
+    }
+
+    /// <summary>Reads main.log from its start after main1.log was read (<paramref name="finished"/>: the file it was then,
+    /// "" for none). A rotation in between moves the file that was main.log then out of sight: unless main1.log is still
+    /// <paramref name="finished"/>, or the file just read (rotated after the read), lines were lost.</summary>
+    private LogRead ReadAfter(string main, string previous, string? finished, List<string> lines, out long end,
+        out string? file, out bool unfinished)
+    {
+        BetweenFilesForTest?.Invoke();
+        var result = ReadFrom(main, 0, null, false, lines, out end, out file, out unfinished);
+        if (result != LogRead.Ok) return result;
+        var now = Identity(previous);
+        return now is not null && (now == finished || now == file) ? LogRead.Ok : LogRead.Failed;
     }
 
     /// <param name="held">Collects the accounts the lines leave, until one confirms an account (see <see cref="Held"/>).</param>
@@ -951,19 +1344,41 @@ internal sealed class ClaudeDesktopLogWatcher(string? directory = null)
         DateTime since, IReadOnlyCollection<ClaudeShelfAccount> registered, ISet<string>? held = null,
         ClaudeScheduledLog? scheduled = null)
     {
+        DateTime? last = null;
+        return Apply(state, lines, since, registered, held, scheduled, ref last);
+    }
+
+    /// <param name="last">When the last dated line of the run read was, before these lines and then after them.</param>
+    private static ClaudeDesktopAccountState Apply(ClaudeDesktopAccountState state, IEnumerable<string> lines,
+        DateTime since, IReadOnlyCollection<ClaudeShelfAccount> registered, ISet<string>? held,
+        ClaudeScheduledLog? scheduled, ref DateTime? last)
+    {
         var accounts = registered.Select(account => account.AccountUuid.ToLowerInvariant()).ToHashSet(StringComparer.Ordinal);
         var pairs = registered.Select(account => account.Key).ToHashSet(StringComparer.Ordinal);
         foreach (var line in lines)
         {
+            // Lines the app could not write may have held a reset or a load: the list it holds is unknown until the next
+            // load, which began after the last line read before them (or after the run's start).
+            if (line.StartsWith(MissingLines, StringComparison.Ordinal))
+            {
+                scheduled?.Reset(new DateTimeOffset(last ?? since));
+                continue;
+            }
             if (line.Length < 20 || !DateTime.TryParseExact(line[..19], "yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture,
                     DateTimeStyles.AssumeLocal, out var at) || at < since - ClockSkew) continue;
+            last = at;
             if (line.Contains("[CCDScheduledTasks]", StringComparison.Ordinal))
             {
-                // Whichever account it is, registered or not: the list loaded is the one not to write.
+                // Whichever account it is, registered or not: the list loaded is the one not to write. A load dated
+                // before the run's start, within the skew allowed, may still be the previous run's: this run's log
+                // cannot tell which list its manager holds then, so it is unknown until the next load.
                 if (ScheduledReset.IsMatch(line)) scheduled?.Reset(new DateTimeOffset(at));
                 else if (ScheduledInitialized.Match(line) is { Success: true } began)
-                    scheduled?.Initialized(began.Groups["account"].Value.ToLowerInvariant() + "/"
+                {
+                    if (at < since) scheduled?.Reset(new DateTimeOffset(at));
+                    else scheduled?.Initialized(began.Groups["account"].Value.ToLowerInvariant() + "/"
                         + began.Groups["org"].Value.ToLowerInvariant(), new DateTimeOffset(at));
+                }
                 continue;
             }
             if (Transition.Match(line) is { Success: true } transition)
@@ -1004,16 +1419,17 @@ internal sealed class ClaudeDesktopLogWatcher(string? directory = null)
     /// <summary>Appends the complete lines after <paramref name="offset"/> and identifies the file, both through one
     /// handle. With <paramref name="expectedFile"/>, another file now carrying the name reads nothing and returns
     /// OtherFile. A <paramref name="final"/> read (a rotated file) that ends mid-line reads nothing and returns
-    /// Unfinished. An empty increment is a success; an unreadable file or a lost range is a failure.</summary>
+    /// Unfinished; any other read keeps a last line not finished for the next one (<paramref name="unfinished"/>). An
+    /// empty increment is a success; an unreadable file or a lost range is a failure.</summary>
     private static LogRead ReadFrom(string path, long offset, string? expectedFile, bool final, List<string> lines,
-        out long end, out string? file)
+        out long end, out string? file, out bool unfinished)
     {
-        end = offset; file = null;
+        end = offset; file = null; unfinished = false;
         try
         {
             using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
             if (!GetFileInformationByHandle(stream.SafeFileHandle, out var information)) return LogRead.Failed;
-            var identity = $"{information.VolumeSerialNumber:x8}-{information.FileIndexHigh:x8}{information.FileIndexLow:x8}";
+            var identity = IdentityOf(information);
             if (expectedFile is not null && identity != expectedFile) return LogRead.OtherFile;
             var length = stream.Length;
             // Shrunk in place, or too far behind: replay the run instead.
@@ -1021,8 +1437,9 @@ internal sealed class ClaudeDesktopLogWatcher(string? directory = null)
             stream.Seek(offset, SeekOrigin.Begin);
             var bytes = new byte[length - offset];
             stream.ReadExactly(bytes);
-            if (final && bytes.Length > 0 && bytes[^1] != (byte)'\n') return LogRead.Unfinished;
             file = identity;
+            unfinished = bytes.Length > 0 && bytes[^1] != (byte)'\n';
+            if (final && unfinished) return LogRead.Unfinished;
             // Keep a trailing partial line for the next read.
             var last = bytes.Length == 0 ? -1 : Array.LastIndexOf(bytes, (byte)'\n');
             if (last < 0) return LogRead.Ok;
@@ -1032,6 +1449,22 @@ internal sealed class ClaudeDesktopLogWatcher(string? directory = null)
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { return LogRead.Failed; }
     }
+
+    /// <summary>Which file the name is now (as <see cref="ReadFrom"/> identifies it); "" when there is none, null when
+    /// that cannot be told.</summary>
+    private static string? Identity(string path)
+    {
+        try
+        {
+            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            return GetFileInformationByHandle(stream.SafeFileHandle, out var information) ? IdentityOf(information) : null;
+        }
+        catch (Exception exception) when (exception is FileNotFoundException or DirectoryNotFoundException) { return ""; }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { return null; }
+    }
+
+    private static string IdentityOf(FileInformation information) =>
+        $"{information.VolumeSerialNumber:x8}-{information.FileIndexHigh:x8}{information.FileIndexLow:x8}";
 
     [StructLayout(LayoutKind.Sequential)]
     private struct FileInformation

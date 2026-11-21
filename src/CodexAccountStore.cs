@@ -23,7 +23,12 @@ internal sealed record SavedCodexAccount(string Id, string Label, string Identit
 /// </summary>
 internal sealed partial class CodexAccountStore
 {
-    internal const string TransactionMutexName = @"Local\CodexWeeklyUsageIndicator.AccountTransaction";
+    /// <summary>The lock every account change holds, shared with the account windows and the installer. A test run
+    /// (<c>GFS_ACCOUNT_TEST_ROOT</c> set) takes one of its own, named after that root, so the widget running on the same
+    /// desktop and the tests never stop each other.</summary>
+    internal static readonly string TransactionMutexName =
+        TransactionMutexFor(Environment.GetEnvironmentVariable("GFS_ACCOUNT_TEST_ROOT"));
+    private const string WidgetTransactionMutexName = @"Local\CodexWeeklyUsageIndicator.AccountTransaction";
     private const int MaxAuthBytes = 1024 * 1024;
     private const int MaxStoreBytes = 16 * 1024 * 1024;
     private const int MaxAccounts = 20;
@@ -416,6 +421,18 @@ internal sealed partial class CodexAccountStore
         new("지원되는 ChatGPT 로그인 파일이 아닙니다. 공식 Codex 로그인으로 다시 등록하세요.");
     private static InvalidOperationException CorruptStore() =>
         new("계정 보관함 또는 복구 기록을 읽을 수 없습니다. 원본 파일을 보존한 채 중단했습니다.");
+
+    /// <summary>The transaction lock's name for a test root (null or blank: the widget's own): the widget's name and the
+    /// first 16 hex digits of the SHA-256 of the root's full path, in lower case.</summary>
+    internal static string TransactionMutexFor(string? testRoot)
+    {
+        if (string.IsNullOrWhiteSpace(testRoot)) return WidgetTransactionMutexName;
+        string root;
+        try { root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(testRoot)); }
+        catch (Exception exception) when (exception is ArgumentException or NotSupportedException or PathTooLongException) { root = testRoot; }
+        var digest = SHA256.HashData(Encoding.UTF8.GetBytes(root.ToLowerInvariant()));
+        return WidgetTransactionMutexName + "." + Convert.ToHexString(digest, 0, 8).ToLowerInvariant();
+    }
 
     private IDisposable AcquireLock()
     {
