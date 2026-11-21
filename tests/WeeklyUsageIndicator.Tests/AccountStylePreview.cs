@@ -34,7 +34,7 @@ internal static class AccountStylePreview
             try
             {
                 var basePath = Environment.GetEnvironmentVariable("GFS_ACCOUNT_TEST_ROOT")
-                    ?? throw new InvalidOperationException("Set GFS_ACCOUNT_TEST_ROOT to the task workspace.");
+                    ?? Path.Combine(Path.GetTempPath(), "gfs-agent", "account-style-preview");
                 root = Path.Combine(basePath, "style-" + Guid.NewGuid().ToString("N"));
                 Application.SetHighDpiMode(standardDpi ? HighDpiMode.DpiUnaware : HighDpiMode.PerMonitorV2); Application.EnableVisualStyles();
                 using (var preview = new Preview(root)) preview.Run(hold);
