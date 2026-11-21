@@ -1647,6 +1647,11 @@ internal static class ClaudeSessionShelfTests
             if (contract == ClaudeDesktopContract.Unreviewed)
                 foreach (var failure in ClaudeDesktopProbe.Unmatched(File.ReadAllBytes(package.AsarPath)))
                     Console.WriteLine($"  unmatched: {failure}");
+            var scheduled = ClaudeDesktopProbe.ScheduledContract(package.AsarPath);
+            Console.WriteLine($"scheduled lists: {scheduled}");
+            if (scheduled == ClaudeDesktopContract.Unreviewed)
+                foreach (var failure in ClaudeDesktopProbe.ScheduledUnmatched(File.ReadAllBytes(package.AsarPath)))
+                    Console.WriteLine($"  unmatched: {failure}");
         }
         var runtime = ClaudeDesktopProbe.Observe();
         Console.WriteLine($"desktop: {runtime.State} host={runtime.HostStartedAt:yyyy-MM-dd HH:mm:ss}");

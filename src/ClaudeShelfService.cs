@@ -1,4 +1,6 @@
 using System.IO.MemoryMappedFiles;
+using System.Text.Encodings.Web;
+using System.Text.Json;
 using System.Text.Json.Nodes;
 
 namespace WeeklyUsageIndicator;
@@ -24,7 +26,8 @@ internal sealed record ClaudeShelfStatus(
     DateTimeOffset? RelaunchArmedUntil,
     DateTime? HostStartedAt = null,
     string? Unreviewed = null,
-    string? Damaged = null)
+    string? Damaged = null,
+    ClaudeScheduledProblem? Scheduled = null)
 {
     internal static readonly ClaudeShelfStatus Initial = new(ClaudeDesktopRunState.Unknown, ClaudeDesktopAccountState.Unknown,
         null, null, 0, null, 0, true, ClaudeShelfProblem.None, null, null);
@@ -32,12 +35,14 @@ internal sealed record ClaudeShelfStatus(
     internal bool RelaunchArmed => RelaunchArmedUntil is { } until && until > DateTimeOffset.Now;
 }
 
-/// <summary>Seams for tests. Production uses the real probes and ShellExecute.</summary>
+/// <summary>Seams for tests. Production uses the real probes and ShellExecute. <see cref="ScheduledContract"/> reads
+/// the app's way of keeping scheduled-task lists; without it they are not aligned.</summary>
 internal sealed record ClaudeShelfEnvironment(Func<ClaudeDesktopRuntime> Observe, Func<ClaudeDesktopPackage?> FindPackage,
-    Func<string, ClaudeDesktopContract> Contract, Action<ClaudeDesktopPackage> Launch, Func<DateTimeOffset> Now)
+    Func<string, ClaudeDesktopContract> Contract, Action<ClaudeDesktopPackage> Launch, Func<DateTimeOffset> Now,
+    Func<string, ClaudeDesktopContract>? ScheduledContract = null)
 {
     internal static readonly ClaudeShelfEnvironment Real = new(ClaudeDesktopProbe.Observe, ClaudeDesktopProbe.FindPackage,
-        ClaudeDesktopProbe.Contract, ClaudeDesktopProbe.Launch, () => DateTimeOffset.Now);
+        ClaudeDesktopProbe.Contract, ClaudeDesktopProbe.Launch, () => DateTimeOffset.Now, ClaudeDesktopProbe.ScheduledContract);
 }
 
 /// <summary>What one background pass observed. <see cref="Reservation"/> is the reopen request that the closure
@@ -123,6 +128,17 @@ internal sealed class ClaudeShelfService : IDisposable
     // Until this widget sees the app confirm an account, and again after lines of its log were lost, a switch it then
     // sees happened at a time it cannot tell: the account left is not dated.
     private bool _unwatched = true;
+    // The scheduled-task alignment (see Schedule): what last ran it, when, and what it reports once that has lasted.
+    private static readonly TimeSpan ScheduledInterval = TimeSpan.FromMinutes(10);
+    private static readonly TimeSpan ScheduledRetry = TimeSpan.FromMinutes(1);
+    private ClaudeScheduledSync _scheduled;
+    private ClaudeScheduledSeedChannel? _seedChannel;
+    private string? _scheduledStamps, _scheduledPhase;
+    private DateTimeOffset _scheduledAt = DateTimeOffset.MinValue;
+    private bool _scheduledWaiting;
+    private (string Key, DateTime? Host)? _scheduledLoaded;
+    private DateTimeOffset? _scheduledTroubleSince;
+    private ClaudeScheduledProblem? _scheduledShown;
     // UI-thread state.
     private bool _busy, _disposed;
     private (Guid Id, DateTimeOffset Until)? _reservation;
@@ -141,8 +157,16 @@ internal sealed class ClaudeShelfService : IDisposable
         _followAppData = shelf is null && layoutSources is null;
         _environment = environment ?? ClaudeShelfEnvironment.Real; _log = log ?? new ClaudeDesktopLogWatcher();
         _layoutSources = layoutSources ?? ClaudeSessionSync.Sources.For(_shelf.Paths);
+        _scheduled = NewScheduled();
+        // The ledger folder stays when the app's profile folder moves, and so does where a seed is asked for.
+        _seedChannel = _environment.ScheduledContract is null ? null : ClaudeScheduledSeedChannel.Open(_shelf.Paths.LedgerDirectory);
         _timer.Tick += (_, _) => Tick();
     }
+
+    /// <summary>The scheduled-task alignment over the shelf's lists and store.</summary>
+    private ClaudeScheduledSync NewScheduled() =>
+        new(_shelf.Paths.SessionsRoot, Path.Combine(_shelf.Paths.LedgerDirectory, ClaudeScheduledSync.StoreFolder),
+            _shelf.Paths.ScheduledTasksRoot, _shelf.AcquireLease);
 
     internal void Start() { if (!_disposed) { _timer.Start(); Tick(); } }
 
@@ -333,10 +357,88 @@ internal sealed class ClaudeShelfService : IDisposable
                 _watchedSince = null;
                 break;
         }
+        Schedule(runtime, app, package, now);
         var profileId = app.Key is { } appKey ? _accounts.FirstOrDefault(account => account.Key == appKey)?.ProfileId : null;
         return new ClaudeShelfPass(new ClaudeShelfStatus(runtime.State, app, profileId, _pending, _accounts.Count, _lastFillAt,
-            _lastCreated, _lastComplete, _problem, _problemDetail, null, runtime.HostStartedAt, _unreviewed, _damaged), accepted,
+            _lastCreated, _lastComplete, _problem, _problemDetail, null, runtime.HostStartedAt, _unreviewed, _damaged,
+            _scheduledShown), accepted,
             package ?? _environment.FindPackage(), switchedFrom, choice);
+    }
+
+    /// <summary>
+    /// Aligns the accounts' scheduled-task lists (<see cref="ClaudeScheduledSync"/>): when one changed on disk, when the
+    /// app starts, stops or has been closed for a moment, every ten minutes, every minute while a list waits to be
+    /// written, and when a seed is asked for. While the app runs only a list the shelf could fill is written (an account
+    /// not shown for the settle window, asked again before each file); once the app has been closed for a moment every
+    /// list is, its state read again before each file. Nothing is written while that state is unknown or while its
+    /// version's way of keeping the lists does not read as reviewed. A problem that lasts is reported in the status.
+    /// </summary>
+    private void Schedule(ClaudeDesktopRuntime runtime, ClaudeDesktopAccountState app, ClaudeDesktopPackage? package,
+        DateTimeOffset now)
+    {
+        if (_environment.ScheduledContract is not { } review) return;
+        var request = _seedChannel?.Request();
+        void Refuse(string status)
+        {
+            if (request is not null) _seedChannel!.Answer(request, new JsonObject { ["status"] = status }.ToJsonString());
+        }
+        if (runtime.State == ClaudeDesktopRunState.Unknown || _accounts.Count < 2)
+        {
+            Refuse(runtime.State == ClaudeDesktopRunState.Unknown ? "app_state_unknown" : "fewer_than_two_accounts");
+            return;
+        }
+        // The app came to an account, at the time its log tells: a list written just before may have been read before.
+        if (runtime.State == ClaudeDesktopRunState.Running && app.Key is { } loaded && _accounts.Any(account => account.Key == loaded)
+            && _scheduledLoaded != (loaded, runtime.HostStartedAt))
+        {
+            var at = app.ObservedAt is { } observed && new DateTimeOffset(observed) is var logged && logged <= now ? logged : now;
+            _scheduled.NoteLoaded(loaded, at);
+            _scheduledLoaded = (loaded, runtime.HostStartedAt);
+        }
+        var closedLong = runtime.State == ClaudeDesktopRunState.Closed && _closedSince is { } closed && now - closed >= ClosedGrace;
+        var phase = runtime.State == ClaudeDesktopRunState.Closed ? closedLong ? "closed" : "closing" : "running";
+        var stamps = _scheduled.Stamps(_accounts);
+        if (request is null && stamps == _scheduledStamps && phase == _scheduledPhase
+            && now - _scheduledAt < (_scheduledWaiting ? ScheduledRetry : ScheduledInterval)) return;
+        _scheduledPhase = phase; _scheduledAt = now; _scheduledStamps = stamps;
+        package ??= _environment.FindPackage();
+        if ((package is null ? ClaudeDesktopContract.Incompatible : review(package.AsarPath)) != ClaudeDesktopContract.Reviewed)
+        {
+            _scheduledShown = new(ClaudeScheduledProblemKind.Unreviewed, package?.Version.ToString());
+            Refuse("unreviewed_app_version");
+            return;
+        }
+        Func<string, bool> mayWrite = runtime.State == ClaudeDesktopRunState.Running ? MayWrite
+            : closedLong ? _ => _environment.Observe().State == ClaudeDesktopRunState.Closed : _ => false;
+        ClaudeScheduledPass pass;
+        try
+        {
+            pass = _scheduled.Pass(_accounts, mayWrite, now, seed: request is not null);
+            // A seed asked for before the first pass: the starting point is taken now, so the fill can be written at once.
+            if (pass is { First: true, Failure: null } && request is not null)
+                pass = _scheduled.Pass(_accounts, mayWrite, now) with { Seed = pass.Seed };
+        }
+        catch (Exception exception) { pass = new(false, 0, [], [], exception.Message, null); }
+        _scheduledStamps = _scheduled.Stamps(_accounts);
+        _scheduledWaiting = pass.Waiting.Count > 0;
+        var trouble = pass.Failure is { } failure ? new ClaudeScheduledProblem(ClaudeScheduledProblemKind.Failed, failure)
+            : pass.Unreadable.Count > 0 ? new ClaudeScheduledProblem(ClaudeScheduledProblemKind.Unreadable, string.Join(", ", pass.Unreadable))
+            : null;
+        if (trouble is null) { _scheduledTroubleSince = null; _scheduledShown = null; }
+        else
+        {
+            _scheduledTroubleSince ??= now;
+            _scheduledWaiting = true;
+            _scheduledShown = now - _scheduledTroubleSince >= UnreadableGrace ? trouble : null;
+        }
+        if (request is null) return;
+        var answer = pass.Seed is { } seed ? ClaudeScheduledCommand.SeedJson(seed) : new JsonObject { ["status"] = pass.Failure ?? "not_seeded" };
+        if (pass.Failure is { } failed && answer["status"]?.GetValue<string>() == "ok") answer["failure"] = failed;
+        answer["written"] = pass.Written;
+        // Lists not written in this pass: the one the app shows (written once it closes), or one it showed a moment ago.
+        answer["waiting"] = new JsonArray(pass.Waiting.Select(label => (JsonNode)label).ToArray());
+        _seedChannel!.Answer(request, answer.ToJsonString(new JsonSerializerOptions
+        { WriteIndented = true, Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping }));
     }
 
     /// <summary>Every minute, when this service made its own lists, moves them to the profile folder the app uses now: the
@@ -350,6 +452,7 @@ internal sealed class ClaudeShelfService : IDisposable
         if (string.Equals(Path.Combine(root, ClaudeAppData.SessionsFolder), Path.TrimEndingDirectorySeparator(
                 Path.GetFullPath(_shelf.Paths.SessionsRoot)), StringComparison.OrdinalIgnoreCase)) return;
         _shelf = new ClaudeSessionShelf(ClaudeShelfPaths.CreateDefault(appRoot: root));
+        _scheduled = NewScheduled();
         _layoutSources = ClaudeSessionSync.Sources.For(_shelf.Paths);
     }
 

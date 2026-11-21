@@ -16,6 +16,7 @@ if (args.Contains("--claude-profile-tests")) { await ClaudeProfileTests.RunAsync
 if (args.Contains("--claude-app-data-tests")) { await ClaudeAppDataTests.RunAsync(); Console.WriteLine("PASS: Claude profile folder"); return; }
 if (args.Contains("--claude-shelf-tests")) { await ClaudeSessionShelfTests.RunAsync(); Console.WriteLine("PASS: Claude session shelf"); return; }
 if (args.Contains("--claude-sync-tests")) { await ClaudeSessionSyncTests.RunAsync(); Console.WriteLine("PASS: Claude session sync"); return; }
+if (args.Contains("--claude-scheduled-tests")) { await ClaudeScheduledTasksTests.RunAsync(); Console.WriteLine("PASS: Claude scheduled tasks"); return; }
 if (args.Contains("--widget-face-preview")) { WidgetFaceTests.Preview(args); return; }
 if (args.Contains("--widget-native-preview")) { await WidgetFaceTests.NativePreview(args); return; }
 if (args.Contains("--widget-face-tests")) { await WidgetFaceTests.RunAsync(); Console.WriteLine("PASS: widget face"); return; }
@@ -60,6 +61,7 @@ var tests = new (string Name, Func<Task> Run)[]
     ("Claude profile folder: legacy roaming, moved out of the package, inside it", ClaudeAppDataTests.RunAsync),
     ("Claude session shelf: fill by adding and advancing, closed- and running-app writes, account mapping and log observation", ClaudeSessionShelfTests.RunAsync),
     ("Claude combined weekly total and session-layout plan", ClaudeSessionSyncTests.RunAsync),
+    ("Claude scheduled tasks: aligned across accounts, the shown list only once the app closes, seed and the app's contract", ClaudeScheduledTasksTests.RunAsync),
     ("Claude per-account reads, saved values, moving the default-home account and identity invalidation", ClaudeControllerTests.RunAsync),
     ("Claude account menu actions and inactive-profile usage", () => ClaudeAccountMenuSmoke.RunAsync()),
     ("account operation lease blocks lifecycle replacement across awaits", AccountOperationLeaseTests.RunAsync),

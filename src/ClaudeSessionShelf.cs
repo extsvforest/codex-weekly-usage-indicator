@@ -14,7 +14,8 @@ internal sealed record ClaudeShelfAccount(string AccountUuid, string OrgUuid, st
 }
 
 internal sealed record ClaudeShelfPaths(string SessionsRoot, string ProjectsRoot, string ScratchRoot,
-    IReadOnlyList<string> RegistryDirectories, string LedgerDirectory, string? DesktopConfig = null)
+    IReadOnlyList<string> RegistryDirectories, string LedgerDirectory, string? DesktopConfig = null,
+    string? ScheduledTasksRoot = null)
 {
     /// <summary>The lists, scratch folders and stores in the app's profile folder (<see cref="ClaudeAppData"/>, found
     /// now unless <paramref name="appRoot"/> names it).</summary>
@@ -35,7 +36,9 @@ internal sealed record ClaudeShelfPaths(string SessionsRoot, string ProjectsRoot
             Path.Combine(local, "CodexWeeklyUsageIndicator.SessionShelf"),
             // Automatic sidebar writes stay off: holding the web UI store's lock while Desktop starts can make Chromium
             // fail to open it and recreate it. Writes run only as a controlled step (see ClaudeLocalStorage).
-            DesktopConfig: null);
+            DesktopConfig: null,
+            // The scheduled tasks' definitions, which every account shares (ClaudeScheduledSync only checks they are there).
+            ScheduledTasksRoot: Path.Combine(config, "scheduled-tasks"));
     }
 }
 
@@ -191,6 +194,8 @@ internal sealed class ClaudeSessionShelf
     private readonly ClaudeShelfPaths _paths;
     private readonly Func<ClaudeLiveSessionScan> _liveWriters;
     private readonly Func<IDisposable> _acquireLease;
+    /// <summary>The account lease the fills hold while they write (the scheduled-task alignment holds it too).</summary>
+    internal IDisposable AcquireLease() => _acquireLease();
     private readonly TimeProvider _time;
     // Plans repeat every minute while the app runs and a hand-over reads two transcripts whole: remember each verdict per
     // state of the earlier file and the later file's length (see WentOn).

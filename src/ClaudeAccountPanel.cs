@@ -207,6 +207,19 @@ internal sealed class ClaudeAccountPanel : UserControl
                 UiText.T("종료하면 다시 열기"));
         if (status.Problem == ClaudeShelfProblem.Failed)
             return (UiText.F($"세션 목록 채우기 실패 · {UiText.Message(status.ProblemDetail ?? "")}"), true, null);
+        // Scheduled tasks are aligned beside the session lists; a problem that lasts takes the same line.
+        if (status.Scheduled is { } scheduled)
+            return (scheduled.Kind switch
+            {
+                ClaudeScheduledProblemKind.Unreviewed => UiText.T("예약 작업 맞추기 멈춤 · 이 Claude 버전의 예약 작업 저장 방식은 아직 확인되지 않았습니다."),
+                ClaudeScheduledProblemKind.Unreadable => UiText.F($"예약 작업 맞추기 보류 · {scheduled.Detail ?? ""} 예약 목록을 읽을 수 없습니다."),
+                _ => UiText.F($"예약 작업 맞추기 실패 · {scheduled.Detail switch
+                {
+                    "store_unreadable" => UiText.T("위젯의 예약 작업 기록을 읽을 수 없습니다."),
+                    "store_unwritable" => UiText.T("위젯의 예약 작업 기록을 저장할 수 없습니다."),
+                    var detail => UiText.Message(detail ?? "")
+                }}")
+            }, true, null);
         if (status.Problem == ClaudeShelfProblem.Held || !status.LastFillComplete)
             return (UiText.T("세션 목록 일부 보류 · 사용 중이거나 복구 중인 세션은 나중에 채웁니다."), false, null);
         if (status.LastFillAt is { } at)

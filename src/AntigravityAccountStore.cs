@@ -150,7 +150,7 @@ internal sealed class AntigravityAccountStore
         return index >= 0 ? index : throw new InvalidOperationException(NotFound);
     }
 
-    private static void CreatePrivateDirectory(string path)
+    internal static void CreatePrivateDirectory(string path)
     {
         var directory = Directory.CreateDirectory(path);
         if ((directory.Attributes & FileAttributes.ReparsePoint) != 0) throw new IOException(Redirected);
