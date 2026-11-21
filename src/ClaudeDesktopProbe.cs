@@ -1,7 +1,6 @@
 using System.Diagnostics;
 using System.Globalization;
 using System.Runtime.InteropServices;
-using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -302,212 +301,6 @@ internal static class ClaudeDesktopProbe
         return failed;
     }
 
-    // The scheduled-task alignment (ClaudeScheduledSync) depends on the app keeping each account's list the way 6.28899
-    // does, apart from the session lists: a missing marker or a flow or schema that reads differently stops that
-    // feature alone. (1) the list is userData\claude-code-sessions\account\org\scheduled-tasks.json, (2) for the Code
-    // tasks' manager, (3) read in one place, parsed whole with one schema, a failure loading none of it, (4) called only
-    // by initialize, which runs at start and after a reset (an account change), with the path it has just stored, (5) a
-    // save writes the whole list from memory, and only to the path loaded, while no reset came between, (6) which a reset
-    // stops. The list's own schema must read as reviewed too (ScheduledSchemaHash), since a list the widget writes has to
-    // pass it. Nothing else reads or writes that list (one call of the load, one of the writer).
-    internal static readonly string[][] ScheduledMarkers =
-    [
-        ["\"scheduled-tasks.json\""],
-        ["logPrefix:\"[CCDScheduledTasks]\""],
-        ["Failed to load scheduled tasks:"],
-        [@"persistToDisk aborted \u2014 superseded by reset()", "persistToDisk aborted — superseded by reset()"]
-    ];
-    internal static readonly (string Anchor, int Before, int After, Regex Flow)[] ScheduledFlows =
-    [
-        (",\"scheduled-tasks.json\")}", 220, 30, new Regex(
-            @"function (?<path>[\w$]+)\((?<a>[\w$]+),(?<o>[\w$]+)\)\{return [\w$]+\.default\.join\([\w$]+\.app\.getPath\(""userData""\),(?<root>[\w$]+),\k<a>,\k<o>,""scheduled-tasks\.json""\)\}",
-            RegexOptions.CultureInvariant)),
-        ("=\"claude-code-sessions\"", 40, 30, new Regex(@"(?<![\w$.])(?<root>[\w$]+)=""claude-code-sessions""[,;]", RegexOptions.CultureInvariant)),
-        ("logPrefix:\"[CCDScheduledTasks]\"", 120, 1600, new Regex(
-            @"(?<![\w$.])[\w$]+=new [\w$]+\(\{logPrefix:""\[CCDScheduledTasks\]"",[^;]{0,1600}?getStorageFilePath:(?<path>[\w$]+),",
-            RegexOptions.CultureInvariant)),
-        ("async loadScheduledTasksFromDisk(", 0, 600, new Regex(
-            @"^async loadScheduledTasksFromDisk\((?<p>[\w$]+)\)\{try\{let (?<t>[\w$]+)=await [\w$]+\(\k<p>,[\w$]+,\{walkRoot:\(0,[\w$]+\.dirname\)\(\k<p>\),lstatWalkRoot:!1\}\),(?<r>[\w$]+)=JSON\.parse\(\k<t>\);return (?<file>[\w$]+)\.parse\(\k<r>\)\}catch\((?<x>[\w$]+)\)\{return \k<x>\.code===""ENOENT""\?\{scheduledTasks:\[\]\}:\([^;]{0,200}?,\{scheduledTasks:\[\],loadFailed:!0\}\)\}\}",
-            RegexOptions.CultureInvariant)),
-        (".loadScheduledTasksFromDisk(", 1500, 40, new Regex(
-            @"initialize\((?<a>[\w$]+),(?<o>[\w$]+)\)\{if\(this\._initializePromise\)\{[^;]{0,120}?Already initialized`\);return\}[^;]{0,160}?;let (?<p>[\w$]+)=this\.config\.getStorageFilePath\(\k<a>,\k<o>\);this\._scheduledTasksFilePath=\k<p>;(?:(?!this\._scheduledTasksFilePath=|(?<![\w$.])\k<p>=(?!=)).){0,1400}?this\.loadScheduledTasksFromDisk\(\k<p>\)",
-            RegexOptions.CultureInvariant | RegexOptions.Singleline)),
-        ("persistToDisk(){let ", 0, 1500, new Regex(
-            @"^persistToDisk\(\)\{let (?<c>[\w$]+)=this\._initCounter,(?<p>[\w$]+)=this\._scheduledTasksFilePath;return this\._persistMutex\.runExclusive\(\(\(\)=>this\.writeSnapshotToDisk\(\k<c>,\k<p>\)\)\)\}async writeSnapshotToDisk\((?<c2>[\w$]+),(?<p2>[\w$]+)\)\{if\(!\k<p2>\)return!1;if\(\k<c2>!==this\._initCounter\)return [^;]{0,160}?,!1;try\{if\(await this\.ensureStorageDir\(\k<p2>\),\k<c2>!==this\._initCounter\|\|\k<p2>!==this\._scheduledTasksFilePath\)return [^;]{0,160}?,!1;(?:(?!this\._scheduledTasksFilePath|(?<![\w$.])\k<p2>=(?!=)).){0,800}?return await [\w$]+\(\k<p2>,\{scheduledTasks:Array\.from\(this\._scheduledTasks\.values\(\)\),recordedSkips:",
-            RegexOptions.CultureInvariant | RegexOptions.Singleline)),
-        ("reset(){this._initCounter++,", 0, 2200, new Regex(
-            @"^reset\(\)\{this\._initCounter\+\+,.{0,2000}?this\._scheduledTasksFilePath=null,this\._taskFilesDir=null,this\._initializePromise=null",
-            RegexOptions.CultureInvariant | RegexOptions.Singleline))
-    ];
-    private static readonly string[] ScheduledShared = ["path", "root", "file"];
-    private static readonly Regex ScheduledFile = new(
-        @"(?<![\w$.])(?<file>[\w$]+)=(?<k>[\w$]+)\(\{scheduledTasks:[\w$]+\((?<entry>[\w$]+)\),recordedSkips:", RegexOptions.CultureInvariant);
-    // The list's file and entry schemas as reviewed (6.28899), their minified names numbered in order (ScheduledSchema).
-    private const string ScheduledSchemaHash = "61F0946ABBAC532D940BBB2CB4D8BDF076C689E92B23465F81F4030BBE1D1596";
-    private static (string Key, ClaudeDesktopContract Contract)? _scheduledContract;
-
-    /// <summary>Whether the installed app keeps scheduled-task lists the way the alignment was designed for; cached per
-    /// bundle like <see cref="Contract(string)"/>.</summary>
-    internal static ClaudeDesktopContract ScheduledContract(string asarPath)
-    {
-        FileInfo info;
-        try { info = new FileInfo(asarPath); if (!info.Exists) return ClaudeDesktopContract.Incompatible; }
-        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { return ClaudeDesktopContract.Incompatible; }
-        var key = asarPath + "|" + info.Length + "|" + info.LastWriteTimeUtc.Ticks;
-        lock (ContractGate) if (_scheduledContract is { } cached && cached.Key == key) return cached.Contract;
-        ClaudeDesktopContract contract;
-        try { contract = ScheduledContract(File.ReadAllBytes(asarPath)); }
-        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { contract = ClaudeDesktopContract.Incompatible; }
-        lock (ContractGate) _scheduledContract = (key, contract);
-        return contract;
-    }
-
-    internal static ClaudeDesktopContract ScheduledContract(ReadOnlySpan<byte> bundle)
-    {
-        foreach (var spellings in ScheduledMarkers)
-        {
-            var found = false;
-            foreach (var spelling in spellings) found |= bundle.IndexOf(Encoding.UTF8.GetBytes(spelling)) >= 0;
-            if (!found) return ClaudeDesktopContract.Incompatible;
-        }
-        return ScheduledUnmatched(bundle, firstOnly: true).Count == 0 ? ClaudeDesktopContract.Reviewed : ClaudeDesktopContract.Unreviewed;
-    }
-
-    /// <summary>Which scheduled-list flows (by index), counts and the schema do not read as reviewed. Read-only.</summary>
-    internal static IReadOnlyList<string> ScheduledUnmatched(ReadOnlySpan<byte> bundle, bool firstOnly = false)
-    {
-        var failed = new List<string>();
-        var shared = new Dictionary<string, string>(StringComparer.Ordinal);
-        for (var index = 0; index < ScheduledFlows.Length; index++)
-        {
-            var (anchor, before, after, flow) = ScheduledFlows[index];
-            var anchorBytes = Encoding.UTF8.GetBytes(anchor);
-            var satisfied = false;
-            for (int offset = 0, found; !satisfied && (found = bundle[offset..].IndexOf(anchorBytes)) >= 0;
-                 offset += found + anchorBytes.Length)
-            {
-                var start = Math.Max(0, offset + found - before);
-                var end = Math.Min(bundle.Length, offset + found + after);
-                var match = flow.Match(Encoding.UTF8.GetString(bundle[start..end]));
-                if (!match.Success) continue;
-                // A name another flow read stands for the same thing here, or this place is not the one.
-                if (ScheduledShared.Any(name => match.Groups[name] is { Success: true } named
-                        && shared.TryGetValue(name, out var known) && known != named.Value)) continue;
-                foreach (var name in ScheduledShared)
-                    if (match.Groups[name] is { Success: true } named) shared[name] = named.Value;
-                satisfied = true;
-            }
-            if (!satisfied) { failed.Add($"scheduled flow {index} ({anchor})"); if (firstOnly) return failed; }
-        }
-        if (Count(bundle, ".loadScheduledTasksFromDisk("u8) != 1 || Count(bundle, "writeSnapshotToDisk("u8) != 2)
-        {
-            failed.Add("scheduled readers or writers");
-            if (firstOnly) return failed;
-        }
-        var schema = shared.TryGetValue("file", out var file) ? ScheduledSchema(bundle, file) : null;
-        if (schema is null || !Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(schema)))
-                .Equals(ScheduledSchemaHash, StringComparison.OrdinalIgnoreCase))
-            failed.Add("scheduled schema");
-        return failed;
-    }
-
-    private static int Count(ReadOnlySpan<byte> bundle, ReadOnlySpan<byte> text)
-    {
-        var count = 0;
-        for (int offset = 0, found; (found = bundle[offset..].IndexOf(text)) >= 0; offset += found + text.Length) count++;
-        return count;
-    }
-
-    /// <summary>The scheduled list's entry and file schemas as text, every name that is not a field or a member numbered
-    /// by first appearance, so renamed minified names read the same and any other change does not; null when they cannot
-    /// be found. <paramref name="file"/> is the file schema's name the load uses.</summary>
-    internal static string? ScheduledSchema(ReadOnlySpan<byte> bundle, string file)
-    {
-        var anchor = "({scheduledTasks:"u8;
-        for (int offset = 0, found; (found = bundle[offset..].IndexOf(anchor)) >= 0; offset += found + anchor.Length)
-        {
-            var at = offset + found;
-            var start = Math.Max(0, at - 60);
-            var head = Encoding.UTF8.GetString(bundle[start..Math.Min(bundle.Length, at + 200)]);
-            Match? match = null;
-            foreach (Match candidate in ScheduledFile.Matches(head))
-                if (candidate.Groups["file"].Value == file && start + Encoding.UTF8.GetByteCount(head.AsSpan(0, candidate.Index))
-                        + Encoding.UTF8.GetByteCount(file + "=" + candidate.Groups["k"].Value) == at) match = candidate;
-            if (match is null) continue;
-            var previous = bundle[..at].LastIndexOf(SourceMapTrailer);
-            var fileStart = previous < 0 ? 0 : previous + SourceMapTrailer.Length;
-            var declaration = Encoding.UTF8.GetBytes(match.Groups["entry"].Value + "=" + match.Groups["k"].Value + "({id:");
-            var entryAt = bundle[fileStart..at].LastIndexOf(declaration);
-            if (entryAt < 0) return null;
-            var entryStart = fileStart + entryAt + declaration.Length - "({id:".Length;
-            if (Balanced(bundle, entryStart) is not { } entryText || Balanced(bundle, at) is not { } fileText) return null;
-            var names = new Dictionary<string, string>(StringComparer.Ordinal);
-            return Renumber(entryText, names) + "\n" + Renumber(fileText, names);
-        }
-        return null;
-    }
-
-    /// <summary>The parenthesized text opening at <paramref name="start"/>, strings skipped; null when it does not close
-    /// within 16 KB.</summary>
-    private static string? Balanced(ReadOnlySpan<byte> bundle, int start)
-    {
-        var text = Encoding.UTF8.GetString(bundle.Slice(start, Math.Min(16384, bundle.Length - start)));
-        var depth = 0;
-        char? quote = null;
-        for (var index = 0; index < text.Length; index++)
-        {
-            var c = text[index];
-            if (quote is not null)
-            {
-                if (c == '\\') { index++; continue; }
-                if (c == quote) quote = null;
-            }
-            else if (c is '"' or '\'' or '`') quote = c;
-            else if (c == '(') depth++;
-            else if (c == ')' && --depth == 0) return text[..(index + 1)];
-        }
-        return null;
-    }
-
-    private static bool IsWord(char c) => char.IsAsciiLetterOrDigit(c) || c is '_' or '$';
-
-    private static string Renumber(string text, Dictionary<string, string> names)
-    {
-        var result = new StringBuilder(text.Length);
-        char? quote = null;
-        for (var index = 0; index < text.Length;)
-        {
-            var c = text[index];
-            if (quote is not null)
-            {
-                result.Append(c);
-                if (c == '\\' && index + 1 < text.Length) { result.Append(text[index + 1]); index += 2; continue; }
-                if (c == quote) quote = null;
-                index++;
-                continue;
-            }
-            if (c is '"' or '\'' or '`') { quote = c; result.Append(c); index++; continue; }
-            if ((char.IsAsciiLetter(c) || c is '_' or '$') && (index == 0 || !IsWord(text[index - 1])))
-            {
-                var end = index + 1;
-                while (end < text.Length && IsWord(text[end])) end++;
-                var word = text[index..end];
-                var member = index > 0 && text[index - 1] == '.' && (index < 3 || text[(index - 3)..index] != "...");
-                if (member || end < text.Length && text[end] == ':') result.Append(word);
-                else
-                {
-                    if (!names.TryGetValue(word, out var number)) names[word] = number = "$" + names.Count.ToString(CultureInfo.InvariantCulture);
-                    result.Append(number);
-                }
-                index = end;
-                continue;
-            }
-            result.Append(c);
-            index++;
-        }
-        return result.ToString();
-    }
-
     private static readonly byte[] SourceMapTrailer = "//# sourceMappingURL="u8.ToArray();
     private const int HeaderBytes = 65536, ExportTailBytes = 8192;
 
@@ -782,7 +575,7 @@ internal static class ClaudeShelfAccounts
     private const long MaxConfigBytes = 32 * 1024 * 1024;
 
     internal static IReadOnlyList<ClaudeShelfAccount> Resolve(IEnumerable<ClaudeProfile> profiles, string ledgerDirectory,
-        string? homeDirectory = null, bool keepCache = true)
+        string? homeDirectory = null)
     {
         var cachePath = Path.Combine(ledgerDirectory, "accounts.json");
         var cache = ReadCache(cachePath);
@@ -804,7 +597,7 @@ internal static class ClaudeShelfAccounts
             accounts.Add(new ClaudeShelfAccount(entry.Account, entry.Org, profile.Label, profile.Id));
         }
         // Removed profiles drop out of the cache; they never come back as fill targets.
-        if (keepCache && !current.Values.OrderBy(entry => entry.ProfileId).SequenceEqual(cache.Values.OrderBy(entry => entry.ProfileId)))
+        if (!current.Values.OrderBy(entry => entry.ProfileId).SequenceEqual(cache.Values.OrderBy(entry => entry.ProfileId)))
             WriteCache(cachePath, current);
         return accounts.DistinctBy(account => account.Key).ToArray();
     }
