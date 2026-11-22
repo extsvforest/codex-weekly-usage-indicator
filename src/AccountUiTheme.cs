@@ -155,6 +155,18 @@ internal static class AccountUiTheme
         path.CloseFigure(); return path;
     }
 
+    /// <summary>Paints what lies under a see-through button before it draws itself. WinForms treats a Button as opaque
+    /// (ButtonBase sets ControlStyles.Opaque) and paints nothing under it, and a double-buffered one draws into a buffer
+    /// the window's controls share: without this, its rounded corners, a quiet button and an inactive tab show whatever
+    /// was drawn there last, as in 1.10.0. The parent paints that part through the theme, as 1.9.1 did; with visual
+    /// styles off, the colour given stands in for it.</summary>
+    internal static void PaintParent(Control child, Graphics g, Color fallback)
+    {
+        if (Application.RenderWithVisualStyles) { ButtonRenderer.DrawParentBackground(g, child.ClientRectangle, child); return; }
+        using var brush = new SolidBrush(fallback);
+        g.FillRectangle(brush, child.ClientRectangle);
+    }
+
     /// <summary>A rounded box with an optional one-device-pixel-per-CSS-pixel edge drawn inside it.</summary>
     internal static void FillBox(Graphics g, RectangleF bounds, float radius, Color fill, Color? edge, float scale, float edgeWidth = 1)
     {
@@ -821,6 +833,7 @@ internal sealed class AccountButton : Button
     {
         var g = e.Graphics; var s = DeviceDpi / 96f;
         var under = AccountUiTheme.SurfaceColor(Parent);
+        AccountUiTheme.PaintParent(this, g, under);
         var (fill, edge, ink) = Roles(under);
         var faded = !Enabled && _kind != AccountButtonKind.Badge;
         Color Fade(Color color) => faded ? AccountUiTheme.Mix(color, under, .5f) : color;
@@ -891,6 +904,7 @@ internal sealed class AccountIconButton : Button
     {
         var g = e.Graphics; var s = DeviceDpi / 96f;
         var under = AccountUiTheme.SurfaceColor(Parent);
+        AccountUiTheme.PaintParent(this, g, under);
         Color? fill = null, edge = null; var ink = AccountUiTheme.Ink2;
         if (_spinning) { fill = AccountUiTheme.Mix(Provider.Main, under, .09f); ink = Provider.Main; }
         else if (_menuOpen || (_pressed && Enabled)) { fill = AccountUiTheme.PressedBackground; edge = AccountUiTheme.ControlBorder; ink = AccountUiTheme.Ink1; }
@@ -991,8 +1005,10 @@ internal sealed class AccountTab : Button, IAccountSurface
     }
     protected override void OnPaint(PaintEventArgs e)
     {
-        var g = e.Graphics; var s = DeviceDpi / 96f; g.SmoothingMode = SmoothingMode.AntiAlias;
+        var g = e.Graphics; var s = DeviceDpi / 96f;
         var under = AccountUiTheme.SubtleBackground;
+        AccountUiTheme.PaintParent(this, g, under);
+        g.SmoothingMode = SmoothingMode.AntiAlias;
         if (_active)
         {
             using (var shade = AccountUiTheme.Rounded(new RectangleF(0, s, Width, Height - s), 7 * s))

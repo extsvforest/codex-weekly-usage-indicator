@@ -9,6 +9,11 @@ internal static class CombinedUsageTests
         var set = new CombinedUsageSnapshot();
         set.Initialize(accounts, batch: false);
         Check(!set.IsComplete(now), "cached observations never count as this batch's successful results");
+        // The account window's total (2026-11-21 design): values kept from an earlier run add up until their week resets.
+        Check(set.Accounts.All(row => row.Counts(now)) && !set.Accounts.Any(row => row.Counts(now.AddDays(6))),
+            "saved values count in the window's total until their reset");
+        set.SetResult("b", accounts[1], CombinedReadState.Failed, "synthetic failure");
+        Check(set.Accounts.Count(row => row.Counts(now)) == 2, "a failed read leaves its previous value out of the window's total");
         set.Initialize(accounts, batch: true);
         foreach (var account in accounts) set.SetResult(account.Id, account, CombinedReadState.Success);
         set.CompletedAt = now;

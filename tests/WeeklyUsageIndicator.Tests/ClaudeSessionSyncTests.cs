@@ -217,6 +217,15 @@ internal static class ClaudeSessionSyncTests
         var expired = b with { Usage = Usage(50, now.AddMinutes(-1), now.AddMinutes(-3)) };
         Check(ClaudeCombinedUsage.From([a, expired], now) is { Complete: false, Confirmed: 1 }, "a window past its reset is not counted");
         Check(ClaudeCombinedUsage.From([], now) is { Accounts: 0, Complete: false }, "no accounts, no total");
+        // 2026-11-21 design: a value kept from an earlier run adds up like one read now, until its week resets.
+        var kept = new ClaudeSummaryRow(Profile("d", "id-d"), null, null, new ClaudeSavedUsage(new(null, new(70, now.AddHours(30)), null), now.AddHours(-20)));
+        total = ClaudeCombinedUsage.From([a, kept], now);
+        Check(total is { Complete: true, Accounts: 2, Remaining: 110 } && total.Next?.Profile.Id == "d" && total.OldestObservation == now.AddHours(-20),
+            "a saved value counts in the total and gives the next reset");
+        Check(ClaudeCombinedUsage.From([a, kept with { Failure = new IOException("fixture") }], now) is { Confirmed: 1, Remaining: 80 },
+            "a failed read leaves its saved value out");
+        Check(ClaudeCombinedUsage.From([a, kept], now.AddHours(31)) is { Confirmed: 1, Remaining: 80 }, "a saved value stops counting at its reset");
+        Check(!ClaudeCombinedUsage.IsConfirmed(kept, now), "a recommendation still rests on this session's readings");
     }
 
     private static void TestPlan()

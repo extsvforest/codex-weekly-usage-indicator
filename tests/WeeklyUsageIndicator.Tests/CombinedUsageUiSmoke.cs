@@ -63,6 +63,8 @@ internal static class CombinedUsageUiSmoke
                         // Opening reads nothing: the rows keep the values last seen until the button asks for a query.
                         await Task.Delay(150);
                         Check(!form.IsOperationInProgress && calls == 0, "opening the window reads nothing");
+                        Check(Find<Label>("CombinedRemainingLabel").Text == "—" && !Find<CombinedUsagePanel>("CombinedUsagePanel").Controls.Find("SummaryBar", false).Single().Visible,
+                            "with no value yet the total is a dash alone, without an empty bar");
                         Capture(form, "combined-saved.png");
                         var refresh = Find<Button>("RefreshAllUsageButton");
                         refresh.PerformClick();
@@ -127,7 +129,12 @@ internal static class CombinedUsageUiSmoke
                         Check(calls == 18 && !form.CombinedUsage.IsComplete(DateTimeOffset.Now) && form.CombinedUsage.Accounts.Single(row => row.Account.IsActive).State == CombinedReadState.Failed,
                             $"returning without saving a fresh observation cannot certify a previous value (calls={calls}, " +
                             $"state={form.CombinedUsage.Accounts.Single(row => row.Account.IsActive).State}, button={refresh.Visible}/{refresh.Enabled}, status={form.StatusText})");
-                        Check(Find<Label>("NextResetLabel").Text == "확인 필요", "an uncertain earlier account prevents a false next-reset headline");
+                        // 2026-11-21 design: the failed account is left out and counted in the note; the next reset is
+                        // the soonest of the accounts that count (서브 계정, four days), as on the Claude page.
+                        Check(Find<Label>("CombinedRemainingLabel").Text == "105%" && Find<Control>("CombinedCoverageLabel").Text == "· 3개 중 2개 확인"
+                              && Find<Label>("NextResetLabel").Text != "확인 필요" && Find<Control>("NextResetAccountLabel").Text.StartsWith("서브 계정 ·", StringComparison.Ordinal),
+                            $"a failed account is left out of the total and the next reset (total={Find<Label>("CombinedRemainingLabel").Text}, " +
+                            $"note={Find<Control>("CombinedCoverageLabel").Text}, next={Find<Label>("NextResetLabel").Text} {Find<Control>("NextResetAccountLabel").Text})");
                         mode = "cancel"; refresh.PerformClick(); await Until(() => calls == 20);
                         form.FormClosed += (_, _) =>
                         {

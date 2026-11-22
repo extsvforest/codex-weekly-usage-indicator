@@ -1,9 +1,9 @@
 namespace WeeklyUsageIndicator;
 
 /// <summary>
-/// The two-column total under the top bar (design .summary-strip): the weekly remaining of the confirmed accounts,
-/// one tick per account, then the next reset with the latest one under it. Only confirmed readings add up; the note
-/// says how many of the accounts that is. Codex and Claude fill it from their own data.
+/// The two-column total under the top bar (design .summary-strip): the weekly remaining of the accounts that count,
+/// one tick per account, then the next reset with the latest one under it. Each page says which values count; the
+/// note says how many of the accounts that is. Codex and Claude fill it from their own data.
 /// </summary>
 internal abstract class AccountSummaryStrip : UserControl
 {
@@ -83,7 +83,8 @@ internal abstract class AccountSummaryStrip : UserControl
             after = Capacity.Right;
         }
         var barLeft = after + 16 * s; var barWidth = Math.Min(172 * s, leftEnd - barLeft);
-        Bar.Visible = barWidth >= 30 * s;
+        // A dash stands alone, as a row without a value shows no empty bar.
+        Bar.Visible = Bar.Remaining is not null && barWidth >= 30 * s;
         AccountUiTheme.Place(Bar, (int)Math.Round(barLeft), (int)Math.Round(row2 + (heroHeight - 5 * s) / 2), (int)Math.Max(0, barWidth), (int)Math.Round(5 * s));
         // Right: title; time to the next reset and whose it is, on one baseline; the latest reset.
         var right = split + 24 * s; var rightEnd = width - 2 * s;
@@ -109,7 +110,8 @@ internal abstract class AccountSummaryStrip : UserControl
     }
 }
 
-/// <summary>The Codex total: only accounts read in this session count; saved values from earlier runs never add up.</summary>
+/// <summary>The Codex total: every account with a weekly value whose week has not reset, read now or kept from an
+/// earlier run; one without a value, or whose latest read failed, is left out and the note counts it (2026-11-21 design).</summary>
 internal sealed class CombinedUsagePanel : AccountSummaryStrip
 {
     internal CombinedUsagePanel() : base(AccountUiTheme.Codex)
@@ -122,25 +124,24 @@ internal sealed class CombinedUsagePanel : AccountSummaryStrip
     internal void Display(CombinedUsageSnapshot snapshot, bool busy, int completed = 0, bool querying = false)
     {
         var now = AccountUsageText.Now;
-        var accounts = snapshot.Accounts.Count; var confirmed = snapshot.ConfirmedCount(now);
-        ShowTotal(accounts, confirmed, snapshot.ConfirmedRemaining(now), querying ? (completed, accounts) : null);
-        var dated = snapshot.ByReset().Where(row => row.IsCurrent(now)).ToArray(); var next = dated.FirstOrDefault();
-        // An unconfirmed account whose (previous) reset may come first leaves the next reset uncertain.
-        var uncertain = snapshot.ByReset().FirstOrDefault(row => !row.IsCurrent(now) &&
-            (row.Account.Usage?.ResetsAt is null || next?.Account.Usage?.ResetsAt is not { } first || row.Account.Usage.ResetsAt <= first));
+        var accounts = snapshot.Accounts.Count;
+        var dated = snapshot.ByReset().Where(row => row.Counts(now)).ToArray(); var next = dated.FirstOrDefault();
+        ShowTotal(accounts, dated.Length, dated.Sum(row => 100 - row.Account.Usage!.UsedPercent), querying ? (completed, accounts) : null);
         if (accounts == 0) { Next.Text = "—"; NextSub.Text = ""; }
-        else if (uncertain is not null)
-        {
-            Next.Text = UiText.T("확인 필요");
-            NextSub.Text = uncertain.Account.Usage?.ResetsAt is { } previous
-                ? UiText.F($"{uncertain.Account.Label} · 이전 일정 {AccountUsageText.ResetOn(previous, now)}")
-                : UiText.F($"{uncertain.Account.Label} · 초기화 시각 미확인");
-        }
+        // The soonest of the accounts that count, as on the Claude page; the note already says when some are left out.
         else if (next?.Account.Usage?.ResetsAt is { } reset)
         {
             Next.Text = TimeUntil(reset, now); NextSub.Text = AccountUsageText.Refills(next.Account.Label, reset, now);
         }
-        else { Next.Text = UiText.T("초기화 미확인"); NextSub.Text = ""; }
+        else
+        {
+            // Nothing counts: the soonest earlier schedule, if any, says when to check.
+            var lead = snapshot.ByReset()[0];
+            Next.Text = UiText.T("확인 필요");
+            NextSub.Text = lead.Account.Usage?.ResetsAt is { } previous
+                ? UiText.F($"{lead.Account.Label} · 이전 일정 {AccountUsageText.ResetOn(previous, now)}")
+                : UiText.F($"{lead.Account.Label} · 초기화 시각 미확인");
+        }
         Latest.Text = dated.LastOrDefault() is { Account.Usage.ResetsAt: { } latest } last
             ? UiText.F($"가장 늦은 초기화 {AccountUsageText.ResetOn(latest, now)} · {last.Account.Label}") : "";
         LatestObservation = snapshot.Accounts.Select(row => row.Account.ObservedAt).Where(at => at is not null).DefaultIfEmpty().Max();
