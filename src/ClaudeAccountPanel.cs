@@ -135,8 +135,11 @@ internal sealed class ClaudeAccountPanel : UserControl
         if (IsDisposed || profiles.Any(profile => !_rows.ContainsKey(profile.Id))) { if (!IsDisposed) BeginReloadOnce(); return; }
         using var layout = AccountUiTheme.DeferLayout(this);
         var now = AccountUsageText.Now;
+        // Each account counts as its row shows it: a failure the row shows leaves it out, and a value kept from an
+        // earlier run is there only while the account needs no sign-in.
         var summaryRows = profiles.Select(profile => new ClaudeSummaryRow(profile, _controller.LastUsage(profile.Id),
-            _controller.LastFailure(profile.Id))).ToArray();
+            Failure(profile.Id), _controller.LastUsage(profile.Id) is null && !RequiresLogin(profile, Failure(profile.Id))
+                ? _controller.SavedUsage(profile.Id) : null)).ToArray();
         var saved = profiles.Where(profile => _controller.LastUsage(profile.Id) is null)
             .Select(profile => _controller.SavedUsage(profile.Id)?.ObservedAt).OfType<DateTimeOffset>().ToArray();
         _summary.Display(summaryRows, _batchProgress, saved);
@@ -628,14 +631,14 @@ internal sealed class ClaudeAccountPanel : UserControl
             else if (v.Stale) ShowState(false, (checkedAt, ink3, false), (UiText.T("· 오래됨"), AccountUiTheme.WarnInk, true));
             else if (v.RetryAfter is { } retry)
                 ShowState(false, (checkedAt, ink3, false), (UiText.F($"· {AccountUsageText.Time(retry)} 재시도"), ink3, false));
-            else if (v.Saved) ShowState(false, (checkedAt, ink3, false), (UiText.T("· 이전 값"), ink3, false));
+            // A value kept from an earlier run reads like any other of its age, as in the design and on the Codex page.
             else ShowState(false, (checkedAt, ink3, false), (v.Recommended ? UiText.T("· 가장 먼저 다시 참") : "", ink3, false));
 
-            // A value being read again, a failed, an old, an unrefreshed and a saved one stay visible but step back. The
-            // total takes only this session's confirmed readings (ClaudeCombinedUsage.IsConfirmed): an old one still
-            // counts until its week resets; a failed, an unrefreshed and a saved one never do.
+            // A value being read again, a failed, an old and an unrefreshed one stay visible but step back. The total
+            // (ClaudeCombinedUsage.Counts) takes every usable value until its week resets, kept from an earlier run or
+            // not; a failed and an unrefreshed one never count.
             var hasValue = v.Remaining is not null;
-            var dim = v.Reading || failed || v.Stale || v.RetryAfter is not null || v.Saved;
+            var dim = v.Reading || failed || v.Stale || v.RetryAfter is not null;
             _percent.Text = hasValue ? $"{v.Remaining}%" : "—";
             var figure = v.Reading ? Dim(ink3, .52f) : failed ? Dim(ink3, .65f) : dim ? ink3 : AccountUiTheme.Ink1;
             _percent.ForeColor = figure; _percent.UnitColor = v.Reading || failed ? figure : ink3;

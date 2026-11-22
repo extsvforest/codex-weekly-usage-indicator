@@ -1,42 +1,51 @@
 namespace WeeklyUsageIndicator;
 
-internal sealed record ClaudeSummaryRow(ClaudeProfile Profile, ClaudeUsageResult? Usage, Exception? Failure);
+/// <param name="Saved">The value kept from an earlier run, given when nothing was read since and the row shows it.</param>
+internal sealed record ClaudeSummaryRow(ClaudeProfile Profile, ClaudeUsageResult? Usage, Exception? Failure, ClaudeSavedUsage? Saved = null);
 
 /// <summary>
 /// The overall weekly balance of every registered Claude account, counted once per verified identity and 100% per
-/// account, like the Codex total. Only a fresh, usable observation counts; a previous value, a failure or a missing
-/// login withholds the total and is reported as partial coverage. The Fable window is a separate limit and is never
-/// added in.
+/// account, like the Codex total. A usable weekly value counts, read in this session or kept from an earlier one, as
+/// the 2026-11-21 design adds old values in; a failure or a missing login leaves the account out, reported as partial
+/// coverage. The Fable window is a separate limit and is never added in.
 /// </summary>
 internal sealed record ClaudeCombinedUsage(int Accounts, int Confirmed, int Remaining, DateTimeOffset? OldestObservation,
     ClaudeSummaryRow? Next, ClaudeSummaryRow? Uncertain, DateTimeOffset? LatestReset)
 {
     internal bool Complete => Accounts > 0 && Confirmed == Accounts;
 
+    /// <summary>A usable reading of this session: what a recommendation of the next account rests on.</summary>
     internal static bool IsConfirmed(ClaudeSummaryRow row, DateTimeOffset now) => row.Failure is null
         && row.Usage is { IsStale: false } usage && ClaudeDisplayMetrics.IsUsable(usage.Snapshot.Weekly, now);
+
+    /// <summary>What the total takes: a usable weekly value, read now or kept from before, whose latest read did not fail.</summary>
+    internal static bool Counts(ClaudeSummaryRow row, DateTimeOffset now) => row.Failure is null
+        && row.Usage is not { IsStale: true } && ClaudeDisplayMetrics.IsUsable(Weekly(row), now);
+
+    internal static ClaudeUsageWindow? Weekly(ClaudeSummaryRow row) => (row.Usage?.Snapshot ?? row.Saved?.Snapshot)?.Weekly;
+    private static DateTimeOffset? Observed(ClaudeSummaryRow row) => row.Usage?.LastUpdatedAt ?? row.Saved?.ObservedAt;
 
     internal static ClaudeCombinedUsage From(IReadOnlyList<ClaudeSummaryRow> rows, DateTimeOffset now)
     {
         // Two profiles signed in to the same subscription are one account: keep its best observation.
         var accounts = rows.GroupBy(row => row.Profile.Identity?.Key ?? "profile:" + row.Profile.Id, StringComparer.Ordinal)
-            .Select(group => group.OrderByDescending(row => IsConfirmed(row, now))
-                .ThenByDescending(row => row.Usage?.LastUpdatedAt ?? DateTimeOffset.MinValue).First()).ToArray();
-        var confirmed = accounts.Where(row => IsConfirmed(row, now)).ToArray();
-        DateTimeOffset? Reset(ClaudeSummaryRow row) => row.Usage?.Snapshot.Weekly?.ResetsAt;
-        var dated = confirmed.Where(row => Reset(row) is not null).OrderBy(row => Reset(row)).ToArray();
+            .Select(group => group.OrderByDescending(row => Counts(row, now))
+                .ThenByDescending(row => Observed(row) ?? DateTimeOffset.MinValue).First()).ToArray();
+        var counted = accounts.Where(row => Counts(row, now)).ToArray();
+        DateTimeOffset? Reset(ClaudeSummaryRow row) => Weekly(row)?.ResetsAt;
+        var dated = counted.Where(row => Reset(row) is not null).OrderBy(row => Reset(row)).ToArray();
         var next = dated.FirstOrDefault();
-        // An unconfirmed account whose (previous) reset may come first leaves the next reset uncertain.
-        var uncertain = accounts.Where(row => !IsConfirmed(row, now)).OrderBy(row => Reset(row) ?? DateTimeOffset.MaxValue)
+        // An account left out whose earlier schedule may come first; the page names it when nothing counts.
+        var uncertain = accounts.Where(row => !Counts(row, now)).OrderBy(row => Reset(row) ?? DateTimeOffset.MaxValue)
             .FirstOrDefault(row => Reset(row) is not { } previous || next is null || previous <= Reset(next));
-        return new ClaudeCombinedUsage(accounts.Length, confirmed.Length,
-            confirmed.Sum(row => UsagePercentage.Remaining(row.Usage!.Snapshot.Weekly!.UsedPercent) ?? 0),
-            confirmed.Length == 0 ? null : confirmed.Min(row => row.Usage!.LastUpdatedAt), next, uncertain,
+        return new ClaudeCombinedUsage(accounts.Length, counted.Length,
+            counted.Sum(row => UsagePercentage.Remaining(Weekly(row)!.UsedPercent) ?? 0),
+            counted.Length == 0 ? null : counted.Min(row => Observed(row)), next, uncertain,
             dated.LastOrDefault() is { } last ? Reset(last) : null);
     }
 }
 
-/// <summary>The Claude total: only readings of this session count; a saved value or a failure never adds up.</summary>
+/// <summary>The Claude total: readings of this session and values kept from an earlier one add up; a failure never does.</summary>
 internal sealed class ClaudeUsageSummaryPanel : AccountSummaryStrip
 {
     internal ClaudeUsageSummaryPanel() : base(AccountUiTheme.Claude)
@@ -52,7 +61,7 @@ internal sealed class ClaudeUsageSummaryPanel : AccountSummaryStrip
     {
         var now = AccountUsageText.Now; var total = ClaudeCombinedUsage.From(rows, now);
         ShowTotal(total.Accounts, total.Confirmed, total.Remaining, progress);
-        DateTimeOffset? Reset(ClaudeSummaryRow row) => row.Usage?.Snapshot.Weekly?.ResetsAt;
+        DateTimeOffset? Reset(ClaudeSummaryRow row) => ClaudeCombinedUsage.Weekly(row)?.ResetsAt;
         if (total.Accounts == 0) { Next.Text = "—"; NextSub.Text = ""; }
         else if (total.Next is { } next && Reset(next) is { } reset)
         {
@@ -66,7 +75,7 @@ internal sealed class ClaudeUsageSummaryPanel : AccountSummaryStrip
                 : UiText.F($"{uncertain.Profile.Label} · 초기화 시각 미확인");
         }
         else { Next.Text = UiText.T("초기화 미확인"); NextSub.Text = ""; }
-        var latest = rows.Where(row => ClaudeCombinedUsage.IsConfirmed(row, now) && Reset(row) is not null).OrderBy(row => Reset(row)).LastOrDefault();
+        var latest = rows.Where(row => ClaudeCombinedUsage.Counts(row, now) && Reset(row) is not null).OrderBy(row => Reset(row)).LastOrDefault();
         Latest.Text = latest is not null && Reset(latest) is { } last
             ? UiText.F($"가장 늦은 초기화 {AccountUsageText.ResetOn(last, now)} · {latest.Profile.Label}") : "";
         LatestObservation = rows.Where(row => row.Usage is not null).Select(row => row.Usage!.LastUpdatedAt)

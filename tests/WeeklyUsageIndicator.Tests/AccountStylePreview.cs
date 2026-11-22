@@ -68,9 +68,11 @@ internal static class AccountStylePreview
         private readonly string _mainLabel;
         private readonly AntigravitySession _antigravity;
         private readonly List<string> _summary = new();
+        private readonly List<string> _unpainted = new();
         private Func<CancellationToken, Task<AntigravityReadResult>> _antigravityRead = _ => throw NoAccess("Antigravity");
         private Func<SavedCodexAccount, CancellationToken, Task> _codexQuery = (_, _) => throw NoAccess("a Codex account");
         private readonly List<string> _codexQueried = new();
+        private SavedCodexAccount[] _codexRead = Array.Empty<SavedCodexAccount>();
         private int _antigravityReads;
         private int? _canceledBeforeClosing;
         private bool _hold;
@@ -105,9 +107,7 @@ internal static class AccountStylePreview
                 Usage = new UsageSnapshot(new[] { 37, 19, 76 }[i], At(23 + 2 * i, 13, 27), 10080, "codex"),
                 ObservedAt = At(21, 13, 20)
             }).ToArray();
-            _combined.Initialize(read, batch: true);
-            foreach (var account in read) _combined.SetResult(account.Id, account, CombinedReadState.Success);
-            _combined.CompletedAt = At(21, 13, 20);
+            _codexRead = read; ReadCodexInThisRun(_combined);
 
             // Claude: five profiles, three of them read earlier in this run, one signed out and one never read.
             var original = Directory.CreateDirectory(Path.Combine(root, "claude-original")).FullName;
@@ -196,6 +196,7 @@ internal static class AccountStylePreview
             };
             Application.Run(form);
             failure?.Throw();
+            Check(_unpainted.Count == 0, "every control paints all of itself, as Windows shows it: " + string.Join("; ", _unpainted.Take(12)));
             // The last step closed the window during a query (BehaviourAsync): it waited, canceled the reads and closed.
             if (_canceledBeforeClosing is { } canceled)
                 Check(form.IsDisposed && _usage.Canceled == canceled + 3, "closing during a query cancels its reads, then closes the window");
@@ -261,6 +262,16 @@ internal static class AccountStylePreview
             Click(form, "CodexProviderTab");
             await Shoot("C-codex", alsoNarrow: true);
             Check(_codexQueried.Count == 0, "opening the Codex page reads no account");
+            // C2: the state of the maintainer's window on 11/22: the widget restarted since the values were read, so each
+            // is one kept from an earlier run, and hours old. The total still adds them up and the rows say they are old.
+            form.CombinedUsage.Initialize(_codexRead, batch: false);
+            _clock.Now = At(21, 23, 30); form.Reload(quiet: true);
+            await Shoot("C2-codex-old");
+            Check(Find<Label>(form, "CombinedRemainingLabel").Text == "168%" && Find<Control>(form, "CombinedCoverageLabel").Text.Length == 0
+                  && Find<Label>(form, "NextResetLabel").Text != UiText.T("확인 필요"),
+                "values kept from an earlier run add up and give the next reset (2026-11-21 design)");
+            ReadCodexInThisRun(form.CombinedUsage);
+            _clock.Now = At(21, 13, 30); form.Reload(quiet: true);
 
             // D: Antigravity, then no account signed in, then nothing read yet, then a first read of a new account.
             Click(form, "AntigravityProviderTab");
@@ -383,33 +394,72 @@ internal static class AccountStylePreview
             await Until(() => !dialog.Visible, "the dialog to close");
         }
 
+        /// <summary>The Codex values as a full query of this run read them at 13:20.</summary>
+        private void ReadCodexInThisRun(CombinedUsageSnapshot set)
+        {
+            set.Initialize(_codexRead, batch: true);
+            foreach (var account in _codexRead) set.SetResult(account.Id, account, CombinedReadState.Success);
+            set.CompletedAt = At(21, 13, 20);
+        }
+
         private void Capture(Form form, string name, Control? overlay = null)
         {
-            if (_folder is null) return;
             HideFocusCues(form);
-            using var whole = new Bitmap(form.Width, form.Height);
-            form.DrawToBitmap(whole, new Rectangle(Point.Empty, whole.Size));
+            // Every screen, pictures or not: a control that leaves part of itself unpainted shows on the screen whatever
+            // its buffer held before (1.10.0's tabs and buttons), and no picture below shows it.
+            var unpainted = Unpainted(form).Concat(overlay is null ? [] : Unpainted(overlay)).ToList();
+            _unpainted.AddRange(unpainted.Select(line => name + ": " + line));
+            if (_folder is null) return;
             var origin = form.PointToScreen(Point.Empty);
-            var client = new Rectangle(origin.X - form.Left, origin.Y - form.Top, form.ClientSize.Width, form.ClientSize.Height);
-            client.Intersect(new Rectangle(Point.Empty, whole.Size));
-            using var image = whole.Clone(client, PixelFormat.Format32bppArgb);
-            if (overlay is { Visible: true, Width: > 0, Height: > 0 })
+            // Two pictures of each screen: what the window paints of itself through WM_PRINT (DrawToBitmap: every child
+            // over its parent's pixels), and what Windows composed from each control's own WM_PAINT ("-screen",
+            // PrintWindow with PW_RENDERFULLCONTENT), the one a person sees.
+            foreach (var (picture, file) in new (Func<Control, Bitmap?>, string)[] { (Printed, name), (Composed, name + "-screen") })
             {
-                // A menu is its own window: it is drawn where it stands over the client area.
-                using var layer = new Bitmap(overlay.Width, overlay.Height);
-                overlay.DrawToBitmap(layer, new Rectangle(Point.Empty, layer.Size));
-                using var graphics = Graphics.FromImage(image);
-                graphics.DrawImage(layer, overlay.Left - origin.X, overlay.Top - origin.Y, layer.Width, layer.Height);
+                using var whole = picture(form);
+                if (whole is null) { _unpainted.Add(name + ": the composed picture could not be taken"); continue; }
+                var client = new Rectangle(origin.X - form.Left, origin.Y - form.Top, form.ClientSize.Width, form.ClientSize.Height);
+                client.Intersect(new Rectangle(Point.Empty, whole.Size));
+                using var image = whole.Clone(client, PixelFormat.Format32bppArgb);
+                if (overlay is { Visible: true, Width: > 0, Height: > 0 })
+                {
+                    // A menu is its own window: it is drawn where it stands over the client area.
+                    using var layer = picture(overlay);
+                    using var graphics = Graphics.FromImage(image);
+                    if (layer is not null) graphics.DrawImage(layer, overlay.Left - origin.X, overlay.Top - origin.Y, layer.Width, layer.Height);
+                }
+                image.Save(Path.Combine(_folder, file + _suffix + ".png"), ImageFormat.Png);
             }
-            image.Save(Path.Combine(_folder, name + _suffix + ".png"), ImageFormat.Png);
-            Inspect(form, name + _suffix, overlay);
+            Inspect(form, name + _suffix, overlay, unpainted);
+        }
+
+        private static Bitmap? Printed(Control window)
+        {
+            var image = new Bitmap(window.Width, window.Height);
+            window.DrawToBitmap(image, new Rectangle(Point.Empty, image.Size));
+            return image;
+        }
+
+        private static Bitmap? Composed(Control window)
+        {
+            var image = new Bitmap(window.Width, window.Height, PixelFormat.Format32bppArgb);
+            bool done;
+            using (var graphics = Graphics.FromImage(image))
+            {
+                var dc = graphics.GetHdc();
+                try { done = PrintWindow(window.Handle, dc, 2); }
+                finally { graphics.ReleaseHdc(dc); }
+            }
+            if (done) return image;
+            image.Dispose();
+            return null;
         }
 
         // What a reviewer would otherwise look for by eye: a control cut by its parent, text shortened with an ellipsis,
         // a button or label narrower than its text, and text in a font other than the bundled Pretendard.
-        private void Inspect(Control top, string name, Control? overlay)
+        private void Inspect(Control top, string name, Control? overlay, List<string> unpainted)
         {
-            var lines = new List<string>();
+            var lines = new List<string>(unpainted);
             foreach (var control in Walk(top).Skip(1).Where(control => control.Visible && control.Width > 0 && control.Height > 0))
             {
                 var parent = control.Parent!;
@@ -450,6 +500,63 @@ internal static class AccountStylePreview
             _shelfOwner?.Dispose();
         }
     }
+
+    // Windows paints each control on its own. A double-buffered one draws into a buffer the window's controls share,
+    // which still holds whatever was drawn there last, and only what the control paints over it reaches the screen; a
+    // Button is opaque to WinForms (ButtonBase sets ControlStyles.Opaque), so nothing is painted under it unless it
+    // paints that itself. Each such control is painted alone twice, as WM_PAINT paints it, over two colours: a pixel
+    // that differs between the two is one it left unpainted.
+    private static List<string> Unpainted(Control top)
+    {
+        var lines = new List<string>();
+        foreach (var control in Walk(top).Where(control => control.Visible && control.ClientSize is { Width: > 0, Height: > 0 }
+            && Style(control, ControlStyles.UserPaint) && Style(control, ControlStyles.OptimizedDoubleBuffer)))
+        {
+            using var magenta = PaintAlone(control, Color.FromArgb(255, 0, 255));
+            using var green = PaintAlone(control, Color.FromArgb(0, 255, 0));
+            if (Differing(magenta, green) is var count and > 0)
+                lines.Add($"unpainted {Describe(control)} {count} of {control.ClientSize.Width * control.ClientSize.Height} px");
+        }
+        return lines;
+    }
+
+    private static readonly MethodInfo GetStyle = typeof(Control).GetMethod("GetStyle", BindingFlags.Instance | BindingFlags.NonPublic)!;
+    private static readonly MethodInfo OnPaint = typeof(Control).GetMethod("OnPaint", BindingFlags.Instance | BindingFlags.NonPublic)!;
+    private static readonly MethodInfo OnPaintBackground = typeof(Control).GetMethod("OnPaintBackground", BindingFlags.Instance | BindingFlags.NonPublic)!;
+    private static bool Style(Control control, ControlStyles style) => (bool)GetStyle.Invoke(control, [style])!;
+
+    private static Bitmap PaintAlone(Control control, Color under)
+    {
+        var image = new Bitmap(control.ClientSize.Width, control.ClientSize.Height, PixelFormat.Format32bppArgb);
+        using var graphics = Graphics.FromImage(image);
+        graphics.Clear(under);
+        using var e = new PaintEventArgs(graphics, control.ClientRectangle);
+        if (!Style(control, ControlStyles.Opaque)) OnPaintBackground.Invoke(control, [e]);
+        OnPaint.Invoke(control, [e]);
+        return image;
+    }
+
+    private static int Differing(Bitmap first, Bitmap second)
+    {
+        var area = new Rectangle(Point.Empty, first.Size);
+        var a = first.LockBits(area, ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+        var b = second.LockBits(area, ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+        try
+        {
+            var (left, right) = (new int[first.Width], new int[first.Width]);
+            var count = 0;
+            for (var y = 0; y < first.Height; y++)
+            {
+                System.Runtime.InteropServices.Marshal.Copy(a.Scan0 + y * a.Stride, left, 0, left.Length);
+                System.Runtime.InteropServices.Marshal.Copy(b.Scan0 + y * b.Stride, right, 0, right.Length);
+                for (var x = 0; x < left.Length; x++) if (left[x] != right[x]) count++;
+            }
+            return count;
+        }
+        finally { first.UnlockBits(a); second.UnlockBits(b); }
+    }
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")] private static extern bool PrintWindow(nint window, nint dc, uint flags);
 
     private static string Describe(Control control) => string.IsNullOrEmpty(control.Name) ? control.GetType().Name : control.Name;
     private static IEnumerable<Control> Walk(Control control) => new[] { control }.Concat(control.Controls.Cast<Control>().SelectMany(Walk));

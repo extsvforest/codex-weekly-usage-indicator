@@ -6,6 +6,11 @@ internal sealed record CombinedAccountUsage(SavedCodexAccount Account, CombinedR
     internal bool HasWeeklyValue => Account.Usage is { UsedPercent: >= 0 and <= 100, WindowDurationMinutes: 10080 };
     internal bool IsCurrent(DateTimeOffset now) => State == CombinedReadState.Success && HasWeeklyValue &&
         Account.ObservedAt is not null && Account.Usage!.ResetsAt is { } reset && reset > now;
+    /// <summary>Whether the account window's total takes this row: a weekly value whose week has not reset, read in this
+    /// session or kept from an earlier one, unless its latest read failed. The 2026-11-21 design adds old values in and
+    /// lets the note count the accounts left out; the hover text keeps the stricter <see cref="IsCurrent"/>.</summary>
+    internal bool Counts(DateTimeOffset now) => State != CombinedReadState.Failed && HasWeeklyValue &&
+        Account.ObservedAt is not null && Account.Usage!.ResetsAt is { } reset && reset > now;
     internal string Status(DateTimeOffset now)
     {
         if (State == CombinedReadState.Failed) return Error is { } error ? UiText.Message(error) : UiText.T("조회 실패");

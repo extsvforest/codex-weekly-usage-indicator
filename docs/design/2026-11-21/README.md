@@ -17,7 +17,13 @@ builds on the 2026-09-22 ordered list rather than replacing it.
   38px line, so the account list starts higher.
 - **A two-part summary.** The weekly total and the next reset, with the latest
   reset as a line under it. The figures are smaller (26px and 21px), so the
-  summary no longer presses on the list.
+  summary no longer presses on the list. Every value the rows show adds up
+  until its week resets, an old one included, and the next reset is the
+  soonest of them; an account without a value, or whose last read failed, is
+  left out and the note says how many count ("5개 중 3개 확인"). 1.10.0 added
+  up only values read since the widget started, so after a restart the
+  window opened on a dash and "확인 필요", the large dash the design set out
+  to remove.
 - **Rows to choose from.** Each row's remaining weekly share is 21px bold over
   an 8px bar, beside the time until it refills and its date. A row without a
   value shows a dash, not an empty bar.
@@ -43,7 +49,8 @@ what is needed.
 ## Queries only when asked
 
 Opening the window or changing tabs reads nothing. Each row shows its last value
-with the time it was read; a row's ↻ reads that account, and the top bar's full
+with the time it was read, a value kept from an earlier run like any other of
+its age (old after six hours or past its reset); a row's ↻ reads that account, and the top bar's full
 query reads the page: on the Claude page every signed-in account, three at a
 time; on the Codex page one batch; on the Antigravity page the account signed
 in now.
@@ -62,6 +69,12 @@ in now.
   the usual way round (the design had them swapped).
 - At the narrowest width the top bar drops the check time when it does not fit;
   in English the list heading reads "Accounts".
+- The title bar is the system's. Where Windows shows an accent colour or dark
+  mode on title bars it is dark, as on the maintainer's PC, while the design
+  drew a light one; the window follows the setting the user chose for every
+  window.
+- When no account has a value to count, the next reset reads "확인 필요" with
+  the soonest earlier schedule, if one is known; the design has no such screen.
 
 ## Tokens
 
@@ -81,6 +94,21 @@ controls cut by their parent, shortened or squeezed text and text outside
 Pretendard. The captures were set beside the design's screens and checked by
 eye. A picture the window draws of itself cannot show the system's corners and
 shadow; the preview checks that Windows took them.
+
+Each screen is saved twice: as the window draws itself (`DrawToBitmap`, which
+paints every child over its parent's pixels) and as Windows composed it from
+each control's own paint (`-screen`, `PrintWindow` with
+`PW_RENDERFULLCONTENT`), the picture a person sees. 1.10.0, installed on the
+maintainer's PC and never published, had tabs and buttons that left their
+see-through parts unpainted: WinForms treats a
+Button as opaque and paints nothing under it, so on the screen those parts
+showed whatever the shared paint buffer held last (pieces of the check time,
+**Check all** and **Windows · WSL connections**), while the self-drawn
+pictures looked right. Every screen now also paints each double-buffered
+control alone twice, over two colours, and fails if any pixel differs. The
+preview includes the Codex page as the maintainer's window showed it when the
+defect was reported (`C2-codex-old`): values kept from before the widget
+restarted, hours old, which the total adds up.
 
 `--account-window-tests` (part of the full suite) checks what the pictures
 cannot: opening reads nothing, a row's ↻ reads that account alone, a full query
