@@ -62,9 +62,6 @@ internal sealed class UsageIndicatorForm : Form
     internal static readonly TimeSpan ClaudeRefreshTimeout =
         ClaudeCodeProcessRunner.CommandTimeout + TimeSpan.FromSeconds(35);
 
-    private const int WidgetWidth = WidgetFace.Width;
-    private const int WidgetHeight = WidgetFace.Height;
-
     private readonly AppServerClient _codexClient = new();
     private readonly ClaudeUsageClient? _claudeClient;
     private readonly ClaudeAccountController? _claudeAccounts;
@@ -106,6 +103,12 @@ internal sealed class UsageIndicatorForm : Form
     private readonly Dictionary<ClaudeDisplayMetric, ToolStripMenuItem> _claudeMetricItems = new();
     private bool _positionInitialized;
     private ToolStripMenuItem? _languageMenu;
+    // The size the user chose, in percent of the 272 × 64 design.
+    private int _scale = WidgetScale.Default;
+    private WidgetScaleDialog? _scaleDialog;
+    // Where the widget was when the size window opened (or after a drag while it is open): every size it shows is
+    // placed from there, so going back to a size puts the widget back where it was at that size.
+    private Rectangle? _scaleOrigin;
     private readonly CodexAccountStore _accountStore = new();
     private AccountManagerForm? _accountManager;
     private readonly CombinedUsageSnapshot _combinedUsage = new();
@@ -155,9 +158,10 @@ internal sealed class UsageIndicatorForm : Form
         }
         _showClaude = !previewMode && IndicatorSettingsStore.LoadShowClaude();
         _claudeMetric = previewMode ? ClaudeDisplayMetric.OverallWeekly : IndicatorSettingsStore.LoadClaudeMetric();
+        _scale = previewMode ? WidgetScale.Default : IndicatorSettingsStore.LoadScale();
         AutoScaleMode = AutoScaleMode.Dpi;
         BackColor = Color.FromArgb(24, 24, 28);
-        ClientSize = new Size(WidgetWidth, WidgetHeight);
+        ClientSize = WidgetFace.SizeAt(_scale);
         DoubleBuffered = true;
         FormBorderStyle = FormBorderStyle.None;
         MaximizeBox = false;
@@ -224,6 +228,8 @@ internal sealed class UsageIndicatorForm : Form
                 _accountManager.Activate();
                 return;
             }
+            // An open size window first gives the widget back the size it keeps, so the place saved is that size's.
+            _scaleDialog?.Close();
             if (_positionInitialized && !_previewMode)
                 IndicatorSettingsStore.SavePosition(Location);
             _pollTimer.Stop();
@@ -335,6 +341,9 @@ internal sealed class UsageIndicatorForm : Form
             _languageMenu.DropDownItems.Add(choice);
         }
 
+        var scaleItem = new ToolStripMenuItem(UiText.T("크기…")) { Name = "WidgetScaleMenu" };
+        scaleItem.Click += (_, _) => BeginInvoke((Action)(() => ShowScaleDialog()));
+
         _contextMenu.Items.AddRange([
             refreshItem,
             claudeMenu,
@@ -342,13 +351,15 @@ internal sealed class UsageIndicatorForm : Form
             copyItem,
             accountsItem,
             _languageMenu,
+            scaleItem,
             new ToolStripSeparator(),
             exitItem
         ]);
     }
 
+    // The size window speaks the language it opened in, so the language waits until it closes.
     private bool CanChangeLanguage => !_accountBusy && _accountManager is not { IsOperationInProgress: true } &&
-        _accountManager is not { Enabled: false } &&
+        _accountManager is not { Enabled: false } && _scaleDialog is null &&
         !(_accountManager?.OwnedForms.Any(f => f.Visible) ?? false);
 
     internal bool ChangeLanguage(string language)
@@ -408,6 +419,67 @@ internal sealed class UsageIndicatorForm : Form
         // Display selection reuses the same snapshot and never starts a query.
         UpdateToolTip();
         Invalidate();
+    }
+
+    internal int ScalePercent => _scale;
+
+    /// <summary>Opens the size window beside the widget, or brings it forward when it is open already.</summary>
+    internal WidgetScaleDialog ShowScaleDialog()
+    {
+        if (_scaleDialog is { IsDisposed: false } open)
+        {
+            open.Activate();
+            return open;
+        }
+        _scaleOrigin = Bounds;
+        // Created on the widget's monitor, then placed once WinForms has given it that monitor's DPI, before it shows:
+        // clear of the widget at every size the widget can take.
+        var dialog = new WidgetScaleDialog(_scale, ApplyScale, KeepScale) { Location = Location };
+        dialog.Load += (_, _) => dialog.Location = ScaleDialogPlace(dialog.Size, dialog.DeviceDpi);
+        dialog.FormClosed += (_, _) =>
+        {
+            if (_scaleDialog == dialog) { _scaleDialog = null; _scaleOrigin = null; }
+            if (_positionInitialized && !_previewMode && !IsDisposed) IndicatorSettingsStore.SavePosition(Location);
+        };
+        _scaleDialog = dialog;
+        dialog.Show();
+        dialog.Activate();
+        return dialog;
+    }
+
+    /// <summary>Shows the widget at a scale at once: on the centre it had, settled on the middle line of the taskbar it
+    /// sits in, and on the screen.</summary>
+    internal void ApplyScale(int scale)
+    {
+        if (!WidgetScale.IsValid(scale)) throw new ArgumentOutOfRangeException(nameof(scale));
+        var target = ScalePlace(_scaleOrigin ?? Bounds, scale);
+        _scale = scale;
+        if (Bounds != target) Bounds = target;
+        _ground = WidgetGrounds.At(Bounds);
+        Invalidate();
+    }
+
+    private void KeepScale(int scale)
+    {
+        ApplyScale(scale);
+        if (!_previewMode) IndicatorSettingsStore.SaveScale(scale);
+    }
+
+    private static Rectangle ScalePlace(Rectangle origin, int scale)
+    {
+        var centre = new Point(origin.Left + origin.Width / 2, origin.Top + origin.Height / 2);
+        Rectangle? taskbar = null;
+        foreach (var bar in NativeWindow.Taskbars())
+            if (bar.Contains(origin)) { taskbar = bar; break; }
+        return WidgetScale.Place(origin, WidgetFace.SizeAt(scale), taskbar, Screen.FromPoint(centre).Bounds);
+    }
+
+    private Point ScaleDialogPlace(Size size, int dpi)
+    {
+        var origin = _scaleOrigin ?? Bounds;
+        var reach = Rectangle.Union(origin, Rectangle.Union(ScalePlace(origin, WidgetScale.Minimum), ScalePlace(origin, WidgetScale.Maximum)));
+        var centre = new Point(origin.Left + origin.Width / 2, origin.Top + origin.Height / 2);
+        return UsageToolTip.PlaceOutside(reach, size, Screen.FromPoint(centre).WorkingArea, (int)(8 * dpi / 96f));
     }
 
     private void PlaceNearTaskbar()
@@ -614,18 +686,21 @@ internal sealed class UsageIndicatorForm : Form
         }
     }
 
+    // Opening the window reads nothing; its pages show the values last seen until a query is asked for.
     private void ShowAccountManager()
     {
         if (_previewMode) return;
         if (_accountManager is null || _accountManager.IsDisposed)
-            _accountManager = CreateAccountManager(refreshAllOnOpen: true);
+            _accountManager = CreateAccountManager();
         _accountManager.Show();
         _accountManager.Activate();
     }
 
-    private AccountManagerForm CreateAccountManager(bool refreshAllOnOpen) => new(_accountStore, SuspendAccountsAsync, ResumeAccounts,
-        queryUsage: QueryAccountUsageAsync, combined: _combinedUsage, usageChanged: UpdateToolTip, refreshAllOnOpen: refreshAllOnOpen, claudeAccounts: _claudeAccounts,
-        claudeShelf: _claudeShelf);
+    private AntigravitySession? _antigravityAccounts;
+
+    private AccountManagerForm CreateAccountManager() => new(_accountStore, SuspendAccountsAsync, ResumeAccounts,
+        queryUsage: QueryAccountUsageAsync, combined: _combinedUsage, usageChanged: UpdateToolTip, claudeAccounts: _claudeAccounts,
+        claudeShelf: _claudeShelf, antigravity: _antigravityAccounts ??= new AntigravitySession(new AntigravityAccountStore()));
 
     private async Task QueryAccountUsageAsync(SavedCodexAccount account, CancellationToken token)
     {
@@ -817,7 +892,7 @@ internal sealed class UsageIndicatorForm : Form
     private void Present()
     {
         if (IsDisposed) return;
-        using var face = WidgetFace.Render(FaceState());
+        using var face = WidgetFace.Render(FaceState(), _scale);
         _ = NativeWindow.SetLayeredPicture(Handle, face);
     }
 
@@ -834,7 +909,7 @@ internal sealed class UsageIndicatorForm : Form
     // Reached only through WM_PRINT (DrawToBitmap): the screen is fed by Present.
     protected override void OnPaintBackground(PaintEventArgs e) { }
 
-    protected override void OnPaint(PaintEventArgs e) => WidgetFace.Draw(e.Graphics, FaceState());
+    protected override void OnPaint(PaintEventArgs e) => WidgetFace.Draw(e.Graphics, FaceState(), _scale);
 
     internal static string BuildTooltipText(UsageSnapshot? codex, ClaudeUsageResult? claude,
         string? codexError, string? claudeError, bool showClaude, CombinedUsageSnapshot? combined = null,
@@ -1018,12 +1093,15 @@ internal sealed class UsageIndicatorForm : Form
         _isDragging = false;
         Capture = false;
         SettleIntoTaskbar();
-        IndicatorSettingsStore.SavePosition(Location);
+        // Moved while the size window is open: the sizes it shows next are placed from here.
+        if (_scaleDialog is not null) _scaleOrigin = Bounds;
+        if (!_previewMode) IndicatorSettingsStore.SavePosition(Location);
     }
 
 }
 
-internal sealed record IndicatorSettings(int? X, int? Y, bool? ShowClaude, string? Language = null, string? ClaudeMetric = null);
+internal sealed record IndicatorSettings(int? X, int? Y, bool? ShowClaude, string? Language = null, string? ClaudeMetric = null,
+    int? ScalePercent = null);
 
 internal static class IndicatorSettingsStore
 {
@@ -1074,6 +1152,17 @@ internal static class IndicatorSettingsStore
     public static void SaveClaudeMetric(ClaudeDisplayMetric metric, string? path = null) =>
         SaveSettings(CurrentOrDefault(path) with { ClaudeMetric = metric.SettingsValue() }, path);
 
+    /// <summary>The widget's scale in percent. Settings from before there was one, or a value out of range, give 100.</summary>
+    public static int LoadScale(string? path = null) =>
+        LoadSettings(path)?.ScalePercent is { } scale && WidgetScale.IsValid(scale) ? scale : WidgetScale.Default;
+
+    public static void SaveScale(int scale, string? path = null)
+    {
+        if (!WidgetScale.IsValid(scale))
+            throw new ArgumentOutOfRangeException(nameof(scale), "The widget scale is 50 to 200 percent.");
+        SaveSettings(CurrentOrDefault(path) with { ScalePercent = scale }, path);
+    }
+
     private static IndicatorSettings CurrentOrDefault(string? path)
     {
         var current = LoadSettings(path);
@@ -1081,7 +1170,8 @@ internal static class IndicatorSettingsStore
         {
             ShowClaude = current?.ShowClaude ?? true,
             Language = UiText.IsSupported(current?.Language) ? current!.Language : current is null ? UiText.SystemLanguage : "ko",
-            ClaudeMetric = ClaudeDisplayMetrics.FromSettings(current?.ClaudeMetric, current is not null).SettingsValue()
+            ClaudeMetric = ClaudeDisplayMetrics.FromSettings(current?.ClaudeMetric, current is not null).SettingsValue(),
+            ScalePercent = current?.ScalePercent is { } scale && WidgetScale.IsValid(scale) ? scale : null
         };
     }
 

@@ -1,6 +1,8 @@
 using System.Text.Json;
 using WeeklyUsageIndicator;
 
+// Started by an Antigravity read under test in place of agy: nothing else of this program runs.
+if (AntigravityTests.StandIn(args) is { } standInExit) Environment.Exit(standInExit);
 if (args.Contains("--english")) UiText.SetLanguage("en");
 if (args.Contains("--live-environment-smoke")) { await LiveEnvironmentSmoke.RunAsync(); return; }
 if (args.Contains("--claude-shelf-live-probe")) { ClaudeSessionShelfTests.LiveProbe(); return; }
@@ -10,17 +12,23 @@ if (args.Contains("--claude-layout-dry-run")) { ClaudeSessionShelfTests.LayoutDr
 if (args.Contains("--claude-older-states")) { ClaudeOlderStatesProbe.Run(args); return; }
 if (args.Contains("--claude-sidebar-store-shape")) { ClaudeSessionShelfTests.SidebarStoreShape(); return; }
 if (args.Contains("--claude-layout-diff")) { ClaudeSessionShelfTests.LayoutDiff(args[Array.IndexOf(args, "--claude-layout-diff") + 1], args[Array.IndexOf(args, "--claude-layout-diff") + 2]); return; }
+if (args.Contains("--claude-profile-tests")) { await ClaudeProfileTests.RunAsync(); Console.WriteLine("PASS: Claude profiles"); return; }
 if (args.Contains("--claude-app-data-tests")) { await ClaudeAppDataTests.RunAsync(); Console.WriteLine("PASS: Claude profile folder"); return; }
 if (args.Contains("--claude-shelf-tests")) { await ClaudeSessionShelfTests.RunAsync(); Console.WriteLine("PASS: Claude session shelf"); return; }
 if (args.Contains("--claude-sync-tests")) { await ClaudeSessionSyncTests.RunAsync(); Console.WriteLine("PASS: Claude session sync"); return; }
 if (args.Contains("--widget-face-preview")) { WidgetFaceTests.Preview(args); return; }
 if (args.Contains("--widget-native-preview")) { await WidgetFaceTests.NativePreview(args); return; }
 if (args.Contains("--widget-face-tests")) { await WidgetFaceTests.RunAsync(); Console.WriteLine("PASS: widget face"); return; }
+if (args.Contains("--widget-scale-tests")) { await WidgetScaleTests.RunAsync(); Console.WriteLine("PASS: widget scale"); return; }
+if (args.Contains("--antigravity-tests")) { await AntigravityTests.RunAsync(); Console.WriteLine("PASS: Antigravity usage"); return; }
+if (args.Contains("--antigravity-live-check")) { await AntigravityTests.LiveCheckAsync(); return; }
 if (args.Contains("--claude-menu-smoke")) { await ClaudeAccountMenuSmoke.RunAsync(); return; }
 if (args.Contains("--live-claude-menu-smoke")) { await ClaudeAccountMenuSmoke.RunAsync(live: true); return; }
 if (args.Contains("--language-ui-smoke")) { await LanguageUiSmoke.RunAsync(); return; }
 if (args.Contains("--localization-tests")) { await LocalizationTests.RunAsync(); return; }
 if (args.Contains("--account-style-preview")) { await AccountStylePreview.RunAsync(args.Contains("--hold"), args.Contains("--standard-dpi")); return; }
+// The same window without pictures: opening reads nothing, one row's read, three at a time, the Antigravity states, closing.
+if (args.Contains("--account-window-tests")) { await AccountStylePreview.RunAsync(false); return; }
 if (args.Contains("--account-opening-smoke")) { await AccountOpeningSmoke.RunAsync(args.Contains("--trace-only")); return; }
 
 if (args.Contains("--live-account-usage-smoke"))
@@ -35,6 +43,13 @@ if (args.Contains("--live-usage-cleanup-smoke"))
 }
 
 if (args.Contains("--combined-ui-smoke")) { await CombinedUsageUiSmoke.RunAsync(); return; }
+if (args.Contains("--account-ui-smoke"))
+{
+    // The account window's own checks, on their own: registration and renaming, then the row's manual query.
+    await AccountUiSmoke.RunAsync(); Console.WriteLine("PASS: account manager registration, rename, cancellation and input focus");
+    await AccountUsageUiSmoke.RunAsync(); Console.WriteLine("PASS: manual usage buttons, async failure and cancellation");
+    return;
+}
 
 if (args.Contains("--live-combined-usage-smoke")) { await LiveCombinedUsageSmoke.RunAsync(); return; }
 
@@ -47,12 +62,14 @@ var tests = new (string Name, Func<Task> Run)[]
     // mouse while the slower credential and lifecycle fixtures continue.
     ("stable light tooltip hover, placement and focus", UsageTooltipHoverSmoke.RunAsync),
     ("widget face: gauges, grounds and states", WidgetFaceTests.RunAsync),
+    ("widget scale: placement, menu and the size window", WidgetScaleTests.RunAsync),
+    ("Antigravity usage: report, account, store and one read at a time", AntigravityTests.RunAsync),
     ("Claude weekly metric, independent expiry and profile cache", ClaudeMetricTests.RunAll),
-    ("Claude official profile identity and shared local work", ClaudeProfileTests.RunAsync),
+    ("Claude official profile identity, link-free profiles and junction-only retirement", ClaudeProfileTests.RunAsync),
     ("Claude profile folder: legacy roaming, moved out of the package, inside it", ClaudeAppDataTests.RunAsync),
     ("Claude session shelf: fill by adding and advancing, closed- and running-app writes, account mapping and log observation", ClaudeSessionShelfTests.RunAsync),
     ("Claude combined weekly total and session-layout plan", ClaudeSessionSyncTests.RunAsync),
-    ("Claude login waits, transient observation and identity invalidation", ClaudeControllerTests.RunAsync),
+    ("Claude per-account reads, saved values, moving the default-home account and identity invalidation", ClaudeControllerTests.RunAsync),
     ("Claude account menu actions and inactive-profile usage", () => ClaudeAccountMenuSmoke.RunAsync()),
     ("account operation lease blocks lifecycle replacement across awaits", AccountOperationLeaseTests.RunAsync),
     ("WSL native targets, independent login and joint recovery", WslCodexTests.RunAsync),
@@ -66,6 +83,8 @@ var tests = new (string Name, Func<Task> Run)[]
     ("manual usage buttons, async failure and cancellation", AccountUsageUiSmoke.RunAsync),
     ("combined weekly snapshot coverage and reset boundaries", CombinedUsageTests.RunAsync),
     ("combined manager opening, refresh, cancellation and cleanup", CombinedUsageUiSmoke.RunAsync),
+    ("account window: no read on opening, one row's read, three at a time, Antigravity states and closing during a query",
+        () => AccountStylePreview.RunAsync(false)),
     ("account manager first paint and stable partial updates", () => AccountOpeningSmoke.RunAsync()),
     ("multi-account tooltip observations and refresh boundaries", UsageTooltipTests.RunAsync),
     ("supervisor retries abnormal exits but respects normal Quit", TestSupervisorAsync),
@@ -98,7 +117,7 @@ if (args.Contains("--claude-usage-tests"))
     foreach (var test in new (string Name, Func<Task> Run)[]
              {
                  ("Claude weekly metric, independent expiry and profile cache", ClaudeMetricTests.RunAll),
-                 ("Claude login waits, transient observation and identity invalidation", ClaudeControllerTests.RunAsync)
+                 ("Claude per-account reads, saved values, moving the default-home account and identity invalidation", ClaudeControllerTests.RunAsync)
              }.Concat(tests[first..]))
     {
         await test.Run();
@@ -564,20 +583,24 @@ static Task TestFileCacheAsync()
     {
         var cachePath = Path.Combine(temporaryDirectory, ClaudeUsageFileCacheStore.CacheFileName);
         var now = new DateTimeOffset(2026, 9, 1, 4, 0, 0, TimeSpan.Zero);
-        var entry = new ClaudeUsageCacheEntry(Snapshot(30, now), now);
-        var store = new ClaudeUsageFileCacheStore(cachePath);
+        var entry = new ClaudeUsageCacheEntry(Snapshot(30, now), now, "profile:digest");
+        var store = new ClaudeUsageFileCacheStore(cachePath, new ManualTimeProvider(now));
 
-        store.Save(entry);
+        store.For(entry.ProfileKey).Save(entry);
         using (var document = JsonDocument.Parse(File.ReadAllText(cachePath)))
         {
             var fields = document.RootElement.EnumerateObject().Select(property => property.Name).ToArray();
-            Assert(fields.SequenceEqual(["Snapshot", "LastUpdatedAt", "ProfileKey"]),
-                "the cache contains only sanitized usage and a nonsecret attribution key");
+            var entryFields = document.RootElement.GetProperty("Entries").EnumerateArray().Single()
+                .EnumerateObject().Select(property => property.Name).ToArray();
+            Assert(fields.SequenceEqual(["Version", "Entries"])
+                   && entryFields.SequenceEqual(["ProfileKey", "Snapshot", "LastUpdatedAt", "Recovery"]),
+                "the cache contains only sanitized usage under a nonsecret attribution key per account");
         }
-        Assert(store.Load() == entry, "the file cache should round-trip the sanitized snapshot");
+        Assert(store.For(entry.ProfileKey).Load() == entry && store.Last(entry.ProfileKey) == entry,
+            "the file cache should round-trip the sanitized snapshot");
 
         File.WriteAllText(cachePath, "not-json");
-        Assert(store.Load() is null && !File.Exists(cachePath), "a corrupt cache should be ignored and deleted");
+        Assert(store.For(entry.ProfileKey).Load() is null && !File.Exists(cachePath), "a corrupt cache should be ignored and deleted");
     }
     finally
     {

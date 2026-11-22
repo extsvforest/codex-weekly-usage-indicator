@@ -80,7 +80,8 @@ internal sealed class UsageToolTip : IDisposable
         var y = Math.Clamp(owner.Top, area.Top, Math.Max(area.Top, area.Bottom - size.Height));
         if (owner.Right + gap + size.Width <= area.Right) return new(owner.Right + gap, y);
         if (owner.Left - gap - size.Width >= area.Left) return new(owner.Left - gap - size.Width, y);
-        return new(x, owner.Top >= area.Top + area.Height / 2 ? owner.Top - gap - size.Height : owner.Bottom + gap);
+        var fallback = owner.Top >= area.Top + area.Height / 2 ? owner.Top - gap - size.Height : owner.Bottom + gap;
+        return new(x, Math.Clamp(fallback, area.Top, Math.Max(area.Top, area.Bottom - size.Height)));
     }
     private static bool IsHeading(string line) => line.StartsWith("CODEX", StringComparison.Ordinal) ||
         line.StartsWith("CLAUDE", StringComparison.Ordinal) || line.StartsWith("전체 계정", StringComparison.Ordinal) || line.StartsWith("All accounts", StringComparison.Ordinal);

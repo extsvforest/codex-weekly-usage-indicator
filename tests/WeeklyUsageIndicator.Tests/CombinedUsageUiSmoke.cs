@@ -60,12 +60,17 @@ internal static class CombinedUsageUiSmoke
                 {
                     try
                     {
-                        Check(form.IsOperationInProgress, "first open begins one batch automatically");
+                        // Opening reads nothing: the rows keep the values last seen until the button asks for a query.
+                        await Task.Delay(150);
+                        Check(!form.IsOperationInProgress && calls == 0, "opening the window reads nothing");
+                        Capture(form, "combined-saved.png");
+                        var refresh = Find<Button>("RefreshAllUsageButton");
+                        refresh.PerformClick();
+                        Check(form.IsOperationInProgress, "the query of every account starts from its button");
                         Capture(form, "combined-progress.png");
                         await Until(() => !form.IsOperationInProgress);
                         Check(calls == 3 && maximum == 1 && restarts == 0 && form.CombinedUsage.IsComplete(DateTimeOffset.Now)
                             && Find<Label>("CombinedRemainingLabel").Text == "168%", "one sequential batch certifies the additive total without helper suspension");
-                        var refresh = Find<Button>("RefreshAllUsageButton");
                         // The window opens at its designed size unless the screen is smaller (the CI runners' 1024×768),
                         // where it is clamped to the working area and the list scrolls: the fit is a claim for the designed size.
                         var area = Screen.FromControl(form).WorkingArea;
@@ -99,7 +104,7 @@ internal static class CombinedUsageUiSmoke
                             "one failed account is retained as previous data and excluded from the confirmed subtotal");
                         Capture(form, "combined-partial.png");
                         mode = "cancel"; refresh.PerformClick(); await Until(() => calls >= 8 || !form.IsOperationInProgress);
-                        Check(calls == 8, $"cancel scenario entered requested member (calls={calls}, busy={form.IsOperationInProgress}, status={Find<Label>("StatusLabel").Text})");
+                        Check(calls == 8, $"cancel scenario entered requested member (calls={calls}, busy={form.IsOperationInProgress}, status={form.StatusText})");
                         Find<Button>("CancelLoginButton").PerformClick(); await Until(() => !form.IsOperationInProgress);
                         Check(calls == 8 && form.CombinedUsage.WasCanceled && !store.HasPendingUsageQuery, "cancel stops current request and never starts remaining account");
                         mode = "cleanup"; refresh.PerformClick(); await Until(() => !form.IsOperationInProgress);
@@ -120,7 +125,8 @@ internal static class CombinedUsageUiSmoke
                         form.Size = form.MinimumSize; await Task.Delay(100); Capture(form, "combined-small.png");
                         mode = "no-save"; refresh.PerformClick(); await Until(() => !form.IsOperationInProgress);
                         Check(calls == 18 && !form.CombinedUsage.IsComplete(DateTimeOffset.Now) && form.CombinedUsage.Accounts.Single(row => row.Account.IsActive).State == CombinedReadState.Failed,
-                            "returning without saving a fresh observation cannot certify a previous value");
+                            $"returning without saving a fresh observation cannot certify a previous value (calls={calls}, " +
+                            $"state={form.CombinedUsage.Accounts.Single(row => row.Account.IsActive).State}, button={refresh.Visible}/{refresh.Enabled}, status={form.StatusText})");
                         Check(Find<Label>("NextResetLabel").Text == "확인 필요", "an uncertain earlier account prevents a false next-reset headline");
                         mode = "cancel"; refresh.PerformClick(); await Until(() => calls == 20);
                         form.FormClosed += (_, _) =>

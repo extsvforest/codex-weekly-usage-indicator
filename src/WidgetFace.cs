@@ -20,12 +20,21 @@ internal sealed record WidgetFaceState(WidgetGauge Codex, WidgetGauge? Claude, b
     WidgetGround Ground = WidgetGround.Floating);
 
 /// <summary>Draws the widget: per provider a ring that fills clockwise with what remains, in the provider's colour, and
-/// the number beside it. Sizes are in pixels of the 272 × 64 window, which does not scale with the display, so the face
-/// reads the same at every scale. Text is filled as outlines: the face is composed with per-pixel alpha, where ClearType
-/// has no opaque background to work against.</summary>
+/// the number beside it. Sizes are in pixels of the 272 × 64 design, drawn at the scale the user chose (100 % by
+/// default); the face does not follow the display's scale. Text is filled as outlines: the face is composed with
+/// per-pixel alpha, where ClearType has no opaque background to work against.</summary>
 internal static class WidgetFace
 {
+    /// <summary>The design's size, which is the window's at 100 %.</summary>
     internal const int Width = 272, Height = 64;
+
+    /// <summary>The window's size at a scale in percent: the design's, scaled and rounded up to whole pixels so that the
+    /// face fits in it whole.</summary>
+    internal static Size SizeAt(int scale)
+    {
+        if (!WidgetScale.IsValid(scale)) throw new ArgumentOutOfRangeException(nameof(scale));
+        return new Size((Width * scale + 99) / 100, (Height * scale + 99) / 100);
+    }
 
     private const float Corner = 18f;
     // On a taskbar: the sheet the pointer lights up, which is also all of the window that takes the pointer.
@@ -56,29 +65,30 @@ internal static class WidgetFace
         Value: Color.FromArgb(28, 28, 30), Unit: Color.FromArgb(150, 28, 28, 30), Missing: Color.FromArgb(110, 28, 28, 30),
         Track: Color.FromArgb(34, 0, 0, 0), Codex: Color.FromArgb(78, 112, 224), Claude: Color.FromArgb(201, 98, 66));
 
-    /// <summary>The face as a premultiplied bitmap of the window's size, for a layered window.</summary>
-    internal static Bitmap Render(WidgetFaceState state)
+    /// <summary>The face as a premultiplied bitmap of the window's size at the scale, for a layered window.</summary>
+    internal static Bitmap Render(WidgetFaceState state, int scale = WidgetScale.Default)
     {
-        var bitmap = new Bitmap(Width, Height, PixelFormat.Format32bppPArgb);
+        var size = SizeAt(scale);
+        var bitmap = new Bitmap(size.Width, size.Height, PixelFormat.Format32bppPArgb);
         using var graphics = Graphics.FromImage(bitmap);
         graphics.Clear(Color.Transparent);
-        Draw(graphics, state);
-        if (state.Ground != WidgetGround.Floating) KeepPointer(bitmap);
+        Draw(graphics, state, scale);
+        if (state.Ground != WidgetGround.Floating) KeepPointer(bitmap, scale);
         return bitmap;
     }
 
     /// <summary>A layered window takes the pointer only where its picture is not fully transparent, so on a taskbar,
     /// where the face has no surface, the clear part of the sheet is given the least alpha there is. It is written into
     /// the pixels: a fill that faint is rounded away by the drawing itself.</summary>
-    private static void KeepPointer(Bitmap face)
+    private static void KeepPointer(Bitmap face, int scale)
     {
-        var bounds = new Rectangle(0, 0, Width, Height);
+        var bounds = new Rectangle(Point.Empty, face.Size);
         var bits = face.LockBits(bounds, ImageLockMode.ReadWrite, PixelFormat.Format32bppPArgb);
         try
         {
-            var pixels = new int[Width * Height];
+            var pixels = new int[face.Width * face.Height];
             Marshal.Copy(bits.Scan0, pixels, 0, pixels.Length);
-            var inside = SheetMask.Value;
+            var inside = SheetMask(scale);
             for (var index = 0; index < pixels.Length; index++)
                 if (inside[index] && (uint)pixels[index] >> 24 == 0) pixels[index] = 0x01000000;
             Marshal.Copy(pixels, 0, bits.Scan0, pixels.Length);
@@ -89,24 +99,56 @@ internal static class WidgetFace
         }
     }
 
-    private static readonly Lazy<bool[]> SheetMask = new(() =>
-    {
-        using var mask = new Bitmap(Width, Height, PixelFormat.Format32bppPArgb);
-        using (var graphics = Graphics.FromImage(mask))
-        {
-            graphics.SmoothingMode = SmoothingMode.AntiAlias;
-            graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
-            using var sheet = Rounded(Sheet, SheetCorner);
-            graphics.FillPath(Brushes.White, sheet);
-        }
-        var inside = new bool[Width * Height];
-        for (var y = 0; y < Height; y++)
-            for (var x = 0; x < Width; x++)
-                inside[y * Width + x] = mask.GetPixel(x, y).A >= 128;
-        return inside;
-    });
+    private static readonly object MaskGate = new();
+    // The sheet at the last scale drawn: the scale changes seldom, and a window shows one sheet.
+    private static (int Scale, bool[] Inside)? _sheetMask;
 
-    internal static void Draw(Graphics graphics, WidgetFaceState state)
+    private static bool[] SheetMask(int scale)
+    {
+        lock (MaskGate)
+        {
+            if (_sheetMask is { } kept && kept.Scale == scale) return kept.Inside;
+            var size = SizeAt(scale);
+            using var mask = new Bitmap(size.Width, size.Height, PixelFormat.Format32bppPArgb);
+            using (var graphics = Graphics.FromImage(mask))
+            {
+                graphics.SmoothingMode = SmoothingMode.AntiAlias;
+                graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                Fit(graphics, scale);
+                using var sheet = Rounded(Sheet, SheetCorner);
+                graphics.FillPath(Brushes.White, sheet);
+            }
+            var pixels = new int[size.Width * size.Height];
+            var bits = mask.LockBits(new Rectangle(Point.Empty, size), ImageLockMode.ReadOnly, PixelFormat.Format32bppPArgb);
+            try { Marshal.Copy(bits.Scan0, pixels, 0, pixels.Length); }
+            finally { mask.UnlockBits(bits); }
+            var inside = new bool[pixels.Length];
+            for (var index = 0; index < pixels.Length; index++) inside[index] = (uint)pixels[index] >> 24 >= 128;
+            _sheetMask = (scale, inside);
+            return inside;
+        }
+    }
+
+    /// <summary>Lays the design onto the window at the scale: enlarged or reduced alike both ways, so the rings stay
+    /// round, and centred in the whole pixels the window rounds up to. At 100 % the design is the window.</summary>
+    private static void Fit(Graphics graphics, int scale)
+    {
+        if (scale == WidgetScale.Default) return;
+        var size = SizeAt(scale);
+        var factor = scale / 100f;
+        graphics.TranslateTransform((size.Width - Width * factor) / 2f, (size.Height - Height * factor) / 2f);
+        graphics.ScaleTransform(factor, factor);
+    }
+
+    internal static void Draw(Graphics graphics, WidgetFaceState state, int scale = WidgetScale.Default)
+    {
+        var whole = graphics.Save();
+        Fit(graphics, scale);
+        DrawDesign(graphics, state);
+        graphics.Restore(whole);
+    }
+
+    private static void DrawDesign(Graphics graphics, WidgetFaceState state)
     {
         graphics.SmoothingMode = SmoothingMode.AntiAlias;
         graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;

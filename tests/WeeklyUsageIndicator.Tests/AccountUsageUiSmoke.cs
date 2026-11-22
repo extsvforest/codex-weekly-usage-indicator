@@ -35,7 +35,7 @@ internal static class AccountUsageUiSmoke
                         if (mode is "failure" or "cleanup-failure") throw new IOException("synthetic failure");
                         if (mode == "cleanup-cancel") throw new OperationCanceledException();
                         return AccountUsageQueryTests.Result();
-                    }, token), token), refreshAllOnOpen: false);
+                    }, token), token));
                 T Find<T>(string name) where T : Control => (T)form.Controls.Find(name, true).Single();
                 form.Shown += async (_, _) =>
                 {
@@ -64,28 +64,27 @@ internal static class AccountUsageUiSmoke
                         Capture(form);
                         mode = "failure";
                         button.PerformClick(); await UntilAsync(() => !form.IsOperationInProgress);
-                        Check(calls == 2 && store.ListAccounts().Single(a => a.Id == target.Id) == queried && Find<Label>("StatusLabel").Text.Contains("가져오지 못했습니다"),
+                        Check(calls == 2 && store.ListAccounts().Single(a => a.Id == target.Id) == queried && form.StatusText.Contains("가져오지 못했습니다"),
                             "failure preserves last value and successful observation time");
                         mode = "cancel";
                         button.PerformClick(); await UntilAsync(() => calls == 3 || !form.IsOperationInProgress);
                         Check(calls == 3 && Find<Button>("CancelLoginButton").Text == "조회 취소", "cancel is a distinct explicit action");
                         Find<Button>("CancelLoginButton").PerformClick(); await UntilAsync(() => !form.IsOperationInProgress);
-                        Check(store.ListAccounts().Single(a => a.Id == target.Id) == queried && Find<Label>("StatusLabel").Text.Contains("조회를 취소"),
+                        Check(store.ListAccounts().Single(a => a.Id == target.Id) == queried && form.StatusText.Contains("조회를 취소"),
                             "cancel preserves last observation and completes cleanup");
                         foreach (var pendingMode in new[] { "cleanup-success", "cleanup-failure", "cleanup-cancel" })
                         {
                             mode = pendingMode;
                             button.PerformClick(); await UntilAsync(() => !form.IsOperationInProgress);
-                            var status = Find<Label>("StatusLabel");
-                            Check(status.Text.Contains("임시 파일 정리 대기") && !status.Text.Contains("복구가 필요"), "committed cleanup has an accurate nonblocking notice");
+                            Check(form.StatusText.Contains("임시 파일 정리 대기") && !form.StatusText.Contains("복구가 필요"), "committed cleanup has an accurate nonblocking notice");
                             var expected = mode == "cleanup-success" ? "사용량을 확인했습니다" : mode == "cleanup-failure" ? "가져오지 못했습니다" : "조회를 취소";
-                            Check(status.Text.Contains(expected) && button.Enabled && form.MenuAction("RenameAccountButton").Enabled
+                            Check(form.StatusText.Contains(expected) && button.Enabled && form.MenuAction("RenameAccountButton").Enabled
                                 && form.MenuAction("DeleteAccountButton").Enabled && form.SelectedSwitchButton!.Enabled, "original outcome and normal account actions survive cleanup failure");
                             // Exercise the actual 5-second reload that used to overwrite errors.
                             if (mode == "cleanup-failure")
                             {
                                 await Task.Delay(5200);
-                                Check(status.Text.Contains(expected), "periodic list reload preserves the original error");
+                                Check(form.StatusText.Contains(expected), "periodic list reload preserves the original error");
                                 Capture(form);
                             }
                             held!.Dispose(); held = null;

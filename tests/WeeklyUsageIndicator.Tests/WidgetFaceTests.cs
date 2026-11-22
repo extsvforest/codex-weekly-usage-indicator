@@ -9,6 +9,7 @@ using WeeklyUsageIndicator;
 internal static class WidgetFaceTests
 {
     private static readonly Color Codex = Color.FromArgb(124, 156, 255), Claude = Color.FromArgb(217, 119, 87);
+    private static readonly Color Value = Color.FromArgb(245, 245, 247);
 
     internal static Task RunAsync()
     {
@@ -63,7 +64,87 @@ internal static class WidgetFaceTests
         using (var stale = WidgetFace.Render(new(new(29), new WidgetGauge(64, Stale: true))))
             Check(Count(stale, Claude) == 0 && Count(fresh, Claude) > 0 && Brightest(stale, from: 136) < Brightest(fresh, from: 136),
                 "a share kept through a failure is drawn fainter");
+        CheckScales();
         return Task.CompletedTask;
+    }
+
+    /// <summary>The face at the scale the user chose: the same design drawn larger or smaller in a window of that size,
+    /// its rings round, its numbers beside them and its sheet whole, on every ground.</summary>
+    private static void CheckScales()
+    {
+        Rectangle ring100 = default, ink100 = default;
+        foreach (var (scale, size) in new[] { (100, new Size(272, 64)), (87, new Size(237, 56)), (120, new Size(327, 77)) })
+        {
+            var factor = scale / 100f;
+            var (dx, dy) = ((size.Width - 272 * factor) / 2f, (size.Height - 64 * factor) / 2f);
+            // A place in the 272 × 64 design, in the pixels of the window at this scale.
+            int X(float x) => (int)Math.Round(x * factor + dx);
+            int Y(float y) => (int)Math.Round(y * factor + dy);
+            Check(WidgetFace.SizeAt(scale) == size, $"at {scale} % the window is {size.Width} × {size.Height}");
+            using (var floating = WidgetFace.Render(new(new(29), new WidgetGauge(64)), scale))
+            {
+                Check(floating.Size == size && floating.PixelFormat == PixelFormat.Format32bppPArgb, $"at {scale} % the face fills its window");
+                Check(floating.GetPixel(0, 0).A == 0 && floating.GetPixel(size.Width - 1, size.Height - 1).A == 0,
+                    $"at {scale} % the corners stay round");
+                Check(floating.GetPixel(X(136), Y(32)).A == 255 && floating.GetPixel(X(136), Y(5)).A == 255,
+                    $"at {scale} % a floating face is opaque");
+                var least = (int)(20 * factor * factor);
+                Check(Count(floating, Codex) > least && Count(floating, Claude) > least, $"at {scale} % each ring keeps its colour");
+                Check(Count(floating, Codex, from: X(136)) == 0 && Count(floating, Claude, to: X(136)) == 0,
+                    $"at {scale} % Codex stays on the left, Claude on the right");
+            }
+            // Full rings show their whole circle, and each number sits beside its ring, centred on it.
+            using (var full = WidgetFace.Render(new(new(100), new WidgetGauge(100)), scale))
+            {
+                var ring = Box(full, pixel => Near(pixel, Codex), to: X(136));
+                var ink = Box(full, pixel => Near(pixel, Value), from: ring.Right, to: X(136));
+                Check(Math.Abs(ring.Width - ring.Height) <= 1 && Math.Abs(ring.Width - 38 * factor) <= 2,
+                    $"at {scale} % a ring is a circle of the design's size ({ring})");
+                Check(Math.Abs(ring.Top + ring.Height / 2f - size.Height / 2f) <= 1, $"at {scale} % the ring is on the middle line ({ring})");
+                Check(!ink.IsEmpty && Math.Abs(ink.Top + ink.Height / 2f - (ring.Top + ring.Height / 2f)) <= 1.5f,
+                    $"at {scale} % the number is centred on its ring ({ink}, ring {ring})");
+                if (scale == 100) (ring100, ink100) = (ring, ink);
+                else Check(Scaled(ring, ring100, factor, dx, dy) && Scaled(ink, ink100, factor, dx, dy),
+                    $"at {scale} % the ring and the number are the design's, scaled (ring {ring}, number {ink})");
+            }
+            using (var docked = WidgetFace.Render(new(new(29), new WidgetGauge(64), Ground: WidgetGround.DarkTaskbar), scale))
+            {
+                Check(Enumerable.Range(0, size.Width).All(x => docked.GetPixel(x, Y(2)).A == 0 && docked.GetPixel(x, Y(61)).A == 0),
+                    $"at {scale} % on a taskbar the face has no surface of its own");
+                var faintest = Enumerable.Range(X(12), X(260) - X(12)).Min(x => (int)docked.GetPixel(x, Y(32)).A);
+                var sheet = docked.GetPixel(X(136), Y(12)).A;
+                Check(faintest > 0 && sheet is > 0 and < 8,
+                    $"at {scale} % the whole sheet still takes the pointer (faintest {faintest}, sheet {sheet})");
+            }
+            using (var hovered = WidgetFace.Render(new(new(29), new WidgetGauge(64), Hovered: true, Ground: WidgetGround.DarkTaskbar), scale))
+                Check(hovered.GetPixel(X(136), Y(12)).A >= 16, $"at {scale} % the pointer lights the sheet up");
+            using (var light = WidgetFace.Render(new(new(29), new WidgetGauge(64), Ground: WidgetGround.LightTaskbar), scale))
+                Check(Darkest(light) < 60, $"at {scale} % the numbers turn dark on a light taskbar");
+        }
+        Check(WidgetFace.SizeAt(50) == new Size(136, 32) && WidgetFace.SizeAt(200) == new Size(544, 128),
+            "the ends of the range are half and twice the design");
+        foreach (var outside in new[] { 49, 201, 0 })
+        {
+            try { WidgetFace.SizeAt(outside); }
+            catch (ArgumentOutOfRangeException) { continue; }
+            throw new InvalidOperationException($"Widget face: a scale of {outside} % should be refused");
+        }
+    }
+
+    /// <summary>Whether a box measured at a scale is the one measured at 100 %, scaled: each edge within two pixels.</summary>
+    private static bool Scaled(Rectangle actual, Rectangle design, float factor, float dx, float dy) =>
+        Math.Abs(actual.Left - (design.Left * factor + dx)) <= 2 && Math.Abs(actual.Right - (design.Right * factor + dx)) <= 2 &&
+        Math.Abs(actual.Top - (design.Top * factor + dy)) <= 2 && Math.Abs(actual.Bottom - (design.Bottom * factor + dy)) <= 2;
+
+    /// <summary>The box round every pixel the test picks between two columns.</summary>
+    private static Rectangle Box(Bitmap face, Func<Color, bool> picks, int from = 0, int? to = null)
+    {
+        int left = int.MaxValue, top = int.MaxValue, right = -1, bottom = -1;
+        for (var y = 0; y < face.Height; y++)
+            for (var x = from; x < (to ?? face.Width); x++)
+                if (picks(face.GetPixel(x, y)))
+                { left = Math.Min(left, x); top = Math.Min(top, y); right = Math.Max(right, x); bottom = Math.Max(bottom, y); }
+        return right < 0 ? Rectangle.Empty : Rectangle.FromLTRB(left, top, right + 1, bottom + 1);
     }
 
     /// <summary>Writes the face in its states over each ground, at its real size and enlarged, for a look by eye:
@@ -74,6 +155,11 @@ internal static class WidgetFaceTests
         var at = Array.IndexOf(args, "--widget-face-preview");
         var folder = args[at + 1];
         Directory.CreateDirectory(folder);
+        // --scale <percent>: the face at the size the user can choose (100 by default).
+        var scaleAt = Array.IndexOf(args, "--scale");
+        var scale = scaleAt >= 0 ? int.Parse(args[scaleAt + 1]) : WidgetScale.Default;
+        var size = WidgetFace.SizeAt(scale);
+        args = scaleAt >= 0 ? args.Where((_, index) => index != scaleAt && index != scaleAt + 1).ToArray() : args;
         using var capture = args.Length > at + 4 ? new Bitmap(args[at + 2]) : null;
         var corner = capture is null ? Point.Empty : new Point(int.Parse(args[at + 3]), int.Parse(args[at + 4]));
         WidgetFaceState[] states =
@@ -95,7 +181,8 @@ internal static class WidgetFaceTests
                      ("floating-over-dark", WidgetGround.Floating, Color.FromArgb(32, 32, 32)),
                  })
         {
-            const int cellWidth = 372, cellHeight = 130, columns = 4, zoom = 2;
+            const int columns = 4, zoom = 2;
+            int cellWidth = size.Width + 100, cellHeight = size.Height + 66;
             var rows = (states.Length + columns - 1) / columns;
             using var sheet = new Bitmap(cellWidth * columns, cellHeight * rows + cellHeight * zoom, PixelFormat.Format32bppPArgb);
             using var graphics = Graphics.FromImage(sheet);
@@ -111,9 +198,9 @@ internal static class WidgetFaceTests
                     {
                         on.DrawImage(capture, new Rectangle(0, 0, cellWidth, cellHeight), new Rectangle(corner.X - 50, corner.Y - 40, cellWidth, cellHeight), GraphicsUnit.Pixel);
                         using var erase = new SolidBrush(capture.GetPixel(corner.X - 20, corner.Y + 32));
-                        on.FillRectangle(erase, 48, 38, WidgetFace.Width + 4, WidgetFace.Height + 4);
+                        on.FillRectangle(erase, 48, 38, size.Width + 4, size.Height + 4);
                     }
-                    using var face = WidgetFace.Render(states[index] with { Ground = ground });
+                    using var face = WidgetFace.Render(states[index] with { Ground = ground }, scale);
                     on.DrawImage(face, 50, 40);
                 }
                 graphics.DrawImage(cell, index % columns * cellWidth, index / columns * cellHeight);
@@ -124,7 +211,7 @@ internal static class WidgetFaceTests
             first!.Dispose();
             sheet.Save(Path.Combine(folder, "face-" + name + ".png"), ImageFormat.Png);
         }
-        using (var alone = WidgetFace.Render(states[0])) alone.Save(Path.Combine(folder, "widget.png"), ImageFormat.Png);
+        using (var alone = WidgetFace.Render(states[0], scale)) alone.Save(Path.Combine(folder, "widget.png"), ImageFormat.Png);
         Console.WriteLine("Widget face preview: " + folder);
     }
 
@@ -184,11 +271,11 @@ internal static class WidgetFaceTests
     private static bool Near(Color pixel, Color colour) =>
         pixel.A > 200 && Math.Abs(pixel.R - colour.R) < 12 && Math.Abs(pixel.G - colour.G) < 12 && Math.Abs(pixel.B - colour.B) < 12;
 
-    private static int Count(Bitmap face, Color colour, int from = 0, int to = WidgetFace.Width)
+    private static int Count(Bitmap face, Color colour, int from = 0, int? to = null)
     {
         var count = 0;
         for (var y = 0; y < face.Height; y++)
-            for (var x = from; x < to; x++)
+            for (var x = from; x < (to ?? face.Width); x++)
                 if (Near(face.GetPixel(x, y), colour)) count++;
         return count;
     }

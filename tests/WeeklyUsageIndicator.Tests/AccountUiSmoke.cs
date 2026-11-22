@@ -27,7 +27,7 @@ internal static class AccountUiSmoke
                 File.WriteAllBytes(Path.Combine(home, "auth.json"), Fixture("a"));
                 var store = new CodexAccountStore(Path.Combine(root, "vault"), home);
                 var suspended = 0; var resumed = 0;
-                using var form = new AccountManagerForm(store, () => { suspended++; return Task.CompletedTask; }, () => resumed++, refreshAllOnOpen: false);
+                using var form = new AccountManagerForm(store, () => { suspended++; return Task.CompletedTask; }, () => resumed++);
                 form.Show();
                 Application.DoEvents();
                 Check(form.Font.Name == "Pretendard", "the portable manager uses its bundled Korean font");
@@ -74,7 +74,7 @@ internal static class AccountUiSmoke
                     Button(dialog, "CancelNameButton").PerformClick();
                 });
                 Check(store.ListAccounts().Single().Label == "Pro A · 주 계정", "cancel preserves original name");
-                Check(!Find<Label>(form, "StatusLabel").Text.Contains("준비하고"), "cancel cannot leave preparing status");
+                Check(!form.StatusText.Contains("준비하고"), "cancel cannot leave preparing status");
                 RespondToDialog(() => Button(form, "AddAccountButton").PerformClick(), "AccountNameDialog", dialog =>
                 {
                     Check(ReferenceEquals(dialog.CancelButton, Button(dialog, "CancelNameButton")), "Escape is wired to cancel");

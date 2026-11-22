@@ -5,11 +5,12 @@ internal sealed class WslCodexConnectionsDialog : Form
     private readonly CodexAccountStore _store;
     private readonly WslCodexService _service;
     private readonly WslCodexConnections _connections;
-    private readonly ComboBox _targets = new() { Name = "WslTargetList", Dock = DockStyle.Fill, DropDownStyle = ComboBoxStyle.DropDownList };
-    private readonly ComboBox _accounts = new() { Name = "WslAccountList", Dock = DockStyle.Fill, DropDownStyle = ComboBoxStyle.DropDownList };
-    private readonly Label _state = AccountUiTheme.Label("", 10, color: AccountUiTheme.Muted);
+    // Anchored left and right only, a list sits on the middle of its row, level with the button beside it.
+    private readonly ComboBox _targets = new() { Name = "WslTargetList", Anchor = AnchorStyles.Left | AnchorStyles.Right, DropDownStyle = ComboBoxStyle.DropDownList };
+    private readonly ComboBox _accounts = new() { Name = "WslAccountList", Anchor = AnchorStyles.Left | AnchorStyles.Right, DropDownStyle = ComboBoxStyle.DropDownList };
+    private readonly Label _state = AccountUiTheme.Label("", 9.5f, color: AccountUiTheme.Ink2);
     private readonly LinkLabel _openLogin = new() { Name = "WslOpenLoginLink", Text = UiText.T("로그인 창 열기"), AutoSize = true, BackColor = Color.Transparent, Visible = false };
-    private readonly Label _bindings = AccountUiTheme.Label("", 10, color: AccountUiTheme.Muted);
+    private readonly Label _bindings = AccountUiTheme.Label("", 9.5f, color: AccountUiTheme.Ink3);
     private readonly CheckBox _enabled = new() { Name = "WslSwitchEnabled", Text = UiText.T("Windows와 함께 전환"), AutoSize = true, BackColor = Color.Transparent };
     private readonly Button _scan = AccountUiTheme.Button("WslScanButton", UiText.T("실행 환경 확인"));
     private readonly Button _capture = AccountUiTheme.Button("WslCaptureButton", UiText.T("현재 WSL 로그인 연결"));
@@ -31,26 +32,28 @@ internal sealed class WslCodexConnectionsDialog : Form
         var stack = AccountUiTheme.Stack(9); stack.Padding = new Padding(28);
         foreach (var height in new[] { 44, 64, 40, 60, 40, 40, 78, 54 }) stack.RowStyles.Add(new RowStyle(SizeType.Absolute, height));
         stack.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        stack.Controls.Add(AccountUiTheme.Label(UiText.T("Windows와 WSL을 함께"), 20, true), 0, 0);
-        var note = AccountUiTheme.Label(UiText.T("WSL에 설치된 Codex만 연결합니다. 환경마다 한 번 로그인하면\n이후에는 계정 전환을 함께 적용할 수 있습니다."), 10, color: AccountUiTheme.Muted);
+        // The account windows' type (design of 2026-11-21): a 17px title, 12-13px text in the quieter inks.
+        stack.Controls.Add(AccountUiTheme.Label(UiText.T("Windows와 WSL을 함께"), 13, true), 0, 0);
+        var note = AccountUiTheme.Label(UiText.T("WSL에 설치된 Codex만 연결합니다. 환경마다 한 번 로그인하면\n이후에는 계정 전환을 함께 적용할 수 있습니다."), 9.5f, color: AccountUiTheme.Ink3);
         note.Dock = DockStyle.Fill; note.AutoSize = false; stack.Controls.Add(note, 0, 1);
         var targetLine = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, Margin = new Padding(0) };
         targetLine.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100)); targetLine.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         _scan.AutoSize = false; _scan.Size = _scan.MinimumSize = new Size(160, 38);
-        _targets.Margin = new Padding(0, 3, 12, 0); targetLine.Controls.Add(_targets, 0, 0); targetLine.Controls.Add(_scan, 1, 0); stack.Controls.Add(targetLine, 0, 2);
+        _targets.Margin = new Padding(0, 0, 12, 0); targetLine.Controls.Add(_targets, 0, 0); targetLine.Controls.Add(_scan, 1, 0); stack.Controls.Add(targetLine, 0, 2);
         var stateRow = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1, Margin = new Padding(0) };
         stateRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100)); stateRow.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         _state.AutoSize = false; _state.Dock = DockStyle.Fill; _state.Padding = new Padding(0, 10, 0, 0); stateRow.Controls.Add(_state, 0, 0);
-        _openLogin.LinkColor = AccountUiTheme.ActiveInk; _openLogin.Anchor = AnchorStyles.Right; stateRow.Controls.Add(_openLogin, 1, 0); stack.Controls.Add(stateRow, 0, 3);
-        stack.Controls.Add(_accounts, 0, 4); stack.Controls.Add(_enabled, 0, 5);
+        _openLogin.LinkColor = _openLogin.ActiveLinkColor = AccountUiTheme.Codex.Ink; _openLogin.Anchor = AnchorStyles.Right; stateRow.Controls.Add(_openLogin, 1, 0); stack.Controls.Add(stateRow, 0, 3);
+        _accounts.Margin = new Padding(0); stack.Controls.Add(_accounts, 0, 4); stack.Controls.Add(_enabled, 0, 5);
         _bindings.AutoSize = false; _bindings.Dock = DockStyle.Fill; _bindings.Padding = new Padding(0, 10, 0, 0); stack.Controls.Add(_bindings, 0, 6);
         var actions = new TableLayoutPanel { Dock = DockStyle.Fill, Margin = new Padding(0), ColumnCount = 3, RowCount = 1 };
         actions.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
         actions.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
         actions.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        // 10px between the buttons and none at the edge, so they end where the lists and the check button end.
         foreach (var action in new[] { _capture, _login })
-        { action.AutoSize = false; action.Dock = DockStyle.Top; action.Height = 38; action.MinimumSize = new Size(0, 38); action.Margin = new Padding(0, 0, 10, 0); actions.Controls.Add(action); }
-        _cancel.AutoSize = false; _cancel.Size = _cancel.MinimumSize = new Size(72, 38); actions.Controls.Add(_cancel);
+        { action.AutoSize = false; action.Dock = DockStyle.Top; action.Height = 38; action.MinimumSize = new Size(0, 38); action.Margin = new Padding(0, 0, action == _capture ? 10 : 0, 0); actions.Controls.Add(action); }
+        _cancel.AutoSize = false; _cancel.Size = _cancel.MinimumSize = new Size(72, 38); _cancel.Margin = new Padding(10, 0, 0, 0); actions.Controls.Add(_cancel);
         stack.Controls.Add(actions, 0, 7);
         var foot = AccountUiTheme.Label(UiText.T("실행 중인 Codex 작업은 먼저 마쳐주세요. 자동으로 종료하지 않습니다."), 9, color: AccountUiTheme.Muted);
         foot.AutoSize = false; foot.Dock = DockStyle.Fill; stack.Controls.Add(foot, 0, 8); Controls.Add(stack);
