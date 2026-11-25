@@ -1609,7 +1609,11 @@ internal static class ClaudeSessionShelfTests
                     layout.Accounts[layout.Active!] = shown;
                 }
                 string Title(string id) => titles.GetValueOrDefault(id) ?? id;
-                Console.WriteLine($"== {known.Label}: {plan.Status} left {known.LeftAt:O} warnings=[{string.Join(",", plan.Warnings ?? [])}] archive={plan.Archive?.Count}");
+                Console.WriteLine($"== {known.Label}: {plan.Status} left {known.LeftAt:O} warnings=[{string.Join(",", plan.Warnings ?? [])}] archive={plan.Archive?.Count} unarchive={plan.Unarchive?.Count}");
+                foreach (var item in plan.Unarchive ?? [])
+                    Console.WriteLine($"  unarchive {item.Title}: live in {item.By}"
+                        + (item.UnarchivedAt is { } back ? $", unarchived there {back.ToLocalTime():MM-dd HH:mm}" : "")
+                        + $", last active {item.LastActive.ToLocalTime():MM-dd HH:mm}");
                 foreach (var rename in plan.RenameGroups ?? []) Console.WriteLine($"  set group {rename.From} aside as {rename.To}");
                 foreach (var name in plan.CreateGroups ?? []) Console.WriteLine($"  create group {name}");
                 foreach (var move in plan.Moves ?? [])

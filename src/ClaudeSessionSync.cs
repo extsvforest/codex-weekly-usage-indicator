@@ -138,8 +138,11 @@ internal sealed class ClaudeSessionLayout
     /// otherwise: in the meantime neither a value it has not reached yet nor what its moves do on the way is anyone's
     /// choice.</summary>
     /// <param name="Renamed">The groups it renames out of the way, by id: the name each had and the one it is given.</param>
+    /// <param name="Unarchived">The sessions it unarchives (see <see cref="ClaudeSessionSync.Revive"/>). Back in the list,
+    /// one shows what it had when it was archived, chosen by nobody now: the first look that finds it takes what it shows
+    /// for no change and checkpoints it, so what the other accounts changed since reaches it.</param>
     internal sealed record Pending(int Stay, IReadOnlyDictionary<string, Target> Sessions, GroupChange? Groups,
-        IReadOnlyDictionary<string, Moved> Renamed);
+        IReadOnlyDictionary<string, Moved> Renamed, IReadOnlyList<string>? Unarchived = null);
 
     /// <summary>A group a plan renames out of the way: it is aside only while it bears the name given.</summary>
     internal sealed record Moved(string From, string To);
@@ -427,7 +430,16 @@ internal sealed class ClaudeSessionLayout
             if (renaming is JsonObject names && Text(names, "from") is { } from && Text(names, "to") is { } to && names.Count == 2)
                 renamed[id] = new(from, to);
             else return null;
-        return new(stay, targets, groups, renamed);
+        List<string>? unarchived = null;
+        if (node["unarchived"] is { } unarchivedNode)
+        {
+            if (unarchivedNode is not JsonArray ids) return null;
+            unarchived = [];
+            foreach (var idNode in ids)
+                if (idNode is JsonValue value && value.TryGetValue<string>(out var id)) unarchived.Add(id);
+                else return null;
+        }
+        return new(stay, targets, groups, renamed, unarchived is { Count: > 0 } ? unarchived : null);
     }
 
     private static bool ReadStampParts(JsonObject stamp, out JsonNode? value, out DateTimeOffset at, out string? by)
@@ -544,6 +556,9 @@ internal sealed class ClaudeSessionLayout
                     ["stay"] = pending.Stay, ["sessions"] = sessions,
                     ["groups"] = pending.Groups is { } order ? Write(order) : null, ["renamed"] = renamed
                 };
+                if (pending.Unarchived is { Count: > 0 } unarchived)
+                    entry["pending"]!["unarchived"] = new JsonArray(unarchived.Order(StringComparer.Ordinal)
+                        .Select(id => (JsonNode?)JsonValue.Create(id)).ToArray());
             }
             if (Renamings.TryGetValue(key, out var renamings) && renamings.Count > 0)
                 entry["renamings"] = new JsonArray(renamings.Select(renaming => (JsonNode?)new JsonObject
@@ -768,10 +783,13 @@ internal static class ClaudeSessionSync
     /// <c>ReadRecords</c> reads them).</param>
     /// <param name="Scheduled">A run a scheduled task started (<c>scheduledTaskId</c>) that the user has not gone on with
     /// (<c>scheduledRunContinued</c>).</param>
+    /// <param name="ArchiveSetAt">When the app last archived or unarchived it (<c>archiveSetAtMs</c>, Unix milliseconds;
+    /// Claude 6.28899 sets it either way): for an archived record when it was archived, for a live one when it was brought
+    /// back. 0 when the app did not record it.</param>
     internal sealed record Record(string SessionId, string? Title, bool Pinned, string? Cli, IReadOnlyList<string> Prior,
         long LastActivityAt, bool Branch = false, bool Renamed = false, string? Parent = null, bool Detached = false,
         DateTimeOffset? Written = null, string? Former = null, string? Model = null, string? Effort = null, string? Mode = null,
-        bool Scheduled = false);
+        bool Scheduled = false, long ArchiveSetAt = 0);
     internal sealed record Group(string Id, string Name, bool Collapsed = false);
     /// <param name="Groups">In sidebar order.</param>
     /// <param name="Nested">The sessions the app nests under another, each with the session at the top of its family, whose
@@ -813,6 +831,12 @@ internal static class ClaudeSessionSync
         DateTimeOffset LastWritten, DateTimeOffset? MovedOn, string? ArchivedIn = null, DateTimeOffset? ArchivedAt = null);
     /// <summary>Where and when a conversation was last archived in another account, and its last activity anywhere.</summary>
     internal sealed record Away(string Account, DateTimeOffset At, DateTimeOffset LastActive);
+    /// <summary>A session archived here to unarchive: another account has its conversation live again since it was last
+    /// archived anywhere (see <see cref="Returning"/>). <c>By</c> is that account, <c>UnarchivedAt</c> when it was
+    /// unarchived there (null when it was only talked in), <c>LastActive</c> its last activity anywhere.</summary>
+    internal sealed record Revive(string Session, string? Title, string By, DateTimeOffset? UnarchivedAt, DateTimeOffset LastActive);
+    /// <summary>Where a conversation archived here is live again, as <see cref="Returning"/> finds it.</summary>
+    internal sealed record Back(string Account, DateTimeOffset? UnarchivedAt, DateTimeOffset LastActive);
     internal sealed record GroupView(string Name, IReadOnlyList<string> Sessions, bool Collapsed = false);
     /// <summary>A session nested under another, by title: it shows that one's group and moves only with it.</summary>
     internal sealed record NestedView(string Title, string Under);
@@ -870,7 +894,8 @@ internal static class ClaudeSessionSync
     /// <c>Permissions</c> are the conversations used within <see cref="SettingsWindow"/> or pinned here whose values it
     /// changes, the most recently used first; <c>SelfSettings</c> the calling session's model and effort, and
     /// <c>SettingsBeyond</c> how many conversations out of that scope it would have changed. <c>Undecided</c> are the
-    /// records here another one continues that stay because what would tell them for older states could not be read.</summary>
+    /// records here another one continues that stay because what would tell them for older states could not be read.
+    /// <c>Unarchive</c> are the sessions archived here to bring back first: the plan made once they are back takes them up.</summary>
     internal sealed record Plan(string Status, string? Current = null, string? CurrentLabel = null,
         IReadOnlyList<OtherView>? Others = null, IReadOnlyList<Retire>? Archive = null,
         IReadOnlyList<GroupRename>? RenameGroups = null, IReadOnlyList<string>? CreateGroups = null,
@@ -880,7 +905,7 @@ internal static class ClaudeSessionSync
         bool? Checkpointed = null, [property: JsonIgnore] ClaudeSessionLayout.Pending? Pending = null,
         IReadOnlyList<SettingModel>? Models = null, IReadOnlyList<SettingEffort>? Efforts = null,
         IReadOnlyList<SettingMode>? Permissions = null, SelfSetting? SelfSettings = null, int? SettingsBeyond = null,
-        IReadOnlyList<Undecided>? Undecided = null);
+        IReadOnlyList<Undecided>? Undecided = null, IReadOnlyList<Revive>? Unarchive = null);
 
     /// <summary>A record here that another one continues (<c>ContinuedBy</c>, by title) and that is neither taken for an
     /// older state nor known for a branch the user went on with: what would tell could not be read (<c>Why</c>, one of
@@ -1173,8 +1198,9 @@ internal static class ClaudeSessionSync
     /// The changes, in the order they must run: rename the groups on their way out, make the groups the list needs in
     /// its order, move sessions (moving a pinned session into a group unpins it, so pins are planned after the moves),
     /// set pins, rename sessions, delete the groups the moves emptied, and only then archive what is ready: older states,
-    /// and conversations another account archived after anyone last talked in them, which the plan otherwise leaves
-    /// alone. Value by value a conversation here takes the newest change any account made to it — this account's own
+    /// and conversations another account archived after anyone last talked in them or brought them back, which the plan
+    /// otherwise leaves alone. Before all of it, a session archived here whose conversation another account has live again
+    /// since is unarchived (<see cref="Plan.Unarchive"/>), and the plan made once it is back takes it up. Value by value a conversation here takes the newest change any account made to it — this account's own
     /// included, and above all what it changed in this stay; a value nobody changed stays. The group list follows the
     /// newest change likewise and is final: the longest start of it already in order stays, the rest is made anew at the
     /// end, a group it lacks goes, and a session filed under a group the list lacks follows that group's renaming or
@@ -1261,6 +1287,9 @@ internal static class ClaudeSessionSync
         // A conversation archived elsewhere after anyone last talked in it goes, with its older states here; the rest is
         // planned. A list not read whole could hide where it is still live, so then none goes.
         var gone = decidable ? Gone(newest, seen, lineage?.Self, currentRecords) : new Dictionary<string, Away>(StringComparer.Ordinal);
+        // A session archived here whose conversation another account has live again since comes back first; the plan made
+        // once it is back takes it up.
+        var returning = decidable ? Returning(currentRecords, archived ?? [], others) : new Dictionary<string, Back>(StringComparer.Ordinal);
         var staying = newest.Where(record => !gone.ContainsKey(record.SessionId)).ToArray();
         var leaving = gone.Keys.Concat(retiring.Where(pair => gone.ContainsKey(pair.Value.Newest.SessionId)).Select(pair => pair.Key))
             .ToHashSet(StringComparer.Ordinal);
@@ -1587,14 +1616,18 @@ internal static class ClaudeSessionSync
             StringComparer.Ordinal);
         foreach (var (id, moving) in renamedHere)
             if (here.Any(group => group.Id == id && group.Name == moving.To)) renamedIntent.TryAdd(id, moving);
+        var shelvedById = (archived ?? []).ToDictionary(record => record.SessionId, StringComparer.Ordinal);
+        var unarchive = returning.Select(pair => new Revive(pair.Key, shelvedById[pair.Key].Title,
+                Label(pair.Value.Account) ?? pair.Value.Account, pair.Value.UnarchivedAt, pair.Value.LastActive))
+            .OrderBy(revive => revive.Title, StringComparer.Ordinal).ThenBy(revive => revive.Session, StringComparer.Ordinal).ToArray();
         var pending = new ClaudeSessionLayout.Pending(me?.Stay ?? 0, intent,
             regrouped ? new(order, orderFrom?.Renamed ?? new Dictionary<string, string>(), orderFrom?.At ?? DateTimeOffset.MinValue,
-                orderBy) : null, renamedIntent);
+                orderBy) : null, renamedIntent, unarchive.Length > 0 ? unarchive.Select(revive => revive.Session).ToArray() : null);
         return new("ok", current, currentLabel, views, archive, renameGroups, create, moves, pins, renames, deleteGroups,
             regrouped ? order : null, regrouped ? Label(orderBy) : null, onlyHere.Select(Name).Order(StringComparer.Ordinal).ToArray(),
             sidebars, notes is { Count: > 0 } ? notes : null, Pending: pending, Models: models, Efforts: efforts,
             Permissions: permissions, SelfSettings: selfSetting, SettingsBeyond: beyond > 0 ? beyond : null,
-            Undecided: undecided.Length > 0 ? undecided : null);
+            Undecided: undecided.Length > 0 ? undecided : null, Unarchive: unarchive.Length > 0 ? unarchive : null);
     }
 
     /// <summary>When a record was last used in its own list: its activity, unless the widget wrote it since (a copy, or an
@@ -1840,8 +1873,9 @@ internal static class ClaudeSessionSync
 
     /// <summary>
     /// What an account changed since <paramref name="checkpoint"/>, each change dated <paramref name="at"/>: a value that
-    /// differs from the checkpoint's, and what a conversation new since then gives (see <see cref="Gives"/>); without a
-    /// checkpoint, everything it gives. A value unknown on either side is no change, nor is a copy's title the widget
+    /// differs from the checkpoint's, and what a conversation new since then gives (see <see cref="Gives"/>), but nothing
+    /// from one the plan in progress unarchived (what it shows is what it had when archived); without a checkpoint,
+    /// everything it gives. A value unknown on either side is no change, nor is a copy's title the widget
     /// wrote there since the checkpoint. A value the plan in progress set out to give is no change of its own: reached,
     /// it counts as the change it came from; not reached yet, or a pin its move undid on the way, it stays in progress;
     /// anything else is a change. A nested session's group is its family's (see <see cref="Nests"/>), never a change of its
@@ -1909,6 +1943,8 @@ internal static class ClaudeSessionSync
                     Model: Chosen(before.Model, shown.Model), Effort: Chosen(before.Effort, shown.Effort),
                     Mode: Chosen(before.Mode, shown.Mode, mode: true));
             }
+            // A session the plan unarchived shows what it had when it was archived, which nobody chose now.
+            else if (pending?.Unarchived?.Contains(record.SessionId, StringComparer.Ordinal) == true) changed = new();
             else changed = Gives(record, shown, state.CopyTitles, checkpoint is null ? evidence?.GetValueOrDefault(record.SessionId) : null);
             ClaudeSessionLayout.Stamp<bool>? pin = changed.Pinned is { } pinnedNow ? new(pinnedNow, at) : null;
             ClaudeSessionLayout.Stamp<string?>? filing = changed.HasGroup && !nested ? new(changed.Group, at) : null;
@@ -2139,7 +2175,9 @@ internal static class ClaudeSessionSync
                 // A rename not done yet, or still borne, stays known; one the user changed since is the user's.
                 Renamed = pending.Renamed.Where(pair => groups.Groups.Any(group => group.Id == pair.Key
                         && (group.Name == pair.Value.From || group.Name == pair.Value.To)))
-                    .ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.Ordinal)
+                    .ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.Ordinal),
+                // What it unarchived is checkpointed now, or still archived (a later plan lists it again).
+                Unarchived = null
             };
         else layout.Pendings.Remove(account);
         // Evidence from the first format has served once its values were seen; pins that look lost wait for the next.
@@ -2278,10 +2316,10 @@ internal static class ClaudeSessionSync
     /// <summary>
     /// The conversations here that another account archived after anyone last talked in them, each with that account (the
     /// one that archived it last), when, and its last activity. No list there shows the conversation live, and a record
-    /// archived there holds it: the same transcript, or one continued from it (not a branch of it). It was archived when
-    /// that record was last written, since the app keeps no time of archiving; that must come after the conversation's
-    /// last activity in every list that has it, so one talked in since, anywhere, stays. The calling session stays, as does
-    /// a session another one staying here is nested under: archiving it would take the family apart.
+    /// archived there holds it (see <see cref="Holds"/>). It was archived when the app says (<see cref="ArchivedAt"/>); that
+    /// must come after the conversation was last live in every list that has it — talked in, or unarchived there or here —
+    /// so one talked in or brought back since, anywhere, stays. The calling session stays, as does a session another one
+    /// staying here is nested under: archiving it would take the family apart.
     /// </summary>
     private static Dictionary<string, Away> Gone(IReadOnlyList<Record> newest, IReadOnlyList<Seen> seen, string? self,
         IReadOnlyList<Record> records)
@@ -2291,24 +2329,25 @@ internal static class ClaudeSessionSync
         {
             if (record.SessionId == self || record.Cli is not { } cli || record.LastActivityAt <= 0) continue;
             var lastActive = record.LastActivityAt;
+            var lastLive = LiveAt(record);
             (string Account, DateTimeOffset At)? last = null;
             foreach (var side in seen)
             {
                 if (side.Matches.TryGetValue(record.SessionId, out var live))
                 {
                     lastActive = Math.Max(lastActive, live.LastActivityAt);
+                    lastLive = Math.Max(lastLive, LiveAt(live));
                     continue;
                 }
                 foreach (var shelved in side.Other.Archived ?? [])
                 {
-                    if (shelved.Written is not { } at || shelved.Cli != cli && (shelved.Branch || !shelved.Prior.Contains(cli, StringComparer.Ordinal)))
-                        continue;
+                    if (!Holds(shelved, cli) || ArchivedAt(shelved) is not { } at) continue;
                     lastActive = Math.Max(lastActive, shelved.LastActivityAt);
                     if (last is null || at > last.Value.At) last = (side.Other.Account, at);
                 }
             }
-            var active = DateTimeOffset.FromUnixTimeMilliseconds(lastActive);
-            if (last is { } away && away.At > active) gone[record.SessionId] = new(away.Account, away.At, active);
+            if (last is { } away && away.At > DateTimeOffset.FromUnixTimeMilliseconds(Math.Max(lastLive, lastActive)))
+                gone[record.SessionId] = new(away.Account, away.At, DateTimeOffset.FromUnixTimeMilliseconds(lastActive));
         }
         for (var held = true; held;)
         {
@@ -2318,6 +2357,65 @@ internal static class ClaudeSessionSync
         }
         return gone;
     }
+
+    /// <summary>
+    /// The sessions archived here whose conversation another account has live again since it was last archived anywhere:
+    /// a list there shows it live (<see cref="Holds"/>), unarchived there or talked in after the latest archiving of it in
+    /// any list, this one's included (<see cref="ArchivedAt"/>). Each with the account of the latest such change, when it
+    /// was unarchived there (when that came after the archiving) and its last activity anywhere. Only the newest state
+    /// archived here comes back — not one another archived record here continues, nor the earlier archived of two with the
+    /// same transcript — and none of a conversation a list here shows live in any state: an older state the plan archived
+    /// stays archived.
+    /// </summary>
+    internal static Dictionary<string, Back> Returning(IReadOnlyList<Record> records, IReadOnlyList<Record> archived,
+        IReadOnlyList<Other> others)
+    {
+        var back = new Dictionary<string, Back>(StringComparer.Ordinal);
+        foreach (var record in archived)
+        {
+            if (record.Cli is not { } cli || ArchivedAt(record) is not { } archivedAt) continue;
+            if (records.Any(live => Holds(live, cli) || !record.Branch && live.Cli is { } liveCli && record.Prior.Contains(liveCli, StringComparer.Ordinal)))
+                continue;
+            if (archived.Any(other => other != record && (other.Cli != cli ? Holds(other, cli)
+                    : ArchivedAt(other) is { } otherAt && (otherAt > archivedAt
+                        || otherAt == archivedAt && string.CompareOrdinal(other.SessionId, record.SessionId) > 0))))
+                continue;
+            var lastArchived = archivedAt.ToUnixTimeMilliseconds();
+            var lastActive = record.LastActivityAt;
+            (string Account, long At, long Unarchived)? latest = null;
+            foreach (var other in others)
+            {
+                foreach (var live in other.Records.Where(live => Holds(live, cli)))
+                {
+                    lastActive = Math.Max(lastActive, live.LastActivityAt);
+                    if (latest is null || LiveAt(live) > latest.Value.At) latest = (other.Account, LiveAt(live), live.ArchiveSetAt);
+                }
+                foreach (var shelved in (other.Archived ?? []).Where(shelved => Holds(shelved, cli)))
+                {
+                    lastActive = Math.Max(lastActive, shelved.LastActivityAt);
+                    if (ArchivedAt(shelved) is { } at) lastArchived = Math.Max(lastArchived, at.ToUnixTimeMilliseconds());
+                }
+            }
+            if (latest is { } newest && newest.At > lastArchived)
+                back[record.SessionId] = new(newest.Account,
+                    newest.Unarchived > lastArchived ? DateTimeOffset.FromUnixTimeMilliseconds(newest.Unarchived) : null,
+                    DateTimeOffset.FromUnixTimeMilliseconds(lastActive));
+        }
+        return back;
+    }
+
+    /// <summary>Whether a record holds the conversation of transcript <paramref name="cli"/>: the same transcript, or one
+    /// continued from it (not a branch of it).</summary>
+    private static bool Holds(Record record, string cli) =>
+        record.Cli == cli || !record.Branch && record.Prior.Contains(cli, StringComparer.Ordinal);
+
+    /// <summary>When an archived record was archived: when the app says (<c>archiveSetAtMs</c>), else when the record was
+    /// last written (an app before 6.28899 kept no time of archiving).</summary>
+    private static DateTimeOffset? ArchivedAt(Record record) =>
+        record.ArchiveSetAt > 0 ? DateTimeOffset.FromUnixTimeMilliseconds(record.ArchiveSetAt) : record.Written;
+
+    /// <summary>When a live record last showed its conversation live: its last activity, or when it was unarchived.</summary>
+    private static long LiveAt(Record record) => Math.Max(record.LastActivityAt, record.ArchiveSetAt);
 
     /// <summary>The transcript a record lists right after <paramref name="cli"/>, its current one last.</summary>
     private static string? NextAfter(Record record, string cli)
@@ -2741,7 +2839,9 @@ internal static class ClaudeSessionSync
                 Detached: Flag(record, "lineageDetached"), Written: new DateTimeOffset(written, TimeSpan.Zero),
                 Former: ParentOf(record, sessionId, detachedToo: true), Model: ModelOf(record), Effort: EffortOf(record),
                 Mode: ModeOf(record),
-                Scheduled: !string.IsNullOrEmpty(Text(record, "scheduledTaskId")) && !Flag(record, "scheduledRunContinued")));
+                Scheduled: !string.IsNullOrEmpty(Text(record, "scheduledTaskId")) && !Flag(record, "scheduledRunContinued"),
+                ArchiveSetAt: record["archiveSetAtMs"] is JsonValue setAt && setAt.TryGetValue<long>(out var archiveSetAt)
+                    && archiveSetAt > 0 ? archiveSetAt : 0));
         }
         return records;
     }

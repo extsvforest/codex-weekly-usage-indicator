@@ -82,7 +82,8 @@ It follows the newest change. For each session's name, pin and group, and for th
 
 - The widget makes the plan, so it needs to be running. It reads titles from each account's session records, pins from the list the app's sidebar shows, and groups and their order from the app's own storage, and it remembers what the plan sets out to change, so a run that stops part way is finished next time rather than taken for your choice.
 - Groups out of place are renamed out of the way and made again at the end in order (the app adds new groups at the end and cannot reorder them); then sessions are moved, pinned and renamed, and groups left empty are deleted, including groups the account you follow no longer has. Deleting a group never deletes a session. A session the widget copied into another account brings over only what you chose there.
-- If a conversation still shows twice (an older state beside the newest), Claude offers to archive the older one; you can bring it back from the app's archive. Nothing is deleted, and sessions only one account has stay as they are.
+- If a conversation still shows twice (an older state beside the newest), Claude archives the older one; you can bring it back from the app's archive. Nothing is deleted, and sessions only one account has stay as they are.
+- Archiving follows the newest change too. A conversation archived in another account and not used anywhere since is archived here; one you unarchived or went on with in another account after it was last archived comes back here first, and then takes the newest name, pin and group.
 - When it is done, Claude shows the accounts' pins and groups side by side and says why anything still differs. The app's tools cannot fold or unfold a group, so Claude names the groups to fold.
 - Pin order is left alone.
 
