@@ -71,6 +71,7 @@ internal static class ClaudeSessionSyncTests
         TestLeftFamilyUnclear();
         TestArchivedInRemadeGroup();
         TestArchivedElsewhere();
+        TestBroughtBack();
         TestSettingsFollowNewest();
         TestSettingsNoChange();
         TestSettingsStartingValue();
@@ -857,7 +858,7 @@ internal static class ClaudeSessionSyncTests
             {
                 ["local_a"] = new(new(false, DateTimeOffset.MinValue), new("티어 2", At(7), ThirdKey), Filed: true),
                 ["local_b"] = new(Title: new("새 이름", At(8)))
-            }, ListChange(["도구", "티어 2"], At(9), ThirdKey), Aside(("g-2", "도구")));
+            }, ListChange(["도구", "티어 2"], At(9), ThirdKey), Aside(("g-2", "도구")), ["local_z", "local_y"]);
             layout.Evidences[ReferenceKey] = new(StringComparer.Ordinal) { ["local_r"] = new(true, false), ["local_s"] = new(false, true) };
             layout.Renamings[CurrentKey] = [new("티어 1", "티어 2", At(6)), new("임시", "도구", At(7))];
             layout.Save(root);
@@ -884,6 +885,7 @@ internal static class ClaudeSessionSyncTests
             Check(loaded.Pendings[CurrentKey] is { Stay: 3 } pending && pending.Sessions["local_a"] == layout.Pendings[CurrentKey].Sessions["local_a"]
                   && pending.Sessions["local_b"] == new Target(Title: new("새 이름", At(8))) && pending.Groups is { Order: ["도구", "티어 2"] }
                   && pending.Renamed["g-2"] == new ClaudeSessionLayout.Moved("도구", "도구 (옮기는 중)")
+                  && pending.Unarchived!.SequenceEqual(["local_y", "local_z"])
                   && loaded.Evidences[ReferenceKey]["local_r"] == new ClaudeSessionLayout.Evidence(true, false)
                   && loaded.Evidences[ReferenceKey]["local_s"] == new ClaudeSessionLayout.Evidence(false, true)
                   && loaded.Renamings[CurrentKey].SequenceEqual([new("티어 1", "티어 2", At(6)), new("임시", "도구", At(7))])
@@ -1944,6 +1946,86 @@ internal static class ClaudeSessionSyncTests
         Check(Compute(pair, null, [Other(ReferenceKey, "계정1", [], null, At(40))], lineage: lineage).Archive!.Single() is
                 { Session: "local_old", Newest: "local_new", ArchivedIn: null },
             "without that archiving, the older state is an older state as before");
+    }
+
+    /// <summary>A conversation archived here that another account has live again comes back first: one stayed archived in
+    /// 계정4 after 계정3 had unarchived it and talked in it (11/23). Unarchived there or talked in after it was last
+    /// archived anywhere, it is listed to unarchive, with that account and when; a copy there not live since, one archived
+    /// later elsewhere, one a list here shows live in another state, an older state or the earlier archived of two here,
+    /// and a branch stay archived. Archiving it the other way waits for an unarchiving likewise, and dates the archiving as
+    /// the app does, not by when the record was last written. Back, what it shows is nobody's change.</summary>
+    private static void TestBroughtBack()
+    {
+        long Ms(double minutes) => At(0).AddMinutes(minutes).ToUnixTimeMilliseconds();
+        // The app rewrites archived records too: each was last written well after it was archived.
+        Record Shelved(string id, string title, string cli, double active, double archivedAt, string[]? prior = null) =>
+            R(id, title, false, cli, prior, Ms(active)) with { ArchiveSetAt = Ms(archivedAt), Written = At(0).AddMinutes(archivedAt + 30) };
+        Record Live(string id, string title, string cli, double active, double unarchivedAt = 0, string[]? prior = null, bool branch = false) =>
+            R(id, title, false, cli, prior, Ms(active), branch) with { ArchiveSetAt = unarchivedAt > 0 ? Ms(unarchivedAt) : 0 };
+        var self = new ClaudeSessionSync.Lineage("local_s", _ => null, (_, _) => null);
+        var here = new[] { Live("local_s", "지금", "s", 50), Live("local_e2", "여기서 이음", "e2", 12, prior: ["e"]) };
+        var shelvedHere = new[]
+        {
+            Shelved("local_a", "되살린 대화", "a", 10, 20), Shelved("local_b", "거기서 말함", "b", 10, 20), Shelved("local_c", "낡은 사본", "c", 10, 20),
+            Shelved("local_d", "또 보관", "d", 10, 20), Shelved("local_e", "옛 상태", "e", 10, 11),
+            Shelved("local_f1", "사슬 앞", "f1", 5, 20), Shelved("local_f2", "사슬 끝", "f2", 10, 20, ["f1"]),
+            Shelved("local_g", "먼저 보관", "g", 10, 20), Shelved("local_g2", "나중 보관", "g", 10, 22),
+            Shelved("local_h", "거기서 이어 감", "h", 10, 20), Shelved("local_i", "거기서 갈라짐", "i", 10, 20)
+        };
+        OtherAccount[] Others() =>
+        [
+            Other(ReferenceKey, "계정1",
+            [
+                Live("local_b1", "거기서 말함", "b", 25), Live("local_c1", "낡은 사본", "c", 15), Live("local_d1", "또 보관", "d", 26, 25),
+                Live("local_e1", "옛 상태", "e", 40), Live("local_g1", "나중 보관", "g", 40),
+                Live("local_h1", "거기서 이어 감", "h2", 30, prior: ["h"]), Live("local_i1", "거기서 갈라짐", "i2", 30, prior: ["i"], branch: true)
+            ], null, At(45)),
+            Other(ThirdKey, "계정3", [Live("local_a3", "되살린 대화", "a", 35, 30), Live("local_f3", "사슬 끝", "f2", 12, 30, ["f1"])], null, At(50),
+                archived: [Shelved("local_d3", "또 보관", "d", 26, 30)])
+        ];
+        var plan = Compute(here, null, Others(), lineage: self, archived: shelvedHere);
+        var items = plan.Unarchive!.ToDictionary(item => item.Session, StringComparer.Ordinal);
+        Check(plan.Unarchive!.Select(item => item.Session).SequenceEqual(["local_b", "local_h", "local_g2", "local_a", "local_f2"])
+              && items["local_a"] is { Title: "되살린 대화", By: "계정3" } a && a.UnarchivedAt == At(30) && a.LastActive == At(35)
+              && items["local_b"] is { By: "계정1", UnarchivedAt: null } b && b.LastActive == At(25)
+              && items["local_f2"] is { By: "계정3" } f && f.UnarchivedAt == At(30) && f.LastActive == At(12)
+              && items["local_g2"] is { By: "계정1", UnarchivedAt: null } && items["local_h"] is { By: "계정1", UnarchivedAt: null },
+            "a conversation another account unarchived, talked in or went on with after it was last archived anywhere comes "
+            + "back, its newest state archived here only, each with that account and when it was unarchived there");
+        Check(plan.Pending!.Unarchived!.Order(StringComparer.Ordinal).SequenceEqual(items.Keys.Order(StringComparer.Ordinal))
+              && plan.Archive is null or { Count: 0 },
+            "the plan keeps what it unarchives in progress, and archives nothing back");
+        Check(Compute(here, null, Others(), lineage: self, archived: shelvedHere, listsWhole: false) is { Unarchive: null, Pending.Unarchived: null },
+            "none comes back while a list cannot be read whole");
+
+        // The other way: an unarchiving anywhere counts as the conversation live then.
+        var live = new[]
+        {
+            Live("local_j", "거기서 풂", "j", 10), Live("local_k", "여기서 풂", "k", 10, 30), Live("local_l", "늦게 씀", "l", 25),
+            Live("local_m", "보관됨", "m", 10)
+        };
+        var away = Compute(live, null,
+        [
+            Other(ReferenceKey, "계정1", [Live("local_j1", "거기서 풂", "j", 10, 30)], null, At(45),
+                archived: [Shelved("local_k1", "여기서 풂", "k", 10, 20), Shelved("local_l1", "늦게 씀", "l", 10, 20), Shelved("local_m1", "보관됨", "m", 10, 20)]),
+            Other(ThirdKey, "계정3", [], null, At(50), archived: [Shelved("local_j3", "거기서 풂", "j", 10, 20)])
+        ], lineage: self);
+        Check(away.Archive!.Single() is { Session: "local_m", ArchivedIn: "계정1" } m && m.ArchivedAt == At(20) && m.LastWritten == At(10)
+              && away.Unarchive is null,
+            "archived elsewhere, one unarchived since there or here stays, as does one talked in before its record was last "
+            + "written but after it was archived; one archived after anyone last had it live goes, dated when it was archived");
+
+        // Back in the list, what it had when it was archived is nobody's change now; a session new to the list gives its own.
+        var groups = Groups(["g=G"], ("local_a", "g"), ("local_n", "g"));
+        var shown = new[] { R("local_a", "되살린 대화", true, "a", activity: Ms(10)), R("local_n", "새 대화", true, "n", activity: Ms(40)) };
+        var pending = new ClaudeSessionLayout.Pending(1, new Dictionary<string, Target>(), null,
+            new Dictionary<string, ClaudeSessionLayout.Moved>(), ["local_a"]);
+        var looked = ClaudeSessionSync.Observe(new(shown, groups, true, NoCopies), PointOf([], groups, At(0), 1), At(60), pending);
+        Check(!looked.Changes.ContainsKey("local_a")
+              && looked.Changes["local_n"] == new Changes(new(true, At(60)), new("G", At(60)), new("새 대화", At(60))),
+            "a session the plan unarchived gives nothing at the look that finds it back; another new one gives what it shows");
+        Check(ClaudeSessionSync.Observe(new(shown, groups, true, NoCopies), PointOf([], groups, At(0), 1), At(60)).Changes.ContainsKey("local_a"),
+            "one unarchived by hand gives what it shows, as any session new to the list");
     }
 
     /// <summary>The user's expectation of 10/20 on disk: 계정3, used last, put its groups in a new order and moved a session;
