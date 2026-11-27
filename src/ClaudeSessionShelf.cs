@@ -14,7 +14,8 @@ internal sealed record ClaudeShelfAccount(string AccountUuid, string OrgUuid, st
 }
 
 internal sealed record ClaudeShelfPaths(string SessionsRoot, string ProjectsRoot, string ScratchRoot,
-    IReadOnlyList<string> RegistryDirectories, string LedgerDirectory, string? DesktopConfig = null)
+    IReadOnlyList<string> RegistryDirectories, string LedgerDirectory, string? DesktopConfig = null,
+    IReadOnlyList<string>? OtherScratchRoots = null)
 {
     /// <summary>The lists, scratch folders and stores in the app's profile folder (<see cref="ClaudeAppData"/>, found
     /// now unless <paramref name="appRoot"/> names it).</summary>
@@ -35,7 +36,12 @@ internal sealed record ClaudeShelfPaths(string SessionsRoot, string ProjectsRoot
             Path.Combine(local, "CodexWeeklyUsageIndicator.SessionShelf"),
             // Automatic sidebar writes stay off: holding the web UI store's lock while Desktop starts can make Chromium
             // fail to open it and recreate it. Writes run only as a controlled step (see ClaudeLocalStorage).
-            DesktopConfig: null);
+            DesktopConfig: null,
+            // The app can name a scratch folder under any profile folder it has used: inside its package it sees
+            // %APPDATA%\Claude for its own folder there.
+            OtherScratchRoots: ClaudeAppData.Candidates(ClaudeAppData.Roaming, local)
+                .Where(candidate => !string.Equals(Path.GetFullPath(candidate), Path.GetFullPath(app), StringComparison.OrdinalIgnoreCase))
+                .Select(candidate => Path.Combine(candidate, "scratch-workspaces")).ToList());
     }
 }
 
@@ -1083,8 +1089,9 @@ internal sealed class ClaudeSessionShelf
         if (Holds(record["worktreeLazy"])) return "worktree_lazy";
         var cwd = Text(record, "cwd");
         if (string.IsNullOrWhiteSpace(cwd) || !Path.IsPathFullyQualified(cwd)) return "no_cwd";
-        // The app deletes a folderless session's scratch folder without checking other accounts.
-        if (IsWithin(cwd, _paths.ScratchRoot)) return "scratch";
+        // The app's periodic sweep deletes a folderless session's scratch folder without checking other accounts (its
+        // delete did too until 7.37095).
+        if (IsWithin(cwd, _paths.ScratchRoot) || (_paths.OtherScratchRoots ?? []).Any(root => IsWithin(cwd, root))) return "scratch";
         if (!Directory.Exists(cwd)) return "missing_cwd";
         return transcripts.ContainsKey(cli.ToLowerInvariant()) ? null : "missing_transcript";
     }

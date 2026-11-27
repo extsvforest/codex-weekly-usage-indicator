@@ -12,6 +12,18 @@ if (args.Contains("--claude-layout-dry-run")) { ClaudeSessionShelfTests.LayoutDr
 if (args.Contains("--claude-older-states")) { ClaudeOlderStatesProbe.Run(args); return; }
 if (args.Contains("--claude-sidebar-store-shape")) { ClaudeSessionShelfTests.SidebarStoreShape(); return; }
 if (args.Contains("--claude-layout-diff")) { ClaudeSessionShelfTests.LayoutDiff(args[Array.IndexOf(args, "--claude-layout-diff") + 1], args[Array.IndexOf(args, "--claude-layout-diff") + 2]); return; }
+// Reads an app bundle (app.asar) against the shelf design, read-only: the contract, and every marker, window or flow that
+// does not read as reviewed, so the review of a new version starts where the shape moved.
+if (args.Contains("--claude-contract-review"))
+{
+    var bundle = File.ReadAllBytes(args[Array.IndexOf(args, "--claude-contract-review") + 1]);
+    Console.WriteLine("contract=" + ClaudeDesktopProbe.Contract(bundle));
+    foreach (var spellings in ClaudeDesktopProbe.ContractMarkers)
+        if (!spellings.Any(spelling => bundle.AsSpan().IndexOf(System.Text.Encoding.UTF8.GetBytes(spelling)) >= 0))
+            Console.WriteLine("missing marker " + spellings[0]);
+    foreach (var item in ClaudeDesktopProbe.Unmatched(bundle)) Console.WriteLine("unmatched " + item);
+    return;
+}
 if (args.Contains("--claude-profile-tests")) { await ClaudeProfileTests.RunAsync(); Console.WriteLine("PASS: Claude profiles"); return; }
 if (args.Contains("--claude-app-data-tests")) { await ClaudeAppDataTests.RunAsync(); Console.WriteLine("PASS: Claude profile folder"); return; }
 if (args.Contains("--claude-shelf-tests")) { await ClaudeSessionShelfTests.RunAsync(); Console.WriteLine("PASS: Claude session shelf"); return; }
