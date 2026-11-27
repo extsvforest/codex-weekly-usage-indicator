@@ -60,7 +60,7 @@ Local file-based ChatGPT authentication is supported. Keyring and managed authen
 
 1. Open the **Claude** tab and choose **Connect existing account** to register the Claude Code account you already use. That account shares its sign-in folder with the Claude app and terminal, which sign it out now and then; the tab offers **Sign in separately** once, to give it a sign-in of its own for the widget's checks.
 2. Choose **+ Add account** and sign in through the official Claude Code login window. Each additional account gets its own official login profile, used for its usage checks.
-3. Switch accounts in the Claude desktop app itself: sign out, then sign in with the other account. The row of the account the app is using shows **In use**, and the widget follows it. While the app is signed out, signed in to an account not registered here, or still confirming a switch, the widget shows `—` with the reason instead of another account's usage.
+3. Switch accounts in the Claude desktop app itself: sign out, then sign in with the other account. The row of the account the app is using shows **In use**, and the widget follows it. While the app is signed out, signed in to an account not registered here, or still confirming a switch, the widget shows `—` with the reason instead of another account's usage. An account you register after the app has already switched to it is recognized without restarting Claude.
 
 ### Keep your Code sessions in every account
 

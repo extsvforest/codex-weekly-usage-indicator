@@ -408,7 +408,8 @@ internal static class ClaudeDesktopProbe
 }
 
 /// <summary>Follows the app's main log in order, from the start of the current app process only. A new run, a
-/// sign-out or an unregistered account invalidates the previous observation.</summary>
+/// sign-out or an unregistered account invalidates the previous observation. What a line means depends on the accounts
+/// registered, so a change in them replays the run: an account registered after the app came to it is known then.</summary>
 internal sealed class ClaudeDesktopLogWatcher(string? directory = null)
 {
     private const long MaxRead = 16 * 1024 * 1024;
@@ -429,6 +430,8 @@ internal sealed class ClaudeDesktopLogWatcher(string? directory = null)
     // name that was just renamed away inherits the old creation time, and the app's rotation does exactly that.
     private string? _file;
     private ClaudeDesktopAccountState _state = ClaudeDesktopAccountState.Closed;
+    // The registered pairs the lines read so far were read with.
+    private string? _registered;
     private readonly HashSet<string> _held = new(StringComparer.Ordinal);
     internal ClaudeDesktopAccountState State => _state;
     /// <summary>The last update found lines lost (a gap): anything could have happened in them, a switch included.</summary>
@@ -447,12 +450,15 @@ internal sealed class ClaudeDesktopLogWatcher(string? directory = null)
         List<string> lines = [];
         LogRead result;
         long end = 0; string? file = null;
-        var replay = _generation != hostStartedAt;
+        var pairs = string.Join("|", registered.Select(account => account.Key).Order(StringComparer.Ordinal));
+        var replay = _generation != hostStartedAt || pairs != _registered;
         if (replay)
         {
-            // A new app run, or a replay after a gap: forget the previous observation and replay this run from both
-            // log files. An unfinished last line in main1.log may have been a sign-out or switch, so nothing before
-            // it may confirm an account; only the complete lines of main.log count then.
+            // A new app run, a replay after a gap, or other accounts registered: forget the previous observation and
+            // replay this run from both log files. (An account registered after the app came to it was read as one not
+            // registered, and its initialization passed over: the app showed it all the same.) An unfinished last line
+            // in main1.log may have been a sign-out or switch, so nothing before it may confirm an account; only the
+            // complete lines of main.log count then.
             _state = ClaudeDesktopAccountState.Unknown;
             result = File.Exists(previous) ? ReadFrom(previous, 0, null, true, lines, out _, out _) : LogRead.Ok;
             if (result == LogRead.Unfinished) result = LogRead.Ok;
@@ -471,7 +477,7 @@ internal sealed class ClaudeDesktopLogWatcher(string? directory = null)
             _generation = null; LostLines = true;
             return _state = ClaudeDesktopAccountState.Unknown;
         }
-        _generation = hostStartedAt; _offset = end; _file = file;
+        _generation = hostStartedAt; _offset = end; _file = file; _registered = pairs;
         // A replay reads the whole run again, the accounts it left included.
         if (replay) _held.Clear();
         return _state = Apply(_state, lines, hostStartedAt.Value, registered, _held);
