@@ -77,6 +77,7 @@ internal static class ClaudeSessionShelfTests
     {
         using var fixture = new Fixture();
         fixture.Record(A, "local_bbbbbbbb-0000-4000-8000-000000000001", fixture.Transcript(), cwd: Path.Combine(fixture.Scratch, "s1"), createCwd: true);
+        fixture.Record(A, "local_bbbbbbbb-0000-4000-8000-000000000008", fixture.Transcript(), cwd: Path.Combine(fixture.OtherScratch, "s2"), createCwd: true);
         fixture.Record(A, "local_bbbbbbbb-0000-4000-8000-000000000002", fixture.Transcript(), cwd: Path.Combine(fixture.Root, "gone"), createCwd: false);
         fixture.Record(A, "local_bbbbbbbb-0000-4000-8000-000000000003", fixture.Transcript(), extra: r => r["sshConfig"] = new JsonObject());
         fixture.Record(A, "local_bbbbbbbb-0000-4000-8000-000000000004", fixture.Transcript(),
@@ -90,10 +91,10 @@ internal static class ClaudeSessionShelfTests
         File.WriteAllText(Path.Combine(fixture.ShelfPath(B), "deleted_" + deletedCli), "");
         var plan = fixture.Shelf().Plan([A, B]);
         var reasons = plan.Skipped.Values.Single();
-        Check(plan.Actions.Count == 0 && reasons["scratch"] == 1 && reasons["missing_cwd"] == 1 && reasons["remote"] == 1
+        Check(plan.Actions.Count == 0 && reasons["scratch"] == 2 && reasons["missing_cwd"] == 1 && reasons["remote"] == 1
               && reasons["worktree_lazy"] == 1 && reasons["missing_transcript"] == 1 && reasons["deleted_in_target"] == 1
               && reasons["overflow_lineage"] == 1,
-            "scratch, missing folders, remote, a worktree not made yet, missing transcripts, target deletions and a lineage past what a copy carries are excluded");
+            "scratch under any profile folder, missing folders, remote, a worktree not made yet, missing transcripts, target deletions and a lineage past what a copy carries are excluded");
 
         File.WriteAllText(Path.Combine(fixture.ShelfPath(B), "local_cccccccc-0000-4000-8000-000000000001.json.tmp"), "{}");
         Check(fixture.Shelf().Plan([A, B]).Held[B.Key] == "recovering", "a pending app recovery holds the target shelf");
@@ -1028,6 +1029,11 @@ internal static class ClaudeSessionShelfTests
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle6(call: claimsNamed.Replace("let i=this.transcriptIdClaims.cliSessionIdsClaimedByLoadedSessions(",
                 "i=this.transcriptIdClaims.cliSessionIdsClaimedByLoadedSessions("))),
             "the claims assigned to the checks' name instead of declared are not reviewed");
+        // A parameter or loop that takes the checks' name before the removal could make the removal mean something else.
+        foreach (var binding in new[] { "try{}catch(i){}", "[].map((i)=>0);", "[].map((n,i)=>0);", "(function(i){});", "for(let i of[]);", "for(const i in{});" })
+            Check(!ClaudeDesktopProbe.IsCompatible(Bundle6(call: Call6.Replace("let t=this.transcriptIdClaims.localIdsClaimedByOthers(e);",
+                    binding + "let t=this.transcriptIdClaims.localIdsClaimedByOthers(e);"))),
+                $"the checks' name taken by {binding} before the removal is not reviewed");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle6(call: Call6.Replace("let t=this.transcriptIdClaims.localIdsClaimedByOthers(e);",
                 "i={};let t=this.transcriptIdClaims.localIdsClaimedByOthers(e);"))),
             "the 6.28899 checks replaced before the removal are not reviewed");
@@ -2839,6 +2845,8 @@ internal static class ClaudeSessionShelfTests
         internal string Sessions => Path.Combine(Root, "claude-code-sessions");
         internal string Projects => Path.Combine(Root, "projects");
         internal string Scratch => Path.Combine(Root, "scratch-workspaces");
+        // A scratch root under another profile folder the app has used.
+        internal string OtherScratch => Path.Combine(Root, "roaming", "Claude", "scratch-workspaces");
         internal string Ledger => Path.Combine(Root, "ledger");
         internal List<string> OriginalHashes { get; } = [];
         private readonly string _work;
@@ -2852,7 +2860,7 @@ internal static class ClaudeSessionShelfTests
         internal string? Config { get; set; }
 
         internal ClaudeSessionShelf Shelf(Func<ClaudeLiveSessionScan>? writers = null) => new(
-            new ClaudeShelfPaths(Sessions, Projects, Scratch, [], Ledger, Config),
+            new ClaudeShelfPaths(Sessions, Projects, Scratch, [], Ledger, Config, [OtherScratch]),
             writers ?? (() => new ClaudeLiveSessionScan(new HashSet<string>(), false)), () => new MemoryStream());
 
         internal string ShelfPath(ClaudeShelfAccount account) => Path.Combine(Sessions, account.AccountUuid, account.OrgUuid);
