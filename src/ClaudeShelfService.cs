@@ -388,7 +388,9 @@ internal sealed class ClaudeShelfService : IDisposable
         IEnumerable<string> Mapped(string account) =>
             _accounts.Where(mapped => string.Equals(mapped.AccountUuid, account, StringComparison.OrdinalIgnoreCase))
                 .Select(mapped => mapped.Key);
-        var showing = (app.Status == ClaudeDesktopAccountStatus.SignedIn && app.AccountUuid is { } account ? Mapped(account) : [])
+        // An account read as not registered maps to none, unless it was registered since: it is shown all the same.
+        var showing = (app.Status is ClaudeDesktopAccountStatus.SignedIn or ClaudeDesktopAccountStatus.Unregistered
+                && app.AccountUuid is { } account ? Mapped(account) : [])
             .Concat(app.Status == ClaudeDesktopAccountStatus.Closed ? [] : _log.Held.SelectMany(Mapped));
         var shown = app.Confirmed || app.Status == ClaudeDesktopAccountStatus.Closed
             ? showing.ToHashSet(StringComparer.Ordinal)

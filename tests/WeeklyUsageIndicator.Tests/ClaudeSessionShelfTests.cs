@@ -19,6 +19,7 @@ internal static class ClaudeSessionShelfTests
         TestFillingWhileRunning();
         TestServiceFillsWhileRunning();
         TestServiceStartedWhileSignedOut();
+        TestServiceAccountRegisteredLater();
         TestWriterAndDesktopRaces();
         TestRecordFields();
         TestUndoAndPendingRecovery();
@@ -394,6 +395,59 @@ internal static class ClaudeSessionShelfTests
         Check(fixture.Files(g).Count == 2, "then that list is filled");
     }
 
+    private static void TestServiceAccountRegisteredLater()
+    {
+        // The app came to an account the widget did not know, and the account was registered a minute later
+        // (2026-11-27). The list the app shows must still be left alone, and the account confirmed, without a restart.
+        using var fixture = new Fixture();
+        var g = new ClaudeShelfAccount("90909090-0000-4000-8000-00000000000c", "91919191-0000-4000-8000-00000000000c", "G", "p-g3");
+        var h = new ClaudeShelfAccount("80808080-0000-4000-8000-00000000000d", "81818181-0000-4000-8000-00000000000d", "H", "p-h3");
+        var k = new ClaudeShelfAccount("70707070-0000-4000-8000-00000000000e", "71717171-0000-4000-8000-00000000000e", "K", "p-k3");
+        var logs = Directory.CreateDirectory(Path.Combine(fixture.Root, "logs")).FullName;
+        var main = Path.Combine(logs, "main.log");
+        var start = new DateTime(2026, 10, 1, 4, 0, 0);
+        var second = 0;
+        string Line(string text) => start.AddSeconds(++second).ToString("yyyy-MM-dd HH:mm:ss") + " [info] " + text;
+        string Init(ClaudeShelfAccount account) => Line(
+            $"[LocalSessionManager] Initialization succeeded — accountId={account.AccountUuid}, orgId={account.OrgUuid}, existingSessions=0");
+        string Transition(ClaudeShelfAccount from, ClaudeShelfAccount to) => Line(
+            $"[account] Login-state transition (loggedOut: false → false, uuid: {from.AccountUuid} → {to.AccountUuid}), clearing oauth cache");
+        var now = DateTimeOffset.Now;
+        var package = new ClaudeDesktopPackage("Claude_9.9.9.9_x64__pzs8sxrjxfjjc", new Version(9, 9, 9, 9), fixture.Root, "Claude_pzs8sxrjxfjjc");
+        var runtime = new ClaudeDesktopRuntime(ClaudeDesktopRunState.Running, start);
+        var environment = new ClaudeShelfEnvironment(() => runtime, () => package, _ => ClaudeDesktopContract.Reviewed, _ => { }, () => now);
+        var sources = new ClaudeSessionSync.Sources(fixture.Sessions, Path.Combine(fixture.Root, "Local Storage", "leveldb"),
+            Path.Combine(fixture.Root, "IndexedDB", "https_claude.ai_0.indexeddb.leveldb"), fixture.Projects, fixture.Ledger);
+        File.WriteAllLines(main, [Init(g)]);
+        fixture.Record(g, "local_9c9c9c9c-0000-4000-8000-000000000001", fixture.Transcript());
+        fixture.Record(h, "local_9c9c9c9c-0000-4000-8000-000000000002", fixture.Transcript());
+        using var owner = new System.Windows.Forms.Control();
+        using var service = new ClaudeShelfService(owner, () => [], fixture.Shelf(), environment, new ClaudeDesktopLogWatcher(logs), sources);
+        service.SetAccountsForTest([g, h]);
+        ClaudeShelfStatus After(TimeSpan wait, params string[] lines)
+        {
+            File.AppendAllLines(main, lines);
+            now += wait;
+            service.Accept(service.Work([], service.ActiveReservation()));
+            return service.Status;
+        }
+        var minute = TimeSpan.FromSeconds(60);
+        var moment = TimeSpan.FromSeconds(3);
+        After(TimeSpan.Zero);
+        After(minute * 3);
+        Check(fixture.Files(h).Count == 2 && fixture.Files(g).Count == 1, "the fixture fills the list the app leaves alone");
+
+        Check(After(moment, Transition(g, k), Init(k)).App.Status == ClaudeDesktopAccountStatus.Unregistered,
+            "the app comes to an account not registered yet");
+        service.SetAccountsForTest([g, h, k]);
+        var registered = After(moment);
+        Check(registered is { AppConfirmed: true, AppProfileId: "p-k3" },
+            "once registered, the account the app shows is confirmed from the lines already read, without a restart");
+        After(minute * 3);
+        Check(fixture.Files(k).Count == 0 && fixture.Files(g).Count == 2,
+            "its list is left for the app to close, and the account it left is filled once settled");
+    }
+
     private static void TestWriterAndDesktopRaces()
     {
         using var fixture = new Fixture();
@@ -617,6 +671,19 @@ internal static class ClaudeSessionShelfTests
             "an account left for one not registered is held");
         Check(watcher.Update(null, registered).Status == ClaudeDesktopAccountStatus.Closed && watcher.Held.Count == 0,
             "a closed app has no current account and holds none");
+
+        // An account registered after the app came to it: the lines already read are read again with it.
+        var late = new ClaudeShelfAccount("5a5a5a5a-0000-4000-8000-00000000005a", "5b5b5b5b-0000-4000-8000-00000000005b", "Late");
+        var lateLogs = Directory.CreateDirectory(Path.Combine(fixture.Root, "late-logs")).FullName;
+        File.WriteAllLines(Path.Combine(lateLogs, "main.log"), [lines[1],
+            Line(100, $"[account] Login-state transition (loggedOut: false → false, uuid: {AccountA} → {late.AccountUuid}), clearing oauth cache"),
+            Line(100, $"[LocalSessionManager] Initialization succeeded — accountId={late.AccountUuid}, orgId={late.OrgUuid}, existingSessions=0")]);
+        var lateWatcher = new ClaudeDesktopLogWatcher(lateLogs);
+        Check(lateWatcher.Update(start, registered).Status == ClaudeDesktopAccountStatus.Unregistered && lateWatcher.Held.SequenceEqual([AccountA]),
+            "an account the widget does not know yet is read as not registered");
+        var known = lateWatcher.Update(start, [A, B, late]);
+        Check(known.Confirmed && known.Key == late.Key && lateWatcher.Held.Count == 0,
+            "once it is registered, the lines already read confirm it");
     }
 
     // Shapes of the reviewed 2.16120.0.0 bundle. Minified names change between builds; the flows must not.
