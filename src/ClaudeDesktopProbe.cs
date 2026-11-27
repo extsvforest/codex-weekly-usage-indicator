@@ -106,9 +106,10 @@ internal static class ClaudeDesktopProbe
         // (4) Since 5.11492 the removal and the setting aside are imports from the chunk that holds them (`Gt.f`).
         // 6.28899 gives the list of ids the delete writes tombstones for the checks' name, declared in the block that
         // writes them, which closes before the removal: that declaration, up to its block's end, is passed over, and
-        // nothing else may assign to the name.
+        // nothing else may assign to the name. 7.37095 gives the checks' name to the claims that block declares first
+        // instead, the list taking another: passed over the same way.
         ("(this.reapChecks,", 60, 2400, new Regex(
-            @"let (?<v>[\w$]+)=(?<maker>[\w$]+)\(this\.reapChecks,[^;]{0,400}?(?<![\w$.])(?<aside>[\w$]+)\(this\.reapChecks,\k<v>,(?:(?<![\w$.])let [\w$]+=this\.transcriptIdClaims\.cliSessionIdsClaimedByLoadedSessions\(\{[^{}]*\}\),\k<v>=\[\.\.\.new Set\(\[[^;{}]*?\]\.filter\([^;{}]*?\)\)\];await [\w$]+\.[\w$]+\(\(0,[\w$]+\.dirname\)\([\w$]+\),\k<v>,Date\.now\(\)\)(?:,[\w$]+\.[\w$]+\(\))?\}|(?!(?<![\w$.])\k<v>=(?!=)).){0,2300}?(?<![\w$.])(?<remover>(?:[\w$]+\.)?[\w$]+)\(this\.diskTranscript,[^;]{0,120},""delete"",\k<v>\)",
+            @"let (?<v>[\w$]+)=(?<maker>[\w$]+)\(this\.reapChecks,[^;]{0,400}?(?<![\w$.])(?<aside>[\w$]+)\(this\.reapChecks,\k<v>,(?:(?<![\w$.])let [\w$]+=this\.transcriptIdClaims\.cliSessionIdsClaimedByLoadedSessions\(\{[^{}]*\}\),\k<v>=\[\.\.\.new Set\(\[[^;{}]*?\]\.filter\([^;{}]*?\)\)\];await [\w$]+\.[\w$]+\(\(0,[\w$]+\.dirname\)\([\w$]+\),\k<v>,Date\.now\(\)\)(?:,[\w$]+\.[\w$]+\(\))?\}|(?<![\w$.])let \k<v>=this\.transcriptIdClaims\.cliSessionIdsClaimedByLoadedSessions\(\{[^{}]*\}\),(?<tombs>[\w$]+)=\[\.\.\.new Set\(\[[^;{}]*?\]\.filter\([^;{}]*?\)\)\];await [\w$]+\.[\w$]+\(\(0,[\w$]+\.dirname\)\([\w$]+\),\k<tombs>,Date\.now\(\)\)(?:,[\w$]+\.[\w$]+\(\))?\}|(?!(?<![\w$.])\k<v>=(?!=)).){0,2300}?(?<![\w$.])(?<remover>(?:[\w$]+\.)?[\w$]+)\(this\.diskTranscript,[^;]{0,120},""delete"",\k<v>\)",
             RegexOptions.CultureInvariant | RegexOptions.Singleline)),
         // (5) Since 5.11492 the removal first waits, out of the shared limit of removals at once, for the checks'
         // `reapAfter` (a wait that swallows its failure and returns nothing), then asks the reap check as before.

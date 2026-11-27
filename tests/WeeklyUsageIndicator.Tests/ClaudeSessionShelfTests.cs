@@ -1018,6 +1018,16 @@ internal static class ClaudeSessionShelfTests
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle6(call: Call6.Replace("cliSessionIdsClaimedByLoadedSessions({localOnly:!0,except:e}),i=[",
                 "cliSessionIdsClaimedByLoadedSessions({localOnly:!0,except:e});i=["))),
             "the delete's list assigned to the checks' name instead of declared is not reviewed");
+        // 7.37095: the claims of that block take the checks' name, and the list another.
+        var claimsNamed = Call6.Replace("let r=this.transcriptIdClaims.cliSessionIdsClaimedByLoadedSessions({localOnly:!0,except:e}),i=[",
+                "let i=this.transcriptIdClaims.cliSessionIdsClaimedByLoadedSessions({localOnly:!0,except:e}),q=[")
+            .Replace("!r.has(e))))];await gn.c((0,Z.dirname)(o),i,Date.now())", "!i.has(e))))];await gn.c((0,Z.dirname)(o),q,Date.now())");
+        Check(ClaudeDesktopProbe.IsCompatible(Bundle6(call: claimsNamed)), "the block's claims under the checks' name, as in 7.37095, stay compatible");
+        Check(!ClaudeDesktopProbe.IsCompatible(Bundle6(call: claimsNamed.Replace("b.n()}if(A&&!u){", "b.n();if(A&&!u){").Replace("a?.reaps(n)}", "a?.reaps(n)}}"))),
+            "a removal inside the block whose claims have the checks' name is not reviewed");
+        Check(!ClaudeDesktopProbe.IsCompatible(Bundle6(call: claimsNamed.Replace("let i=this.transcriptIdClaims.cliSessionIdsClaimedByLoadedSessions(",
+                "i=this.transcriptIdClaims.cliSessionIdsClaimedByLoadedSessions("))),
+            "the claims assigned to the checks' name instead of declared are not reviewed");
         Check(!ClaudeDesktopProbe.IsCompatible(Bundle6(call: Call6.Replace("let t=this.transcriptIdClaims.localIdsClaimedByOthers(e);",
                 "i={};let t=this.transcriptIdClaims.localIdsClaimedByOthers(e);"))),
             "the 6.28899 checks replaced before the removal are not reviewed");
